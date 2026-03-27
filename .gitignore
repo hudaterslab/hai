@@ -1,0 +1,16 @@
+dll/nvinfer.dll
+src/nvinfer.dll
+dll/opencv_world451.dll
+dll/opencv_world460.dll
+x64/Release/opencv_world4.dll
+*.mp4
+*.avi
+models
+.vs
+*.weights
+x64/Release/csp-p6.engine
+x64/Release/csp-p6.onnx
+x64/Release/helmet.engine
+x64/Release/nvinfer.dll
+x64/Release/nvinfer_builder_resource.dll
+*.engine

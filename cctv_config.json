@@ -1,0 +1,27 @@
+{
+    "170_9001": {
+        "url": "rtsp://192.168.1.170:9001/S.mp4",
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                1430,
+                44
+            ],
+            [
+                1593,
+                1696
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "170_9002": {
+        "url": "rtsp://192.168.1.170:9002/s.mp4",
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    }
+}
