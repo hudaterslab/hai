@@ -12,7 +12,6 @@ import threading
 import queue
 from collections import deque, defaultdict
 import concurrent.futures
-import msvcrt
 import pytz
 import requests
 
@@ -20,18 +19,19 @@ import requests
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp;stimeout=3000000;buffer_size=1024;max_delay=500000"
 
-# [GPU 설정]
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-# [2] PyCUDA & TensorRT
-import pycuda.driver as cuda
-import tensorrt as trt
+# [2] DeepX NPU 엔진 임포트
+try:
+    from dx_engine import InferenceEngine, InferenceOption
+except ImportError:
+    print("❌ [오류] dx_engine 모듈을 찾을 수 없습니다. DeepX SDK가 올바르게 설치되었는지 확인하십시오.")
+    sys.exit(1)
 
 # ==========================================
 # 0. 설정 및 상수
 # ==========================================
 CONFIG_FILE = "cctv_config.json"
-EVENT_ROOT_DIR = r"C:\CCTV_EVENT_ALERT"
+# 라즈베리파이 환경에 맞게 경로 수정 권장 (예: /home/pi/CCTV_EVENT_ALERT)
+EVENT_ROOT_DIR = "./CCTV_EVENT_ALERT" 
 
 SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
@@ -52,45 +52,10 @@ RTSP_LIST = [
     "rtsp://192.168.1.170:9001/S.mp4",
     "rtsp://192.168.1.170:9002/s.mp4"
 ]
-# RTSP_LIST = [
-#     "rtsp://admin1:11qqaa..@192.168.100.2:554/h264",
-#     "rtsp://admin1:11qqaa..@192.168.100.5:554/h264",
-#     "rtsp://admin1:11qqaa..@192.168.100.7:554/h264",
-#     "rtsp://admin1:11qqaa..@192.168.100.8:554/h264",
-#     "rtsp://admin1:11qqaa..@192.168.100.9:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.16:554/stream1",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.78:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.79:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.83:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.90:554/stream1",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.91:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.27:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.65:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.67:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.68:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.69:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.70:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.71:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.72:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.73:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.74:554/stream1",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.77:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.80:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.81:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.82:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.84:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.85:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.86:554/h264",
-#     "rtsp://ca37bba7:qwert12@@192.168.100.87:554/h264",
-#     "rtsp://e138e933:qwert12@@192.168.100.26:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.28:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.29:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.75:554/stream1",
-#     "rtsp://e138e933:qwert12@@192.168.100.76:554/stream1",
-# ]
 
-MODEL_HELMET_PATH   = "helmet_3cls_v8.engine"
-MODEL_GENERAL_PATH = "yolov9-e.engine"
+# 💡 NPU용 모델 경로로 수정 (.dxnn)
+MODEL_HELMET_PATH   = "helmet_3cls_v8.dxnn"
+MODEL_GENERAL_PATH = "yolov9-e.dxnn"
 
 # Model IDs
 ID_H_HELMET = 0; ID_H_NO_HELMET = 1; ID_H_PERSON = 2
@@ -417,84 +382,97 @@ class ConfigManager:
     def clear_all(self): self.config = {}; self.save()
 
 # ==========================================
-# YOLO TRT
+# 💡 [핵심 수정 부분] 딥엑스 NPU 엔진 (YoLoDeepX)
 # ==========================================
-class YoLoTRT:
-    def __init__(self, engine_path, cuda_ctx):
-        self.logger = trt.Logger(trt.Logger.INFO)
-        self.cuda_ctx = cuda_ctx 
+class YoLoDeepX:
+    def __init__(self, engine_path):
+        self.engine_path = engine_path
         try:
-            self.cuda_ctx.push() 
-            with open(engine_path, "rb") as f:
-                self.engine = trt.Runtime(self.logger).deserialize_cuda_engine(f.read())
-            self.context = self.engine.create_execution_context()
-            self.inputs, self.outputs, self.allocations = [], [], []
-            for i in range(self.engine.num_io_tensors):
-                name = self.engine.get_tensor_name(i)
-                dtype = self.engine.get_tensor_dtype(name)
-                shape = self.engine.get_tensor_shape(name)
-                if shape[0] < 0: shape[0] = 1
-                size = trt.volume(shape) * dtype.itemsize
-                alloc = cuda.mem_alloc(size)
-                self.allocations.append(alloc)
-                binding = {'index': i, 'name': name, 'shape': list(shape), 'alloc': alloc}
-                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT: self.inputs.append(binding)
-                else: self.outputs.append(binding)
+            io = InferenceOption()
+            self.engine = InferenceEngine(self.engine_path, io)
+            print(f"✅ [DeepX] Model Loaded Successfully: {os.path.basename(self.engine_path)}")
         except Exception as e:
-            print(f"❌ [Model Load Fail] {e}")
+            print(f"❌ [DeepX Load Fail] {e}")
             raise e
-        finally: 
-            try: self.cuda_ctx.pop()
-            except: pass
+
+    def letter_box(self, img, new_shape=(640,640)):
+        h, w = img.shape[:2]
+        scale = min(new_shape[0]/h, new_shape[1]/w)
+        nw, nh = int(w*scale), int(h*scale)
+        resized = cv2.resize(img, (nw, nh))
+        canvas = np.full((new_shape[0], new_shape[1], 3), 114, dtype=np.uint8)
+        dw, dh = (new_shape[1] - nw) // 2, (new_shape[0] - nh) // 2
+        canvas[dh:dh+nh, dw:dw+nw] = resized
+        return canvas, scale, (dw, dh)
+
+    def postprocess(self, output_tensor, conf_thres=0.45, iou_thres=0.45):
+        pred = np.array(output_tensor[0])
+        if pred.ndim == 3 and pred.shape[1] == 84: 
+            pred = pred.transpose((0, 2, 1))
+        pred = pred[0]
+        
+        scores = np.max(pred[:, 4:], axis=1)
+        mask = scores > conf_thres
+        pred = pred[mask]
+        
+        if len(pred) == 0: return []
+
+        boxes = pred[:, :4]
+        scores = np.max(pred[:, 4:], axis=1)
+        class_ids = np.argmax(pred[:, 4:], axis=1)
+        
+        boxes_xyxy = boxes.copy()
+        boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+        boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+        boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+        boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
+        
+        indices = cv2.dnn.NMSBoxes(boxes_xyxy.tolist(), scores.tolist(), conf_thres, iou_thres)
+        
+        results = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                results.append([boxes_xyxy[i], scores[i], class_ids[i]])
+        return results
 
     def infer(self, img):
         if img is None: return np.empty((0,6))
-        try:
-            self.cuda_ctx.push()
-            h, w = img.shape[:2]
-            r = min(640/h, 640/w)
-            nw, nh = int(w*r), int(h*r)
-            resized = cv2.resize(img, (nw, nh))
-            dw, dh = (640-nw)/2, (640-nh)/2
-            padded = cv2.copyMakeBorder(resized, int(dh), int(640-nh-int(dh)), int(dw), int(640-nw-int(dw)), cv2.BORDER_CONSTANT, value=(114,114,114))
-            inp = np.ascontiguousarray(padded.transpose(2,0,1)[::-1]).astype(np.float32) / 255.0
+        
+        h_orig, w_orig = img.shape[:2]
+        
+        # 1. 전처리
+        npu_input, scale, offset = self.letter_box(img)
+        npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+        
+        # 2. 딥엑스 NPU 추론
+        output_tensor = self.engine.run([npu_input_rgb])
+        
+        # 3. 후처리
+        raw_dets = self.postprocess(output_tensor)
+        if not raw_dets: return np.empty((0,6))
+        
+        # 4. 원본 이미지 좌표로 변환
+        res = []
+        dw, dh = offset
+        for box, score, cls_id in raw_dets:
+            x1 = (box[0] - dw) / scale
+            y1 = (box[1] - dh) / scale
+            x2 = (box[2] - dw) / scale
+            y2 = (box[3] - dh) / scale
             
-            cuda.memcpy_htod(self.inputs[0]['alloc'], inp)
-            self.context.execute_v2(self.allocations)
-            out = np.zeros(self.outputs[0]['shape'], dtype=np.float32)
-            cuda.memcpy_dtoh(out, self.outputs[0]['alloc'])
+            # 이미지 바운더리 클리핑
+            x1 = np.clip(x1, 0, w_orig)
+            y1 = np.clip(y1, 0, h_orig)
+            x2 = np.clip(x2, 0, w_orig)
+            y2 = np.clip(y2, 0, h_orig)
             
-            if out.shape[1] < out.shape[2]: out = out.transpose(0,2,1)
-            scores = np.max(out[0,:,4:], axis=1)
-            mask = scores >= 0.5
-            pred = out[0][mask]
-            if len(pred) == 0: return np.empty((0,6))
-            cx = pred[:, 0]; cy = pred[:, 1]; bw = pred[:, 2]; bh = pred[:, 3]
-            x1 = (cx - bw/2 - dw) / r; y1 = (cy - bh/2 - dh) / r
-            x2 = (cx + bw/2 - dw) / r; y2 = (cy + bh/2 - dh) / r
-            res = []
-            cls = np.argmax(pred[:,4:], axis=1)
-            for i in range(len(pred)):
-                res.append([np.clip(x1[i],0,w), np.clip(y1[i],0,h), np.clip(x2[i],0,w), np.clip(y2[i],0,h), scores[mask][i], cls[i]])
-            return np.array(res)
-        except Exception as e:
-            raise e 
-        finally:
-            try: self.cuda_ctx.pop()
-            except: pass
+            res.append([x1, y1, x2, y2, score, cls_id])
+            
+        return np.array(res)
 
     def destroy(self):
-        try:
-            self.cuda_ctx.push()
-            for alloc in self.allocations:
-                try: alloc.free()
-                except: pass
-            if self.context: del self.context
-            if self.engine: del self.engine
-        except: pass
-        finally: 
-            try: self.cuda_ctx.pop()
-            except: pass
+        # 딥엑스 엔진은 파이썬 GC가 메모리를 해제하므로 별도 destroy 불필요
+        pass
 
 # ==========================================
 # 움직임 디텍터 (배경 차분) - 그림자 제거 설정 적용
@@ -789,7 +767,7 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_h, det_g, gpu_id, cam_id, sensitivity):
+    def __init__(self, ip, conf, det_h, det_g, npu_id, cam_id, sensitivity):
         self.ip = ip; self.conf = conf 
         # use_gstreamer=False로 설정하여 Windows 환경 로컬 테스트를 정상화합니다.
         self.reader = FrameReader(conf['url'], ip, use_gstreamer=False)
@@ -797,7 +775,7 @@ class Camera:
         self.roi_lines = conf.get('roi_lines', [])
         self.events = conf.get('events', [])
         self.det_h = det_h; self.det_g = det_g
-        self.gpu_id = gpu_id; self.cam_id = cam_id 
+        self.npu_id = npu_id; self.cam_id = cam_id 
         self.trk_h = SimpleTracker(is_helmet=True); self.trk_g = SimpleTracker(is_helmet=False)
         self.last_draw = None
         self.alerted = defaultdict(set); self.last_evt_t = {}
@@ -1113,37 +1091,9 @@ def run_wizard_batch_mode(mgr):
                 if input("    라인 추가? (y/n): ")!='y': break
         mgr.set_config(ip, {"url": url, "roi_poly": roi_p, "roi_lines": roi_l, "events": events})
 
-def reassign_cameras(dead_gpu_id, active_gpu_ids, cams, detectors):
-    if not active_gpu_ids:
-        print("🚨 [CRITICAL] 살아남은 GPU가 없습니다. 시스템을 종료해야 합니다.")
-        return False
-    new_gpu_id = active_gpu_ids[0]
-    print(f"⚠️ [Failover] GPU {dead_gpu_id} 사망 -> GPU {new_gpu_id} 로 카메라 이동 중...")
-    moved_count = 0
-    for c in cams:
-        if c.gpu_id == dead_gpu_id:
-            c.gpu_id = new_gpu_id
-            c.det_h = detectors[new_gpu_id]['h']
-            c.det_g = detectors[new_gpu_id]['g']
-            moved_count += 1
-    print(f"✅ [Failover] 총 {moved_count}대 카메라 재할당 완료.")
-    return True
-
 def main():
-    cuda.init()
-    physical_gpus = cuda.Device.count()
-    print(f"✅ [System] Detected {physical_gpus} NVIDIA GPUs.")
+    print("✅ [System] DeepX NPU 환경으로 초기화를 시작합니다.")
     
-    use_gpu_count = physical_gpus
-    try:
-        user_val = input(f">> 사용할 GPU 개수 입력 (기본값: {physical_gpus}, 최대: {physical_gpus}): ")
-        if user_val.strip():
-            cnt = int(user_val)
-            if 1 <= cnt <= physical_gpus:
-                use_gpu_count = cnt
-    except: pass
-    print(f"⚙️ [설정] 총 {use_gpu_count}개의 GPU를 사용합니다.")
-
     sensitivity = 5
     try:
         val = input(">> 움직임 감지 민감도 설정 (1-10, 엔터시 기본값 5): ")
@@ -1153,9 +1103,8 @@ def main():
     except: pass
     print(f"✅ 민감도 설정: {sensitivity}")
 
-    contexts = []
     detectors = {} 
-    active_gpu_ids = [] 
+    active_npu_ids = [0] # 딥엑스 모듈은 단일 노드로 취급하여 ID 0 매핑
     cams = []
     loop_count = 0 
     
@@ -1166,44 +1115,34 @@ def main():
         elif input("설정 초기화? (y/n): ").lower() == 'y':
             mgr.clear_all(); run_wizard_batch_mode(mgr)
 
-        if not os.path.exists(MODEL_HELMET_PATH): print("모델 없음"); return
+        if not os.path.exists(MODEL_HELMET_PATH) or not os.path.exists(MODEL_GENERAL_PATH): 
+            print("❌ 모델 파일(.dxnn)을 찾을 수 없습니다. 경로를 확인하십시오.")
+            return
 
-        print(">> Loading Models...")
-        for i in range(use_gpu_count):
-            try:
-                dev = cuda.Device(i)
-                ctx = dev.make_context()
-                contexts.append(ctx)
-                d_h = YoLoTRT(MODEL_HELMET_PATH, ctx)
-                d_g = YoLoTRT(MODEL_GENERAL_PATH, ctx)
-                detectors[i] = {'h': d_h, 'g': d_g}
-                active_gpu_ids.append(i)
-                print(f"  -> GPU {i}: Model Loaded Successfully.")
-            except Exception as e:
-                print(f"❌ GPU {i} 초기화 실패 (Skip): {e}")
-                try: ctx.pop() 
-                except: pass
-
-        if not active_gpu_ids:
-            print("❌ 사용 가능한 GPU가 없습니다. 종료합니다."); return
+        print(">> Loading DeepX Models...")
+        
+        # 딥엑스 엔진 인스턴스 생성
+        d_h = YoLoDeepX(MODEL_HELMET_PATH)
+        d_g = YoLoDeepX(MODEL_GENERAL_PATH)
+        detectors[0] = {'h': d_h, 'g': d_g}
 
         load_count = 0
-        num_active = len(active_gpu_ids)
+        num_active = len(active_npu_ids)
 
         for rtsp in RTSP_LIST:
             ip = extract_ip(rtsp); conf = mgr.get_config(ip)
             if conf and conf.get('events'):
                 if 'url' not in conf: conf['url'] = rtsp.strip()
                 cam_id = load_count + 1 
-                target_gpu_idx = active_gpu_ids[load_count % num_active]
-                target_dets = detectors[target_gpu_idx]
-                cams.append(Camera(ip, conf, target_dets['h'], target_dets['g'], target_gpu_idx, cam_id, sensitivity))
-                print(f"Load [CAM {cam_id}]: {ip} -> GPU {target_gpu_idx}")
+                target_npu_idx = active_npu_ids[load_count % num_active]
+                target_dets = detectors[target_npu_idx]
+                cams.append(Camera(ip, conf, target_dets['h'], target_dets['g'], target_npu_idx, cam_id, sensitivity))
+                print(f"Load [CAM {cam_id}]: {ip} -> NPU {target_npu_idx}")
                 load_count += 1
         
         if not cams: print("카메라 없음"); return
         
-        print("\n[INFO] 모니터링 시작 (상시 녹화 모드 + Failover)")
+        print("\n[INFO] 모니터링 시작 (상시 녹화 모드)")
 
         while True:
             loop_count += 1
@@ -1213,10 +1152,10 @@ def main():
             processed_results = [None] * len(cams)
             valid_frame_count = 0 
             
-            current_active_gpus = list(active_gpu_ids)
+            current_active_npus = list(active_npu_ids)
             
-            for gpu_idx in current_active_gpus:
-                cam_indices = [i for i, c in enumerate(cams) if c.gpu_id == gpu_idx]
+            for npu_idx in current_active_npus:
+                cam_indices = [i for i, c in enumerate(cams) if c.npu_id == npu_idx]
                 if not cam_indices: continue
                 
                 try:
@@ -1232,23 +1171,17 @@ def main():
                         run_helmet = any(e in ["no_helmet", "intrusion"] for e in c.events)
                         run_general = any(e in ["illegal_parking", "conveyor_crossing", "signal_vehicle"] for e in c.events)
                         
-                        d_h, d_g = [], []
-                        if run_helmet: d_h = c.det_h.infer(fr)
-                        if run_general: d_g = c.det_g.infer(fr)
+                        d_h_res, d_g_res = [], []
+                        # NPU 동기식 추론 (프레임 드랍 병목 발생 예상 구간)
+                        if run_helmet: d_h_res = c.det_h.infer(fr)
+                        if run_general: d_g_res = c.det_g.infer(fr)
                         
-                        processed_results[idx] = (fr, d_h, d_g, True)
+                        processed_results[idx] = (fr, d_h_res, d_g_res, True)
 
                 except Exception as e:
-                    print(f"\n💀 [FATAL ERROR] GPU {gpu_idx} 에서 오류 발생! (GPU 사망 추정)")
+                    print(f"\n💀 [FATAL ERROR] NPU {npu_idx} 에서 오류 발생!")
                     print(f"   Error: {e}")
-                    
-                    if gpu_idx in active_gpu_ids:
-                        active_gpu_ids.remove(gpu_idx)
-                    
-                    success = reassign_cameras(gpu_idx, active_gpu_ids, cams, detectors)
-                    if not success:
-                        print("시스템을 종료합니다.")
-                        raise e 
+                    raise e 
             
             if valid_frame_count == 0: time.sleep(0.01)
 
@@ -1257,12 +1190,12 @@ def main():
                 if res is None: 
                     final_imgs.append(cams[idx].last_draw)
                     continue
-                fr, d_h, d_g, connected = res
+                fr, d_h_res, d_g_res, connected = res
                 if not connected:
                     img = cams[idx].draw(None, [], [], {}, connected=False)
                     final_imgs.append(img)
                 else:
-                    t_h, t_g, alarms = cams[idx].run_logic(fr, d_h, d_g)
+                    t_h, t_g, alarms = cams[idx].run_logic(fr, d_h_res, d_g_res)
                     img = cams[idx].draw(fr, t_h, t_g, alarms, connected=True)
                     final_imgs.append(img)
 
@@ -1277,7 +1210,7 @@ def main():
                 print("\n" + "="*40); print("       [ 🛠️ 실시간 설정 변경 모드 ]       "); print("="*40)
                 try:
                     print("현재 등록된 카메라 목록:")
-                    for c in cams: print(f" [CAM {c.cam_id}] {c.ip} (GPU {c.gpu_id}) | Events: {c.events}")
+                    for c in cams: print(f" [CAM {c.cam_id}] {c.ip} (NPU {c.npu_id}) | Events: {c.events}")
                     
                     val = input("\n>> 수정할 CAM 번호 입력 (취소: Enter): ").strip()
                     if val == "":
@@ -1340,12 +1273,6 @@ def main():
     finally:
         print("\n[종료 절차 시작] 리소스 정리 중...")
         for c in cams: c.stop()
-        for gpu_id, det_set in detectors.items():
-            if det_set.get('h'): det_set['h'].destroy()
-            if det_set.get('g'): det_set['g'].destroy()
-        for ctx in contexts:
-            try: ctx.pop()
-            except: pass
         cv2.destroyAllWindows()
         print("[종료 완료]")
 
