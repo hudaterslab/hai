@@ -10,27 +10,56 @@ import datetime
 import traceback
 import threading
 import queue
+import logging
+import psutil
 from collections import deque, defaultdict
 import concurrent.futures
 import pytz
 import requests
 
-# [1] 환경 변수 설정
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp;stimeout=3000000;buffer_size=1024;max_delay=500000"
+# ==========================================
+# [1] 전문적인 로깅 시스템 구축
+# ==========================================
+LOG_DIR = "./logs"
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
 
-# [2] DeepX NPU 엔진 임포트
+log_filename = datetime.datetime.now().strftime("cctv_%Y%m%d_%H%M%S.log")
+log_filepath = os.path.join(LOG_DIR, log_filename)
+
+logger = logging.getLogger("CCTV_SYSTEM")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s | %(levelname)-7s | [%(funcName)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+# ==========================================
+# [2] 환경 변수 설정
+# ==========================================
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+os.environ["OPENCV_FFMPEG_DEBUG"] = "0"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;3000000|max_delay;500000"
+
+# [3] DeepX NPU 엔진 임포트
 try:
     from dx_engine import InferenceEngine, InferenceOption
 except ImportError:
-    print("❌ [오류] dx_engine 모듈을 찾을 수 없습니다. DeepX SDK가 올바르게 설치되었는지 확인하십시오.")
+    logger.error("dx_engine 모듈을 찾을 수 없습니다. DeepX SDK가 올바르게 설치되었는지 확인하십시오.")
     sys.exit(1)
 
 # ==========================================
 # 0. 설정 및 상수
 # ==========================================
 CONFIG_FILE = "cctv_config.json"
-# 라즈베리파이 환경에 맞게 경로 수정 권장 (예: /home/pi/CCTV_EVENT_ALERT)
 EVENT_ROOT_DIR = "./CCTV_EVENT_ALERT" 
 
 SCREEN_WIDTH = 1280
@@ -38,26 +67,24 @@ SCREEN_HEIGHT = 720
 BATCH_SIZE = 9
 GC_INTERVAL = 300           
 MAX_SAVE_QUEUE = 50
-WATCHDOG_TIMEOUT = 10.0
+WATCHDOG_TIMEOUT = 30.0
 
-# [녹화 및 알림 설정]
 REC_FPS = 30             
 REC_PRE_SEC = 10         
 REC_POST_SEC = 10        
 REC_BUFFER_SIZE = REC_FPS * REC_PRE_SEC
 VISUAL_ALARM_DURATION = 5.0 
 
-# [RTSP URL 리스트]
+# 💡 [핵심 수정] 카메라의 실제 스트림 포맷인 .avi 로 주소 변경
 RTSP_LIST = [
-    "rtsp://192.168.1.170:9001/S.mp4",
-    "rtsp://192.168.1.170:9002/s.mp4"
+    "rtsp://192.168.1.170:9001/S.avi",
+    "rtsp://192.168.1.170:9002/s.avi",
+    "rtsp://192.168.1.170:9003/S.mp4"
 ]
 
-# 💡 NPU용 모델 경로로 수정 (.dxnn)
-MODEL_HELMET_PATH   = "helmet_3cls_v8.dxnn"
-MODEL_GENERAL_PATH = "yolov9-e.dxnn"
+MODEL_HELMET_PATH   = "helmet_3cls_v8_new.dxnn"
+MODEL_GENERAL_PATH = "YOLOV8M-1.dxnn"
 
-# Model IDs
 ID_H_HELMET = 0; ID_H_NO_HELMET = 1; ID_H_PERSON = 2
 ID_G_PERSON = 0; ID_G_CAR = 2; ID_G_BUS = 5; ID_G_TRUCK = 7
 TARGET_VEHICLES = [ID_G_CAR, ID_G_BUS, ID_G_TRUCK]
@@ -69,24 +96,20 @@ IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 # ==========================================
 def extract_ip(rtsp_url: str) -> str:
     try:
-        # 1. 인증 정보 제외하고 IP:Port 부분 추출
         if "@" in rtsp_url:
             rest = rtsp_url.split("@")[-1]
         else:
             rest = rtsp_url.split("//")[1]
             
-        ip_port = rest.split("/")[0]  # 예: "192.168.1.170:9001"
-        
-        # 2. IP 마지막 자리와 포트를 결합하여 반환
+        ip_port = rest.split("/")[0]  
         if ":" in ip_port:
             ip_part, port_part = ip_port.split(":")
-            last_octet = ip_part.split(".")[-1] # "170" 추출
-            return f"{last_octet}_{port_part}"  # "170_9001" 반환
+            last_octet = ip_part.split(".")[-1] 
+            return f"{last_octet}_{port_part}"  
         else:
-            # 포트가 없는 경우 마지막 자리만 반환
             return ip_port.split(".")[-1]
-            
-    except Exception: 
+    except Exception as e: 
+        logger.warning(f"IP 추출 실패: {e}")
         return "unknown_cam"
 
 def calculate_iou(box1, box2):
@@ -154,24 +177,16 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
 # ==========================================
 def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, bboxes, img_width=None, img_height=None):
     url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
-    
     event_type_mapping = {
-        "conveyor_crossing": 1, 
-        "no_helmet": 2,         
-        "signal_vehicle": 3,    
-        "illegal_parking": 4,
-        "intrusion": 5          # 필요하다면 매핑 추가
+        "conveyor_crossing": 1, "no_helmet": 2, "signal_vehicle": 3, "illegal_parking": 4, "intrusion": 5          
     }
-    
     if event_name not in event_type_mapping:
-        print(f"⏩ [API 스킵] 정의되지 않은 이벤트 타입: {event_name}")
+        logger.info(f"[API 스킵] 정의되지 않은 이벤트 타입: {event_name}")
         return
         
     api_event_type = event_type_mapping[event_name]
-
     kst = pytz.timezone('Asia/Seoul')
     collected_at = datetime.datetime.now(kst).strftime('%Y-%m-%dT%H:%M:%S')
-
     detected_objects_json = json.dumps(bboxes) if bboxes else "[]"
 
     data = {
@@ -186,34 +201,26 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
     if img_height: data["imageHeight"] = img_height
 
     if not os.path.exists(image_path):
-        print(f"❌ [API 에러] 파일을 찾을 수 없습니다: {image_path}")
+        logger.error(f"[API 에러] 파일을 찾을 수 없습니다: {image_path}")
         return
 
     try:
         with open(image_path, 'rb') as f:
             files = {"image": (os.path.basename(image_path), f, "image/jpeg")}
             response = requests.post(url, data=data, files=files)
-            
             if response.status_code == 200:
-                print(f"✅ [API 전송 성공] {os.path.basename(image_path)}")
+                logger.info(f"[API 전송 성공] {os.path.basename(image_path)}")
             else:
-                print(f"❌ [API 전송 실패] 코드: {response.status_code}, 메시지: {response.text}")
+                logger.error(f"[API 전송 실패] 코드: {response.status_code}, 메시지: {response.text}")
     except Exception as e:
-        print(f"❌ [API 예외 발생]: {e}")
+        logger.error(f"[API 예외 발생]: {e}")
 
-
-# ---------------------------------------------------------
-# 2. 이미지 저장 + API 전송을 동시에 수행하는 새로운 Task 함수
-# ---------------------------------------------------------
 def _save_and_send_task(img, img_path, api_params):
-    # 1) 기존 _save_task의 역할 (이미지 쓰기)
     try:
         cv2.imwrite(img_path, img)
     except Exception as e:
-        print(f"❌ [이미지 저장 실패] {e}")
+        logger.error(f"[이미지 저장 실패] {e}")
         return
-    
-    # 2) 저장이 완료되면 API 전송 실행
     try:
         send_event_image_to_receiver(
             image_path=img_path,
@@ -225,19 +232,14 @@ def _save_and_send_task(img, img_path, api_params):
             img_height=api_params['img_height']
         )
     except Exception as e:
-        print(f"❌ [Task 내부 API 호출 에러] {e}")
+        logger.error(f"[Task 내부 API 호출 에러] {e}")
 
-
-# ---------------------------------------------------------
-# 3. 기존 이벤트 로직 수정
-# ---------------------------------------------------------
 def save_event_image_with_mark(frame, ip, event_type, bbox, tid):
     if IMAGE_SAVER_POOL._work_queue.qsize() > MAX_SAVE_QUEUE: return
     try:
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        
         now = datetime.datetime.now()
         msg = f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}"
         cv2.putText(img, msg, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -248,34 +250,23 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid):
             
         fname = f"{now.strftime('%Y%m%d_%H%M%S')}_{ip}_{event_type}_{tid}.jpg"
         img_path = os.path.join(dpath, fname)
-        
-        # 이전 턴에서 만들었던 JSON 로컬 저장 로직 유지 (원치 않으시면 삭제 무방)
         h, w = frame.shape[:2]
         
-        # ==========================================
-        # 💡 API 전송을 위한 파라미터 패키징
-        # ==========================================
-        ai_detected_bboxes = [
-            {"id": tid, "box": [x1, y1, x2, y2], "label": event_type}
-        ]
-        
+        ai_detected_bboxes = [{"id": tid, "box": [x1, y1, x2, y2], "label": event_type}]
         api_params = {
             'event_name': event_type,
-            'terminal_id': "2",  # 샘플에 맞춰 고정
-            'cctv_id': 1,            # 다중 카메라 환경이라면 ip를 기반으로 맵핑 추천
+            'terminal_id': "99999", 
+            'cctv_id': 1,            
             'bboxes': ai_detected_bboxes,
             'img_width': w,
             'img_height': h
         }
-        
-        # 기존 _save_task 대신, 저장과 전송을 묶어둔 _save_and_send_task를 스레드 풀에 던집니다.
         IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, api_params)
-        
     except Exception as e: 
-        print(f"❌ [EventLogic Error] {e}")
+        logger.error(f"[EventLogic Error] {e}")
 
 # ==========================================
-# 영상 녹화기 (Video Recorder)
+# 영상 녹화기
 # ==========================================
 class VideoRecorder:
     def __init__(self, ip):
@@ -296,7 +287,7 @@ class VideoRecorder:
             if time.time() > self.record_end_time:
                 self.recording = False
                 self.write_queue.put(None)
-                print(f"🎬 [녹화종료] {self.ip} - {self.current_event}")
+                logger.info(f"🎬 [녹화종료] {self.ip} - {self.current_event}")
             else:
                 self.write_queue.put(frame)
 
@@ -305,7 +296,7 @@ class VideoRecorder:
         if self.recording:
             self.record_end_time = now + REC_POST_SEC
         else:
-            print(f"🎥 [녹화시작] {self.ip} - {event_name}")
+            logger.info(f"🎥 [녹화시작] {self.ip} - {event_name}")
             self.recording = True
             self.record_end_time = now + REC_POST_SEC
             self.current_event = event_name
@@ -332,7 +323,7 @@ class VideoRecorder:
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 writer = cv2.VideoWriter(fpath, fourcc, REC_FPS, (w, h))
                 if not writer.isOpened():
-                    print(f"❌ [녹화에러] 파일을 열 수 없습니다: {fpath}")
+                    logger.error(f"[녹화에러] 파일을 열 수 없습니다: {fpath}")
                     writer = None; continue
             if writer: writer.write(frame)
 
@@ -382,7 +373,7 @@ class ConfigManager:
     def clear_all(self): self.config = {}; self.save()
 
 # ==========================================
-# 💡 [핵심 수정 부분] 딥엑스 NPU 엔진 (YoLoDeepX)
+# 딥엑스 NPU 엔진
 # ==========================================
 class YoLoDeepX:
     def __init__(self, engine_path):
@@ -390,9 +381,9 @@ class YoLoDeepX:
         try:
             io = InferenceOption()
             self.engine = InferenceEngine(self.engine_path, io)
-            print(f"✅ [DeepX] Model Loaded Successfully: {os.path.basename(self.engine_path)}")
+            logger.info(f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)}")
         except Exception as e:
-            print(f"❌ [DeepX Load Fail] {e}")
+            logger.error(f"[DeepX Load Fail] {e}")
             raise e
 
     def letter_box(self, img, new_shape=(640,640)):
@@ -439,19 +430,13 @@ class YoLoDeepX:
         if img is None: return np.empty((0,6))
         
         h_orig, w_orig = img.shape[:2]
-        
-        # 1. 전처리
         npu_input, scale, offset = self.letter_box(img)
         npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
         
-        # 2. 딥엑스 NPU 추론
         output_tensor = self.engine.run([npu_input_rgb])
-        
-        # 3. 후처리
         raw_dets = self.postprocess(output_tensor)
         if not raw_dets: return np.empty((0,6))
         
-        # 4. 원본 이미지 좌표로 변환
         res = []
         dw, dh = offset
         for box, score, cls_id in raw_dets:
@@ -460,7 +445,6 @@ class YoLoDeepX:
             x2 = (box[2] - dw) / scale
             y2 = (box[3] - dh) / scale
             
-            # 이미지 바운더리 클리핑
             x1 = np.clip(x1, 0, w_orig)
             y1 = np.clip(y1, 0, h_orig)
             x2 = np.clip(x2, 0, w_orig)
@@ -471,19 +455,13 @@ class YoLoDeepX:
         return np.array(res)
 
     def destroy(self):
-        # 딥엑스 엔진은 파이썬 GC가 메모리를 해제하므로 별도 destroy 불필요
         pass
 
-# ==========================================
-# 움직임 디텍터 (배경 차분) - 그림자 제거 설정 적용
-# ==========================================
 class MotionDetector:
     def __init__(self, sensitivity):
         self.threshold = 100 - ((sensitivity - 1) * 9) 
-        # [수정] detectShadows=True로 변경하여 그림자(127)와 실제 움직임(255) 구분
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=self.threshold, detectShadows=True)
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
     def apply(self, frame):
         if frame is None: return None
         small_frame = cv2.resize(frame, (640, 360))
@@ -491,9 +469,6 @@ class MotionDetector:
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
         return fg_mask 
 
-# ==========================================
-# 이벤트 디텍터
-# ==========================================
 class IntrusionDetector:
     def __init__(self, roi):
         self.roi = np.array(roi, dtype=np.int32)
@@ -571,12 +546,7 @@ class HelmetDetector:
     def process(self, tracks, track_map, motion_mask=None):
         triggered = []
         nh = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
-        
-        for n in nh:
-            # 사람 몸통(Person)과의 교차 영역(IoU/IoA)을 계산하는 조건을 완전히 배제했습니다.
-            # 이로써 AI 모델이 사람 몸통을 놓치고 머리만 검출하더라도 무조건 이벤트가 트리거됩니다.
-            triggered.append(int(n[4]))
-                
+        for n in nh: triggered.append(int(n[4]))
         return triggered
 
 class SignalVehicleDetector:
@@ -587,119 +557,57 @@ class SignalVehicleDetector:
         self.vehicle_history = defaultdict(lambda: deque(maxlen=30)) 
 
     def _get_distance_point_to_rect(self, point, bbox):
-        """
-        사람(point)과 차량 박스(bbox) 사이의 최단 거리를 구합니다.
-        사람이 차량 내부에 있으면 거리는 0입니다.
-        사람이 차량 오른쪽에 있으면 '차량 오른쪽 면'과의 거리를 잽니다.
-        """
-        px, py = point
-        bx1, by1, bx2, by2 = bbox
-        
-        # x축 거리 계산 (사람이 박스 안에 있으면 0)
+        px, py = point; bx1, by1, bx2, by2 = bbox
         dx = max(bx1 - px, 0, px - bx2)
-        # y축 거리 계산 (사람이 박스 안에 있으면 0)
         dy = max(by1 - py, 0, py - by2)
-        
-        # 유클리드 거리 (피타고라스)
         return math.sqrt(dx*dx + dy*dy)
 
     def process(self, tracks, track_map, motion_mask):
         triggered = []
         if self.roi.size == 0 or motion_mask is None: return triggered
         
-        scale_x = 640 / SCREEN_WIDTH
-        scale_y = 360 / SCREEN_HEIGHT
-
-        # 1. 사람들의 중심점(발 쪽이 더 정확할 수 있으나 여기선 중심 사용) 리스트업
-        people_points = []
-        for t in tracks:
-            if track_map.get(int(t[4])) == ID_G_PERSON:
-                people_points.append(get_center_point(*t[:4])) # 필요시 get_foot_point로 변경 가능
-
-        # 2. 차량 처리
+        scale_x = 640 / SCREEN_WIDTH; scale_y = 360 / SCREEN_HEIGHT
+        people_points = [get_center_point(*t[:4]) for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         current_vehicle_ids = set()
         
         for t in tracks:
             tid = int(t[4])
-            if track_map.get(tid) not in TARGET_VEHICLES:
-                continue
+            if track_map.get(tid) not in TARGET_VEHICLES: continue
                 
             current_vehicle_ids.add(tid)
             x1, y1, x2, y2 = t[:4]
             center = get_center_point(x1, y1, x2, y2)
-            
-            # 히스토리 업데이트
             self.vehicle_history[tid].append(center)
             
-            # [필터링 1] "가려졌다 나타난 주차 차량" 방지 (실제 이동 여부 확인)
-            # 최근 N프레임 동안의 좌표 이동 거리를 계산
             if len(self.vehicle_history[tid]) > 5:
-                start_pt = self.vehicle_history[tid][0]
-                curr_pt = self.vehicle_history[tid][-1]
-                displacement = get_distance(start_pt, curr_pt)
-                
-                # 좌표가 거의 안 움직였으면(예: 10픽셀 미만), 
-                # 픽셀 모션(앞차가 비켜서 생기는 변화)이 있어도 무시 (주차된 차로 간주)
-                if displacement < 40.0: 
-                    continue 
-            else:
-                # 트래킹 초기 단계(등장 직후)에는 판단 보류 혹은 패스
-                # (너무 빨리 알람이 울리는 것을 방지하려면 continue 사용)
-                continue 
+                if get_distance(self.vehicle_history[tid][0], self.vehicle_history[tid][-1]) < 40.0: continue 
+            else: continue 
 
-            # [기존 로직] 픽셀 모션 체크
-            mx1 = int(x1 * scale_x); my1 = int(y1 * scale_y)
-            mx2 = int(x2 * scale_x); my2 = int(y2 * scale_y)
-            
-            mx1 = max(0, mx1); my1 = max(0, my1)
-            mx2 = min(640, mx2); my2 = min(360, my2)
+            mx1 = max(0, int(x1 * scale_x)); my1 = max(0, int(y1 * scale_y))
+            mx2 = min(640, int(x2 * scale_x)); my2 = min(360, int(y2 * scale_y))
             
             if mx2 > mx1 and my2 > my1:
                 car_roi_mask = motion_mask[my1:my2, mx1:mx2]
                 _, motion_only = cv2.threshold(car_roi_mask, 250, 255, cv2.THRESH_BINARY)
-                motion_pixels = cv2.countNonZero(motion_only)
                 total_pixels = (mx2 - mx1) * (my2 - my1)
                 
-                if total_pixels > 0:
-                    ratio = motion_pixels / total_pixels
-                    
-                    if ratio > self.motion_threshold_ratio:
-                        # 차량이 ROI 안에 있는지 확인
-                        if cv2.pointPolygonTest(self.roi, center, False) >= 0:
-                            
-                            # [개선된 로직] 신호수 거리 판단
-                            vehicle_height = y2 - y1
-                            safe_radius = vehicle_height # 차량 높이만큼을 안전 반경으로 설정
-                            
-                            has_signalman = False
-                            for pp in people_points:
-                                # 기존: 차량 '중심' vs 사람 '중심' 거리
-                                # 변경: 차량 '박스(가장 가까운 면)' vs 사람 '중심' 거리
-                                # 이렇게 하면 차량 중심이 멀어도, 차량 범퍼 옆에 사람이 있으면 거리 0~가까움으로 계산됨
-                                dist = self._get_distance_point_to_rect(pp, (x1, y1, x2, y2))
-                                
-                                if dist < safe_radius:
-                                    has_signalman = True
-                                    break
-                            
-                            if not has_signalman:
-                                triggered.append(tid)
+                if total_pixels > 0 and (cv2.countNonZero(motion_only) / total_pixels) > self.motion_threshold_ratio:
+                    if cv2.pointPolygonTest(self.roi, center, False) >= 0:
+                        safe_radius = y2 - y1
+                        has_signalman = any(self._get_distance_point_to_rect(pp, (x1, y1, x2, y2)) < safe_radius for pp in people_points)
+                        if not has_signalman: triggered.append(tid)
 
-        # 사라진 차량은 히스토리에서 제거 (메모리 관리)
         for tid in list(self.vehicle_history.keys()):
-            if tid not in current_vehicle_ids:
-                del self.vehicle_history[tid]
-
+            if tid not in current_vehicle_ids: del self.vehicle_history[tid]
         return triggered
 
 # ==========================================
-# 비동기 프레임 리더
+# 안정적인 FFMPEG 백엔드 기반 프레임 리더
 # ==========================================
 class FrameReader:
-    def __init__(self, url, ip, use_gstreamer=False):  # 기본값을 False로 변경
+    def __init__(self, url, ip):  
         self.url = url.strip()
         self.ip = ip
-        self.use_gstreamer = use_gstreamer  
         self.lock = threading.Lock()
         self.frame = None
         self.fid = 0
@@ -707,27 +615,14 @@ class FrameReader:
         self.connected = False
         self.last_frame_time = time.time()
         self.is_stuck = False
+        self.resolution_checked = False
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
         while self.running:
-            if self.use_gstreamer:
-                # uridecodebin 플러그인을 사용하여 H.264/H.265를 자동 식별 및 디코딩합니다.
-                # OpenCV가 처리할 수 있도록 BGR 포맷으로 변환 후 앱싱크로 전달합니다.
-                pipeline = (
-                    f"uridecodebin uri={self.url} ! "
-                    f"videoconvert ! video/x-raw, format=BGR ! "
-                    f"appsink drop=true max-buffers=1"
-                )
-                cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-            else:
-                cap = cv2.VideoCapture(self.url)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                try:
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000) 
-                except: pass
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
                 time.sleep(5)
@@ -739,20 +634,32 @@ class FrameReader:
             
             while self.running and cap.isOpened():
                 if time.time() - self.last_frame_time > WATCHDOG_TIMEOUT:
-                    print(f"⚠️ [Watchdog] {self.ip}: Timeout. Force Reconnecting...")
+                    logger.warning(f"[{self.ip}] Timeout. Force Reconnecting...")
                     self.is_stuck = True 
                     break
                 
                 ret, fr = cap.read()
                 if not ret: 
-                    print(f"⚠️ [Reader] {self.ip}: Stream broken.")
+                    logger.warning(f"[{self.ip}] Stream broken.")
                     time.sleep(1)
                     break
                 
+                if fr is not None:
+                    if not self.resolution_checked:
+                        h, w = fr.shape[:2]
+                        logger.info(f"[{self.ip}] 수신된 해상도: {w} x {h}")
+                        self.resolution_checked = True
+
+                    # 💡 메모리 보호: 720p 이상일 경우 즉시 리사이즈
+                    if fr.shape[1] > 1280:
+                        scale = 1280 / fr.shape[1]
+                        fr = cv2.resize(fr, (1280, int(fr.shape[0] * scale)), interpolation=cv2.INTER_NEAREST)
+
                 with self.lock:
                     self.frame = fr
                     self.fid += 1
                     self.last_frame_time = time.time()
+                
                 time.sleep(0.005)
             
             self.connected = False
@@ -769,8 +676,7 @@ class FrameReader:
 class Camera:
     def __init__(self, ip, conf, det_h, det_g, npu_id, cam_id, sensitivity):
         self.ip = ip; self.conf = conf 
-        # use_gstreamer=False로 설정하여 Windows 환경 로컬 테스트를 정상화합니다.
-        self.reader = FrameReader(conf['url'], ip, use_gstreamer=False)
+        self.reader = FrameReader(conf['url'], ip)
         self.roi_poly = conf.get('roi_poly', [])
         self.roi_lines = conf.get('roi_lines', [])
         self.events = conf.get('events', [])
@@ -806,9 +712,9 @@ class Camera:
         fr, fid, connected = self.reader.read()
         if fr is None and not connected:
             if time.time() - self.reader.last_frame_time > (WATCHDOG_TIMEOUT + 2.0):
-                print(f"💀 [Fatal] {self.ip}: Reader thread dead. Spawning NEW thread.")
+                logger.error(f"[{self.ip}] Reader thread dead. Spawning NEW thread.")
                 self.reader.running = False 
-                self.reader = FrameReader(self.conf['url'], self.ip, use_gstreamer=False)
+                self.reader = FrameReader(self.conf['url'], self.ip)
                 time.sleep(0.5)
         if fr is not None: self.recorder.update(fr)
         return fr, connected
@@ -880,25 +786,22 @@ class Camera:
             for i in range(0, len(self.roi_lines), 2):
                 if i+1 < len(self.roi_lines): cv2.line(fr, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0,0,255), 2)
 
-        # 1. 안전모 모델 트래커 시각화 (클래스 텍스트 추가 및 색상 재배치)
         for t in t_h:
             tid = int(t[4]); cls_id = int(t[6])
             
-            # 클래스별 색상 및 디버깅용 라벨 지정
             if cls_id == ID_H_HELMET:
-                color = (255, 0, 0) # 파란색
+                color = (255, 0, 0) 
                 label = f"Helmet [{tid}]"
             elif cls_id == ID_H_NO_HELMET:
-                color = (0, 0, 255) # 빨간색 (이상 상황 명시)
+                color = (0, 0, 255) 
                 label = f"No-Helmet [{tid}]"
             elif cls_id == ID_H_PERSON:
-                color = (0, 255, 0) # 초록색
+                color = (0, 255, 0) 
                 label = f"Person [{tid}]"
             else:
-                color = (0, 255, 255) # 노란색 (예상치 못한 클래스 확인용)
+                color = (0, 255, 255) 
                 label = f"Unknown({cls_id}) [{tid}]"
 
-            # 알람 발생 시 시각적 효과 강제 적용
             if tid in alarms:
                 color = (0, 0, 255)
                 label = f"ALARM: {label}"
@@ -906,13 +809,11 @@ class Camera:
             else:
                 cv2.rectangle(fr, (int(t[0]),int(t[1])), (int(t[2]),int(t[3])), color, 2)
                 
-            # 디버깅을 위해 바운딩 박스 위에 라벨을 그립니다.
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
             ft = get_foot_point(*t[:4])
             if "conveyor_crossing" in self.events: cv2.circle(fr, ft, 5, (255,0,255), -1)
 
-        # 2. 일반 모델 트래커 시각화 (텍스트 라벨 추가)
         for t in t_g:
             tid = int(t[4])+10000
             cls_id = int(t[6])
@@ -968,7 +869,7 @@ class Camera:
         
         bb = next((t[:4] for t in tracks if int(t[4]) == real_tid), None)
         if bb is not None:
-            print(f"🚨 [CAM {self.cam_id}] {ename} Detected! ID:{real_tid}")
+            logger.warning(f"🚨 [CAM {self.cam_id}] {ename} Detected! ID:{real_tid}")
             save_event_image_with_mark(fr, self.ip, ename, bb, real_tid)
             self.recorder.trigger(ename)
             self.alerted[tid].add(ename)
@@ -982,9 +883,7 @@ class Camera:
 # Main
 # ==========================================
 def capture_snapshot(url):
-    # 초기 설정 마법사 스냅샷에도 필요에 따라 GStreamer 파이프라인을 적용할 수 있으나, 
-    # 안정성을 위해 우선 기존 FFMPEG 방식을 유지합니다.
-    cap = cv2.VideoCapture(url.strip())
+    cap = cv2.VideoCapture(url.strip(), cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened(): return None
     ret, frame = cap.read()
@@ -1006,7 +905,7 @@ def get_roi_points_scaled(frame, title, mode="poly"):
             if mode=="line" and len(pts)>=2: return
             pts.append([int(x/scale), int(y/scale)])
     cv2.setMouseCallback(wname, mouse_cb)
-    print(f">> '{title}' 그리기 모드. 점을 찍고 Enter(완료) 또는 ESC(취소). Line 모드는 2점.")
+    logger.info(f"'{title}' 그리기 모드. 점을 찍고 Enter(완료) 또는 ESC(취소). Line 모드는 2점.")
     while True:
         temp = disp_frame.copy()
         dp = [[int(p[0]*scale), int(p[1]*scale)] for p in pts]
@@ -1017,19 +916,19 @@ def get_roi_points_scaled(frame, title, mode="poly"):
             if len(dp)>0: cv2.polylines(temp, [np.array(dp, np.int32)], True, (0,255,0), 2)
         cv2.imshow(wname, temp)
         k = cv2.waitKey(1)
-        if k==13: break # Enter
-        if k==27: pts=[]; break # ESC
+        if k==13: break 
+        if k==27: pts=[]; break 
         if mode=="line" and len(pts)==2: cv2.waitKey(500); break
     cv2.destroyWindow(wname)
     return pts
 
 def run_wizard_batch_mode(mgr):
-    print("\n=== CCTV 일괄 설정 마법사 (Batch Mode) ===")
+    logger.info("=== CCTV 일괄 설정 마법사 (Batch Mode) ===")
     selected_indices = []
     total = len(RTSP_LIST)
     for i in range(0, total, BATCH_SIZE):
         batch_urls = RTSP_LIST[i : i + BATCH_SIZE]
-        print(f"\n[Batch {i//BATCH_SIZE + 1}] 카메라 {i+1} ~ {min(i+BATCH_SIZE, total)} 로딩 중...")
+        logger.info(f"[Batch {i//BATCH_SIZE + 1}] 카메라 {i+1} ~ {min(i+BATCH_SIZE, total)} 로딩 중...")
         frames = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
             frames = list(executor.map(capture_snapshot, batch_urls))
@@ -1060,13 +959,18 @@ def run_wizard_batch_mode(mgr):
             except: pass
     cv2.destroyWindow("Select Cameras")
     
-    if not selected_indices: print("선택된 카메라가 없습니다."); return
+    if not selected_indices: 
+        logger.info("선택된 카메라가 없습니다.")
+        return
 
-    print(f"\n>> 총 {len(selected_indices)}대 설정 시작")
+    logger.info(f"총 {len(selected_indices)}대 설정 시작")
     for idx in selected_indices:
         url = RTSP_LIST[idx].strip(); ip = extract_ip(url)
-        print(f"\n[{ip}] 설정 중..."); frame = capture_snapshot(url)
-        if frame is None: print(" -> 실패"); continue
+        logger.info(f"[{ip}] 설정 중...")
+        frame = capture_snapshot(url)
+        if frame is None: 
+            logger.error(" -> 캡처 실패")
+            continue
         h, w = frame.shape[:2]; ratio = 960 / w
         preview = cv2.resize(frame, (960, int(h*ratio)))
         win_name = f"Check Cam: {ip}"
@@ -1092,7 +996,7 @@ def run_wizard_batch_mode(mgr):
         mgr.set_config(ip, {"url": url, "roi_poly": roi_p, "roi_lines": roi_l, "events": events})
 
 def main():
-    print("✅ [System] DeepX NPU 환경으로 초기화를 시작합니다.")
+    logger.info("[System] DeepX NPU 환경으로 초기화를 시작합니다.")
     
     sensitivity = 5
     try:
@@ -1101,27 +1005,42 @@ def main():
             sensitivity = int(val)
             sensitivity = max(1, min(10, sensitivity))
     except: pass
-    print(f"✅ 민감도 설정: {sensitivity}")
+    logger.info(f"민감도 설정: {sensitivity}")
 
     detectors = {} 
-    active_npu_ids = [0] # 딥엑스 모듈은 단일 노드로 취급하여 ID 0 매핑
+    active_npu_ids = [0]
     cams = []
     loop_count = 0 
     
     try:
         mgr = ConfigManager(CONFIG_FILE)
         if not os.path.exists(CONFIG_FILE):
-            print("설정 파일 없음."); run_wizard_batch_mode(mgr)
-        elif input("설정 초기화? (y/n): ").lower() == 'y':
-            mgr.clear_all(); run_wizard_batch_mode(mgr)
+            logger.warning("설정 파일이 없습니다. 초기 설정 마법사는 디스플레이 환경이 필수입니다.")
+            run_wizard_batch_mode(mgr)
+        else:
+            is_reset = input(">> 설정 초기화 마법사를 실행하시겠습니까? (y/n): ").strip().lower()
+            if is_reset == 'y':
+                logger.warning("설정 마법사는 디스플레이 환경이 필수입니다.")
+                mgr.clear_all()
+                run_wizard_batch_mode(mgr)
+
+        val_disp = input(">> 모니터링 화면(GUI)을 출력하시겠습니까? (y/n, 기본값 y): ").strip().lower()
+        use_display = False if val_disp == 'n' else True
+        
+        use_drawing = True
+        if use_display:
+            val_draw = input(">> 화면에 박스 및 텍스트(시각화)를 그리시겠습니까? (y/n, 기본값 y): ").strip().lower()
+            use_drawing = False if val_draw == 'n' else True
+        else:
+            logger.info("디스플레이가 꺼져 있으므로 실시간 화면 그리기도 비활성화됩니다.")
+            use_drawing = False
 
         if not os.path.exists(MODEL_HELMET_PATH) or not os.path.exists(MODEL_GENERAL_PATH): 
-            print("❌ 모델 파일(.dxnn)을 찾을 수 없습니다. 경로를 확인하십시오.")
+            logger.error("모델 파일(.dxnn)을 찾을 수 없습니다. 경로를 확인하십시오.")
             return
 
-        print(">> Loading DeepX Models...")
+        logger.info("Loading DeepX Models...")
         
-        # 딥엑스 엔진 인스턴스 생성
         d_h = YoLoDeepX(MODEL_HELMET_PATH)
         d_g = YoLoDeepX(MODEL_GENERAL_PATH)
         detectors[0] = {'h': d_h, 'g': d_g}
@@ -1137,14 +1056,32 @@ def main():
                 target_npu_idx = active_npu_ids[load_count % num_active]
                 target_dets = detectors[target_npu_idx]
                 cams.append(Camera(ip, conf, target_dets['h'], target_dets['g'], target_npu_idx, cam_id, sensitivity))
-                print(f"Load [CAM {cam_id}]: {ip} -> NPU {target_npu_idx}")
+                logger.info(f"Load [CAM {cam_id}]: {ip} -> NPU {target_npu_idx}")
                 load_count += 1
         
-        if not cams: print("카메라 없음"); return
+        if not cams: 
+            logger.warning("카메라 없음")
+            return
         
-        print("\n[INFO] 모니터링 시작 (상시 녹화 모드)")
+        logger.info("모니터링 시작 (상시 녹화 모드 / 종료: Ctrl+C 또는 'q')")
+
+        target_fps = 15
+        dynamic_delay = 1.0 / target_fps
 
         while True:
+            start_time = time.time()
+            
+            cpu_usage = psutil.cpu_percent(interval=None)
+            if cpu_usage > 85:
+                target_fps = max(5, target_fps - 2)
+            elif cpu_usage < 60:
+                target_fps = min(15, target_fps + 1)
+            dynamic_delay = 1.0 / target_fps
+
+            # 빈 루프에서의 CPU 공회전 방지
+            if loop_count % 100 == 0:
+                time.sleep(0.1)
+
             loop_count += 1
             if loop_count % GC_INTERVAL == 0: gc.collect()
             
@@ -1167,114 +1104,70 @@ def main():
                             continue
                         valid_frame_count += 1
                         
-                        # [수정] 움직임 여부와 상관없이 항상 추론 (AI Always On)
                         run_helmet = any(e in ["no_helmet", "intrusion"] for e in c.events)
                         run_general = any(e in ["illegal_parking", "conveyor_crossing", "signal_vehicle"] for e in c.events)
                         
                         d_h_res, d_g_res = [], []
-                        # NPU 동기식 추론 (프레임 드랍 병목 발생 예상 구간)
                         if run_helmet: d_h_res = c.det_h.infer(fr)
                         if run_general: d_g_res = c.det_g.infer(fr)
                         
                         processed_results[idx] = (fr, d_h_res, d_g_res, True)
 
                 except Exception as e:
-                    print(f"\n💀 [FATAL ERROR] NPU {npu_idx} 에서 오류 발생!")
-                    print(f"   Error: {e}")
+                    logger.error(f"[FATAL ERROR] NPU {npu_idx} 에서 오류 발생: {e}")
                     raise e 
             
-            if valid_frame_count == 0: time.sleep(0.01)
+            if valid_frame_count == 0: 
+                time.sleep(0.01)
 
             final_imgs = []
             for idx, res in enumerate(processed_results):
                 if res is None: 
-                    final_imgs.append(cams[idx].last_draw)
+                    if use_display and use_drawing:
+                        final_imgs.append(cams[idx].draw(None, [], [], {}, connected=False))
+                    elif use_display:
+                        final_imgs.append(np.zeros((360, 640, 3), dtype=np.uint8))
                     continue
+                
                 fr, d_h_res, d_g_res, connected = res
                 if not connected:
-                    img = cams[idx].draw(None, [], [], {}, connected=False)
-                    final_imgs.append(img)
+                    if use_display and use_drawing:
+                        final_imgs.append(cams[idx].draw(None, [], [], {}, connected=False))
+                    elif use_display:
+                        final_imgs.append(np.zeros((360, 640, 3), dtype=np.uint8))
                 else:
                     t_h, t_g, alarms = cams[idx].run_logic(fr, d_h_res, d_g_res)
-                    img = cams[idx].draw(fr, t_h, t_g, alarms, connected=True)
-                    final_imgs.append(img)
+                    if use_display:
+                        if use_drawing:
+                            img = cams[idx].draw(fr, t_h, t_g, alarms, connected=True)
+                        else:
+                            img = cv2.resize(fr, (640, 360)) 
+                        final_imgs.append(img)
 
-            valid_imgs = [img for img in final_imgs if img is not None]
-            if valid_imgs:
-                mosaic = create_mosaic_image(valid_imgs)
-                if mosaic is not None: cv2.imshow("Monitor", mosaic)
-            
-            key = cv2.waitKey(1)
-            if key == ord('q'): break
-            elif key == ord('e'):
-                print("\n" + "="*40); print("       [ 🛠️ 실시간 설정 변경 모드 ]       "); print("="*40)
-                try:
-                    print("현재 등록된 카메라 목록:")
-                    for c in cams: print(f" [CAM {c.cam_id}] {c.ip} (NPU {c.npu_id}) | Events: {c.events}")
-                    
-                    val = input("\n>> 수정할 CAM 번호 입력 (취소: Enter): ").strip()
-                    if val == "":
-                        print(">> 취소되었습니다.")
-                        continue
-                    target_id = int(val)
+            if use_display:
+                valid_imgs = [img for img in final_imgs if img is not None]
+                if valid_imgs:
+                    mosaic = create_mosaic_image(valid_imgs)
+                    if mosaic is not None: cv2.imshow("Monitor", mosaic)
+                
+                key = cv2.waitKey(1)
+                if key == ord('q'): break
 
-                    target_cam = next((c for c in cams if c.cam_id == target_id), None)
-                    if target_cam:
-                        print(f"\n>> [CAM {target_id}] 현재 이벤트: {target_cam.events}")
-                        print("1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량감지")
-                        sel = input(">> 활성화할 이벤트 번호 입력 (예: 1,3) / 모두 끄기: 0 : ")
-                        new_events = []
-                        if '1' in sel: new_events.append("intrusion")
-                        if '2' in sel: new_events.append("illegal_parking")
-                        if '3' in sel: new_events.append("no_helmet")
-                        if '4' in sel: new_events.append("conveyor_crossing")
-                        if '5' in sel: new_events.append("signal_vehicle")
-                        
-                        new_poly = target_cam.roi_poly; new_lines = target_cam.roi_lines
-                        need_poly = any(x in new_events for x in ["intrusion", "illegal_parking", "signal_vehicle"])
-                        need_line = "conveyor_crossing" in new_events
-                        
-                        if need_poly or need_line:
-                            print(f"\n🎨 [CAM {target_id}] 구역 설정을 위해 화면을 캡처합니다...")
-                            
-                            snapshot = None
-                            if target_cam.reader.frame is not None:
-                                snapshot = target_cam.reader.frame.copy()
-                            
-                            if snapshot is None:
-                                print("⚠️ 현재 프레임 없음. 스냅샷 재접속 시도...")
-                                snapshot = capture_snapshot(target_cam.reader.url)
+            elapsed = time.time() - start_time
+            sleep_time = dynamic_delay - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
-                            if snapshot is not None:
-                                if need_poly:
-                                    print(" -> 구역(Polygon) 그리기 시작")
-                                    new_poly = get_roi_points_scaled(snapshot, f"CAM {target_id} Polygon")
-                                if need_line:
-                                    print(" -> 횡단 라인(Line) 그리기 시작")
-                                    new_lines = []
-                                    while True:
-                                        l = get_roi_points_scaled(snapshot, f"CAM {target_id} Line", mode="line")
-                                        if len(l)==2: new_lines.extend(l)
-                                        if input("    라인 추가? (y/n): ")!='y': break
-                            else: print("❌ 카메라 데이터 없음. 기존 구역 유지.")
-
-                        target_cam.update_config(new_events, new_poly, new_lines)
-                        conf_data = mgr.get_config(target_cam.ip)
-                        if conf_data:
-                            conf_data['events'] = new_events
-                            conf_data['roi_poly'] = new_poly
-                            conf_data['roi_lines'] = new_lines
-                            mgr.set_config(target_cam.ip, conf_data)
-                        print(f"✅ [CAM {target_id}] 설정 및 구역 업데이트 완료: {new_events}")
-                except Exception as e:
-                    print(f"❌ 설정 오류: {e}")
-
-    except Exception: traceback.print_exc()
+    except KeyboardInterrupt:
+        logger.info("[종료] 사용자에 의해 모니터링이 중단되었습니다 (Ctrl+C).")
+    except Exception as e: 
+        logger.error(f"예외 발생: {e}")
+        traceback.print_exc()
     finally:
-        print("\n[종료 절차 시작] 리소스 정리 중...")
+        logger.info("[종료 절차 시작] 리소스 정리 중...")
         for c in cams: c.stop()
         cv2.destroyAllWindows()
-        print("[종료 완료]")
+        logger.info("[종료 완료]")
 
 if __name__ == "__main__":
     main()

@@ -14,3 +14,5 @@ x64/Release/helmet.engine
 x64/Release/nvinfer.dll
 x64/Release/nvinfer_builder_resource.dll
 *.engine
+*.dxnn
+CCTV_EVENT_ALERT/events

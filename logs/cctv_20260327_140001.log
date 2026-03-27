@@ -1,0 +1,9 @@
+2026-03-27 14:00:01 | INFO    | [main] [System] DeepX NPU 환경으로 초기화를 시작합니다.
+2026-03-27 14:00:03 | INFO    | [main] 민감도 설정: 5
+2026-03-27 14:00:06 | INFO    | [main] Loading DeepX Models...
+2026-03-27 14:00:06 | ERROR   | [__init__] [DeepX Load Fail] Failed to create InferenceEngine for model 'helmet_3cls_v8_new.dxnn': [dxrt-exception] Invalid operation exception {"The current firmware version is 2.1.5.
+Please update your firmware to version 2.4.0 or higher.":/media/recomputer/USB1/dx-all-suite/dx-runtime/dx_rt/lib/device_version.cpp:216:CheckVersion}
+2026-03-27 14:00:06 | ERROR   | [main] 예외 발생: Failed to create InferenceEngine for model 'helmet_3cls_v8_new.dxnn': [dxrt-exception] Invalid operation exception {"The current firmware version is 2.1.5.
+Please update your firmware to version 2.4.0 or higher.":/media/recomputer/USB1/dx-all-suite/dx-runtime/dx_rt/lib/device_version.cpp:216:CheckVersion}
+2026-03-27 14:00:06 | INFO    | [main] [종료 절차 시작] 리소스 정리 중...
+2026-03-27 14:00:06 | INFO    | [main] [종료 완료]
