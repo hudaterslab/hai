@@ -75,15 +75,16 @@ REC_POST_SEC = 10
 REC_BUFFER_SIZE = REC_FPS * REC_PRE_SEC
 VISUAL_ALARM_DURATION = 5.0 
 
-# 💡 [핵심 수정] 카메라의 실제 스트림 포맷인 .avi 로 주소 변경
+# 💡 [업데이트] 9003번 포트 스트림(S.mp4) 추가
 RTSP_LIST = [
     "rtsp://192.168.1.170:9001/S.avi",
-    "rtsp://192.168.1.170:9002/s.avi",
+    "rtsp://192.168.1.170:9002/S.avi",
     "rtsp://192.168.1.170:9003/S.mp4"
 ]
 
 MODEL_HELMET_PATH   = "helmet_3cls_v8_new.dxnn"
 MODEL_GENERAL_PATH = "YOLOV8M-1.dxnn"
+MODEL_FACE_PATH = "YOLOV7_Face-1.dxnn"
 
 ID_H_HELMET = 0; ID_H_NO_HELMET = 1; ID_H_PERSON = 2
 ID_G_PERSON = 0; ID_G_CAR = 2; ID_G_BUS = 5; ID_G_TRUCK = 7
@@ -373,15 +374,17 @@ class ConfigManager:
     def clear_all(self): self.config = {}; self.save()
 
 # ==========================================
-# 딥엑스 NPU 엔진
+# 딥엑스 NPU 엔진 (YOLO v7 / v8 자동 파싱 탑재)
 # ==========================================
 class YoLoDeepX:
     def __init__(self, engine_path):
         self.engine_path = engine_path
+        # 💡 [핵심] 파일명에 'v7'이 포함되어 있으면 YOLOv7 후처리 로직(Objectness 분리)을 사용
+        self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
         try:
             io = InferenceOption()
             self.engine = InferenceEngine(self.engine_path, io)
-            logger.info(f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)}")
+            logger.info(f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)} (YOLOv{'7' if self.is_yolov7 else '8'} 타입)")
         except Exception as e:
             logger.error(f"[DeepX Load Fail] {e}")
             raise e
@@ -397,34 +400,60 @@ class YoLoDeepX:
         return canvas, scale, (dw, dh)
 
     def postprocess(self, output_tensor, conf_thres=0.45, iou_thres=0.45):
-        pred = np.array(output_tensor[0])
-        if pred.ndim == 3 and pred.shape[1] == 84: 
-            pred = pred.transpose((0, 2, 1))
-        pred = pred[0]
-        
-        scores = np.max(pred[:, 4:], axis=1)
-        mask = scores > conf_thres
-        pred = pred[mask]
-        
-        if len(pred) == 0: return []
+        try:
+            pred = np.array(output_tensor[0])
+            
+            # YOLOv8의 경우 [batch, num_classes+4, num_boxes] 배열일 수 있으므로 동적 트랜스포즈
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
+                pred = pred.transpose((0, 2, 1))
+            
+            if pred.ndim == 3:
+                pred = pred[0] # batch 차원 제거 -> [N, C]
+            
+            C = pred.shape[1]
+            
+            # 💡 [완벽한 해결책] YOLOv7과 YOLOv8의 Tensor 배열 구조를 구분하여 파싱
+            if self.is_yolov7 or C == 6 or C == 85:
+                # YOLOv7 Format: 5번째 인덱스가 Objectness(객체 존재 여부)
+                obj_conf = pred[:, 4]
+                if C > 5:
+                    cls_conf = pred[:, 5:]
+                    scores = obj_conf * np.max(cls_conf, axis=1)
+                    class_ids = np.argmax(cls_conf, axis=1)
+                else:
+                    # 완벽한 1-Class 전용 모델일 경우
+                    scores = obj_conf
+                    class_ids = np.zeros(len(scores), dtype=int)
+            else:
+                # YOLOv8 Format: Objectness 없이 4번부터 바로 Class Confidence 시작
+                scores = np.max(pred[:, 4:], axis=1)
+                class_ids = np.argmax(pred[:, 4:], axis=1)
 
-        boxes = pred[:, :4]
-        scores = np.max(pred[:, 4:], axis=1)
-        class_ids = np.argmax(pred[:, 4:], axis=1)
-        
-        boxes_xyxy = boxes.copy()
-        boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
-        boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
-        boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
-        boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
-        
-        indices = cv2.dnn.NMSBoxes(boxes_xyxy.tolist(), scores.tolist(), conf_thres, iou_thres)
-        
-        results = []
-        if len(indices) > 0:
-            for i in indices.flatten():
-                results.append([boxes_xyxy[i], scores[i], class_ids[i]])
-        return results
+            mask = scores > conf_thres
+            pred = pred[mask]
+            scores = scores[mask]
+            class_ids = class_ids[mask]
+            
+            if len(pred) == 0: return []
+
+            boxes = pred[:, :4]
+            
+            boxes_xyxy = boxes.copy()
+            boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+            boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+            boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+            boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
+            
+            indices = cv2.dnn.NMSBoxes(boxes_xyxy.tolist(), scores.tolist(), conf_thres, iou_thres)
+            
+            results = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    results.append([boxes_xyxy[i], scores[i], class_ids[i]])
+            return results
+        except Exception as e:
+            logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
 
     def infer(self, img):
         if img is None: return np.empty((0,6))
@@ -433,26 +462,31 @@ class YoLoDeepX:
         npu_input, scale, offset = self.letter_box(img)
         npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
         
-        output_tensor = self.engine.run([npu_input_rgb])
-        raw_dets = self.postprocess(output_tensor)
-        if not raw_dets: return np.empty((0,6))
-        
-        res = []
-        dw, dh = offset
-        for box, score, cls_id in raw_dets:
-            x1 = (box[0] - dw) / scale
-            y1 = (box[1] - dh) / scale
-            x2 = (box[2] - dw) / scale
-            y2 = (box[3] - dh) / scale
+        try:
+            output_tensor = self.engine.run([npu_input_rgb])
+            # 💡 v7 얼굴 모델은 보수적 감지를 위해 임계값을 살짝 낮춥니다 (오탐 방지는 모자이크부에서 수행)
+            raw_dets = self.postprocess(output_tensor, conf_thres=0.30 if self.is_yolov7 else 0.45)
+            if not raw_dets: return np.empty((0,6))
             
-            x1 = np.clip(x1, 0, w_orig)
-            y1 = np.clip(y1, 0, h_orig)
-            x2 = np.clip(x2, 0, w_orig)
-            y2 = np.clip(y2, 0, h_orig)
-            
-            res.append([x1, y1, x2, y2, score, cls_id])
-            
-        return np.array(res)
+            res = []
+            dw, dh = offset
+            for box, score, cls_id in raw_dets:
+                x1 = (box[0] - dw) / scale
+                y1 = (box[1] - dh) / scale
+                x2 = (box[2] - dw) / scale
+                y2 = (box[3] - dh) / scale
+                
+                x1 = np.clip(x1, 0, w_orig)
+                y1 = np.clip(y1, 0, h_orig)
+                x2 = np.clip(x2, 0, w_orig)
+                y2 = np.clip(y2, 0, h_orig)
+                
+                res.append([x1, y1, x2, y2, score, cls_id])
+                
+            return np.array(res)
+        except Exception as e:
+            logger.error(f"NPU Inference Error: {e}")
+            return np.empty((0,6))
 
     def destroy(self):
         pass
@@ -650,7 +684,6 @@ class FrameReader:
                         logger.info(f"[{self.ip}] 수신된 해상도: {w} x {h}")
                         self.resolution_checked = True
 
-                    # 💡 메모리 보호: 720p 이상일 경우 즉시 리사이즈
                     if fr.shape[1] > 1280:
                         scale = 1280 / fr.shape[1]
                         fr = cv2.resize(fr, (1280, int(fr.shape[0] * scale)), interpolation=cv2.INTER_NEAREST)
@@ -674,19 +707,19 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_h, det_g, npu_id, cam_id, sensitivity):
+    def __init__(self, ip, conf, det_h, det_g, det_f, npu_id, cam_id, sensitivity):
         self.ip = ip; self.conf = conf 
         self.reader = FrameReader(conf['url'], ip)
         self.roi_poly = conf.get('roi_poly', [])
         self.roi_lines = conf.get('roi_lines', [])
         self.events = conf.get('events', [])
-        self.det_h = det_h; self.det_g = det_g
+        self.det_h = det_h; self.det_g = det_g; self.det_f = det_f
         self.npu_id = npu_id; self.cam_id = cam_id 
         self.trk_h = SimpleTracker(is_helmet=True); self.trk_g = SimpleTracker(is_helmet=False)
         self.last_draw = None
         self.alerted = defaultdict(set); self.last_evt_t = {}
-        
         self.visual_alarms = {} 
+        self.face_blur_cache = {}
 
         self.config_lock = threading.Lock() 
         self.motion_det = MotionDetector(sensitivity)
@@ -717,9 +750,9 @@ class Camera:
                 self.reader = FrameReader(self.conf['url'], self.ip)
                 time.sleep(0.5)
         if fr is not None: self.recorder.update(fr)
-        return fr, connected
+        return fr, fid, connected
 
-    def run_logic(self, fr, d_h, d_g):
+    def run_logic(self, fr, fid, d_h, d_g):
         with self.config_lock:
             motion_mask = self.motion_det.apply(fr) 
 
@@ -733,28 +766,28 @@ class Camera:
                     ids = h.process(t_g, tm)
                     for i in ids: 
                         draw_tid = i + 10000
-                        self._trigger(fr, draw_tid, ename, t_g, now)
+                        self._trigger(fr, fid, draw_tid, ename, t_g, now)
                         current_alarms[draw_tid] = ename
                 elif ename == "conveyor_crossing":
                     tm = {int(t[4]): int(t[6]) for t in t_g}
                     ids = h.process(t_g, tm, target_cls=ID_G_PERSON)
                     for i in ids: 
                         draw_tid = i + 10000
-                        self._trigger(fr, draw_tid, ename, t_g, now)
+                        self._trigger(fr, fid, draw_tid, ename, t_g, now)
                         current_alarms[draw_tid] = ename
                 elif ename == "signal_vehicle":
                     tm = {int(t[4]): int(t[6]) for t in t_g}
                     ids = h.process(t_g, tm, motion_mask=motion_mask)
                     for i in ids: 
                         draw_tid = i + 10000
-                        self._trigger(fr, draw_tid, ename, t_g, now)
+                        self._trigger(fr, fid, draw_tid, ename, t_g, now)
                         current_alarms[draw_tid] = ename
                 else: 
                     tm = {int(t[4]): int(t[6]) for t in t_h}
                     ids = h.process(t_h, tm)
                     for i in ids: 
                         draw_tid = i
-                        self._trigger(fr, draw_tid, ename, t_h, now)
+                        self._trigger(fr, fid, draw_tid, ename, t_h, now)
                         current_alarms[draw_tid] = ename
             
             for tid, ename in current_alarms.items():
@@ -862,7 +895,7 @@ class Camera:
         self.last_draw = fr
         return fr
 
-    def _trigger(self, fr, tid, ename, tracks, now):
+    def _trigger(self, fr, fid, tid, ename, tracks, now):
         real_tid = tid if tid < 10000 else tid - 10000
         if ename in self.alerted[tid]: return
         if now - self.last_evt_t.get(ename, 0) < 60: return
@@ -870,7 +903,37 @@ class Camera:
         bb = next((t[:4] for t in tracks if int(t[4]) == real_tid), None)
         if bb is not None:
             logger.warning(f"🚨 [CAM {self.cam_id}] {ename} Detected! ID:{real_tid}")
-            save_event_image_with_mark(fr, self.ip, ename, bb, real_tid)
+            
+            # 💡 [보강] 단일/다중 클래스에 상관없이 모든 검출 객체(얼굴)만 정밀하게 모자이크
+            if fid not in self.face_blur_cache:
+                blur_img = fr.copy()
+                if self.det_f is not None:
+                    try:
+                        f_dets = self.det_f.infer(blur_img)
+                        for fx1, fy1, fx2, fy2, fscore, fcls in f_dets:
+                            # 얼굴 인식 전용 모델이므로, 신뢰도 0.3 이상이면 클래스 ID를 무시하고 렌더링
+                            if fscore > 0.3:
+                                fx1, fy1, fx2, fy2 = max(0, int(fx1)), max(0, int(fy1)), int(fx2), int(fy2)
+                                fh, fw = fy2 - fy1, fx2 - fx1
+                                
+                                # 자동차나 벽 전체를 잡는 터무니없는 오탐(화면의 80% 이상)만 차단
+                                if fw > blur_img.shape[1] * 0.8 or fh > blur_img.shape[0] * 0.8:
+                                    continue 
+                                    
+                                roi = blur_img[fy1:fy2, fx1:fx2]
+                                if roi.size > 0:
+                                    small = cv2.resize(roi, (fw//15 + 1, fh//15 + 1), interpolation=cv2.INTER_LINEAR)
+                                    blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                    except Exception as e:
+                        logger.error(f"얼굴 모자이크 처리 중 오류: {e}")
+                
+                self.face_blur_cache[fid] = blur_img
+                if len(self.face_blur_cache) > 5:
+                    self.face_blur_cache.pop(next(iter(self.face_blur_cache)))
+            
+            saved_img = self.face_blur_cache[fid]
+            
+            save_event_image_with_mark(saved_img, self.ip, ename, bb, real_tid)
             self.recorder.trigger(ename)
             self.alerted[tid].add(ename)
             self.last_evt_t[ename] = now
@@ -1035,15 +1098,16 @@ def main():
             logger.info("디스플레이가 꺼져 있으므로 실시간 화면 그리기도 비활성화됩니다.")
             use_drawing = False
 
-        if not os.path.exists(MODEL_HELMET_PATH) or not os.path.exists(MODEL_GENERAL_PATH): 
-            logger.error("모델 파일(.dxnn)을 찾을 수 없습니다. 경로를 확인하십시오.")
+        if not os.path.exists(MODEL_HELMET_PATH) or not os.path.exists(MODEL_GENERAL_PATH) or not os.path.exists(MODEL_FACE_PATH): 
+            logger.error("모델 파일(.dxnn)을 찾을 수 없습니다. Face 모델을 포함하여 3개의 경로를 모두 확인하십시오.")
             return
 
-        logger.info("Loading DeepX Models...")
+        logger.info("Loading DeepX Models (Helmet, General, Face)...")
         
         d_h = YoLoDeepX(MODEL_HELMET_PATH)
         d_g = YoLoDeepX(MODEL_GENERAL_PATH)
-        detectors[0] = {'h': d_h, 'g': d_g}
+        d_f = YoLoDeepX(MODEL_FACE_PATH)
+        detectors[0] = {'h': d_h, 'g': d_g, 'f': d_f}
 
         load_count = 0
         num_active = len(active_npu_ids)
@@ -1055,7 +1119,8 @@ def main():
                 cam_id = load_count + 1 
                 target_npu_idx = active_npu_ids[load_count % num_active]
                 target_dets = detectors[target_npu_idx]
-                cams.append(Camera(ip, conf, target_dets['h'], target_dets['g'], target_npu_idx, cam_id, sensitivity))
+                
+                cams.append(Camera(ip, conf, target_dets['h'], target_dets['g'], target_dets['f'], target_npu_idx, cam_id, sensitivity))
                 logger.info(f"Load [CAM {cam_id}]: {ip} -> NPU {target_npu_idx}")
                 load_count += 1
         
@@ -1078,7 +1143,6 @@ def main():
                 target_fps = min(15, target_fps + 1)
             dynamic_delay = 1.0 / target_fps
 
-            # 빈 루프에서의 CPU 공회전 방지
             if loop_count % 100 == 0:
                 time.sleep(0.1)
 
@@ -1098,9 +1162,9 @@ def main():
                 try:
                     for idx in cam_indices:
                         c = cams[idx]
-                        fr, connected = raw_data[idx]
+                        fr, fid, connected = raw_data[idx]
                         if fr is None or not connected:
-                            processed_results[idx] = (None, [], [], False)
+                            processed_results[idx] = (None, fid, [], [], False)
                             continue
                         valid_frame_count += 1
                         
@@ -1111,7 +1175,7 @@ def main():
                         if run_helmet: d_h_res = c.det_h.infer(fr)
                         if run_general: d_g_res = c.det_g.infer(fr)
                         
-                        processed_results[idx] = (fr, d_h_res, d_g_res, True)
+                        processed_results[idx] = (fr, fid, d_h_res, d_g_res, True)
 
                 except Exception as e:
                     logger.error(f"[FATAL ERROR] NPU {npu_idx} 에서 오류 발생: {e}")
@@ -1129,14 +1193,14 @@ def main():
                         final_imgs.append(np.zeros((360, 640, 3), dtype=np.uint8))
                     continue
                 
-                fr, d_h_res, d_g_res, connected = res
+                fr, fid, d_h_res, d_g_res, connected = res
                 if not connected:
                     if use_display and use_drawing:
                         final_imgs.append(cams[idx].draw(None, [], [], {}, connected=False))
                     elif use_display:
                         final_imgs.append(np.zeros((360, 640, 3), dtype=np.uint8))
                 else:
-                    t_h, t_g, alarms = cams[idx].run_logic(fr, d_h_res, d_g_res)
+                    t_h, t_g, alarms = cams[idx].run_logic(fr, fid, d_h_res, d_g_res)
                     if use_display:
                         if use_drawing:
                             img = cams[idx].draw(fr, t_h, t_g, alarms, connected=True)
