@@ -1111,9 +1111,26 @@ def main():
 
         load_count = 0
         num_active = len(active_npu_ids)
+        skipped_missing_config = []
+        skipped_no_events = []
+        skipped_invalid_ip = []
 
-        for rtsp in RTSP_LIST:
-            ip = extract_ip(rtsp); conf = mgr.get_config(ip)
+        for rtsp in rtsp_list:
+            ip = extract_ip(rtsp)
+            conf = mgr.get_config(ip)
+            if ip == "unknown_cam":
+                skipped_invalid_ip.append(rtsp)
+                logger.warning(f"[카메라 스킵] IP 추출 실패로 설정 매칭 불가: {rtsp!r}")
+                continue
+            if not conf:
+                skipped_missing_config.append((ip, rtsp))
+                logger.warning(f"[카메라 스킵] 설정 없음: ip_key={ip}, url={rtsp}")
+                continue
+            if not conf.get('events'):
+                skipped_no_events.append((ip, rtsp))
+                logger.warning(f"[카메라 스킵] 이벤트 설정 없음: ip_key={ip}, url={rtsp}")
+                continue
+
             if conf and conf.get('events'):
                 if 'url' not in conf: conf['url'] = rtsp.strip()
                 cam_id = load_count + 1 
@@ -1125,7 +1142,14 @@ def main():
                 load_count += 1
         
         if not cams: 
-            logger.warning("카메라 없음")
+            logger.warning(
+                f"카메라 없음 | csv={len(rtsp_list)} config_keys={len(mgr.config)} "
+                f"missing_config={len(skipped_missing_config)} no_events={len(skipped_no_events)} "
+                f"invalid_ip={len(skipped_invalid_ip)}"
+            )
+            if skipped_missing_config:
+                logger.warning(f"설정 키 예시: {list(mgr.config.keys())[:10]}")
+                logger.warning(f"미매칭 CSV 예시: {[ip for ip, _url in skipped_missing_config[:10]]}")
             return
         
         logger.info("모니터링 시작 (상시 녹화 모드 / 종료: Ctrl+C 또는 'q')")
