@@ -16,6 +16,8 @@ from collections import deque, defaultdict
 import concurrent.futures
 import pytz
 import requests
+import re
+from urllib.parse import urlsplit, unquote
 
 # ==========================================
 # [1] 전문적인 로깅 시스템 구축
@@ -95,8 +97,41 @@ IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 # ==========================================
 # 유틸리티 함수
 # ==========================================
+def sanitize_camera_url(url: str) -> str:
+    return re.sub(r'\s+', '', (url or '').strip())
+
+def parse_camera_endpoint(rtsp_url: str):
+    clean_url = sanitize_camera_url(rtsp_url)
+    if not clean_url:
+        raise ValueError("빈 RTSP URL")
+
+    if "://" not in clean_url:
+        clean_url = f"rtsp://{clean_url}"
+
+    parsed = urlsplit(clean_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"잘못된 RTSP URL 형식: {rtsp_url!r}")
+
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    host_port = netloc.strip("[]")
+    if not host_port:
+        raise ValueError(f"호스트를 찾을 수 없음: {rtsp_url!r}")
+
+    if ":" in host_port and host_port.count(":") == 1:
+        host, port = host_port.split(":", 1)
+    else:
+        host, port = host_port, ""
+
+    host = host.strip()
+    port = port.strip()
+    if not host:
+        raise ValueError(f"호스트를 찾을 수 없음: {rtsp_url!r}")
+
+    return clean_url, unquote(host), port
+
 def extract_ip(rtsp_url: str) -> str:
     try:
+<<<<<<< HEAD
         if "@" in rtsp_url:
             rest = rtsp_url.split("@")[-1]
         else:
@@ -109,10 +144,93 @@ def extract_ip(rtsp_url: str) -> str:
             return f"{last_octet}_{port_part}"  
         else:
             return ip_port.split(".")[-1]
+=======
+        _clean_url, host, port = parse_camera_endpoint(rtsp_url)
+        host_tail = host.split(".")[-1]
+        return f"{host_tail}_{port}" if port else host_tail
+>>>>>>> 1d8e9dd (Harden RTSP URL parsing)
     except Exception as e: 
-        logger.warning(f"IP 추출 실패: {e}")
+        logger.warning(f"IP 추출 실패: {e} | input={rtsp_url!r}")
         return "unknown_cam"
 
+<<<<<<< HEAD
+=======
+def normalize_roi_points(points, width, height):
+    if not points or width <= 0 or height <= 0:
+        return []
+    return [[round(float(x) / width, 6), round(float(y) / height, 6)] for x, y in points]
+
+def denormalize_roi_points(points, width, height):
+    if not points or width <= 0 or height <= 0:
+        return []
+    return [[int(round(float(x) * width)), int(round(float(y) * height))] for x, y in points]
+
+def roi_points_are_normalized(points):
+    if not points:
+        return False
+    try:
+        return all(0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0 for x, y in points)
+    except (TypeError, ValueError):
+        return False
+
+def load_rtsp_list_from_csv(csv_path):
+    if not os.path.exists(csv_path):
+        logger.error(f"카메라 목록 CSV를 찾을 수 없습니다: {csv_path}")
+        return []
+
+    rtsp_list = []
+    try:
+        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+            sample = f.read(2048)
+            f.seek(0)
+            has_header = csv.Sniffer().has_header(sample)
+
+            if has_header:
+                reader = csv.DictReader(f)
+                for row_idx, row in enumerate(reader, start=2):
+                    if not row:
+                        continue
+                    url = (
+                        row.get('url')
+                        or row.get('rtsp')
+                        or row.get('rtsp_url')
+                        or row.get('camera_url')
+                    )
+                    url = sanitize_camera_url(url)
+                    if url:
+                        rtsp_list.append(url)
+                    else:
+                        logger.warning(f"CSV {row_idx}행에 URL 컬럼이 비어 있어 건너뜁니다.")
+            else:
+                reader = csv.reader(f)
+                for row_idx, row in enumerate(reader, start=1):
+                    if not row:
+                        continue
+                    first_col = row[0] if row else ''
+                    url = sanitize_camera_url(first_col)
+                    if not url or url.startswith('#'):
+                        continue
+                    rtsp_list.append(url)
+    except csv.Error as e:
+        logger.error(f"카메라 CSV 파싱 실패: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"카메라 CSV 로드 실패: {e}")
+        return []
+
+    unique_rtsp_list = []
+    seen = set()
+    for url in rtsp_list:
+        if url in seen:
+            logger.warning(f"중복 카메라 URL 건너뜀: {url}")
+            continue
+        seen.add(url)
+        unique_rtsp_list.append(url)
+
+    logger.info(f"카메라 CSV 로드 완료: {len(unique_rtsp_list)}대")
+    return unique_rtsp_list
+
+>>>>>>> 1d8e9dd (Harden RTSP URL parsing)
 def calculate_iou(box1, box2):
     x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
