@@ -19,7 +19,6 @@ DEFAULT_REMOTE_PORT = None
 DEFAULT_REMOTE_DIR = "/volume1/Hudaters/dhkim"
 DEFAULT_LOCAL_OUTPUT_DIR = "snapshot_exports"
 DEFAULT_CAPTURE_RETRIES = 3
-DEFAULT_WARMUP_FRAMES = 5
 EXTERNAL_IP_SERVICES = (
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
@@ -100,11 +99,11 @@ def is_valid_snapshot_file(path):
     return image is not None and getattr(image, "size", 0) > 0
 
 
-def capture_and_save_snapshot(rtsp_url, local_path, retries, warmup_frames):
+def capture_and_save_snapshot(rtsp_url, local_path, retries):
     last_error = "unknown"
     for attempt in range(1, retries + 1):
         # Retry the full capture-save-verify path so broken JPEGs do not get uploaded.
-        frame = capture_snapshot(rtsp_url, warmup_frames=warmup_frames)
+        frame = capture_snapshot(rtsp_url)
         if not is_valid_snapshot_frame(frame):
             last_error = "empty frame"
             print(f"[WARN] Snapshot retry {attempt}/{retries}: invalid frame for {rtsp_url}", file=sys.stderr)
@@ -224,7 +223,6 @@ def main():
     parser.add_argument("--remote-port", type=int, default=DEFAULT_REMOTE_PORT)
     parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
     parser.add_argument("--capture-retries", type=int, default=DEFAULT_CAPTURE_RETRIES)
-    parser.add_argument("--warmup-frames", type=int, default=DEFAULT_WARMUP_FRAMES)
     parser.add_argument(
         "--local-output-dir",
         default=DEFAULT_LOCAL_OUTPUT_DIR,
@@ -312,12 +310,7 @@ def main():
             filename = f"{index:03d}_{camera_name}_{timestamp}.jpg"
             local_path = str(local_output_dir / filename)
 
-            ok, last_error = capture_and_save_snapshot(
-                rtsp_url,
-                local_path,
-                max(1, args.capture_retries),
-                max(0, args.warmup_frames),
-            )
+            ok, last_error = capture_and_save_snapshot(rtsp_url, local_path, max(1, args.capture_retries))
             if not ok:
                 failed += 1
                 print(f"[FAIL] Snapshot capture failed: {rtsp_url} | reason={last_error}", file=sys.stderr)
