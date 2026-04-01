@@ -131,30 +131,13 @@ def parse_camera_endpoint(rtsp_url: str):
 
 def extract_ip(rtsp_url: str) -> str:
     try:
-<<<<<<< HEAD
-        if "@" in rtsp_url:
-            rest = rtsp_url.split("@")[-1]
-        else:
-            rest = rtsp_url.split("//")[1]
-            
-        ip_port = rest.split("/")[0]  
-        if ":" in ip_port:
-            ip_part, port_part = ip_port.split(":")
-            last_octet = ip_part.split(".")[-1] 
-            return f"{last_octet}_{port_part}"  
-        else:
-            return ip_port.split(".")[-1]
-=======
         _clean_url, host, port = parse_camera_endpoint(rtsp_url)
         host_tail = host.split(".")[-1]
         return f"{host_tail}_{port}" if port else host_tail
->>>>>>> 1d8e9dd (Harden RTSP URL parsing)
     except Exception as e: 
         logger.warning(f"IP 추출 실패: {e} | input={rtsp_url!r}")
         return "unknown_cam"
 
-<<<<<<< HEAD
-=======
 def normalize_roi_points(points, width, height):
     if not points or width <= 0 or height <= 0:
         return []
@@ -230,7 +213,6 @@ def load_rtsp_list_from_csv(csv_path):
     logger.info(f"카메라 CSV 로드 완료: {len(unique_rtsp_list)}대")
     return unique_rtsp_list
 
->>>>>>> 1d8e9dd (Harden RTSP URL parsing)
 def calculate_iou(box1, box2):
     x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
