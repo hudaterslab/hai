@@ -14,8 +14,8 @@ import cv2
 
 DEFAULT_CAMERA_CSV = "cameras.csv"
 DEFAULT_REMOTE_USER = None
-DEFAULT_REMOTE_HOST = "112.217.187.130"
-DEFAULT_REMOTE_PORT = 21423
+DEFAULT_REMOTE_HOST = None
+DEFAULT_REMOTE_PORT = None
 DEFAULT_REMOTE_DIR = "/volume1/Hudaters/dhkim"
 DEFAULT_LOCAL_OUTPUT_DIR = "snapshot_exports"
 EXTERNAL_IP_SERVICES = (
@@ -195,6 +195,21 @@ def main():
     if not remote_user:
         print("Remote SSH user is required.", file=sys.stderr)
         return 1
+    remote_host = (args.remote_host or input("Remote SSH host: ").strip())
+    if not remote_host:
+        print("Remote SSH host is required.", file=sys.stderr)
+        return 1
+    remote_port = args.remote_port
+    if remote_port is None:
+        port_text = input("Remote SSH port: ").strip()
+        if not port_text:
+            print("Remote SSH port is required.", file=sys.stderr)
+            return 1
+        try:
+            remote_port = int(port_text)
+        except ValueError:
+            print(f"Invalid remote SSH port: {port_text!r}", file=sys.stderr)
+            return 1
 
     if not os.path.exists(args.csv):
         print(f"CSV not found: {args.csv}", file=sys.stderr)
@@ -227,8 +242,8 @@ def main():
     try:
         open_ssh_master(
             remote_user,
-            args.remote_host,
-            args.remote_port,
+            remote_host,
+            remote_port,
         )
     except subprocess.CalledProcessError as exc:
         print(f"Failed to establish SSH session: {exc}", file=sys.stderr)
@@ -238,8 +253,8 @@ def main():
         try:
             ensure_remote_dir(
                 remote_user,
-                args.remote_host,
-                args.remote_port,
+                remote_host,
+                remote_port,
                 remote_dir,
             )
         except subprocess.CalledProcessError as exc:
@@ -266,8 +281,8 @@ def main():
                 upload_snapshot(
                     local_path,
                     remote_user,
-                    args.remote_host,
-                    args.remote_port,
+                    remote_host,
+                    remote_port,
                     remote_dir,
                 )
                 uploaded += 1
@@ -278,8 +293,8 @@ def main():
     finally:
         close_ssh_master(
             remote_user,
-            args.remote_host,
-            args.remote_port,
+            remote_host,
+            remote_port,
         )
     print(f"Done. uploaded={uploaded}, failed={failed}")
     return 0 if uploaded > 0 and failed == 0 else 1

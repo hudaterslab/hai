@@ -541,37 +541,70 @@ class ParkingDetector:
             if tid not in curr_ids: del self.states[tid]
         return triggered
 
+
 class CrossingDetector:
     def __init__(self, roi_lines):
         self.lines = []
         for i in range(0, len(roi_lines), 2):
-            if i+1 < len(roi_lines): self.lines.append((roi_lines[i], roi_lines[i+1]))
+            if i + 1 < len(roi_lines): self.lines.append((roi_lines[i], roi_lines[i + 1]))
         self.prev = {}
-        self.candidates = {} 
+        self.candidates = {}
+
+        # 💡 [핵심 수정] 무한 연장선이 아닌 '실제 그려진 유한 선분'만 통과했는지 검사하는 양방향 판정
+
+    def _is_intersect(self, p1, p2, p3, p4):
+        # p1, p2: 사용자가 그린 ROI 선분
+        # p3, p4: 사람의 발 이동 궤적 (과거 -> 현재)
+        c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
+        c2 = ccw(p3, p4, p1) * ccw(p3, p4, p2)
+        # 두 선분이 서로를 가로지를 때만 True 반환 (가상의 연장선 오탐 완벽 차단)
+        return c1 < 0 and c2 < 0
+
     def process(self, tracks, track_map, target_cls, motion_mask=None):
         triggered = []
-        curr_ids = set(); now = time.time()
+        curr_ids = set()
+        now = time.time()
+
         for t in tracks:
             tid = int(t[4]); curr_ids.add(tid)
             if track_map.get(tid) != target_cls: continue
-            curr_pos = get_foot_point(*t[:4]); obj_width = t[2] - t[0]
+
+            curr_pos = get_foot_point(*t[:4])
+            obj_width = t[2] - t[0]
+
             if tid in self.prev:
                 pp = self.prev[tid]
+
+                # 1. 교차 지점 후보 등록
                 if tid not in self.candidates:
                     for p1, p2 in self.lines:
-                        if (ccw(p1, p2, pp) * ccw(p1, p2, curr_pos) < 0):
-                            self.candidates[tid] = {'crossing_pt': curr_pos, 'width': obj_width, 'timestamp': now}
+                        # 💡 기존의 절반짜리 판정식을 완벽한 유한 선분 판정식으로 교체
+                        if self._is_intersect(p1, p2, pp, curr_pos):
+                            self.candidates[tid] = {
+                                'crossing_pt': curr_pos,
+                                'width': obj_width,
+                                'timestamp': now
+                            }
                             break
+
+            # 2. 바운딩 박스 떨림(Jittering) 방어 로직
             if tid in self.candidates:
                 cand = self.candidates[tid]
                 moved_dist = get_distance(cand['crossing_pt'], curr_pos)
-                if moved_dist > (cand['width'] * 0.5):
-                    triggered.append(tid); del self.candidates[tid]
+
+                # 라인을 밟은 후, 객체 가로폭의 60% 이상 확실하게 넘어가야만 최종 알람 발생 (노이즈 방지)
+                if moved_dist > (cand['width'] * 0.6):
+                    triggered.append(tid)
+                    del self.candidates[tid]
+                # 5초가 지나도록 완전히 넘어가지 않고 맴돌면 오탐으로 간주하고 후보에서 삭제
                 elif now - cand['timestamp'] > 5.0:
                     del self.candidates[tid]
+
             self.prev[tid] = curr_pos
+
+        # 프레임에서 사라진 객체들 메모리 정리
         for tid in list(self.prev.keys()):
-            if tid not in curr_ids: 
+            if tid not in curr_ids:
                 del self.prev[tid]
                 if tid in self.candidates: del self.candidates[tid]
         return triggered
