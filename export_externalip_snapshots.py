@@ -18,6 +18,8 @@ DEFAULT_REMOTE_HOST = None
 DEFAULT_REMOTE_PORT = None
 DEFAULT_REMOTE_DIR = "/volume1/Hudaters/dhkim"
 DEFAULT_LOCAL_OUTPUT_DIR = "snapshot_exports"
+DEFAULT_CAPTURE_RETRIES = 3
+DEFAULT_WARMUP_FRAMES = 5
 EXTERNAL_IP_SERVICES = (
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
@@ -72,14 +74,55 @@ def load_camera_urls(csv_path):
     return urls
 
 
-def capture_snapshot(rtsp_url):
+def capture_snapshot(rtsp_url, warmup_frames=0):
     cap = cv2.VideoCapture(clean_rtsp_url(rtsp_url), cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         return None
-    ok, frame = cap.read()
+    frame = None
+    ok = False
+    for _ in range(max(1, warmup_frames + 1)):
+        ok, current = cap.read()
+        if ok and is_valid_snapshot_frame(current):
+            frame = current
     cap.release()
     return frame if ok else None
+
+
+def is_valid_snapshot_frame(frame):
+    return frame is not None and getattr(frame, "size", 0) > 0
+
+
+def is_valid_snapshot_file(path):
+    if not os.path.exists(path) or os.path.getsize(path) <= 0:
+        return False
+    image = cv2.imread(path)
+    return image is not None and getattr(image, "size", 0) > 0
+
+
+def capture_and_save_snapshot(rtsp_url, local_path, retries, warmup_frames):
+    last_error = "unknown"
+    for attempt in range(1, retries + 1):
+        # Retry the full capture-save-verify path so broken JPEGs do not get uploaded.
+        frame = capture_snapshot(rtsp_url, warmup_frames=warmup_frames)
+        if not is_valid_snapshot_frame(frame):
+            last_error = "empty frame"
+            print(f"[WARN] Snapshot retry {attempt}/{retries}: invalid frame for {rtsp_url}", file=sys.stderr)
+            continue
+
+        if not cv2.imwrite(local_path, frame):
+            last_error = "imwrite failed"
+            print(f"[WARN] Snapshot retry {attempt}/{retries}: save failed for {local_path}", file=sys.stderr)
+            continue
+
+        if not is_valid_snapshot_file(local_path):
+            last_error = "saved file validation failed"
+            print(f"[WARN] Snapshot retry {attempt}/{retries}: corrupted file for {local_path}", file=sys.stderr)
+            continue
+
+        return True, None
+
+    return False, last_error
 
 
 def ensure_remote_dir(user, host, port, remote_dir):
@@ -180,6 +223,8 @@ def main():
     parser.add_argument("--remote-host", default=DEFAULT_REMOTE_HOST)
     parser.add_argument("--remote-port", type=int, default=DEFAULT_REMOTE_PORT)
     parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
+    parser.add_argument("--capture-retries", type=int, default=DEFAULT_CAPTURE_RETRIES)
+    parser.add_argument("--warmup-frames", type=int, default=DEFAULT_WARMUP_FRAMES)
     parser.add_argument(
         "--local-output-dir",
         default=DEFAULT_LOCAL_OUTPUT_DIR,
@@ -266,8 +311,13 @@ def main():
             filename = f"{index:03d}_{camera_name}_{timestamp}.jpg"
             local_path = str(local_output_dir / filename)
 
-            frame = capture_snapshot(rtsp_url)
-            if frame is None:
+            ok, last_error = capture_and_save_snapshot(
+                rtsp_url,
+                local_path,
+                max(1, args.capture_retries),
+                max(0, args.warmup_frames),
+            )
+            if not ok:
                 failed += 1
                 print(f"[FAIL] Snapshot capture failed: {rtsp_url}", file=sys.stderr)
                 continue
