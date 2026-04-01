@@ -8,7 +8,7 @@ import sys
 import tempfile
 import urllib.request
 from pathlib import Path
-
+import numpy as np
 import cv2
 
 
@@ -19,6 +19,8 @@ DEFAULT_REMOTE_PORT = None
 DEFAULT_REMOTE_DIR = "/volume1/Hudaters/dhkim"
 DEFAULT_LOCAL_OUTPUT_DIR = "snapshot_exports"
 DEFAULT_CAPTURE_RETRIES = 3
+DEFAULT_WARMUP_FRAMES = 20
+DEFAULT_SAMPLE_FRAMES = 10
 EXTERNAL_IP_SERVICES = (
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
@@ -73,19 +75,38 @@ def load_camera_urls(csv_path):
     return urls
 
 
-def capture_snapshot(rtsp_url, warmup_frames=0):
+def score_snapshot_frame(frame):
+    if not is_valid_snapshot_frame(frame):
+        return -1.0
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    stddev = float(gray.std())
+    p05 = float(np.percentile(gray, 5))
+    p95 = float(np.percentile(gray, 95))
+    dynamic_range = p95 - p05
+    return stddev + dynamic_range
+
+
+def capture_snapshot(rtsp_url, warmup_frames=0, sample_frames=1):
     cap = cv2.VideoCapture(clean_rtsp_url(rtsp_url), cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         return None
-    frame = None
-    ok = False
-    for _ in range(max(1, warmup_frames + 1)):
+    best_frame = None
+    best_score = -1.0
+    total_reads = max(1, warmup_frames + sample_frames)
+    sample_start = max(0, warmup_frames)
+    for read_idx in range(total_reads):
         ok, current = cap.read()
-        if ok and is_valid_snapshot_frame(current):
-            frame = current
+        if not ok or not is_valid_snapshot_frame(current):
+            continue
+        if read_idx < sample_start:
+            continue
+        score = score_snapshot_frame(current)
+        if score > best_score:
+            best_score = score
+            best_frame = current.copy()
     cap.release()
-    return frame if ok else None
+    return best_frame
 
 
 def is_valid_snapshot_frame(frame):
@@ -99,11 +120,11 @@ def is_valid_snapshot_file(path):
     return image is not None and getattr(image, "size", 0) > 0
 
 
-def capture_and_save_snapshot(rtsp_url, local_path, retries):
+def capture_and_save_snapshot(rtsp_url, local_path, retries, warmup_frames, sample_frames):
     last_error = "unknown"
     for attempt in range(1, retries + 1):
         # Retry the full capture-save-verify path so broken JPEGs do not get uploaded.
-        frame = capture_snapshot(rtsp_url)
+        frame = capture_snapshot(rtsp_url, warmup_frames=warmup_frames, sample_frames=sample_frames)
         if not is_valid_snapshot_frame(frame):
             last_error = "empty frame"
             print(f"[WARN] Snapshot retry {attempt}/{retries}: invalid frame for {rtsp_url}", file=sys.stderr)
@@ -223,6 +244,8 @@ def main():
     parser.add_argument("--remote-port", type=int, default=DEFAULT_REMOTE_PORT)
     parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
     parser.add_argument("--capture-retries", type=int, default=DEFAULT_CAPTURE_RETRIES)
+    parser.add_argument("--warmup-frames", type=int, default=DEFAULT_WARMUP_FRAMES)
+    parser.add_argument("--sample-frames", type=int, default=DEFAULT_SAMPLE_FRAMES)
     parser.add_argument(
         "--local-output-dir",
         default=DEFAULT_LOCAL_OUTPUT_DIR,
@@ -310,7 +333,13 @@ def main():
             filename = f"{index:03d}_{camera_name}_{timestamp}.jpg"
             local_path = str(local_output_dir / filename)
 
-            ok, last_error = capture_and_save_snapshot(rtsp_url, local_path, max(1, args.capture_retries))
+            ok, last_error = capture_and_save_snapshot(
+                rtsp_url,
+                local_path,
+                max(1, args.capture_retries),
+                max(0, args.warmup_frames),
+                max(1, args.sample_frames),
+            )
             if not ok:
                 failed += 1
                 print(f"[FAIL] Snapshot capture failed: {rtsp_url} | reason={last_error}", file=sys.stderr)

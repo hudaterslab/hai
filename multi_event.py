@@ -2,6 +2,7 @@ import os
 import sys
 import gc
 import json
+import csv
 import cv2
 import math
 import numpy as np
@@ -62,6 +63,7 @@ except ImportError:
 # 0. 설정 및 상수
 # ==========================================
 CONFIG_FILE = "cctv_config.json"
+CAMERA_LIST_FILE = "cameras.csv"
 EVENT_ROOT_DIR = "./CCTV_EVENT_ALERT" 
 
 SCREEN_WIDTH = 1280
@@ -76,15 +78,9 @@ REC_PRE_SEC = 10
 REC_POST_SEC = 10        
 REC_BUFFER_SIZE = REC_FPS * REC_PRE_SEC
 VISUAL_ALARM_DURATION = 5.0 
+EVENT_COOLDOWN_SEC = 600
 
-# 💡 [업데이트] 9003번 포트 스트림(S.mp4) 추가
-RTSP_LIST = [
-    "rtsp://192.168.1.170:9001/S.avi",
-    "rtsp://192.168.1.170:9002/S.avi",
-    "rtsp://192.168.1.170:9003/S.mp4"
-]
-
-MODEL_HELMET_PATH   = "helmet_3cls_v8_new.dxnn"
+MODEL_HELMET_PATH   = "helmet_3cls_v8.dxnn"
 MODEL_GENERAL_PATH = "YOLOV8M-1.dxnn"
 MODEL_FACE_PATH = "YOLOV7_Face-1.dxnn"
 
@@ -356,7 +352,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid):
         ai_detected_bboxes = [{"id": tid, "box": [x1, y1, x2, y2], "label": event_type}]
         api_params = {
             'event_name': event_type,
-            'terminal_id': "99999", 
+            'terminal_id': "3",
             'cctv_id': 1,            
             'bboxes': ai_detected_bboxes,
             'img_width': w,
@@ -666,7 +662,8 @@ class CrossingDetector:
         now = time.time()
 
         for t in tracks:
-            tid = int(t[4]); curr_ids.add(tid)
+            tid = int(t[4])
+            curr_ids.add(tid)
             if track_map.get(tid) != target_cls: continue
 
             curr_pos = get_foot_point(*t[:4])
@@ -707,6 +704,7 @@ class CrossingDetector:
             if tid not in curr_ids:
                 del self.prev[tid]
                 if tid in self.candidates: del self.candidates[tid]
+
         return triggered
 
 class HelmetDetector:
@@ -772,8 +770,8 @@ class SignalVehicleDetector:
 # 안정적인 FFMPEG 백엔드 기반 프레임 리더
 # ==========================================
 class FrameReader:
-    def __init__(self, url, ip):  
-        self.url = url.strip()
+    def __init__(self, url, ip):
+        self.url = url.replace(" ","").strip()
         self.ip = ip
         self.lock = threading.Lock()
         self.frame = None
@@ -817,9 +815,9 @@ class FrameReader:
                         logger.info(f"[{self.ip}] 수신된 해상도: {w} x {h}")
                         self.resolution_checked = True
 
-                    if fr.shape[1] > 1280:
-                        scale = 1280 / fr.shape[1]
-                        fr = cv2.resize(fr, (1280, int(fr.shape[0] * scale)), interpolation=cv2.INTER_NEAREST)
+                    if fr.shape[1] > 720:
+                        scale =720 / fr.shape[1]
+                        fr = cv2.resize(fr, (720, int(fr.shape[0] * scale)), interpolation=cv2.INTER_NEAREST)
 
                 with self.lock:
                     self.frame = fr
@@ -843,8 +841,14 @@ class Camera:
     def __init__(self, ip, conf, det_h, det_g, det_f, npu_id, cam_id, sensitivity):
         self.ip = ip; self.conf = conf 
         self.reader = FrameReader(conf['url'], ip)
-        self.roi_poly = conf.get('roi_poly', [])
-        self.roi_lines = conf.get('roi_lines', [])
+        self.roi_poly = []
+        self.roi_lines = []
+        self.roi_poly_norm = conf.get('roi_poly_norm', [])
+        self.roi_lines_norm = conf.get('roi_lines_norm', [])
+        self.using_normalized_roi = bool(self.roi_poly_norm or self.roi_lines_norm)
+        if not self.using_normalized_roi:
+            self.roi_poly = conf.get('roi_poly', [])
+            self.roi_lines = conf.get('roi_lines', [])
         self.events = conf.get('events', [])
         self.det_h = det_h; self.det_g = det_g; self.det_f = det_f
         self.npu_id = npu_id; self.cam_id = cam_id 
@@ -853,10 +857,22 @@ class Camera:
         self.alerted = defaultdict(set); self.last_evt_t = {}
         self.visual_alarms = {} 
         self.face_blur_cache = {}
+        self.roi_frame_shape = None
 
         self.config_lock = threading.Lock() 
         self.motion_det = MotionDetector(sensitivity)
         self.recorder = VideoRecorder(ip)
+        self.init_handlers()
+
+    def _update_runtime_roi(self, frame_shape):
+        if not self.using_normalized_roi:
+            return
+        if self.roi_frame_shape == frame_shape[:2]:
+            return
+        height, width = frame_shape[:2]
+        self.roi_poly = denormalize_roi_points(self.roi_poly_norm, width, height)
+        self.roi_lines = denormalize_roi_points(self.roi_lines_norm, width, height)
+        self.roi_frame_shape = frame_shape[:2]
         self.init_handlers()
 
     def init_handlers(self):
@@ -872,6 +888,8 @@ class Camera:
             self.events = new_events
             if new_poly is not None: self.roi_poly = new_poly
             if new_lines is not None: self.roi_lines = new_lines
+            self.using_normalized_roi = False
+            self.roi_frame_shape = None
             self.init_handlers()
 
     def process_frame(self):
@@ -882,7 +900,10 @@ class Camera:
                 self.reader.running = False 
                 self.reader = FrameReader(self.conf['url'], self.ip)
                 time.sleep(0.5)
-        if fr is not None: self.recorder.update(fr)
+        if fr is not None:
+            with self.config_lock:
+                self._update_runtime_roi(fr.shape)
+            self.recorder.update(fr)
         return fr, fid, connected
 
     def run_logic(self, fr, fid, d_h, d_g):
@@ -1031,7 +1052,7 @@ class Camera:
     def _trigger(self, fr, fid, tid, ename, tracks, now):
         real_tid = tid if tid < 10000 else tid - 10000
         if ename in self.alerted[tid]: return
-        if now - self.last_evt_t.get(ename, 0) < 60: return
+        if now - self.last_evt_t.get(ename, 0) < EVENT_COOLDOWN_SEC: return
         
         bb = next((t[:4] for t in tracks if int(t[4]) == real_tid), None)
         if bb is not None:
@@ -1079,7 +1100,8 @@ class Camera:
 # Main
 # ==========================================
 def capture_snapshot(url):
-    cap = cv2.VideoCapture(url.strip(), cv2.CAP_FFMPEG)
+    clean_url = re.sub(r'\s+', '', url)
+    cap = cv2.VideoCapture(clean_url, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened(): return None
     ret, frame = cap.read()
@@ -1116,14 +1138,17 @@ def get_roi_points_scaled(frame, title, mode="poly"):
         if k==27: pts=[]; break 
         if mode=="line" and len(pts)==2: cv2.waitKey(500); break
     cv2.destroyWindow(wname)
-    return pts
+    return normalize_roi_points(pts, orig_w, orig_h)
 
-def run_wizard_batch_mode(mgr):
+def run_wizard_batch_mode(mgr, rtsp_list):
     logger.info("=== CCTV 일괄 설정 마법사 (Batch Mode) ===")
     selected_indices = []
-    total = len(RTSP_LIST)
+    total = len(rtsp_list)
+    if total == 0:
+        logger.warning("설정할 카메라가 없습니다. cameras.csv 내용을 확인하십시오.")
+        return
     for i in range(0, total, BATCH_SIZE):
-        batch_urls = RTSP_LIST[i : i + BATCH_SIZE]
+        batch_urls = rtsp_list[i : i + BATCH_SIZE]
         logger.info(f"[Batch {i//BATCH_SIZE + 1}] 카메라 {i+1} ~ {min(i+BATCH_SIZE, total)} 로딩 중...")
         frames = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
@@ -1161,7 +1186,7 @@ def run_wizard_batch_mode(mgr):
 
     logger.info(f"총 {len(selected_indices)}대 설정 시작")
     for idx in selected_indices:
-        url = RTSP_LIST[idx].strip(); ip = extract_ip(url)
+        url = rtsp_list[idx].strip(); ip = extract_ip(url)
         logger.info(f"[{ip}] 설정 중...")
         frame = capture_snapshot(url)
         if frame is None: 
@@ -1189,10 +1214,14 @@ def run_wizard_batch_mode(mgr):
                 l = get_roi_points_scaled(frame, "Line", mode="line")
                 if len(l)==2: roi_l.extend(l)
                 if input("    라인 추가? (y/n): ")!='y': break
-        mgr.set_config(ip, {"url": url, "roi_poly": roi_p, "roi_lines": roi_l, "events": events})
+        mgr.set_config(ip, {"url": url, "roi_poly_norm": roi_p, "roi_lines_norm": roi_l, "events": events})
 
 def main():
     logger.info("[System] DeepX NPU 환경으로 초기화를 시작합니다.")
+    rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
+    if not rtsp_list:
+        logger.error(f"카메라 목록을 불러오지 못했습니다. {CAMERA_LIST_FILE} 파일을 확인하십시오.")
+        return
     
     sensitivity = 5
     try:
@@ -1212,13 +1241,13 @@ def main():
         mgr = ConfigManager(CONFIG_FILE)
         if not os.path.exists(CONFIG_FILE):
             logger.warning("설정 파일이 없습니다. 초기 설정 마법사는 디스플레이 환경이 필수입니다.")
-            run_wizard_batch_mode(mgr)
+            run_wizard_batch_mode(mgr, rtsp_list)
         else:
             is_reset = input(">> 설정 초기화 마법사를 실행하시겠습니까? (y/n): ").strip().lower()
             if is_reset == 'y':
                 logger.warning("설정 마법사는 디스플레이 환경이 필수입니다.")
                 mgr.clear_all()
-                run_wizard_batch_mode(mgr)
+                run_wizard_batch_mode(mgr, rtsp_list)
 
         val_disp = input(">> 모니터링 화면(GUI)을 출력하시겠습니까? (y/n, 기본값 y): ").strip().lower()
         use_display = False if val_disp == 'n' else True

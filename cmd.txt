@@ -1,0 +1,17 @@
+tmux new -s hai
+
+cd ~/Desktop/hai
+source venv-dx-runtime/bin/activate
+python3 multi_event.py | tee run.log
+
+# tmux에서 분리
+# Ctrl+b 누른 뒤 d
+
+# 다시 접속
+tmux attach -t hai
+
+# 세션 목록 확인
+tmux ls
+
+# tmux 세션 종료
+tmux kill-session -t hai

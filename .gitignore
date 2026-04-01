@@ -16,3 +16,13 @@ x64/Release/nvinfer_builder_resource.dll
 *.engine
 *.dxnn
 CCTV_EVENT_ALERT/events
+
+# Local runtime/config files
+cameras.csv
+cctv_config.json
+logs/
+snapshot_exports/
+.idea/
+__pycache__/
+*.swo
+roi_from_snapshots.py
