@@ -20,9 +20,13 @@ CCTV_EVENT_ALERT/events
 # Local runtime/config files
 cameras.csv
 cctv_config.json
+config/*.json
+!config/*.sample.json
 logs/
 snapshot_exports/
 .idea/
 __pycache__/
 *.swo
 roi_from_snapshots.py
+.codex
+.codex_local_skills/
