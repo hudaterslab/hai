@@ -675,22 +675,34 @@ class CrossingDetector:
                 # 1. 교차 지점 후보 등록
                 if tid not in self.candidates:
                     for p1, p2 in self.lines:
-                        # 💡 기존의 절반짜리 판정식을 완벽한 유한 선분 판정식으로 교체
+                        # 💡q 기존의 절반짜리 판정식을 완벽한 유한 선분 판정식으로 교체
                         if self._is_intersect(p1, p2, pp, curr_pos):
                             self.candidates[tid] = {
                                 'crossing_pt': curr_pos,
                                 'width': obj_width,
-                                'timestamp': now
+                                'timestamp': now,
+                                'line': (p1,p2),
+                                'entry_side': ccw(p1,p2,pp)
                             }
                             break
 
             # 2. 바운딩 박스 떨림(Jittering) 방어 로직
             if tid in self.candidates:
                 cand = self.candidates[tid]
+                p1, p2 = cand['line']
+                curr_side = ccw(p1, p2, curr_pos)
                 moved_dist = get_distance(cand['crossing_pt'], curr_pos)
 
                 # 라인을 밟은 후, 객체 가로폭의 60% 이상 확실하게 넘어가야만 최종 알람 발생 (노이즈 방지)
-                if moved_dist > (cand['width'] * 0.6):
+                # if moved_dist > (cand['width'] * 0.6):
+                direction_confirmed = (
+                        cand['entry_side'] != 0
+                        and curr_side != 0
+                        and cand['entry_side'] * curr_side < 0
+                )
+                dist_threshold = max(cand['width'] * 0.5, 15)
+                distance_confirmed = moved_dist > dist_threshold
+                if direction_confirmed and distance_confirmed:
                     triggered.append(tid)
                     del self.candidates[tid]
                 # 5초가 지나도록 완전히 넘어가지 않고 맴돌면 오탐으로 간주하고 후보에서 삭제
