@@ -65,6 +65,10 @@ BATCH_SIZE = 9
 GC_INTERVAL = 300           
 MAX_SAVE_QUEUE = 50
 WATCHDOG_TIMEOUT = 30.0
+STREAM_WARMUP_FRAMES = 20
+STREAM_READ_FAIL_THRESHOLD = 5
+STREAM_RECONNECT_DELAY_SEC = 2.0
+STREAM_BROKEN_RETRY_DELAY_SEC = 1.0
 
 REC_FPS = 30             
 REC_PRE_SEC = 10         
@@ -1117,22 +1121,86 @@ class FrameReader:
         self.last_frame_time = time.time()
         self.is_stuck = False
         self.resolution_checked = False
+        self.warmup_complete = False
+        self.consecutive_read_failures = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+
+    # 2026-04-07 by dhkim
+    # HEVC RTSP가 GOP 중간부터 열릴 때 초반 깨진 프레임을 이벤트 로직에 넘기지 않도록 warm-up/reconnect 경로를 보강한 블록.
+    def _reset_connection_state(self):
+        """새 연결 또는 재연결 시작 시 수신 상태를 초기화한다."""
+        self.connected = False
+        self.is_stuck = False
+        self.warmup_complete = False
+        self.consecutive_read_failures = 0
+
+    def _warmup_stream(self, cap):
+        """초기 decode 불안정 구간을 버리기 위해 몇 프레임을 미리 읽고 안정화한다."""
+        logger.info(f"[{self.ip}] Stream warm-up start frames={STREAM_WARMUP_FRAMES}")
+        warmed = 0
+        while self.running and cap.isOpened() and warmed < STREAM_WARMUP_FRAMES:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                self.consecutive_read_failures += 1
+                if self.consecutive_read_failures >= STREAM_READ_FAIL_THRESHOLD:
+                    logger.warning(f"[{self.ip}] Warm-up failed read_failures={self.consecutive_read_failures}")
+                    return False
+                time.sleep(0.05)
+                continue
+
+            self.consecutive_read_failures = 0
+            warmed += 1
+            with self.lock:
+                self.frame = frame
+                self.fid += 1
+                self.last_frame_time = time.time()
+
+        if warmed < STREAM_WARMUP_FRAMES:
+            return False
+
+        self.warmup_complete = True
+        self.connected = True
+        logger.info(f"[{self.ip}] Stream warm-up complete frames={warmed}")
+        return True
+
+    def _prepare_frame(self, frame):
+        """정상 프레임의 해상도 로그와 입력 크기 정규화를 처리한다."""
+        if frame is None:
+            return None
+        if not self.resolution_checked:
+            height, width = frame.shape[:2]
+            logger.info(f"[{self.ip}] 수신된 해상도: {width} x {height}")
+            self.resolution_checked = True
+
+        if frame.shape[1] > 720:
+            scale = 720 / frame.shape[1]
+            frame = cv2.resize(frame, (720, int(frame.shape[0] * scale)), interpolation=cv2.INTER_NEAREST)
+        return frame
 
     def _run(self):
         """연결이 끊기거나 멈추면 자동 재연결을 반복하는 수신 루프다."""
         while self.running:
+            self._reset_connection_state()
+            logger.info(f"[{self.ip}] Opening RTSP stream url={self.url}")
             cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
-                time.sleep(5)
+                logger.warning(f"[{self.ip}] RTSP open failed. retry_in={STREAM_RECONNECT_DELAY_SEC}s")
+                time.sleep(STREAM_RECONNECT_DELAY_SEC)
                 continue
 
-            self.connected = True
             self.last_frame_time = time.time()
-            self.is_stuck = False
+            if not self._warmup_stream(cap):
+                self.connected = False
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                if self.running:
+                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                continue
             
             while self.running and cap.isOpened():
                 if time.time() - self.last_frame_time > WATCHDOG_TIMEOUT:
@@ -1140,38 +1208,42 @@ class FrameReader:
                     self.is_stuck = True 
                     break
                 
-                ret, fr = cap.read()
-                if not ret: 
-                    logger.warning(f"[{self.ip}] Stream broken.")
-                    time.sleep(1)
-                    break
-                
-                if fr is not None:
-                    if not self.resolution_checked:
-                        h, w = fr.shape[:2]
-                        logger.info(f"[{self.ip}] 수신된 해상도: {w} x {h}")
-                        self.resolution_checked = True
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    self.consecutive_read_failures += 1
+                    if self.consecutive_read_failures >= STREAM_READ_FAIL_THRESHOLD:
+                        logger.warning(
+                            f"[{self.ip}] Stream broken. consecutive_read_failures={self.consecutive_read_failures}"
+                        )
+                        time.sleep(STREAM_BROKEN_RETRY_DELAY_SEC)
+                        break
+                    time.sleep(0.02)
+                    continue
 
-                    if fr.shape[1] > 720:
-                        scale =720 / fr.shape[1]
-                        fr = cv2.resize(fr, (720, int(fr.shape[0] * scale)), interpolation=cv2.INTER_NEAREST)
+                self.consecutive_read_failures = 0
+                frame = self._prepare_frame(frame)
 
                 with self.lock:
-                    self.frame = fr
+                    self.frame = frame
                     self.fid += 1
                     self.last_frame_time = time.time()
                 
                 time.sleep(0.005)
             
             self.connected = False
-            try: cap.release()
-            except: pass
-            if self.running: time.sleep(2)
+            self.warmup_complete = False
+            try:
+                cap.release()
+            except Exception:
+                pass
+            if self.running:
+                logger.info(f"[{self.ip}] Reconnecting after stream loop exit")
+                time.sleep(STREAM_RECONNECT_DELAY_SEC)
 
     def read(self):
         """현재 최신 프레임과 프레임 ID, 연결 상태를 스레드 안전하게 반환한다."""
         with self.lock:
-            if self.is_stuck or (time.time() - self.last_frame_time > WATCHDOG_TIMEOUT):
+            if self.is_stuck or not self.warmup_complete or (time.time() - self.last_frame_time > WATCHDOG_TIMEOUT):
                 return None, self.fid, False
             return self.frame, self.fid, self.connected
 
