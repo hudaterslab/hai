@@ -1185,7 +1185,7 @@ class FrameReader:
 
 class Camera:
     """카메라 1대의 읽기, 추론, 이벤트 판정, 시각화, 저장을 묶는 실행 단위다."""
-    def __init__(self, ip, conf, det_h, det_g, det_f, npu_id, cam_id, sensitivity):
+    def __init__(self, ip, conf, helmet_detector, general_detector, face_detector, npu_id, cam_id, sensitivity):
         self.ip = ip; self.conf = conf 
         self.reader = FrameReader(conf['url'], ip)
         self.terminal_id = str(conf.get('terminal_id', "3"))
@@ -1200,9 +1200,9 @@ class Camera:
             self.roi_poly = conf.get('roi_poly', [])
             self.roi_lines = conf.get('roi_lines', [])
         self.events = conf.get('events', [])
-        self.det_h = det_h; self.det_g = det_g; self.det_f = det_f
+        self.helmet_detector = helmet_detector; self.general_detector = general_detector; self.face_detector = face_detector
         self.npu_id = npu_id; self.cam_id = cam_id 
-        self.trk_h = SimpleTracker(is_helmet=True); self.trk_g = SimpleTracker(is_helmet=False)
+        self.helmet_tracker = SimpleTracker(is_helmet=True); self.general_tracker = SimpleTracker(is_helmet=False)
         self.last_draw = None
         self.alerted = defaultdict(set); self.last_evt_t = {}
         self.visual_alarms = {} 
@@ -1271,8 +1271,8 @@ class Camera:
 
     def _update_visual_alarms(self, current_alarms, now):
         """현재 프레임 알람을 반영하고 만료된 시각 알람을 정리한다."""
-        for tid, ename in current_alarms.items():
-            self.visual_alarms[tid] = {'evt': ename, 'expire': now + VISUAL_ALARM_DURATION}
+        for tid, event_name in current_alarms.items():
+            self.visual_alarms[tid] = {'evt': event_name, 'expire': now + VISUAL_ALARM_DURATION}
 
         for tid in list(self.visual_alarms.keys()):
             if now > self.visual_alarms[tid]['expire']:
@@ -1288,12 +1288,12 @@ class Camera:
 
     def _apply_face_blur(self, image):
         """얼굴 검출 결과를 기반으로 입력 이미지에 모자이크를 적용한다."""
-        if self.det_f is None:
+        if self.face_detector is None:
             return image
 
         try:
-            f_dets = self.det_f.infer(image)
-            for fx1, fy1, fx2, fy2, fscore, fcls in f_dets:
+            face_detections = self.face_detector.infer(image)
+            for fx1, fy1, fx2, fy2, fscore, fcls in face_detections:
                 if fscore <= 0.3:
                     continue
 
@@ -1368,7 +1368,7 @@ class Camera:
             self._update_runtime_roi(frame.shape)
         self.recorder.update(frame)
 
-    def _collect_standard_events(self, event_name, handler, tracks, track_map, now, fr, fid, draw_tid_offset=0, motion_mask=None):
+    def _collect_standard_events(self, event_name, handler, tracks, track_map, now, frame, frame_id, draw_tid_offset=0, motion_mask=None):
         """ID 목록을 반환하는 detector 결과를 공통 흐름으로 처리한다."""
         if motion_mask is None:
             ids = handler.process(tracks, track_map)
@@ -1379,19 +1379,19 @@ class Camera:
         current_alarms = {}
         for track_id in ids:
             draw_tid = track_id + draw_tid_offset
-            self._trigger(fr, fid, draw_tid, event_name, tracks, now)
+            self._trigger_event(frame, frame_id, draw_tid, event_name, tracks, now)
             current_alarms[draw_tid] = event_name
         return current_alarms
 
-    def _collect_crossing_events(self, handler, tracks, track_map, now, fr, fid):
+    def _collect_crossing_events(self, handler, tracks, track_map, now, frame, frame_id):
         """crossing detector payload를 공통 알람 형태로 변환한다."""
-        events = handler.process(tracks, track_map, target_cls=ID_G_PERSON, frame=fr, fid=fid)
+        events = handler.process(tracks, track_map, target_cls=ID_G_PERSON, frame=frame, fid=frame_id)
         self._log_handler_result("conveyor_crossing", len(events))
         current_alarms = {}
         for evt in events:
             draw_tid = evt['tid'] + 10000
-            self._trigger(
-                fr, fid, draw_tid, "conveyor_crossing", tracks, now,
+            self._trigger_event(
+                frame, frame_id, draw_tid, "conveyor_crossing", tracks, now,
                 event_frame=evt.get('snapshot_frame'),
                 event_bbox=evt.get('snapshot_bbox'),
                 event_fid=evt.get('snapshot_fid'),
@@ -1399,25 +1399,25 @@ class Camera:
             current_alarms[draw_tid] = "conveyor_crossing"
         return current_alarms
 
-    def _collect_handler_alarms(self, fr, fid, now, t_h, t_g, t_h_map, t_g_map, motion_mask):
+    def _collect_handler_alarms(self, frame, frame_id, now, helmet_tracks, general_tracks, helmet_track_map, general_track_map, motion_mask):
         """handler 종류별 분기를 감싸 현재 프레임 알람 딕셔너리를 만든다."""
         current_alarms = {}
         for event_name, handler in self.handlers.items():
             if event_name == "illegal_parking":
                 current_alarms.update(
-                    self._collect_standard_events(event_name, handler, t_g, t_g_map, now, fr, fid, draw_tid_offset=10000)
+                    self._collect_standard_events(event_name, handler, general_tracks, general_track_map, now, frame, frame_id, draw_tid_offset=10000)
                 )
             elif event_name == "conveyor_crossing":
-                current_alarms.update(self._collect_crossing_events(handler, t_g, t_g_map, now, fr, fid))
+                current_alarms.update(self._collect_crossing_events(handler, general_tracks, general_track_map, now, frame, frame_id))
             elif event_name == "signal_vehicle":
                 current_alarms.update(
                     self._collect_standard_events(
-                        event_name, handler, t_g, t_g_map, now, fr, fid,
+                        event_name, handler, general_tracks, general_track_map, now, frame, frame_id,
                         draw_tid_offset=10000, motion_mask=motion_mask
                     )
                 )
             else:
-                current_alarms.update(self._collect_standard_events(event_name, handler, t_h, t_h_map, now, fr, fid))
+                current_alarms.update(self._collect_standard_events(event_name, handler, helmet_tracks, helmet_track_map, now, frame, frame_id))
         return current_alarms
 
     # 2026-04-06 by dhkim
@@ -1531,57 +1531,57 @@ class Camera:
 
     def process_frame(self):
         """프레임을 읽고 필요 시 reader 재생성 및 녹화 버퍼 업데이트까지 처리한다."""
-        fr, fid, connected = self.reader.read()
-        self._ensure_reader_alive(fr, connected)
-        self._update_runtime_state(fr)
-        return fr, fid, connected
+        frame, frame_id, connected = self.reader.read()
+        self._ensure_reader_alive(frame, connected)
+        self._update_runtime_state(frame)
+        return frame, frame_id, connected
 
-    def run_logic(self, fr, fid, d_h, d_g):
+    def run_logic(self, frame, frame_id, helmet_detections, general_detections):
         """추론 결과를 tracker와 detector에 흘려 보내 실제 알람 여부를 결정한다."""
         with self.config_lock:
-            motion_mask = self.motion_det.apply(fr) 
+            motion_mask = self.motion_det.apply(frame) 
 
-            t_h = self.trk_h.update(d_h); t_g = self.trk_g.update(d_g)
+            helmet_tracks = self.helmet_tracker.update(helmet_detections); general_tracks = self.general_tracker.update(general_detections)
             now = time.time()
-            t_h_map = self._build_track_map(t_h)
-            t_g_map = self._build_track_map(t_g)
-            current_alarms = self._collect_handler_alarms(fr, fid, now, t_h, t_g, t_h_map, t_g_map, motion_mask)
+            helmet_track_map = self._build_track_map(helmet_tracks)
+            general_track_map = self._build_track_map(general_tracks)
+            current_alarms = self._collect_handler_alarms(frame, frame_id, now, helmet_tracks, general_tracks, helmet_track_map, general_track_map, motion_mask)
 
-            return t_h, t_g, self._update_visual_alarms(current_alarms, now)
+            return helmet_tracks, general_tracks, self._update_visual_alarms(current_alarms, now)
 
-    def draw(self, fr, t_h, t_g, alarms, connected=True):
+    def draw(self, frame, helmet_tracks, general_tracks, alarms, connected=True):
         """디버그/모니터링용 오버레이를 포함한 시각화 프레임을 만든다."""
-        if fr is None or not connected:
+        if frame is None or not connected:
             return self._draw_no_signal()
 
-        h_frame, w_frame = fr.shape[:2]
+        h_frame, w_frame = frame.shape[:2]
         if len(alarms) > 0:
-            cv2.rectangle(fr, (0, 0), (w_frame, h_frame), (0, 0, 255), 20)
+            cv2.rectangle(frame, (0, 0), (w_frame, h_frame), (0, 0, 255), 20)
 
-        self._draw_roi(fr)
-        self._draw_tracks(fr, t_h, alarms, track_kind="helmet")
-        self._draw_tracks(fr, t_g, alarms, track_kind="general")
-        self._draw_camera_overlay(fr)
-        self._draw_status_panel(fr, alarms)
-        self.last_draw = fr
-        return fr
+        self._draw_roi(frame)
+        self._draw_tracks(frame, helmet_tracks, alarms, track_kind="helmet")
+        self._draw_tracks(frame, general_tracks, alarms, track_kind="general")
+        self._draw_camera_overlay(frame)
+        self._draw_status_panel(frame, alarms)
+        self.last_draw = frame
+        return frame
 
-    def _trigger(self, fr, fid, tid, ename, tracks, now, event_frame=None, event_bbox=None, event_fid=None):
+    def _trigger_event(self, frame, frame_id, tid, event_name, tracks, now, event_frame=None, event_bbox=None, event_fid=None):
         """쿨다운을 확인한 뒤 이벤트 프레임 저장, 얼굴 모자이크, 녹화 트리거를 수행한다."""
         real_tid = tid if tid < 10000 else tid - 10000
-        if ename in self.alerted[tid]: return
-        cooldown_sec = self._get_event_option(ename, 'cooldown_sec', EVENT_COOLDOWN_SEC)
-        if now - self.last_evt_t.get(ename, 0) < cooldown_sec: return
+        if event_name in self.alerted[tid]: return
+        cooldown_sec = self._get_event_option(event_name, 'cooldown_sec', EVENT_COOLDOWN_SEC)
+        if now - self.last_evt_t.get(event_name, 0) < cooldown_sec: return
 
-        bb = self._resolve_event_bbox(real_tid, tracks, event_bbox=event_bbox)
-        if bb is None:
+        bbox = self._resolve_event_bbox(real_tid, tracks, event_bbox=event_bbox)
+        if bbox is None:
             return
 
-        logger.warning(f"🚨 [CAM {self.cam_id}] {ename} Detected! ID:{real_tid}")
-        source_frame = event_frame if event_frame is not None else fr
-        source_fid = event_fid if event_fid is not None else fid
+        logger.warning(f"🚨 [CAM {self.cam_id}] {event_name} Detected! ID:{real_tid}")
+        source_frame = event_frame if event_frame is not None else frame
+        source_fid = event_fid if event_fid is not None else frame_id
         saved_img = self._build_event_image(source_frame, source_fid, use_cache=event_frame is None)
-        self._persist_event(saved_img, ename, bb, real_tid, now, tid)
+        self._persist_event(saved_img, event_name, bbox, real_tid, now, tid)
     
     def stop(self): 
         """카메라 리더와 녹화 스레드를 종료 상태로 전환한다."""
@@ -1634,7 +1634,7 @@ def get_roi_points_scaled(frame, title, mode="poly"):
     cv2.destroyWindow(wname)
     return normalize_roi_points(pts, orig_w, orig_h)
 
-def run_wizard_batch_mode(mgr, rtsp_list):
+def run_wizard_batch_mode(config_manager, rtsp_list):
     """여러 카메라를 배치 단위로 훑으며 ROI와 이벤트를 설정하는 초기 마법사다."""
     logger.info("=== CCTV 일괄 설정 마법사 (Batch Mode) ===")
     selected_indices = []
@@ -1687,8 +1687,8 @@ def run_wizard_batch_mode(mgr, rtsp_list):
         if frame is None: 
             logger.error(" -> 캡처 실패")
             continue
-        h, w = frame.shape[:2]; ratio = 960 / w
-        preview = cv2.resize(frame, (960, int(h*ratio)))
+        height, width = frame.shape[:2]; ratio = 960 / width
+        preview = cv2.resize(frame, (960, int(height * ratio)))
         win_name = f"Check Cam: {ip}"
         cv2.namedWindow(win_name); cv2.imshow(win_name, preview); cv2.moveWindow(win_name, 100, 100); cv2.waitKey(1)
         print("1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량감지")
@@ -1710,7 +1710,7 @@ def run_wizard_batch_mode(mgr, rtsp_list):
                 if len(l)==2: roi_l.extend(l)
                 if input("    라인 추가? (y/n): ")!='y': break
 
-        existing_conf = mgr.get_config(ip) or {}
+        existing_conf = config_manager.get_config(ip) or {}
         cctv_id = existing_conf.get("cctv_id", 1)
 
         val_cctv = input(f">> cctv_id 입력 (기본값 {cctv_id}): ").strip()
@@ -1722,7 +1722,7 @@ def run_wizard_batch_mode(mgr, rtsp_list):
 
         # 2026-04-06 by dhkim
         # 카메라 개별 설정 파일에는 ROI, 이벤트 목록, cctv_id만 남기고 공통 정책은 common으로 분리하려는 저장 구조 변경.
-        mgr.set_config(ip, {
+        config_manager.set_config(ip, {
             "url": url,
             "cctv_id": cctv_id,
             "roi_poly_norm": roi_p,
@@ -1806,17 +1806,17 @@ def prepare_config_manager(rtsp_list):
         expected_type=dict,
         return_meta=True,
     )
-    mgr = ConfigManager(CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE)
+    config_manager = ConfigManager(CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE)
     if cameras_state != "ok":
         logger.warning("카메라 설정 파일이 없거나 손상되었습니다. 초기 설정 마법사는 디스플레이 환경이 필수입니다.")
-        run_wizard_batch_mode(mgr, rtsp_list)
+        run_wizard_batch_mode(config_manager, rtsp_list)
     else:
         is_reset = input(">> 설정 초기화 마법사를 실행하시겠습니까? (y/n): ").strip().lower()
         if is_reset == 'y':
             logger.warning("설정 마법사는 디스플레이 환경이 필수입니다.")
-            mgr.clear_all()
-            run_wizard_batch_mode(mgr, rtsp_list)
-    return mgr
+            config_manager.clear_all()
+            run_wizard_batch_mode(config_manager, rtsp_list)
+    return config_manager
 
 def load_detectors():
     """필수 모델 파일을 확인하고 DeepX detector 묶음을 생성한다."""
@@ -1825,12 +1825,12 @@ def load_detectors():
         return None
 
     logger.info("Loading DeepX Models (Helmet, General, Face)...")
-    d_h = YoLoDeepX(MODEL_HELMET_PATH)
-    d_g = YoLoDeepX(MODEL_GENERAL_PATH)
-    d_f = YoLoDeepX(MODEL_FACE_PATH)
-    return {0: {'h': d_h, 'g': d_g, 'f': d_f}}
+    helmet_detector = YoLoDeepX(MODEL_HELMET_PATH)
+    general_detector = YoLoDeepX(MODEL_GENERAL_PATH)
+    face_detector = YoLoDeepX(MODEL_FACE_PATH)
+    return {0: {'h': helmet_detector, 'g': general_detector, 'f': face_detector}}
 
-def build_cameras(rtsp_list, mgr, detectors, active_npu_ids, sensitivity):
+def build_cameras(rtsp_list, config_manager, detectors, active_npu_ids, sensitivity):
     """RTSP 목록과 저장된 설정을 바탕으로 실제 Camera 인스턴스를 구성한다."""
     cams = []
     load_count = 0
@@ -1841,7 +1841,7 @@ def build_cameras(rtsp_list, mgr, detectors, active_npu_ids, sensitivity):
 
     for rtsp in rtsp_list:
         ip = extract_ip(rtsp)
-        conf = mgr.get_config(ip)
+        conf = config_manager.get_config(ip)
         if ip == "unknown_cam":
             skipped_invalid_ip.append(rtsp)
             logger.warning(f"[카메라 스킵] IP 추출 실패로 설정 매칭 불가: {rtsp!r}")
@@ -1880,7 +1880,7 @@ def _render_camera_frame(camera, result, use_display, use_drawing):
             return _blank_monitor_frame()
         return None
 
-    fr, fid, d_h_res, d_g_res, connected = result
+    frame, frame_id, helmet_detections, general_detections, connected = result
     if not connected:
         if use_display and use_drawing:
             return camera.draw(None, [], [], {}, connected=False)
@@ -1888,12 +1888,12 @@ def _render_camera_frame(camera, result, use_display, use_drawing):
             return _blank_monitor_frame()
         return None
 
-    t_h, t_g, alarms = camera.run_logic(fr, fid, d_h_res, d_g_res)
+    helmet_tracks, general_tracks, alarms = camera.run_logic(frame, frame_id, helmet_detections, general_detections)
     if not use_display:
         return None
     if use_drawing:
-        return camera.draw(fr, t_h, t_g, alarms, connected=True)
-    return cv2.resize(fr, (640, 360))
+        return camera.draw(frame, helmet_tracks, general_tracks, alarms, connected=True)
+    return cv2.resize(frame, (640, 360))
 
 def run_monitor_loop(cams, active_npu_ids, use_display, use_drawing):
     """카메라 입력, 추론, 이벤트 판정, 모니터 표시 루프를 실행한다."""
@@ -1932,22 +1932,22 @@ def run_monitor_loop(cams, active_npu_ids, use_display, use_drawing):
             try:
                 for idx in cam_indices:
                     c = cams[idx]
-                    fr, fid, connected = raw_data[idx]
-                    if fr is None or not connected:
-                        processed_results[idx] = (None, fid, [], [], False)
+                    frame, frame_id, connected = raw_data[idx]
+                    if frame is None or not connected:
+                        processed_results[idx] = (None, frame_id, [], [], False)
                         continue
                     valid_frame_count += 1
 
                     run_helmet = any(e in ["no_helmet", "intrusion"] for e in c.events)
                     run_general = any(e in ["illegal_parking", "conveyor_crossing", "signal_vehicle"] for e in c.events)
 
-                    d_h_res, d_g_res = [], []
+                    helmet_detections, general_detections = [], []
                     if run_helmet:
-                        d_h_res = c.det_h.infer(fr)
+                        helmet_detections = c.helmet_detector.infer(frame)
                     if run_general:
-                        d_g_res = c.det_g.infer(fr)
+                        general_detections = c.general_detector.infer(frame)
 
-                    processed_results[idx] = (fr, fid, d_h_res, d_g_res, True)
+                    processed_results[idx] = (frame, frame_id, helmet_detections, general_detections, True)
 
             except Exception as e:
                 logger.error(f"[FATAL ERROR] NPU {npu_idx} 에서 오류 발생: {e}")
@@ -1991,22 +1991,22 @@ def main():
     
     try:
         sensitivity, use_display, use_drawing = prompt_runtime_options()
-        mgr = prepare_config_manager(rtsp_list)
+        config_manager = prepare_config_manager(rtsp_list)
         detectors = load_detectors()
         if detectors is None:
             return
         cams, skipped_missing_config, skipped_no_events, skipped_invalid_ip = build_cameras(
-            rtsp_list, mgr, detectors, active_npu_ids, sensitivity
+            rtsp_list, config_manager, detectors, active_npu_ids, sensitivity
         )
         
         if not cams: 
             logger.warning(
-                f"카메라 없음 | csv={len(rtsp_list)} config_keys={len(mgr.config)} "
+                f"카메라 없음 | csv={len(rtsp_list)} config_keys={len(config_manager.config)} "
                 f"missing_config={len(skipped_missing_config)} no_events={len(skipped_no_events)} "
                 f"invalid_ip={len(skipped_invalid_ip)}"
             )
             if skipped_missing_config:
-                logger.warning(f"설정 키 예시: {list(mgr.config.keys())[:10]}")
+                logger.warning(f"설정 키 예시: {list(config_manager.config.keys())[:10]}")
                 logger.warning(f"미매칭 CSV 예시: {[ip for ip, _url in skipped_missing_config[:10]]}")
             return
         run_monitor_loop(cams, active_npu_ids, use_display, use_drawing)
