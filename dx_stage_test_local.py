@@ -36,7 +36,9 @@ def parse_args():
     parser.add_argument("--warmup-reads", type=int, default=30, help="캡처 후 버릴 프레임 수")
     parser.add_argument("--read-timeout-sec", type=float, default=10.0)
     parser.add_argument("--infer-timeout-sec", type=float, default=15.0)
+    parser.add_argument("--load-timeout-sec", type=float, default=15.0)
     parser.add_argument("--models", default="helmet,general,face", help="쉼표 구분 모델 목록 또는 all")
+    parser.add_argument("--worker-load", action="store_true")
     parser.add_argument("--worker-infer", action="store_true")
     parser.add_argument("--model-path")
     parser.add_argument("--frame-path")
@@ -134,37 +136,107 @@ def normalize_models(raw_models):
     return models
 
 
+def _worker_print(payload):
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def run_worker_load(model_path):
+    import time as _time
+    from multi_event import YoLoDeepX
+
+    started_at = _time.time()
+    _worker_print({"step": "worker_start", "model_path": model_path})
+    YoLoDeepX(model_path)
+    model_loaded_at = _time.time()
+    _worker_print({"step": "worker_model_loaded", "elapsed": round(model_loaded_at - started_at, 3)})
+
+
 def run_worker_infer(model_path, frame_path):
     import time as _time
     from multi_event import YoLoDeepX
 
     started_at = _time.time()
-    print(json.dumps({"step": "worker_start", "model_path": model_path, "frame_path": frame_path}, ensure_ascii=False))
+    _worker_print({"step": "worker_start", "model_path": model_path, "frame_path": frame_path})
     model = YoLoDeepX(model_path)
     model_loaded_at = _time.time()
-    print(json.dumps({"step": "worker_model_loaded", "elapsed": round(model_loaded_at - started_at, 3)}, ensure_ascii=False))
+    _worker_print({"step": "worker_model_loaded", "elapsed": round(model_loaded_at - started_at, 3)})
     frame = cv2.imread(frame_path)
     if frame is None:
         raise RuntimeError(f"프레임 로드 실패: {frame_path}")
-    print(json.dumps({"step": "worker_frame_loaded", "width": int(frame.shape[1]), "height": int(frame.shape[0])}, ensure_ascii=False))
+    _worker_print({"step": "worker_frame_loaded", "width": int(frame.shape[1]), "height": int(frame.shape[0])})
+    infer_started_at = _time.time()
+    _worker_print({"step": "worker_infer_start", "elapsed_since_start": round(infer_started_at - started_at, 3)})
     detections = model.infer(frame)
     infer_done_at = _time.time()
-    payload = {
-        "step": "worker_done",
-        "model_path": model_path,
-        "load_elapsed": round(model_loaded_at - started_at, 3),
-        "infer_elapsed": round(infer_done_at - model_loaded_at, 3),
-        "detections": 0 if detections is None else int(len(detections)),
-    }
-    print(json.dumps(payload, ensure_ascii=False))
+    _worker_print(
+        {
+            "step": "worker_done",
+            "model_path": model_path,
+            "load_elapsed": round(model_loaded_at - started_at, 3),
+            "infer_elapsed": round(infer_done_at - infer_started_at, 3),
+            "detections": 0 if detections is None else int(len(detections)),
+        }
+    )
 
 
-def run_model_probe(script_path, model_name, model_path, frame_path, infer_timeout_sec):
+def _collect_worker_logs(model_name, stdout_lines, stderr_lines):
+    for line in stdout_lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            log_step("worker_stdout_raw", model=model_name, line=line)
+            continue
+        step = payload.pop("step", "worker")
+        log_step(step, model=model_name, **payload)
+    for line in stderr_lines:
+        log_step("worker_stderr", model=model_name, line=line)
+
+
+def run_subprocess_step(script_path, model_name, cmd, timeout_sec, phase_name):
+    log_step(f"{phase_name}_start", model=model_name, timeout_sec=timeout_sec, command=" ".join(cmd))
+    started_at = time.time()
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = round(time.time() - started_at, 3)
+        log_step(f"{phase_name}_timeout", model=model_name, timeout_sec=timeout_sec, elapsed=elapsed)
+        return None
+
+    elapsed = round(time.time() - started_at, 3)
+    stdout_lines = [line for line in (result.stdout or "").strip().splitlines() if line.strip()]
+    stderr_lines = [line for line in (result.stderr or "").strip().splitlines() if line.strip()]
+    _collect_worker_logs(model_name, stdout_lines, stderr_lines)
+    if result.returncode != 0:
+        stderr_tail = stderr_lines[-1] if stderr_lines else ""
+        log_step(f"{phase_name}_failed", model=model_name, elapsed=elapsed, returncode=result.returncode, detail=stderr_tail)
+        return None
+
+    log_step(f"{phase_name}_ok", model=model_name, elapsed=elapsed)
+    return stdout_lines
+
+
+def run_model_probe(script_path, model_name, model_path, frame_path, load_timeout_sec, infer_timeout_sec):
     if not os.path.exists(model_path):
         log_step("model_missing", model=model_name, model_path=model_path)
         return
 
-    cmd = [
+    load_cmd = [
+        sys.executable,
+        script_path,
+        "--worker-load",
+        "--model-path",
+        model_path,
+    ]
+    if run_subprocess_step(script_path, model_name, load_cmd, load_timeout_sec, "load_subprocess") is None:
+        return
+
+    infer_cmd = [
         sys.executable,
         script_path,
         "--worker-infer",
@@ -173,47 +245,16 @@ def run_model_probe(script_path, model_name, model_path, frame_path, infer_timeo
         "--frame-path",
         frame_path,
     ]
-    log_step("infer_subprocess_start", model=model_name, timeout_sec=infer_timeout_sec, model_path=model_path)
-    started_at = time.time()
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=infer_timeout_sec,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        elapsed = round(time.time() - started_at, 3)
-        log_step("infer_timeout", model=model_name, timeout_sec=infer_timeout_sec, elapsed=elapsed)
-        return
-
-    elapsed = round(time.time() - started_at, 3)
-    stdout_lines = [line for line in (result.stdout or "").strip().splitlines() if line.strip()]
-    stderr_lines = [line for line in (result.stderr or "").strip().splitlines() if line.strip()]
-    if stdout_lines:
-        log_step("infer_subprocess_stdout", model=model_name, lines=len(stdout_lines), last_line=stdout_lines[-1])
-    if stderr_lines:
-        log_step("infer_subprocess_stderr", model=model_name, lines=len(stderr_lines), last_line=stderr_lines[-1])
-    if result.returncode != 0:
-        stderr_tail = stderr_lines[-1] if stderr_lines else ""
-        log_step("infer_failed", model=model_name, elapsed=elapsed, returncode=result.returncode, detail=stderr_tail)
-        return
-
-    payload = json.loads(stdout_lines[-1])
-    log_step(
-        "infer_ok",
-        model=model_name,
-        elapsed=elapsed,
-        load_elapsed=payload["load_elapsed"],
-        infer_elapsed=payload["infer_elapsed"],
-        detections=payload["detections"],
-    )
+    run_subprocess_step(script_path, model_name, infer_cmd, infer_timeout_sec, "infer_subprocess")
 
 
 def main():
     args = parse_args()
     setup_logging({"logging": {"dir": "./logs", "level": "INFO", "retention_days": 14}})
+
+    if args.worker_load:
+        run_worker_load(args.model_path)
+        return
 
     if args.worker_infer:
         run_worker_infer(args.model_path, args.frame_path)
@@ -234,6 +275,7 @@ def main():
                 model_name=model_name,
                 model_path=MODEL_MAP[model_name],
                 frame_path=frame_path,
+                load_timeout_sec=args.load_timeout_sec,
                 infer_timeout_sec=args.infer_timeout_sec,
             )
     finally:
