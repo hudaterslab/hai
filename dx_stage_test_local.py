@@ -153,6 +153,7 @@ def run_worker_load(model_path):
 
 def run_worker_infer(model_path, frame_path):
     import time as _time
+    import numpy as _np
     from multi_event import YoLoDeepX
 
     started_at = _time.time()
@@ -166,7 +167,49 @@ def run_worker_infer(model_path, frame_path):
     _worker_print({"step": "worker_frame_loaded", "width": int(frame.shape[1]), "height": int(frame.shape[0])})
     infer_started_at = _time.time()
     _worker_print({"step": "worker_infer_start", "elapsed_since_start": round(infer_started_at - started_at, 3)})
-    detections = model.infer(frame)
+    height, width = frame.shape[:2]
+    preprocess_started_at = _time.time()
+    npu_input, scale, offset = model.letter_box(frame)
+    _worker_print(
+        {
+            "step": "worker_letter_box_done",
+            "elapsed": round(_time.time() - preprocess_started_at, 3),
+            "scale": round(float(scale), 6),
+            "offset": [int(offset[0]), int(offset[1])],
+        }
+    )
+    rgb_started_at = _time.time()
+    npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+    _worker_print({"step": "worker_rgb_done", "elapsed": round(_time.time() - rgb_started_at, 3)})
+
+    engine_run_started_at = _time.time()
+    _worker_print({"step": "worker_engine_run_start"})
+    output_tensor = model.engine.run([npu_input_rgb])
+    _worker_print({"step": "worker_engine_run_done", "elapsed": round(_time.time() - engine_run_started_at, 3)})
+
+    postprocess_started_at = _time.time()
+    raw_detections = model.postprocess(output_tensor, conf_thres=0.30 if model.is_yolov7 else 0.45)
+    _worker_print(
+        {
+            "step": "worker_postprocess_done",
+            "elapsed": round(_time.time() - postprocess_started_at, 3),
+            "raw_detections": 0 if not raw_detections else int(len(raw_detections)),
+        }
+    )
+
+    detections = []
+    dw, dh = offset
+    for box, score, cls_id in raw_detections or []:
+        x1 = (box[0] - dw) / scale
+        y1 = (box[1] - dh) / scale
+        x2 = (box[2] - dw) / scale
+        y2 = (box[3] - dh) / scale
+        x1 = _np.clip(x1, 0, width)
+        y1 = _np.clip(y1, 0, height)
+        x2 = _np.clip(x2, 0, width)
+        y2 = _np.clip(y2, 0, height)
+        detections.append([x1, y1, x2, y2, score, cls_id])
+
     infer_done_at = _time.time()
     _worker_print(
         {
