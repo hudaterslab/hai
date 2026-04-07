@@ -1990,10 +1990,16 @@ def _blank_monitor_frame():
     """디스플레이는 켜졌지만 그리기는 꺼진 경우 사용할 빈 프레임을 만든다."""
     return np.zeros((360, 640, 3), dtype=np.uint8)
 
+def _log_render_state(camera, stage, **fields):
+    """메인 루프의 카메라별 진행 상태를 한 줄 로그로 남긴다."""
+    joined = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info(f"[CAM {camera.cam_id}] stage={stage} ip={camera.ip} {joined}".rstrip())
+
 def _render_camera_frame(camera, result, use_display, use_drawing):
     """카메라별 추론 결과를 화면 출력용 프레임으로 변환한다."""
     if result is None:
         camera._log_signal_state(None, False)
+        _log_render_state(camera, "render_skip", reason="result_none")
         if use_display and use_drawing:
             return camera.draw(None, [], [], {}, connected=False)
         if use_display:
@@ -2003,6 +2009,7 @@ def _render_camera_frame(camera, result, use_display, use_drawing):
     frame, frame_id, helmet_detections, general_detections, connected = result
     if not connected:
         camera._log_signal_state(frame, connected)
+        _log_render_state(camera, "render_skip", reason="disconnected", frame_id=frame_id)
         if use_display and use_drawing:
             return camera.draw(None, [], [], {}, connected=False)
         if use_display:
@@ -2010,11 +2017,28 @@ def _render_camera_frame(camera, result, use_display, use_drawing):
         return None
 
     camera._log_signal_state(frame, connected)
+    _log_render_state(
+        camera,
+        "run_logic_start",
+        frame_id=frame_id,
+        helmet_detections=len(helmet_detections),
+        general_detections=len(general_detections),
+    )
     helmet_tracks, general_tracks, alarms = camera.run_logic(frame, frame_id, helmet_detections, general_detections)
+    _log_render_state(
+        camera,
+        "run_logic_done",
+        frame_id=frame_id,
+        helmet_tracks=len(helmet_tracks),
+        general_tracks=len(general_tracks),
+        alarms=len(alarms),
+    )
     if not use_display:
         return None
     if use_drawing:
+        _log_render_state(camera, "draw_start", frame_id=frame_id)
         return camera.draw(frame, helmet_tracks, general_tracks, alarms, connected=True)
+    _log_render_state(camera, "draw_skip", frame_id=frame_id, reason="use_drawing_false")
     return cv2.resize(frame, (640, 360))
 
 def run_monitor_loop(cams, active_npu_ids, use_display, use_drawing):
@@ -2055,6 +2079,13 @@ def run_monitor_loop(cams, active_npu_ids, use_display, use_drawing):
                 for idx in cam_indices:
                     c = cams[idx]
                     frame, frame_id, connected = raw_data[idx]
+                    _log_render_state(
+                        c,
+                        "process_frame_done",
+                        frame_id=frame_id,
+                        connected=connected,
+                        frame_ready=frame is not None,
+                    )
                     if frame is None or not connected:
                         processed_results[idx] = (None, frame_id, [], [], False)
                         continue
@@ -2065,9 +2096,13 @@ def run_monitor_loop(cams, active_npu_ids, use_display, use_drawing):
 
                     helmet_detections, general_detections = [], []
                     if run_helmet:
+                        _log_render_state(c, "infer_start", model="helmet", frame_id=frame_id)
                         helmet_detections = c.helmet_detector.infer(frame)
+                        _log_render_state(c, "infer_done", model="helmet", frame_id=frame_id, detections=len(helmet_detections))
                     if run_general:
+                        _log_render_state(c, "infer_start", model="general", frame_id=frame_id)
                         general_detections = c.general_detector.infer(frame)
+                        _log_render_state(c, "infer_done", model="general", frame_id=frame_id, detections=len(general_detections))
 
                     processed_results[idx] = (frame, frame_id, helmet_detections, general_detections, True)
 
