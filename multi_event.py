@@ -69,6 +69,8 @@ STREAM_WARMUP_FRAMES = 20
 STREAM_READ_FAIL_THRESHOLD = 5
 STREAM_RECONNECT_DELAY_SEC = 2.0
 STREAM_BROKEN_RETRY_DELAY_SEC = 1.0
+INFER_WARN_SEC = 1.0
+INFER_INFO_SEC = 0.2
 
 REC_FPS = 30             
 REC_PRE_SEC = 10         
@@ -1995,6 +1997,21 @@ def _log_render_state(camera, stage, **fields):
     joined = " ".join(f"{key}={value}" for key, value in fields.items())
     logger.info(f"[CAM {camera.cam_id}] stage={stage} ip={camera.ip} {joined}".rstrip())
 
+def _log_infer_timing(camera, model_name, frame_id, elapsed_sec, detections_count=None):
+    """모델별 inference 시간을 기록하고 지연이 크면 warning으로 올린다."""
+    fields = {
+        "model": model_name,
+        "frame_id": frame_id,
+        "elapsed": round(elapsed_sec, 3),
+    }
+    if detections_count is not None:
+        fields["detections"] = detections_count
+    if elapsed_sec >= INFER_WARN_SEC:
+        joined = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.warning(f"[CAM {camera.cam_id}] stage=infer_slow ip={camera.ip} {joined}".rstrip())
+    elif elapsed_sec >= INFER_INFO_SEC:
+        _log_render_state(camera, "infer_timing", **fields)
+
 def _render_camera_frame(camera, result, use_display, use_drawing):
     """카메라별 추론 결과를 화면 출력용 프레임으로 변환한다."""
     if result is None:
@@ -2097,12 +2114,18 @@ def run_monitor_loop(cams, active_npu_ids, use_display, use_drawing):
                     helmet_detections, general_detections = [], []
                     if run_helmet:
                         _log_render_state(c, "infer_start", model="helmet", frame_id=frame_id)
+                        infer_started_at = time.time()
                         helmet_detections = c.helmet_detector.infer(frame)
+                        infer_elapsed = time.time() - infer_started_at
                         _log_render_state(c, "infer_done", model="helmet", frame_id=frame_id, detections=len(helmet_detections))
+                        _log_infer_timing(c, "helmet", frame_id, infer_elapsed, len(helmet_detections))
                     if run_general:
                         _log_render_state(c, "infer_start", model="general", frame_id=frame_id)
+                        infer_started_at = time.time()
                         general_detections = c.general_detector.infer(frame)
+                        infer_elapsed = time.time() - infer_started_at
                         _log_render_state(c, "infer_done", model="general", frame_id=frame_id, detections=len(general_detections))
+                        _log_infer_timing(c, "general", frame_id, infer_elapsed, len(general_detections))
 
                     processed_results[idx] = (frame, frame_id, helmet_detections, general_detections, True)
 
