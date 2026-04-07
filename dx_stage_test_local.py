@@ -246,8 +246,12 @@ def run_subprocess_step(script_path, model_name, cmd, timeout_sec, phase_name):
             timeout=timeout_sec,
             check=False,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         elapsed = round(time.time() - started_at, 3)
+        stdout_lines = [line for line in (exc.stdout or "").strip().splitlines() if line.strip()]
+        stderr_lines = [line for line in (exc.stderr or "").strip().splitlines() if line.strip()]
+        if stdout_lines or stderr_lines:
+            _collect_worker_logs(model_name, stdout_lines, stderr_lines)
         log_step(f"{phase_name}_timeout", model=model_name, timeout_sec=timeout_sec, elapsed=elapsed)
         return None
 
