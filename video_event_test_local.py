@@ -81,6 +81,12 @@ class OfflineVideoCamera(Camera):
         self.event_history = []
         self.init_handlers()
 
+    # 2026-04-07 by dhkim
+    # 오프라인 테스트 카메라는 FrameReader를 쓰지 않으므로 reader=None 상태에서도 안전하게 종료되도록 override 한다.
+    def stop(self):
+        """오프라인 테스트에서 recorder만 정리하고 종료한다."""
+        self.recorder.stop()
+
     def _persist_event(self, saved_img, event_name, bbox, real_tid, now, tid):
         """오프라인 테스트에서는 저장 대신 메모리에 이벤트만 기록한다."""
         self.event_counter[event_name] += 1
