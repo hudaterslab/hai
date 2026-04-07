@@ -1247,6 +1247,19 @@ class FrameReader:
                 return None, self.fid, False
             return self.frame, self.fid, self.connected
 
+    def get_debug_state(self):
+        """현재 reader 상태를 디버깅 로그용으로 반환한다."""
+        with self.lock:
+            return {
+                "connected": self.connected,
+                "warmup_complete": self.warmup_complete,
+                "is_stuck": self.is_stuck,
+                "frame_ready": self.frame is not None,
+                "frame_id": self.fid,
+                "last_frame_age": round(time.time() - self.last_frame_time, 3),
+                "consecutive_read_failures": self.consecutive_read_failures,
+            }
+
     # 2026-04-06 by dhkim
     # 재연결이나 종료 시 reader thread가 누적되지 않도록 명시적인 stop/join 경로를 만들려고 추가한 블록.
     def stop(self, join_timeout=3.0):
@@ -1280,6 +1293,7 @@ class Camera:
         self.visual_alarms = {} 
         self.face_blur_cache = {}
         self.roi_frame_shape = None
+        self.last_signal_state = None
 
         self.config_lock = threading.Lock() 
         self.motion_det = MotionDetector(sensitivity)
@@ -1607,6 +1621,39 @@ class Camera:
         self._ensure_reader_alive(frame, connected)
         self._update_runtime_state(frame)
         return frame, frame_id, connected
+
+    # 2026-04-07 by dhkim
+    # 화면에 NO SIGNAL이 뜰 때 reader 내부 상태를 함께 남겨 원인을 좁히기 쉽게 하려는 블록.
+    def _log_signal_state(self, frame, connected):
+        """카메라 신호 상태가 바뀔 때만 상세 원인을 로그로 남긴다."""
+        reader_state = self.reader.get_debug_state()
+        state_key = (
+            connected,
+            frame is not None,
+            reader_state["connected"],
+            reader_state["warmup_complete"],
+            reader_state["is_stuck"],
+            reader_state["frame_ready"],
+            reader_state["consecutive_read_failures"],
+        )
+        if self.last_signal_state == state_key:
+            return
+        self.last_signal_state = state_key
+
+        if connected and frame is not None:
+            logger.info(
+                f"[CAM {self.cam_id}] signal restored ip={self.ip} frame_id={reader_state['frame_id']} "
+                f"last_frame_age={reader_state['last_frame_age']}"
+            )
+            return
+
+        logger.warning(
+            f"[CAM {self.cam_id}] NO SIGNAL ip={self.ip} connected={connected} frame_ready={frame is not None} "
+            f"reader_connected={reader_state['connected']} warmup_complete={reader_state['warmup_complete']} "
+            f"is_stuck={reader_state['is_stuck']} cached_frame={reader_state['frame_ready']} "
+            f"frame_id={reader_state['frame_id']} last_frame_age={reader_state['last_frame_age']} "
+            f"read_failures={reader_state['consecutive_read_failures']}"
+        )
 
     def run_logic(self, frame, frame_id, helmet_detections, general_detections):
         """추론 결과를 tracker와 detector에 흘려 보내 실제 알람 여부를 결정한다."""
@@ -1946,6 +1993,7 @@ def _blank_monitor_frame():
 def _render_camera_frame(camera, result, use_display, use_drawing):
     """카메라별 추론 결과를 화면 출력용 프레임으로 변환한다."""
     if result is None:
+        camera._log_signal_state(None, False)
         if use_display and use_drawing:
             return camera.draw(None, [], [], {}, connected=False)
         if use_display:
@@ -1954,12 +2002,14 @@ def _render_camera_frame(camera, result, use_display, use_drawing):
 
     frame, frame_id, helmet_detections, general_detections, connected = result
     if not connected:
+        camera._log_signal_state(frame, connected)
         if use_display and use_drawing:
             return camera.draw(None, [], [], {}, connected=False)
         if use_display:
             return _blank_monitor_frame()
         return None
 
+    camera._log_signal_state(frame, connected)
     helmet_tracks, general_tracks, alarms = camera.run_logic(frame, frame_id, helmet_detections, general_detections)
     if not use_display:
         return None
