@@ -77,11 +77,16 @@ REC_BUFFER_SIZE = REC_FPS * REC_PRE_SEC
 VISUAL_ALARM_DURATION = 5.0 
 EVENT_COOLDOWN_SEC = 600
 
-MODEL_HELMET_PATH   = "helmet_3cls_v8.dxnn"
+MODEL_HELMET_PATH   = "best.dxnn"
 MODEL_GENERAL_PATH = "YOLOV8M-1.dxnn"
 MODEL_FACE_PATH = "YOLOV7_Face-1.dxnn"
 
-ID_H_HELMET = 0; ID_H_NO_HELMET = 1; ID_H_PERSON = 2
+# 2026-04-07 by dhkim
+# best.dxnn(7cls)를 헬멧 탐지 경로에 재사용하면서 no_helmet 이벤트는 person_head 클래스로 임시 대응한다.
+ID_H_PERSON = 0
+ID_H_PERSON_LOWER_BODY = 1
+ID_H_HELMET = 2
+ID_H_NO_HELMET = 3
 ID_G_PERSON = 0; ID_G_CAR = 2; ID_G_BUS = 5; ID_G_TRUCK = 7
 TARGET_VEHICLES = [ID_G_CAR, ID_G_BUS, ID_G_TRUCK]
 
@@ -416,11 +421,6 @@ def clean_overlapping_detections(detections, is_helmet_model=True):
             iou = calculate_iou(detections[i][:4], detections[j][:4])
             if iou > 0.85 and int(detections[i][5]) == int(detections[j][5]):
                 if detections[i][4] < detections[j][4]: keep[i] = False
-            if is_helmet_model:
-                c_i, c_j = int(detections[i][5]), int(detections[j][5])
-                if ((c_i == ID_H_HELMET and c_j == ID_H_NO_HELMET) or 
-                    (c_i == ID_H_NO_HELMET and c_j == ID_H_HELMET)):
-                    if iou > 0.6 and c_i == ID_H_HELMET: keep[i] = False
     return detections[keep]
 
 def get_foot_point(x1, y1, x2, y2):
@@ -1042,12 +1042,38 @@ class CrossingDetector:
         return triggered
 
 class HelmetDetector:
-    """안전모 미착용 클래스를 단순 필터링해 이벤트 대상으로 넘긴다."""
+    """helmet/person_head 조합으로 미착용 대상을 판정한다."""
+    def __init__(self):
+        self.head_helmet_iou_threshold = 0.10
+        self.head_helmet_cover_threshold = 0.30
+
+    def _is_head_protected(self, head_track, helmet_tracks):
+        """head 박스와 겹치거나 상단을 충분히 덮는 helmet 박스가 있으면 착용으로 본다."""
+        head_bbox = head_track[:4]
+        head_area = max((head_bbox[2] - head_bbox[0]) * (head_bbox[3] - head_bbox[1]), 1.0)
+        for helmet_track in helmet_tracks:
+            helmet_bbox = helmet_track[:4]
+            iou = calculate_iou(head_bbox, helmet_bbox)
+            if iou >= self.head_helmet_iou_threshold:
+                return True
+
+            x1 = max(head_bbox[0], helmet_bbox[0])
+            y1 = max(head_bbox[1], helmet_bbox[1])
+            x2 = min(head_bbox[2], helmet_bbox[2])
+            y2 = min(head_bbox[3], helmet_bbox[3])
+            inter_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            if (inter_area / head_area) >= self.head_helmet_cover_threshold:
+                return True
+        return False
+
     def process(self, tracks, track_map, motion_mask=None):
-        """미착용 track ID만 추려 반환한다."""
+        """person_head만 있고 helmet이 대응되지 않는 track ID를 no_helmet으로 본다."""
         triggered = []
-        nh = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
-        for n in nh: triggered.append(int(n[4]))
+        head_tracks = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
+        helmet_tracks = [t for t in tracks if track_map.get(int(t[4])) == ID_H_HELMET]
+        for head_track in head_tracks:
+            if not self._is_head_protected(head_track, helmet_tracks):
+                triggered.append(int(head_track[4]))
         return triggered
 
 class SignalVehicleDetector:
@@ -1471,7 +1497,7 @@ class Camera:
 
     def _collect_crossing_events(self, handler, tracks, track_map, now, frame, frame_id):
         """crossing detector payload를 공통 알람 형태로 변환한다."""
-        events = handler.process(tracks, track_map, target_cls=ID_G_PERSON, frame=frame, fid=frame_id)
+        events = handler.process(tracks, track_map, target_cls=ID_H_PERSON_LOWER_BODY, frame=frame, fid=frame_id)
         self._log_handler_result("conveyor_crossing", len(events))
         current_alarms = {}
         for evt in events:
@@ -1494,7 +1520,7 @@ class Camera:
                     self._collect_standard_events(event_name, handler, general_tracks, general_track_map, now, frame, frame_id, draw_tid_offset=10000)
                 )
             elif event_name == "conveyor_crossing":
-                current_alarms.update(self._collect_crossing_events(handler, general_tracks, general_track_map, now, frame, frame_id))
+                current_alarms.update(self._collect_crossing_events(handler, helmet_tracks, helmet_track_map, now, frame, frame_id))
             elif event_name == "signal_vehicle":
                 current_alarms.update(
                     self._collect_standard_events(
@@ -1529,12 +1555,14 @@ class Camera:
         """helmet tracker 결과의 클래스별 색상과 라벨을 계산한다."""
         tid = int(track[4])
         cls_id = int(track[6])
+        if cls_id == ID_H_PERSON:
+            return tid, cls_id, (0, 255, 0), f"Person [{tid}]"
+        if cls_id == ID_H_PERSON_LOWER_BODY:
+            return tid, cls_id, (0, 200, 255), f"LowerBody [{tid}]"
         if cls_id == ID_H_HELMET:
             return tid, cls_id, (255, 0, 0), f"Helmet [{tid}]"
         if cls_id == ID_H_NO_HELMET:
-            return tid, cls_id, (0, 0, 255), f"No-Helmet [{tid}]"
-        if cls_id == ID_H_PERSON:
-            return tid, cls_id, (0, 255, 0), f"Person [{tid}]"
+            return tid, cls_id, (0, 0, 255), f"Head [{tid}]"
         return tid, cls_id, (0, 255, 255), f"Unknown({cls_id}) [{tid}]"
 
     def _get_general_track_style(self, track, alarms):
@@ -2091,8 +2119,8 @@ def run_monitor_loop(cams, active_npu_ids, use_display, use_drawing):
                         continue
                     valid_frame_count += 1
 
-                    run_helmet = any(e in ["no_helmet", "intrusion"] for e in c.events)
-                    run_general = any(e in ["illegal_parking", "conveyor_crossing", "signal_vehicle"] for e in c.events)
+                    run_helmet = any(e in ["no_helmet", "intrusion", "conveyor_crossing"] for e in c.events)
+                    run_general = any(e in ["illegal_parking", "signal_vehicle"] for e in c.events)
 
                     helmet_detections, general_detections = [], []
                     if run_helmet:
