@@ -1,5 +1,5 @@
 {
-    "terminal_id": "3",
+    "terminal_id": "1",
     "logging": {
         "dir": "./logs",
         "level": "INFO",
@@ -22,7 +22,7 @@
         "conveyor_crossing": {
             "enabled": false,
             "cooldown_sec": 600,
-            "snapshot_mode": "crossing_moment",
+            "snapshot_mode": "current_frame",
             "distance_ratio": 0.5,
             "min_distance_px": 15,
             "candidate_ttl_sec": 5.0,
@@ -32,5 +32,16 @@
             "enabled": false,
             "cooldown_sec": 600
         }
-    }
+    },
+    "models": {
+        "HELMET": "models/helmet_3cls_v8.dxnn",
+        "GENERAL": "models/YOLOV8M-1.dxnn",
+        "FACE": "models/yolov8m-face.dxnn"
+    },
+    "SKIP_FRAMES": 4,
+    "REC_FPS": 30,
+    "REC_PRE_SEC": 3,
+    "REC_POST_SEC": 4,
+    "WATCHDOG_TIMEOUT": 30.0,
+    "VISUAL_ALARM_DURATION": 5.0
 }

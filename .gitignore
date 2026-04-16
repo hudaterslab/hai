@@ -1,18 +1,12 @@
-dll/nvinfer.dll
-src/nvinfer.dll
-dll/opencv_world451.dll
-dll/opencv_world460.dll
-x64/Release/opencv_world4.dll
+models/
+test/
+logs/
+
 *.mp4
 *.avi
 models
 .vs
 *.weights
-x64/Release/csp-p6.engine
-x64/Release/csp-p6.onnx
-x64/Release/helmet.engine
-x64/Release/nvinfer.dll
-x64/Release/nvinfer_builder_resource.dll
 *.engine
 *.dxnn
 CCTV_EVENT_ALERT/events
@@ -20,8 +14,8 @@ CCTV_EVENT_ALERT/events
 # Local runtime/config files
 cameras.csv
 cctv_config.json
-config/*.json
-!config/*.sample.json
+#config/*.json
+#!config/*.sample.json
 logs/
 snapshot_exports/
 .idea/
