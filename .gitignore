@@ -1,10 +1,9 @@
-models/
+models/*
 test/
-logs/
+logs/*
 
 *.mp4
 *.avi
-models
 .vs
 *.weights
 *.engine

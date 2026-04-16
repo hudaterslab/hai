@@ -26,7 +26,8 @@
             "distance_ratio": 0.5,
             "min_distance_px": 15,
             "candidate_ttl_sec": 5.0,
-            "direction_check": true
+            "direction_check": true,
+            "max_crossing_angle": 45.0
         },
         "signal_vehicle": {
             "enabled": false,

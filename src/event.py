@@ -126,12 +126,13 @@ class CrossingDetector(BaseEventDetector):
         self.prev = {}
         self.candidates = {}
         
-        # 💡 [핵심] 기본 스냅샷 모드를 'crossing_moment'로 변경하여 선을 넘는 정확한 찰나를 캡처
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
         self.distance_ratio = config.get("distance_ratio", 0.5)
         self.min_distance_px = config.get("min_distance_px", 15)
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
         self.direction_check = config.get("direction_check", True)
+        # 💡 [핵심] 수평 이동 각도 필터링을 위한 파라미터 (기본값 45도)
+        self.max_crossing_angle = config.get("max_crossing_angle", 45.0)
 
     def _is_intersect(self, p1, p2, p3, p4):
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
@@ -163,7 +164,6 @@ class CrossingDetector(BaseEventDetector):
                             'timestamp': now, 
                             'line': (p1, p2),
                             'entry_side': ccw(p1, p2, self.prev[tid]), 
-                            # 💡 교차하는 순간의 frame을 무조건 복사하여 보관
                             'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
                             'bbox': tuple(t[:4]), 
                             'fid': fid
@@ -176,20 +176,30 @@ class CrossingDetector(BaseEventDetector):
                 curr_side = ccw(p1, p2, curr_pos)
                 moved_dist = get_distance(cand['crossing_pt'], curr_pos)
                 
+                # 💡 [핵심] 궤적 각도 계산 로직 추가
+                dx = curr_pos[0] - cand['crossing_pt'][0]
+                dy = curr_pos[1] - cand['crossing_pt'][1]
+                
+                # math.atan2(y, x)를 이용해 각도를 구하되, 수평선 대비 절댓값을 취함 (0도=완전 수평, 90도=완전 수직)
+                angle_deg = math.degrees(math.atan2(abs(dy), abs(dx))) if (dx != 0 or dy != 0) else 0.0
+                
                 if self.direction_check:
                     direction_ok = (cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] * curr_side < 0)
                 else:
                     direction_ok = True
                 
-                if direction_ok and moved_dist > max(cand['width'] * self.distance_ratio, self.min_distance_px):
-                    triggered.append({
-                        'tid': tid, 
-                        'bbox': cand['bbox'], 
-                        'frame': cand['frame'], 
-                        'fid': cand['fid']
-                    })
-                    del self.candidates[tid]
-                elif now - cand['timestamp'] > self.candidate_ttl_sec:
+                # 수평 횡단 각도 제한과 이동 거리 조건을 모두 만족해야 이벤트 발동
+                if direction_ok and angle_deg <= self.max_crossing_angle:
+                    if moved_dist > max(cand['width'] * self.distance_ratio, self.min_distance_px):
+                        triggered.append({
+                            'tid': tid, 
+                            'bbox': cand['bbox'], 
+                            'frame': cand['frame'], 
+                            'fid': cand['fid']
+                        })
+                        del self.candidates[tid]
+                # 각도를 벗어났거나 유효시간이 지났으면 후보에서 탈락
+                elif now - cand['timestamp'] > self.candidate_ttl_sec or angle_deg > self.max_crossing_angle:
                     del self.candidates[tid]
                     
             self.prev[tid] = curr_pos

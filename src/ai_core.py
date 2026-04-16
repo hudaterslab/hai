@@ -6,9 +6,22 @@ import queue
 import logging
 import threading
 import subprocess
-from common import clean_overlapping_detections, calculate_iou
+from common import clean_overlapping_detections, calculate_iou, SYS_CFG
 
 logger = logging.getLogger("VMS_SYSTEM")
+
+# ==========================================
+# 모델별 동적 신뢰도(Confidence) 임계값 매핑
+# ==========================================
+def get_model_confidence(engine_path, default_conf=0.45):
+    conf_map = SYS_CFG.get("model_confidences", {})
+    ep_lower = engine_path.lower()
+    if "helmet" in ep_lower:
+        return conf_map.get("HELMET", 0.50)
+    elif "face" in ep_lower:
+        return conf_map.get("FACE", 0.35)
+    else:
+        return conf_map.get("GENERAL", 0.60)
 
 # ==========================================
 # 💡 [핵심 방어 로직] 모델 경로 & 확장자 자동 보정
@@ -56,7 +69,8 @@ if USE_NPU:
 # ==========================================
 if USE_NPU:
     def onInferenceCallbackFunc(outputs, user_arg):
-        cam_id, model_type, fid, scale, offset, semaphore, is_yolov7, input_tensor = user_arg
+        # 💡 하드코딩된 변수 대신 conf_thres를 매개변수로 주입받습니다.
+        cam_id, model_type, fid, scale, offset, semaphore, is_yolov7, conf_thres, input_tensor = user_arg
         try:
             pred = np.array(outputs[0], copy=True)
             if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
@@ -77,7 +91,7 @@ if USE_NPU:
                 scores = np.max(pred[:, 4:], axis=1)
                 class_ids = np.argmax(pred[:, 4:], axis=1)
 
-            conf_thres = 0.30 if is_yolov7 else 0.45
+            # 💡 동적으로 할당된 임계값을 사용하여 노이즈(비닐 등)를 걸러냅니다.
             mask = scores > conf_thres
             pred = pred[mask]
             scores = scores[mask]
@@ -114,6 +128,7 @@ if USE_NPU:
         def __init__(self, engine_path):
             self.engine_path = resolve_model_path(engine_path, is_gpu=False)
             self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
+            self.conf_thres = get_model_confidence(self.engine_path)
             
             if not os.path.exists(self.engine_path):
                 logger.error(f"❌ [NPU 모드] 모델 누락: {self.engine_path} (NPU 환경에서는 .dxnn 모델이 필수입니다)")
@@ -139,13 +154,14 @@ if USE_NPU:
                 
             npu_input, scale, offset = self.letter_box(img)
             input_tensor = np.ascontiguousarray(cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB))
-            user_arg = (cam_id, model_type, fid, scale, offset, semaphore, self.is_yolov7, input_tensor)
+            user_arg = (cam_id, model_type, fid, scale, offset, semaphore, self.is_yolov7, self.conf_thres, input_tensor)
             self.engine.run_async([input_tensor], user_arg=user_arg)
 
     class DeepXModelSync:
         def __init__(self, engine_path):
             self.engine_path = resolve_model_path(engine_path, is_gpu=False)
             self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
+            self.conf_thres = get_model_confidence(self.engine_path)
             
             if not os.path.exists(self.engine_path):
                 logger.error(f"❌ [NPU 모드] 모델 누락: {self.engine_path}")
@@ -186,8 +202,7 @@ if USE_NPU:
                     scores = np.max(pred[:, 4:], axis=1)
                     class_ids = np.argmax(pred[:, 4:], axis=1)
 
-                conf_thres = 0.30 if self.is_yolov7 else 0.45
-                mask = scores > conf_thres
+                mask = scores > self.conf_thres
                 pred = pred[mask]; scores = scores[mask]; class_ids = class_ids[mask]
                 
                 if len(pred) == 0: return []
@@ -195,7 +210,7 @@ if USE_NPU:
                 boxes[:, 0] = boxes[:, 0] - boxes[:, 2] / 2; boxes[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
                 boxes[:, 2] = boxes[:, 0] + boxes[:, 2]; boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
                 
-                indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), conf_thres, 0.45)
+                indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), self.conf_thres, 0.45)
                 if len(indices) == 0: return []
                     
                 res = []
@@ -210,7 +225,6 @@ if USE_NPU:
             except Exception:
                 return []
 
-    # 파이프라인 매핑 (NPU 활성화)
     VisionModelAsync = DeepXModelAsync
     VisionModelSync = DeepXModelSync
 
@@ -224,6 +238,7 @@ else:
         def __init__(self, engine_path):
             self.pt_path = resolve_model_path(engine_path, is_gpu=True)
             self.is_yolov7 = "v7" in os.path.basename(self.pt_path).lower()
+            self.conf_thres = get_model_confidence(self.pt_path)
             self.model = None
             
             try:
@@ -247,7 +262,7 @@ else:
             
             def _infer():
                 try:
-                    results = self.model(img, verbose=False, conf=0.30 if self.is_yolov7 else 0.45)
+                    results = self.model(img, verbose=False, conf=self.conf_thres)
                     boxes = []
                     for r in results:
                         if r.boxes is not None and len(r.boxes) > 0:
@@ -270,6 +285,7 @@ else:
         def __init__(self, engine_path):
             self.pt_path = resolve_model_path(engine_path, is_gpu=True)
             self.is_yolov7 = "v7" in os.path.basename(self.pt_path).lower()
+            self.conf_thres = get_model_confidence(self.pt_path)
             self.model = None
             
             try:
@@ -284,7 +300,7 @@ else:
         def infer(self, img):
             if img is None or self.model is None: return []
             try:
-                results = self.model(img, verbose=False, conf=0.30 if self.is_yolov7 else 0.45)
+                results = self.model(img, verbose=False, conf=self.conf_thres)
                 boxes = []
                 for r in results:
                     if r.boxes is not None and len(r.boxes) > 0:
@@ -298,7 +314,6 @@ else:
                 logger.error(f"GPU Sync Error: {e}")
                 return []
 
-    # 파이프라인 매핑 (GPU 활성화)
     VisionModelAsync = GPUModelAsync
     VisionModelSync = GPUModelSync
 
