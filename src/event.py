@@ -5,8 +5,8 @@ import numpy as np
 from collections import defaultdict, deque
 from common import (
     ID_H_NO_HELMET, ID_H_PERSON, ID_G_PERSON, TARGET_VEHICLES, 
-    SCREEN_WIDTH, SCREEN_HEIGHT, get_foot_point, get_check_point, 
-    get_center_point, get_distance, ccw, calculate_iou
+    SCREEN_WIDTH, SCREEN_HEIGHT, get_check_point, get_center_point, 
+    get_distance, ccw, calculate_iou
 )
 
 class MotionDetector:
@@ -131,7 +131,6 @@ class CrossingDetector(BaseEventDetector):
         self.min_distance_px = config.get("min_distance_px", 15)
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
         self.direction_check = config.get("direction_check", True)
-        # 💡 [핵심] 수평 이동 각도 필터링을 위한 파라미터 (기본값 45도)
         self.max_crossing_angle = config.get("max_crossing_angle", 45.0)
 
     def _is_intersect(self, p1, p2, p3, p4):
@@ -152,15 +151,16 @@ class CrossingDetector(BaseEventDetector):
             if g_map.get(tid) != ID_G_PERSON:
                 continue
                 
-            curr_pos = get_foot_point(*t[:4])
-            obj_width = t[2] - t[0]
+            # 💡 [핵심] 컨베이어 벨트 등 물리적 접점 계산을 위해 하단 중앙 좌표로 교체
+            curr_pos = get_check_point(*t[:4])
+            obj_height = t[3] - t[1]
             
             if tid in self.prev and tid not in self.candidates:
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, self.prev[tid], curr_pos):
                         self.candidates[tid] = {
                             'crossing_pt': curr_pos, 
-                            'width': obj_width, 
+                            'height': obj_height, 
                             'timestamp': now, 
                             'line': (p1, p2),
                             'entry_side': ccw(p1, p2, self.prev[tid]), 
@@ -176,11 +176,8 @@ class CrossingDetector(BaseEventDetector):
                 curr_side = ccw(p1, p2, curr_pos)
                 moved_dist = get_distance(cand['crossing_pt'], curr_pos)
                 
-                # 💡 [핵심] 궤적 각도 계산 로직 추가
                 dx = curr_pos[0] - cand['crossing_pt'][0]
                 dy = curr_pos[1] - cand['crossing_pt'][1]
-                
-                # math.atan2(y, x)를 이용해 각도를 구하되, 수평선 대비 절댓값을 취함 (0도=완전 수평, 90도=완전 수직)
                 angle_deg = math.degrees(math.atan2(abs(dy), abs(dx))) if (dx != 0 or dy != 0) else 0.0
                 
                 if self.direction_check:
@@ -188,9 +185,8 @@ class CrossingDetector(BaseEventDetector):
                 else:
                     direction_ok = True
                 
-                # 수평 횡단 각도 제한과 이동 거리 조건을 모두 만족해야 이벤트 발동
                 if direction_ok and angle_deg <= self.max_crossing_angle:
-                    if moved_dist > max(cand['width'] * self.distance_ratio, self.min_distance_px):
+                    if moved_dist > max(cand['height'] * self.distance_ratio, self.min_distance_px):
                         triggered.append({
                             'tid': tid, 
                             'bbox': cand['bbox'], 
@@ -198,7 +194,6 @@ class CrossingDetector(BaseEventDetector):
                             'fid': cand['fid']
                         })
                         del self.candidates[tid]
-                # 각도를 벗어났거나 유효시간이 지났으면 후보에서 탈락
                 elif now - cand['timestamp'] > self.candidate_ttl_sec or angle_deg > self.max_crossing_angle:
                     del self.candidates[tid]
                     

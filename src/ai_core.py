@@ -10,9 +10,6 @@ from common import clean_overlapping_detections, calculate_iou, SYS_CFG
 
 logger = logging.getLogger("VMS_SYSTEM")
 
-# ==========================================
-# 모델별 동적 신뢰도(Confidence) 임계값 매핑
-# ==========================================
 def get_model_confidence(engine_path, default_conf=0.45):
     conf_map = SYS_CFG.get("model_confidences", {})
     ep_lower = engine_path.lower()
@@ -23,29 +20,19 @@ def get_model_confidence(engine_path, default_conf=0.45):
     else:
         return conf_map.get("GENERAL", 0.60)
 
-# ==========================================
-# 💡 [핵심 방어 로직] 모델 경로 & 확장자 자동 보정
-# ==========================================
 def resolve_model_path(engine_path, is_gpu=False):
     target_path = engine_path
-    
-    # 1. 하드웨어 환경에 맞춰 확장자 강제 변환
     if is_gpu:
         target_path = target_path.replace(".dxnn", ".pt")
     else:
         target_path = target_path.replace(".pt", ".dxnn")
         
-    # 2. JSON에 적힌 경로 그대로 존재하면 사용
     if os.path.exists(target_path):
         return target_path
         
-    # 3. 파일이 없다면 구버전 설정으로 간주하고, 강제로 models/ 폴더 하위를 탐색
     alt_path = os.path.join("models", os.path.basename(target_path))
     return alt_path
 
-# ==========================================
-# 하드웨어 환경(NPU vs GPU) 동적 감지
-# ==========================================
 def check_deepx_npu():
     try:
         res = subprocess.run(["dxrt-cli", "-i"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -64,12 +51,8 @@ if USE_NPU:
         USE_NPU = False
         logger.warning("🟡 NPU가 감지되었으나 dx_engine 임포트에 실패했습니다. GPU 모드로 대체합니다.")
 
-# ==========================================
-# 1. DeepX NPU 전용 구현체 (USE_NPU == True 일 때만 평가됨)
-# ==========================================
 if USE_NPU:
     def onInferenceCallbackFunc(outputs, user_arg):
-        # 💡 하드코딩된 변수 대신 conf_thres를 매개변수로 주입받습니다.
         cam_id, model_type, fid, scale, offset, semaphore, is_yolov7, conf_thres, input_tensor = user_arg
         try:
             pred = np.array(outputs[0], copy=True)
@@ -91,8 +74,8 @@ if USE_NPU:
                 scores = np.max(pred[:, 4:], axis=1)
                 class_ids = np.argmax(pred[:, 4:], axis=1)
 
-            # 💡 동적으로 할당된 임계값을 사용하여 노이즈(비닐 등)를 걸러냅니다.
-            mask = scores > conf_thres
+            # 💡 ByteTrack을 위해 NMS 전 임계값을 낮춰 Low-confidence 박스도 살려둡니다. (0.1 기준)
+            mask = scores > 0.1
             pred = pred[mask]
             scores = scores[mask]
             class_ids = class_ids[mask]
@@ -105,7 +88,7 @@ if USE_NPU:
                 raw_boxes[:, 2] = raw_boxes[:, 0] + raw_boxes[:, 2]
                 raw_boxes[:, 3] = raw_boxes[:, 1] + raw_boxes[:, 3]
                 
-                indices = cv2.dnn.NMSBoxes(raw_boxes.tolist(), scores.tolist(), conf_thres, 0.45)
+                indices = cv2.dnn.NMSBoxes(raw_boxes.tolist(), scores.tolist(), 0.1, 0.45)
                 if len(indices) > 0:
                     dw, dh = offset
                     for i in indices.flatten():
@@ -202,7 +185,7 @@ if USE_NPU:
                     scores = np.max(pred[:, 4:], axis=1)
                     class_ids = np.argmax(pred[:, 4:], axis=1)
 
-                mask = scores > self.conf_thres
+                mask = scores > 0.1
                 pred = pred[mask]; scores = scores[mask]; class_ids = class_ids[mask]
                 
                 if len(pred) == 0: return []
@@ -210,7 +193,7 @@ if USE_NPU:
                 boxes[:, 0] = boxes[:, 0] - boxes[:, 2] / 2; boxes[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
                 boxes[:, 2] = boxes[:, 0] + boxes[:, 2]; boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
                 
-                indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), self.conf_thres, 0.45)
+                indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), 0.1, 0.45)
                 if len(indices) == 0: return []
                     
                 res = []
@@ -228,9 +211,6 @@ if USE_NPU:
     VisionModelAsync = DeepXModelAsync
     VisionModelSync = DeepXModelSync
 
-# ==========================================
-# 2. NVIDIA GPU 전용 구현체 (USE_NPU == False 일 때만 평가됨)
-# ==========================================
 else:
     logger.info("🔵 NVIDIA GPU 모드 활성화: PyTorch(Ultralytics) 추론 엔진을 가동합니다.")
     
@@ -262,7 +242,8 @@ else:
             
             def _infer():
                 try:
-                    results = self.model(img, verbose=False, conf=self.conf_thres)
+                    # 💡 트래커 단에서 걸러내기 위해 자체 추론은 0.1의 낮은 신뢰도까지 허용
+                    results = self.model(img, verbose=False, conf=0.1)
                     boxes = []
                     for r in results:
                         if r.boxes is not None and len(r.boxes) > 0:
@@ -300,7 +281,7 @@ else:
         def infer(self, img):
             if img is None or self.model is None: return []
             try:
-                results = self.model(img, verbose=False, conf=self.conf_thres)
+                results = self.model(img, verbose=False, conf=0.1)
                 boxes = []
                 for r in results:
                     if r.boxes is not None and len(r.boxes) > 0:
@@ -318,10 +299,12 @@ else:
     VisionModelSync = GPUModelSync
 
 # ==========================================
-# 칼만 필터를 탑재한 SORT Tracker
+# 💡 [핵심] 순수 NumPy 경량 ByteTrack 구현체
+# 외부 패키지(lap, scipy) 의존성 지옥을 방지하기 위해 
+# Greedy 기반 2-Stage IOU Association을 지원합니다.
 # ==========================================
 class KalmanBoxTracker:
-    def __init__(self, bbox, cls_id):
+    def __init__(self, bbox, cls_id, conf):
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
         self.kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
@@ -330,6 +313,7 @@ class KalmanBoxTracker:
         self.kf.errorCovPost = np.eye(4, dtype=np.float32)
 
         self.cls = cls_id
+        self.conf = conf
         self.lost = 0
         
         cx = (bbox[0] + bbox[2]) / 2.0
@@ -344,66 +328,103 @@ class KalmanBoxTracker:
         cx, cy = pred[0, 0], pred[1, 0]
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
 
-    def correct(self, bbox):
+    def correct(self, bbox, conf):
         cx = (bbox[0] + bbox[2]) / 2.0
         cy = (bbox[1] + bbox[3]) / 2.0
         self.w = bbox[2] - bbox[0]
         self.h = bbox[3] - bbox[1]
         self.kf.correct(np.array([[cx], [cy]], np.float32))
+        self.conf = conf
         self.lost = 0
         
     def get_state(self):
         cx, cy = self.kf.statePost[0, 0], self.kf.statePost[1, 0]
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
 
-class SortTracker:
-    def __init__(self, max_lost=50, is_helmet=True):
+class ByteTracker:
+    def __init__(self, track_thresh=0.5, track_buffer=50, match_thresh=0.2, is_helmet=True):
+        self.track_thresh = track_thresh
+        self.track_buffer = track_buffer
+        self.match_thresh = match_thresh
+        self.is_helmet = is_helmet
         self.next_id = 1
         self.tracks = {}
-        self.max_lost = max_lost
-        self.is_helmet = is_helmet
+
+    def _associate(self, detections, trackers_keys, iou_threshold):
+        if len(trackers_keys) == 0 or len(detections) == 0:
+            return [], list(range(len(detections))), trackers_keys
+
+        iou_matrix = np.zeros((len(detections), len(trackers_keys)), dtype=np.float32)
+        for d, det in enumerate(detections):
+            for t, tid in enumerate(trackers_keys):
+                iou_matrix[d, t] = calculate_iou(det[:4], self.tracks[tid].get_state())
+
+        matched_indices = []
+        unmatched_dets = []
+        unmatched_trks = list(trackers_keys)
+
+        for d in range(len(detections)):
+            best_t_idx = -1
+            best_iou = iou_threshold
+            for t, tid in enumerate(trackers_keys):
+                if tid in unmatched_trks and iou_matrix[d, t] > best_iou:
+                    best_iou = iou_matrix[d, t]
+                    best_t_idx = t
+            
+            if best_t_idx != -1:
+                matched_indices.append((d, trackers_keys[best_t_idx]))
+                unmatched_trks.remove(trackers_keys[best_t_idx])
+            else:
+                unmatched_dets.append(d)
+
+        return matched_indices, unmatched_dets, unmatched_trks
 
     def update(self, detections):
-        detections = clean_overlapping_detections(detections, self.is_helmet)
-        used_dets = set()
-        
+        if len(detections) > 0:
+            detections = clean_overlapping_detections(detections, self.is_helmet)
+            
         for tid in list(self.tracks.keys()):
             self.tracks[tid].predict()
 
-        for tid, trk in self.tracks.items():
-            best_iou = 0
-            best_idx = -1
-            pred_bbox = trk.get_state()
-            
-            for i, det in enumerate(detections):
-                if i in used_dets or int(det[5]) != trk.cls:
-                    continue
-                iou = calculate_iou(pred_bbox, det[:4])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_idx = i
-                    
-            if best_iou > 0.2:
-                trk.correct(detections[best_idx][:4])
-                used_dets.add(best_idx)
-            else:
-                trk.lost += 1
-                
-        self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.max_lost}
-        
-        for i, det in enumerate(detections):
-            if i not in used_dets:
-                self.tracks[self.next_id] = KalmanBoxTracker(det[:4], int(det[5]))
-                self.next_id += 1
-                
+        # 1. 박스를 High와 Low로 분리
+        dets_high = [d for d in detections if d[4] >= self.track_thresh]
+        dets_low = [d for d in detections if 0.1 <= d[4] < self.track_thresh]
+
+        # 2. First Association: High Confidence 객체를 기존 트래커와 매칭
+        active_track_keys = list(self.tracks.keys())
+        matched_high, unmatched_dets_high, unmatched_trks = self._associate(dets_high, active_track_keys, self.match_thresh)
+
+        for d_idx, tid in matched_high:
+            self.tracks[tid].correct(dets_high[d_idx][:4], dets_high[d_idx][4])
+
+        # 3. Second Association: Low Confidence 객체를 남은 트래커와 매칭 (ByteTrack의 핵심)
+        matched_low, unmatched_dets_low, unmatched_trks_final = self._associate(dets_low, unmatched_trks, 0.4)
+
+        for d_idx, tid in matched_low:
+            self.tracks[tid].correct(dets_low[d_idx][:4], dets_low[d_idx][4])
+
+        # 4. 남은 트래커는 Lost 처리
+        for tid in unmatched_trks_final:
+            self.tracks[tid].lost += 1
+
+        # 5. 매칭되지 않은 High Confidence 박스는 새로운 트래커로 등록
+        for d_idx in unmatched_dets_high:
+            det = dets_high[d_idx]
+            self.tracks[self.next_id] = KalmanBoxTracker(det[:4], int(det[5]), det[4])
+            self.next_id += 1
+
+        # 6. Lost 기간이 초과된 트래커 삭제
+        self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.track_buffer}
+
         return self._get_results()
 
     def predict_only(self):
         for tid, trk in self.tracks.items():
             trk.predict()
             trk.lost += 1
-        self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.max_lost}
+        self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.track_buffer}
         return self._get_results()
 
     def _get_results(self):
-        return np.array([[*t.get_state(), tid, 1.0, t.cls] for tid, t in self.tracks.items() if t.lost <= 10])
+        # UI 표출을 위해 lost <= 10 인 객체만 리턴
+        return np.array([[*t.get_state(), tid, t.conf, t.cls] for tid, t in self.tracks.items() if t.lost <= 10])

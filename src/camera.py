@@ -14,10 +14,12 @@ from common import (
     STREAM_READ_FAIL_THRESHOLD, STREAM_RECONNECT_DELAY_SEC, 
     STREAM_BROKEN_RETRY_DELAY_SEC, denormalize_roi_points, 
     save_event_image_with_mark, ID_H_HELMET, ID_H_NO_HELMET, 
-    ID_H_PERSON, ID_G_PERSON, ID_G_CAR, ID_G_BUS, ID_G_TRUCK
+    ID_H_PERSON, ID_G_PERSON, ID_G_CAR, ID_G_BUS, ID_G_TRUCK,
+    NAS_UPLOADER_POOL, _upload_to_nas_task 
 )
 from event import MotionDetector, EVENT_REGISTRY
-from ai_core import SortTracker
+# 💡 [핵심] SortTracker에서 ByteTracker로 교체
+from ai_core import ByteTracker
 
 logger = logging.getLogger("VMS_SYSTEM")
 
@@ -64,39 +66,10 @@ class FrameReader:
         self.warmup_complete = False
         self.consecutive_read_failures = 0
 
-    def _warmup_stream(self, cap):
-        warmed = 0
-        while self.running and cap.isOpened() and warmed < STREAM_WARMUP_FRAMES:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                self.consecutive_read_failures += 1
-                if self.consecutive_read_failures >= STREAM_READ_FAIL_THRESHOLD:
-                    return False
-                time.sleep(0.05)
-                continue
-                
-            self.consecutive_read_failures = 0
-            warmed += 1
-            
-            with self.lock:
-                self.frame = frame
-                self.fid += 1
-                self.last_frame_time = time.time()
-                
-        if warmed < STREAM_WARMUP_FRAMES:
-            return False
-            
-        self.warmup_complete = True
-        self.connected = True
-        return True
-
     def _run(self):
         while self.running:
             self._reset_connection_state()
 
-            # ==========================================
-            # 💡 [추가] 로컬 MP4 파일 다이렉트 재생 로직
-            # ==========================================
             if not self.url.startswith("rtsp://"):
                 cap = cv2.VideoCapture(self.url)
                 self.connected = True
@@ -108,7 +81,6 @@ class FrameReader:
                     ret, frame = cap.read()
                     
                     if not ret:
-                        # 영상이 끝나면 처음부터 다시 무한 반복
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
 
@@ -118,7 +90,6 @@ class FrameReader:
                         self.fid += 1
                         self.last_frame_time = time.time()
 
-                    # 실제 영상 배속과 비슷하게 맞추기
                     elapsed = time.time() - start_t
                     if delay > elapsed:
                         time.sleep(delay - elapsed)
@@ -127,7 +98,7 @@ class FrameReader:
                 self.connected = False
                 time.sleep(1)
                 continue
-            self._reset_connection_state()
+                
             codec = get_stream_codec(self.url)
             
             if codec == "hevc":
@@ -200,8 +171,9 @@ class FrameReader:
             self.thread.join(timeout=join_timeout)
 
 class VideoRecorder:
-    def __init__(self, ip):
+    def __init__(self, ip, terminal_id="3"):
         self.ip = ip
+        self.terminal_id = terminal_id
         self.buffer = deque(maxlen=SYS_CFG.get("REC_FPS", 30) * SYS_CFG.get("REC_PRE_SEC", 3))
         self.write_queue = queue.Queue(maxsize=SYS_CFG.get("REC_FPS", 30) * SYS_CFG.get("REC_PRE_SEC", 3) * 2)
         self.recording = False
@@ -254,6 +226,7 @@ class VideoRecorder:
 
     def _writer_loop(self):
         writer = None
+        fpath = None
         while self.running or not self.write_queue.empty():
             try:
                 frame = self.write_queue.get(timeout=1.0)
@@ -264,6 +237,8 @@ class VideoRecorder:
                 if writer:
                     writer.release()
                     writer = None
+                    if fpath and os.path.exists(fpath):
+                        NAS_UPLOADER_POOL.submit(_upload_to_nas_task, fpath, "videos", self.ip, self.current_event, self.terminal_id)
                 continue
                 
             if writer is None:
@@ -286,6 +261,8 @@ class VideoRecorder:
                 
         if writer:
             writer.release()
+            if fpath and os.path.exists(fpath):
+                NAS_UPLOADER_POOL.submit(_upload_to_nas_task, fpath, "videos", self.ip, self.current_event, self.terminal_id)
 
     def stop(self):
         self.recording = False
@@ -318,8 +295,9 @@ class Camera:
         self.latest_npu = {'h': None, 'g': None}
         self.last_submit_fid = -1
         
-        self.helmet_tracker = SortTracker(is_helmet=True)
-        self.general_tracker = SortTracker(is_helmet=False)
+        # 💡 [핵심] ByteTracker로 교체 (신뢰도 임계값은 AI_core단에서 동적 매핑되므로 유지력 향상됨)
+        self.helmet_tracker = ByteTracker(is_helmet=True)
+        self.general_tracker = ByteTracker(is_helmet=False)
         
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
@@ -329,7 +307,7 @@ class Camera:
         self.roi_frame_shape = None
         self.config_lock = threading.Lock() 
         self.motion_det = MotionDetector(sensitivity)
-        self.recorder = VideoRecorder(ip)
+        self.recorder = VideoRecorder(ip, self.terminal_id) 
         
         self.handlers = []
         self.init_handlers()
@@ -419,7 +397,6 @@ class Camera:
             }
             
             for handler in self.handlers:
-                # 💡 [핵심] 이제 단일 트랙이 아닌 전체 트랙과 맵을 handler에 모두 주입합니다.
                 triggered_events = handler.process(helmet_tracks, general_tracks, track_maps, motion_mask, frame, frame_id)
                 
                 for evt in triggered_events:
