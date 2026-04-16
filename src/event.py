@@ -22,14 +22,10 @@ class MotionDetector:
         fg_mask = self.bg_subtractor.apply(small_frame)
         return cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
 
-# ==========================================
-# [핵심] 멀티 모델 지원을 위한 공통 인터페이스 변경
-# ==========================================
 class BaseEventDetector:
     event_name = "base"
     menu_name = "BASE"    
     gui_name = "BASE"     
-    # 💡 단일 track_type 대신, 필요로 하는 AI 모델들을 명시하는 배열로 구조 변경
     required_models = ["general"] 
     roi_type = "polygon"
 
@@ -44,9 +40,6 @@ class BaseEventDetector:
     def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
         return []
 
-# ==========================================
-# 개별 이벤트 구현체
-# ==========================================
 class IntrusionDetector(BaseEventDetector):
     event_name = "intrusion"
     menu_name = "침입"
@@ -133,7 +126,8 @@ class CrossingDetector(BaseEventDetector):
         self.prev = {}
         self.candidates = {}
         
-        self.snapshot_mode = config.get("snapshot_mode", "current_frame")
+        # 💡 [핵심] 기본 스냅샷 모드를 'crossing_moment'로 변경하여 선을 넘는 정확한 찰나를 캡처
+        self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
         self.distance_ratio = config.get("distance_ratio", 0.5)
         self.min_distance_px = config.get("min_distance_px", 15)
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
@@ -169,6 +163,7 @@ class CrossingDetector(BaseEventDetector):
                             'timestamp': now, 
                             'line': (p1, p2),
                             'entry_side': ccw(p1, p2, self.prev[tid]), 
+                            # 💡 교차하는 순간의 frame을 무조건 복사하여 보관
                             'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
                             'bbox': tuple(t[:4]), 
                             'fid': fid
@@ -211,7 +206,6 @@ class HelmetDetector(BaseEventDetector):
     event_name = "no_helmet"
     menu_name = "안전모"
     gui_name = "NO-HELMET"
-    # 💡 [핵심] 안전모 이벤트는 헬멧 모델과 범용 모델 두 개 모두를 필수로 요구합니다.
     required_models = ["helmet", "general"]
     roi_type = "none"
 
@@ -235,7 +229,6 @@ class HelmetDetector(BaseEventDetector):
         h_map = track_maps["helmet"]
         g_map = track_maps["general"]
         
-        # 💡 각자의 모델에서 도출된 최적의 객체만 추출합니다.
         no_helmets = [t for t in helmet_tracks if h_map.get(int(t[4])) == ID_H_NO_HELMET]
         persons = [t for t in general_tracks if g_map.get(int(t[4])) == ID_G_PERSON]
         
@@ -246,7 +239,6 @@ class HelmetDetector(BaseEventDetector):
                 if ioa > max_ioa:
                     max_ioa = ioa
                     
-            # IoU가 아닌 IoA 사용: "머리 박스 전체 면적 중 50% 이상이 사람 몸 안에 포함되는가?"
             if max_ioa > 0.5:
                 triggered.append({
                     'tid': int(nh[4]), 

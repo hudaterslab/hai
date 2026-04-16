@@ -352,7 +352,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="3"
         
         cv2.putText(img, f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
-        if str(terminal_id) == "1":
+        if str(terminal_id) == "99999":
             cv2.putText(img, "[ TEST IMAGE ]", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
             
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))

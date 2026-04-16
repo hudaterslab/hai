@@ -71,7 +71,8 @@ def get_roi_points_scaled(frame, title, mode="poly"):
     disp_frame = cv2.resize(frame, (disp_w, disp_h))
     
     wname = "ROI Setup Window"
-    cv2.namedWindow(wname)
+    cv2.namedWindow(wname, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(wname, disp_w, disp_h)
     
     def mouse_cb(e, x, y, f, p):
         if e == cv2.EVENT_LBUTTONDOWN:
@@ -147,6 +148,9 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
             cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
             cv2.putText(mosaic, str(idx + 1), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
             
+        # 💡 [핵심] 창 크기가 작게 나오는 문제를 방지하기 위해 WINDOW_NORMAL 적용 및 크기 강제 설정
+        cv2.namedWindow("Select Cameras", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Select Cameras", 1280, 720)
         cv2.imshow("Select Cameras", mosaic)
         cv2.waitKey(1)
         
@@ -170,8 +174,10 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
             ratio = 960 / width
             preview = cv2.resize(frame, (960, int(height * ratio)))
             
+            # 💡 [핵심] 개별 카메라 확인 창도 명시적으로 크기 지정
             win_name = "Camera Check"
-            cv2.namedWindow(win_name)
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win_name, 960, int(height * ratio))
             cv2.imshow(win_name, preview)
             cv2.moveWindow(win_name, 100, 100)
             cv2.waitKey(1)
@@ -204,19 +210,10 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
                         roi_l.extend(l)
                     if input("    라인 추가? (y/n): ") != 'y':
                         break
-                        
-            existing_conf = config_manager.get_config(ip) or {}
-            cctv_id = existing_conf.get("cctv_id", 1)
-            val_cctv = input(f">> cctv_id 입력 (기본값 {cctv_id}): ").strip()
-            if val_cctv:
-                try:
-                    cctv_id = int(val_cctv)
-                except Exception:
-                    pass
-                    
+            
+            # 기존 cctv_id 수동 입력 부분 제거 (아래에서 일괄 자동 처리됨)
             config_manager.set_config(ip, {
                 "url": url, 
-                "cctv_id": cctv_id, 
                 "roi_poly_norm": roi_p, 
                 "roi_lines_norm": roi_l, 
                 "events": events
@@ -245,13 +242,38 @@ def prompt_runtime_options():
 
 def prepare_config_manager(rtsp_list):
     config_manager = ConfigManager(CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE)
-    if not os.path.exists(CONFIG_CAMERAS_FILE):
+    
+    # 💡 [핵심] rtsp_list에 있는 URL들을 json에 자동 병합 및 등록
+    added_new = False
+    for url in rtsp_list:
+        ip = extract_ip(url)
+        if ip not in config_manager.camera_configs:
+            config_manager.camera_configs[ip] = {
+                "url": url,
+                "events": [],
+                "roi_poly_norm": [],
+                "roi_lines_norm": []
+            }
+            added_new = True
+
+    # 💡 [핵심] cctv_id 1번부터 순차적으로 자동 부여
+    for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
+        config_manager.camera_configs[ip]["cctv_id"] = idx
+        
+    if added_new:
+        config_manager.save()
+        config_manager.config = config_manager.build_runtime_config()
+        logger.info("✅ 새로운 RTSP 주소가 감지되어 자동으로 cameras.json에 등록 및 ID 번호 부여가 완료되었습니다.")
+
+    # 마법사 실행 여부는 선택사항으로 변경
+    val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
+    if val_setup == 'y':
         run_wizard_batch_mode(config_manager, rtsp_list)
-    else:
-        val_reset = input(">> 설정 초기화 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
-        if val_reset == 'y':
-            config_manager.clear_all()
-            run_wizard_batch_mode(config_manager, rtsp_list)
+        # 마법사 종료 후 다시 한번 ID 정렬 보장
+        for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
+            config_manager.camera_configs[ip]["cctv_id"] = idx
+        config_manager.save()
+        config_manager.config = config_manager.build_runtime_config()
             
     return config_manager
 
@@ -267,7 +289,7 @@ def main():
         if not rtsp_list:
             return logger.error("네트워크에 카메라가 없습니다.")
 
-    cams = [] # 💡 [핵심] UnboundLocalError 방지를 위해 try 블록 전 변수 초기화
+    cams = [] 
     
     try:
         sensitivity, use_display, use_drawing = prompt_runtime_options()
@@ -282,11 +304,12 @@ def main():
         for i, rtsp in enumerate(rtsp_list):
             ip = extract_ip(rtsp)
             conf = config_manager.get_config(ip)
+            # 이벤트가 없어도 스트리밍은 띄울 수 있도록 조건 유연화 가능하나, 우선 기존 정책 유지
             if conf and conf.get('events'):
                 cams.append(Camera(ip, conf, face_engine, i % 3, len(cams) + 1, sensitivity))
         
         if not cams:
-            return logger.warning("활성화된 카메라가 없습니다.")
+            return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
 
         target_fps = SYS_CFG.get("REC_FPS", 30)
         dynamic_delay = 1.0 / target_fps
