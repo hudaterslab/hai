@@ -4,8 +4,8 @@ import math
 import numpy as np
 from collections import defaultdict, deque
 from common import (
-    ID_H_NO_HELMET, ID_H_PERSON, ID_G_PERSON, TARGET_VEHICLES, 
-    SCREEN_WIDTH, SCREEN_HEIGHT, get_check_point, get_center_point, 
+    ID_H_HELMET, ID_H_NO_HELMET, ID_H_PERSON, ID_G_PERSON, TARGET_VEHICLES, 
+    get_check_point, get_center_point, 
     get_distance, ccw, calculate_iou
 )
 
@@ -74,6 +74,9 @@ class ParkingDetector(BaseEventDetector):
 
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
+        # 주정차 판정 기준은 이벤트 설정에서 조정할 수 있게 유지한다.
+        self.stationary_distance_px = float(config.get("stationary_distance_px", 30))
+        self.min_stop_sec = float(config.get("min_stop_sec", 5.0))
         self.states = defaultdict(lambda: {'start': 0, 'pos': None})
 
     def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
@@ -93,9 +96,11 @@ class ParkingDetector(BaseEventDetector):
                     curr_ids.add(tid)
                     c = get_center_point(*t[:4])
                     
-                    if self.states[tid]['start'] == 0 or get_distance(c, self.states[tid]['pos']) > 30:
+                    # 차량 중심이 일정 픽셀 이상 움직이면 정차 누적 시간을 다시 시작한다.
+                    if self.states[tid]['start'] == 0 or get_distance(c, self.states[tid]['pos']) > self.stationary_distance_px:
                         self.states[tid].update({'start': now, 'pos': c})
-                    elif now - self.states[tid]['start'] > 5.0:
+                    # 지정한 시간 이상 거의 움직이지 않고 ROI 안에 머물면 주정차로 본다.
+                    elif now - self.states[tid]['start'] > self.min_stop_sec:
                         triggered.append({
                             'tid': tid, 
                             'bbox': t[:4], 
@@ -214,6 +219,13 @@ class HelmetDetector(BaseEventDetector):
     required_models = ["helmet", "general"]
     roi_type = "none"
 
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        # 헬멧이 최근에 관측된 위치를 잠시 유지해, 조명/가림으로 HELMET가 순간 미탐되거나
+        # NO_HELMET가 순간 오탐된 경우에도 이벤트가 바로 발생하지 않도록 보호한다.
+        self.recent_helmet_hold_sec = float(config.get("recent_helmet_hold_sec", 1.0))
+        self.recent_helmet_evidence = deque()
+
     def _get_intersection_over_head_area(self, head_box, person_box):
         x1 = max(head_box[0], person_box[0])
         y1 = max(head_box[1], person_box[1])
@@ -229,10 +241,51 @@ class HelmetDetector(BaseEventDetector):
             return 0
         return inter_area / head_area
 
+    def _has_conflicting_helmet_detection(self, no_helmet_box, helmet_tracks, h_map):
+        # NO_HELMET와 거의 같은 위치에 HELMET도 함께 존재하면 모델 판단이 충돌한 상황으로 본다.
+        # 이 경우 즉시 이벤트를 발생시키지 않고 보류해 순간적인 이벤트 오탐을 줄인다.
+        for ht in helmet_tracks:
+            if h_map.get(int(ht[4])) != ID_H_HELMET:
+                continue
+            if self._get_intersection_over_head_area(no_helmet_box, ht[:4]) > 0.5:
+                return True
+            if self._get_intersection_over_head_area(ht[:4], no_helmet_box) > 0.5:
+                return True
+        return False
+
+    def _prune_recent_helmet_evidence(self, now):
+        while self.recent_helmet_evidence and (now - self.recent_helmet_evidence[0]['timestamp']) > self.recent_helmet_hold_sec:
+            self.recent_helmet_evidence.popleft()
+
+    def _remember_current_helmet_detections(self, helmet_tracks, h_map, now):
+        for ht in helmet_tracks:
+            if h_map.get(int(ht[4])) != ID_H_HELMET:
+                continue
+            # 현재 프레임의 HELMET 검출을 잠시 보관해, 다음 몇 프레임 동안 보호 증거로 사용한다.
+            self.recent_helmet_evidence.append({
+                'bbox': tuple(ht[:4]),
+                'timestamp': now
+            })
+
+    def _has_recent_helmet_evidence(self, no_helmet_box):
+        # 현재 프레임에 HELMET가 없더라도, 같은 위치에 최근 HELMET가 있었다면
+        # 순간적인 미탐/오탐 가능성을 우선 의심하고 no_helmet 이벤트를 보류한다.
+        for item in self.recent_helmet_evidence:
+            helmet_box = item['bbox']
+            if self._get_intersection_over_head_area(no_helmet_box, helmet_box) > 0.5:
+                return True
+            if self._get_intersection_over_head_area(helmet_box, no_helmet_box) > 0.5:
+                return True
+        return False
+
     def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
         triggered = []
         h_map = track_maps["helmet"]
         g_map = track_maps["general"]
+        now = time.time()
+
+        self._prune_recent_helmet_evidence(now)
+        self._remember_current_helmet_detections(helmet_tracks, h_map, now)
         
         no_helmets = [t for t in helmet_tracks if h_map.get(int(t[4])) == ID_H_NO_HELMET]
         persons = [t for t in general_tracks if g_map.get(int(t[4])) == ID_G_PERSON]
@@ -243,7 +296,17 @@ class HelmetDetector(BaseEventDetector):
                 ioa = self._get_intersection_over_head_area(nh[:4], p[:4])
                 if ioa > max_ioa:
                     max_ioa = ioa
-                    
+
+            # 사람과의 정합은 맞더라도, 같은 위치에 HELMET 검출이 함께 있으면
+            # 이벤트 단계에서는 보수적으로 no_helmet 경보를 막는다.
+            if self._has_conflicting_helmet_detection(nh[:4], helmet_tracks, h_map):
+                continue
+
+            # 현재 프레임 충돌이 없더라도, 같은 위치에 최근 HELMET 증거가 있었다면
+            # 조명/가림으로 인한 순간적인 NO_HELMET 오탐 가능성을 먼저 의심한다.
+            if self._has_recent_helmet_evidence(nh[:4]):
+                continue
+
             if max_ioa > 0.5:
                 triggered.append({
                     'tid': int(nh[4]), 
@@ -262,8 +325,18 @@ class SignalVehicleDetector(BaseEventDetector):
 
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.motion_threshold_ratio = 0.10
-        self.vehicle_history = defaultdict(lambda: deque(maxlen=30)) 
+        # signal_vehicle 판정 민감도는 이벤트 설정에서 조정할 수 있게 유지한다.
+        self.motion_threshold_ratio = float(config.get("motion_threshold_ratio", 0.10))
+        self.vehicle_history = defaultdict(lambda: deque(maxlen=30))
+        # 순간적인 검출 누락이나 motion 흔들림으로 즉시 오탐이 나지 않도록
+        # 차량별 조건 만족 횟수를 짧게 누적해 안정적으로 판정한다.
+        self.condition_hits = defaultdict(int)
+        self.min_condition_hits = int(config.get("min_condition_hits", 3))
+        self.max_condition_hits = int(config.get("max_condition_hits", 5))
+        # 차량이 신호수를 잠깐 가리는 경우를 고려해 "현재 프레임에 사람이 안 보임"이 아니라
+        # "최근 일정 시간 동안 차량 근처에서 사람을 보지 못함"을 기준으로 부재를 판단한다.
+        self.person_hold_sec = float(config.get("person_hold_sec", 1.5))
+        self.last_person_seen_ts = {}
 
     def _get_distance_point_to_rect(self, point, bbox):
         px, py = point
@@ -274,13 +347,13 @@ class SignalVehicleDetector(BaseEventDetector):
         triggered = []
         current_vehicle_ids = set()
         g_map = track_maps["general"]
+        now = time.time()
         
         if self.roi_poly.size == 0 or motion_mask is None:
             return triggered
-        
-        scale_x = 640 / SCREEN_WIDTH
-        scale_y = 360 / SCREEN_HEIGHT
+
         people_points = [get_center_point(*t[:4]) for t in general_tracks if g_map.get(int(t[4])) == ID_G_PERSON]
+        mask_h, mask_w = motion_mask.shape[:2]
         
         for t in general_tracks:
             tid = int(t[4])
@@ -293,30 +366,59 @@ class SignalVehicleDetector(BaseEventDetector):
             self.vehicle_history[tid].append(center)
             
             if len(self.vehicle_history[tid]) > 5 and get_distance(self.vehicle_history[tid][0], self.vehicle_history[tid][-1]) >= 40.0:
-                mx1 = max(0, int(x1 * scale_x))
-                my1 = max(0, int(y1 * scale_y))
-                mx2 = min(640, int(x2 * scale_x))
-                my2 = min(360, int(y2 * scale_y))
+                # motion_mask는 이미 detector 입력 프레임과 같은 640x360 좌표계다.
+                # 여기서 다시 SCREEN 기준으로 축소하면 차량 bbox와 다른 영역을 읽게 된다.
+                mx1 = max(0, int(x1))
+                my1 = max(0, int(y1))
+                mx2 = min(mask_w, int(x2))
+                my2 = min(mask_h, int(y2))
                 
                 if mx2 > mx1 and my2 > my1:
                     car_roi_mask = motion_mask[my1:my2, mx1:mx2]
                     _, motion_only = cv2.threshold(car_roi_mask, 250, 255, cv2.THRESH_BINARY)
                     total_pixels = (mx2 - mx1) * (my2 - my1)
-                    
-                    if total_pixels > 0 and (cv2.countNonZero(motion_only) / total_pixels) > self.motion_threshold_ratio:
-                        if cv2.pointPolygonTest(self.roi_poly, center, False) >= 0:
-                            safe_radius = y2 - y1
-                            if not any(self._get_distance_point_to_rect(pp, (x1, y1, x2, y2)) < safe_radius for pp in people_points):
-                                triggered.append({
-                                    'tid': tid, 
-                                    'bbox': t[:4], 
-                                    'frame': None, 
-                                    'fid': fid
-                                })
-                                
+                    motion_ratio = (cv2.countNonZero(motion_only) / total_pixels) if total_pixels > 0 else 0.0
+                    in_roi = cv2.pointPolygonTest(self.roi_poly, center, False) >= 0
+                    safe_radius = y2 - y1
+                    has_nearby_person = any(
+                        self._get_distance_point_to_rect(pp, (x1, y1, x2, y2)) < safe_radius
+                        for pp in people_points
+                    )
+                    if has_nearby_person:
+                        # 사람 박스가 검출된 순간의 시간을 기록해, 이후 잠깐 가려지는 구간에서도
+                        # 즉시 "신호수 없음"으로 뒤집히지 않도록 최근 목격 이력을 유지한다.
+                        self.last_person_seen_ts[tid] = now
+                    last_seen_ts = self.last_person_seen_ts.get(tid, 0.0)
+                    person_absent_long_enough = (now - last_seen_ts) > self.person_hold_sec
+
+                    condition_met = (
+                        motion_ratio > self.motion_threshold_ratio and
+                        in_roi and
+                        person_absent_long_enough
+                    )
+
+                    if condition_met:
+                        self.condition_hits[tid] = min(self.condition_hits[tid] + 1, self.max_condition_hits)
+                    else:
+                        # 한 프레임 실패했다고 바로 0으로 초기화하지 않고 완만히 감소시켜
+                        # 사람/모션 검출이 잠깐 흔들려도 경보 후보를 조금 더 안정적으로 유지한다.
+                        self.condition_hits[tid] = max(self.condition_hits[tid] - 1, 0)
+
+                    if self.condition_hits[tid] >= self.min_condition_hits:
+                        triggered.append({
+                            'tid': tid, 
+                            'bbox': t[:4], 
+                            'frame': None, 
+                            'fid': fid
+                        })
+
         for tid in list(self.vehicle_history.keys()):
             if tid not in current_vehicle_ids:
                 del self.vehicle_history[tid]
+                if tid in self.condition_hits:
+                    del self.condition_hits[tid]
+                if tid in self.last_person_seen_ts:
+                    del self.last_person_seen_ts[tid]
                 
         return triggered
 

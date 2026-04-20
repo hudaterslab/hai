@@ -430,8 +430,11 @@ class Camera:
             return
             
         cooldown_sec = self.event_config.get(event_name, {}).get('cooldown_sec', 600)
-        
-        if now - self.last_evt_t.get(event_name, 0) < cooldown_sec:
+
+        # illegal_parking은 동일 카메라의 다른 차량까지 함께 막지 않도록 차량 단위 cooldown을 적용한다.
+        # 다른 이벤트는 기존 동작을 유지해 event_name 기준 cooldown을 그대로 사용한다.
+        cooldown_key = (event_name, real_tid) if event_name == "illegal_parking" else event_name
+        if now - self.last_evt_t.get(cooldown_key, 0) < cooldown_sec:
             return
             
         bbox = event_bbox
@@ -462,7 +465,7 @@ class Camera:
         
         self.recorder.trigger(event_name)
         self.alerted[tid].add(event_name)
-        self.last_evt_t[event_name] = now
+        self.last_evt_t[cooldown_key] = now
 
     def draw(self, frame, helmet_tracks, general_tracks, alarms, connected=True):
         if frame is None or not connected:

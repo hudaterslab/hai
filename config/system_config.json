@@ -12,12 +12,15 @@
         },
         "illegal_parking": {
             "enabled": false,
-            "cooldown_sec": 600
+            "cooldown_sec": 600,
+            "stationary_distance_px": 30,
+            "min_stop_sec": 5.0
         },
         "no_helmet": {
             "enabled": false,
             "cooldown_sec": 600,
-            "blur_face": true
+            "blur_face": true,
+            "recent_helmet_hold_sec": 1.0
         },
         "conveyor_crossing": {
             "enabled": false,
@@ -30,7 +33,11 @@
         },
         "signal_vehicle": {
             "enabled": false,
-            "cooldown_sec": 600
+            "cooldown_sec": 600,
+            "motion_threshold_ratio": 0.10,
+            "min_condition_hits": 3,
+            "max_condition_hits": 5,
+            "person_hold_sec": 1.5
         }
     },
     "models": {
