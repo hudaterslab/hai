@@ -328,13 +328,17 @@ class KalmanBoxTracker:
         cx, cy = pred[0, 0], pred[1, 0]
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
 
-    def correct(self, bbox, conf):
+    def correct(self, bbox, conf, cls_id=None):
         cx = (bbox[0] + bbox[2]) / 2.0
         cy = (bbox[1] + bbox[3]) / 2.0
         self.w = bbox[2] - bbox[0]
         self.h = bbox[3] - bbox[1]
         self.kf.correct(np.array([[cx], [cy]], np.float32))
         self.conf = conf
+        # Track class를 최초 생성 시점 값으로 고정하면 오분류가 오래 남을 수 있다.
+        # 안전한 1차 수정으로, detection과 매칭된 프레임에서는 최신 class로만 갱신한다.
+        if cls_id is not None:
+            self.cls = int(cls_id)
         self.lost = 0
         
     def get_state(self):
@@ -346,6 +350,10 @@ class ByteTracker:
         self.track_thresh = track_thresh
         self.track_buffer = track_buffer
         self.match_thresh = match_thresh
+        # Low-confidence salvage 단계는 track continuity 회복이 목적이다.
+        # 기존 0.4는 1차 매칭(기본 0.2)보다 더 엄격해서 low box를 살리는 효과가 약했다.
+        # 안전하게 1차와 같은 수준으로 완화해 ID가 불필요하게 끊기는 빈도를 줄인다.
+        self.low_match_thresh = match_thresh
         self.is_helmet = is_helmet
         self.next_id = 1
         self.tracks = {}
@@ -395,13 +403,13 @@ class ByteTracker:
         matched_high, unmatched_dets_high, unmatched_trks = self._associate(dets_high, active_track_keys, self.match_thresh)
 
         for d_idx, tid in matched_high:
-            self.tracks[tid].correct(dets_high[d_idx][:4], dets_high[d_idx][4])
+            self.tracks[tid].correct(dets_high[d_idx][:4], dets_high[d_idx][4], dets_high[d_idx][5])
 
         # 3. Second Association: Low Confidence 객체를 남은 트래커와 매칭 (ByteTrack의 핵심)
-        matched_low, unmatched_dets_low, unmatched_trks_final = self._associate(dets_low, unmatched_trks, 0.4)
+        matched_low, unmatched_dets_low, unmatched_trks_final = self._associate(dets_low, unmatched_trks, self.low_match_thresh)
 
         for d_idx, tid in matched_low:
-            self.tracks[tid].correct(dets_low[d_idx][:4], dets_low[d_idx][4])
+            self.tracks[tid].correct(dets_low[d_idx][:4], dets_low[d_idx][4], dets_low[d_idx][5])
 
         # 4. 남은 트래커는 Lost 처리
         for tid in unmatched_trks_final:
