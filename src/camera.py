@@ -272,7 +272,7 @@ class VideoRecorder:
             self.thread.join(timeout=3.0)
 
 class Camera:
-    def __init__(self, ip, conf, face_engine, npu_id, cam_id, sensitivity):
+    def __init__(self, ip, conf, face_engine, npu_id, cam_id, sensitivity, tower_lamp=None):
         self.ip = ip
         self.conf = conf 
         self.reader = FrameReader(conf['url'], ip)
@@ -308,6 +308,7 @@ class Camera:
         self.config_lock = threading.Lock() 
         self.motion_det = MotionDetector(sensitivity)
         self.recorder = VideoRecorder(ip, self.terminal_id) 
+        self.tower_lamp = tower_lamp
         
         self.handlers = []
         self.init_handlers()
@@ -464,6 +465,9 @@ class Camera:
         )
         
         self.recorder.trigger(event_name)
+        # 이벤트가 최종 확정되었을 때만 타워램프를 울려, 인퍼런스 흔들림과 이벤트 경보를 분리한다.
+        if self.tower_lamp is not None:
+            self.tower_lamp.trigger_event(event_name)
         self.alerted[tid].add(event_name)
         self.last_evt_t[cooldown_key] = now
 

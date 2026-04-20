@@ -21,6 +21,7 @@ from event import EVENT_REGISTRY
 # 💡 [핵심] 이제 환경 독립적인 통합 VisionModel 클래스를 임포트합니다.
 from ai_core import VisionModelAsync, VisionModelSync, async_result_queue
 from camera import Camera
+from tower_lamp import TowerLampController
 
 logger = logging.getLogger("VMS_SYSTEM")
 
@@ -294,6 +295,7 @@ def main():
     try:
         sensitivity, use_display, use_drawing = prompt_runtime_options()
         config_manager = prepare_config_manager(rtsp_list)
+        tower_lamp = TowerLampController(config_manager.common_config)
 
         engines_h = [VisionModelAsync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn")) for _ in range(3)]
         engines_g = [VisionModelAsync(SYS_CFG.get("models", {}).get("GENERAL", "models/YOLOV8M-1.dxnn")) for _ in range(3)]
@@ -306,7 +308,7 @@ def main():
             conf = config_manager.get_config(ip)
             # 이벤트가 없어도 스트리밍은 띄울 수 있도록 조건 유연화 가능하나, 우선 기존 정책 유지
             if conf and conf.get('events'):
-                cams.append(Camera(ip, conf, face_engine, i % 3, len(cams) + 1, sensitivity))
+                cams.append(Camera(ip, conf, face_engine, i % 3, len(cams) + 1, sensitivity, tower_lamp=tower_lamp))
         
         if not cams:
             return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
@@ -381,6 +383,9 @@ def main():
                 if cv2.waitKey(1) == ord('q'):
                     break
 
+            # 이벤트 패턴은 즉시 켜고, 메인 루프에서 만료 시간을 지나면 자동으로 종료한다.
+            tower_lamp.update(time.time())
+
             sleep_time = dynamic_delay - (time.time() - start_time)
             if sleep_time > 0:
                 time.sleep(sleep_time)
@@ -391,6 +396,10 @@ def main():
         logger.error(f"예외 발생: {e}")
         traceback.print_exc()
     finally:
+        try:
+            tower_lamp.shutdown()
+        except Exception:
+            pass
         for c in cams:
             c.stop()
         cv2.destroyAllWindows()

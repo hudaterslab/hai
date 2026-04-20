@@ -68,6 +68,76 @@ def load_system_config():
             "GENERAL": "models/YOLOV8M-1.dxnn",
             "FACE": "models/YOLOV7_Face-1.dxnn"
         },
+        "tower_lamp": {
+            "enabled": False,
+            "host": "",
+            "port": 20000,
+            "timeout_sec": 2.0,
+            "reset_after_sec": 5.0,
+            "default_pattern": "default_alarm",
+            "patterns": {
+                "default_alarm": {
+                    "red": "BLINK",
+                    "yellow": "OFF",
+                    "green": "OFF",
+                    "blue": "OFF",
+                    "white": "OFF",
+                    "sound_channel": 0,
+                    "sound_group": 0,
+                    "hold_sec": 5.0
+                },
+                "signal_vehicle": {
+                    "red": "OFF",
+                    "yellow": "BLINK",
+                    "green": "OFF",
+                    "blue": "OFF",
+                    "white": "OFF",
+                    "sound_channel": 1,
+                    "sound_group": 0,
+                    "hold_sec": 5.0
+                },
+                "illegal_parking": {
+                    "red": "ON",
+                    "yellow": "OFF",
+                    "green": "OFF",
+                    "blue": "OFF",
+                    "white": "OFF",
+                    "sound_channel": 2,
+                    "sound_group": 0,
+                    "hold_sec": 5.0
+                },
+                "conveyor_crossing": {
+                    "red": "BLINK",
+                    "yellow": "OFF",
+                    "green": "OFF",
+                    "blue": "ON",
+                    "white": "OFF",
+                    "sound_channel": 3,
+                    "sound_group": 0,
+                    "hold_sec": 5.0
+                },
+                "no_helmet": {
+                    "red": "BLINK",
+                    "yellow": "OFF",
+                    "green": "OFF",
+                    "blue": "OFF",
+                    "white": "ON",
+                    "sound_channel": 4,
+                    "sound_group": 0,
+                    "hold_sec": 5.0
+                },
+                "intrusion": {
+                    "red": "BLINK",
+                    "yellow": "BLINK",
+                    "green": "OFF",
+                    "blue": "OFF",
+                    "white": "OFF",
+                    "sound_channel": 5,
+                    "sound_group": 0,
+                    "hold_sec": 5.0
+                }
+            }
+        },
         "SKIP_FRAMES": 4,
         "REC_FPS": 30,
         "REC_PRE_SEC": 3,
