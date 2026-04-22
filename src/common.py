@@ -24,10 +24,6 @@ warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 logger = logging.getLogger("VMS_SYSTEM")
 
-# ==========================================
-# 💡 [핵심 해결] 프로젝트 절대 경로 동적 계산
-# common.py 파일의 위치(src/)를 기준으로 한 단계 상위 디렉터리(hai/)를 루트로 고정합니다.
-# ==========================================
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 CONFIG_COMMON_FILE = os.path.join(PROJECT_ROOT, "config", "system_config.json")
@@ -85,6 +81,12 @@ def load_system_config():
             "GENERAL": "models/YOLOV8M-1.dxnn",
             "FACE": "models/YOLOV8M-Face.dxnn"
         },
+        # 💡 [핵심] 사용자가 직접 민감도를 제어할 수 있도록 초기값 세팅 보장
+        "model_confidences": {
+            "HELMET": 0.50,
+            "GENERAL": 0.50,
+            "FACE": 0.35
+        },
         "SKIP_FRAMES": 4,
         "REC_FPS": 30,
         "REC_PRE_SEC": 3,
@@ -125,7 +127,6 @@ def _log_nas_sync_worker(terminal_id, log_dir):
             pass
 
 def setup_logging(common_conf):
-    # 로그 경로도 절대 경로로 하드닝
     raw_log_dir = str(common_conf.get("logging", {}).get("dir", os.path.join(PROJECT_ROOT, "logs")))
     log_dir = raw_log_dir if os.path.isabs(raw_log_dir) else os.path.join(PROJECT_ROOT, raw_log_dir)
     

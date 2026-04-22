@@ -128,7 +128,12 @@ class CrossingDetector(BaseEventDetector):
             if g_map.get(tid) != ID_G_PERSON: 
                 continue
                 
-            curr_pos, obj_height, x1, y1, x2, y2 = get_foot_point(*t[:4]), t[3] - t[1], *t[:4]
+            x1, y1, x2, y2 = t[:4]
+            # 💡 [핵심 해결] 가림 현상 방어: 2/3 지점이 아닌 실제 박스 가장 하단부(허리/골반)를 횡단의 기준점으로 삼습니다.
+            curr_pos = (int((x1 + x2) / 2), int(y2))
+            
+            obj_height = y2 - y1
+            obj_width = max(1, x2 - x1)
             is_frame_out = (x1 <= 15) or (x2 >= SCREEN_WIDTH - 15) or (y1 <= 15) or (y2 >= SCREEN_HEIGHT - 15)
             
             if tid in self.prev and tid not in self.candidates:
@@ -143,11 +148,21 @@ class CrossingDetector(BaseEventDetector):
                         
             if tid in self.candidates:
                 cand = self.candidates[tid]
-                moved_dist, size_change_ratio = get_distance(cand['crossing_pt'], curr_pos), abs(obj_height - cand['height']) / max(cand['height'], 1)
+                moved_dist = get_distance(cand['crossing_pt'], curr_pos)
+                aspect_ratio = obj_height / obj_width
+                
+                # 💡 [Anti-Leaning 로직] 컨베이어 벨트에 가려져 비율이 정사각형에 가깝게 무너지면(AR < 1.2) 단순 상체 쏠림 작업으로 판단하고 무시합니다.
+                if aspect_ratio < 1.2:
+                    self.prev[tid] = curr_pos
+                    continue
+                
                 direction_ok = (cand['entry_side'] != 0 and ccw(cand['line'][0], cand['line'][1], curr_pos) != 0 and cand['entry_side'] * ccw(cand['line'][0], cand['line'][1], curr_pos) < 0) if self.direction_check else True
                 
                 if direction_ok:
-                    if moved_dist > max(min(cand['height'], obj_height) * self.distance_ratio, self.min_distance_px) or is_frame_out or size_change_ratio > 0.15:
+                    # 박스가 가려져 극단적으로 작아졌을 때 임계값마저 낮아지는 것을 막기 위해 최소 이동 거리를 40px로 고정
+                    dynamic_threshold = max(40.0, obj_height * self.distance_ratio)
+                    
+                    if moved_dist > dynamic_threshold or is_frame_out:
                         triggered.append({'tid': tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
                         del self.candidates[tid]
                 elif now - cand['timestamp'] > self.candidate_ttl_sec: 
@@ -232,12 +247,10 @@ class SignalVehicleDetector(BaseEventDetector):
             foot_center = get_foot_point(x1, y1, x2, y2)
             vehicle_size = max(x2 - x1, y2 - y1)
             
-            # 💡 [핵심 해결] 고정 픽셀(60px) 대신 차량 크기의 60%를 초과하는 비상식적인 점프만 텔레포트로 간주
             if len(self.vehicle_history[tid]) > 0:
                 prev_foot = self.vehicle_history[tid][-1]
                 dynamic_jump_threshold = max(60.0, vehicle_size * 0.6)
                 
-                # 1프레임만에 임계값 이상 점프하면 트래킹 에러이므로 히스토리 초기화
                 if get_distance(prev_foot, foot_center) > dynamic_jump_threshold:
                     self.vehicle_history[tid].clear()
                     continue

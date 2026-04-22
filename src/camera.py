@@ -229,8 +229,15 @@ class Camera:
         self.cam_id = cam_id 
         self.latest_npu = {'h': None, 'g': None}
         self.last_submit_fid = -1
-        self.helmet_tracker = ByteTracker(is_helmet=True)
-        self.general_tracker = ByteTracker(is_helmet=False)
+        
+        # 💡 [핵심] JSON 설정값의 모델 민감도를 ByteTracker에 동적 주입 (Data Binding)
+        hel_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.50)
+        gen_conf = SYS_CFG.get("model_confidences", {}).get("GENERAL", 0.50)
+        self.face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
+        
+        self.helmet_tracker = ByteTracker(track_thresh=hel_conf, is_helmet=True)
+        self.general_tracker = ByteTracker(track_thresh=gen_conf, is_helmet=False)
+        
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
         self.visual_alarms = {}
@@ -261,7 +268,8 @@ class Camera:
             return image
         try:
             for fx1, fy1, fx2, fy2, fscore, _ in self.face_detector.infer(image):
-                if fscore <= 0.3: 
+                # 💡 JSON 설정값(face_conf)과 동적 연동
+                if fscore <= self.face_conf: 
                     continue
                 fx1 = max(0, int(fx1))
                 fy1 = max(0, int(fy1))
@@ -315,8 +323,6 @@ class Camera:
 
     def _trigger_event(self, frame, frame_id, tid, event_name, tracks, now, event_frame=None, event_bbox=None, event_fid=None):
         real_tid = tid if tid < 10000 else tid - 10000
-        
-        # 💡 [핵심 원인 수정] 쿨다운 초기값을 -999999(과거)로 설정하여 첫 번째 이벤트가 차단당하는 논리적 버그 해결
         if event_name in self.alerted[tid] or now - self.last_evt_t.get(event_name, -999999) < self.event_config.get(event_name, {}).get('cooldown_sec', 600): 
             return
             

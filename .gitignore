@@ -12,7 +12,7 @@ CCTV_EVENT_ALERT/events
 
 # Local runtime/config files
 cameras.csv
-cctv_config.json
+config
 #config/*.json
 #!config/*.sample.json
 logs/
