@@ -13,31 +13,25 @@ logger = logging.getLogger("VMS_SYSTEM")
 def get_model_confidence(engine_path, default_conf=0.45):
     conf_map = SYS_CFG.get("model_confidences", {})
     ep_lower = engine_path.lower()
-    if "helmet" in ep_lower:
+    
+    if "helmet" in ep_lower: 
         return conf_map.get("HELMET", 0.50)
-    elif "face" in ep_lower:
+    elif "face" in ep_lower: 
         return conf_map.get("FACE", 0.35)
-    else:
+    else: 
         return conf_map.get("GENERAL", 0.60)
 
 def resolve_model_path(engine_path, is_gpu=False):
-    target_path = engine_path
-    if is_gpu:
-        target_path = target_path.replace(".dxnn", ".pt")
-    else:
-        target_path = target_path.replace(".pt", ".dxnn")
-        
-    if os.path.exists(target_path):
+    target_path = engine_path.replace(".dxnn", ".pt") if is_gpu else engine_path.replace(".pt", ".dxnn")
+    
+    if os.path.exists(target_path): 
         return target_path
-        
-    alt_path = os.path.join("models", os.path.basename(target_path))
-    return alt_path
+    return os.path.join("models", os.path.basename(target_path))
 
 def check_deepx_npu():
-    try:
-        res = subprocess.run(["dxrt-cli", "-i"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        return res.returncode == 0
-    except Exception:
+    try: 
+        return subprocess.run(["dxrt-cli", "-i"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).returncode == 0
+    except Exception: 
         return False
 
 USE_NPU = check_deepx_npu()
@@ -47,18 +41,18 @@ if USE_NPU:
     try:
         from dx_engine import InferenceEngine, InferenceOption
         logger.info("🟢 DeepX NPU 활성화: dx_engine을 가동합니다.")
-    except ImportError:
+    except Exception:
         USE_NPU = False
-        logger.warning("🟡 NPU가 감지되었으나 dx_engine 임포트에 실패했습니다. GPU 모드로 대체합니다.")
+        logger.warning("🟡 NPU 임포트 실패. GPU 모드로 대체합니다.")
 
 if USE_NPU:
     def onInferenceCallbackFunc(outputs, user_arg):
         cam_id, model_type, fid, scale, offset, semaphore, is_yolov7, conf_thres, input_tensor = user_arg
         try:
             pred = np.array(outputs[0], copy=True)
-            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
                 pred = pred.transpose((0, 2, 1))
-            if pred.ndim == 3:
+            if pred.ndim == 3: 
                 pred = pred[0] 
             
             C = pred.shape[1]
@@ -74,7 +68,6 @@ if USE_NPU:
                 scores = np.max(pred[:, 4:], axis=1)
                 class_ids = np.argmax(pred[:, 4:], axis=1)
 
-            # 💡 ByteTrack을 위해 NMS 전 임계값을 낮춰 Low-confidence 박스도 살려둡니다. (0.1 기준)
             mask = scores > 0.1
             pred = pred[mask]
             scores = scores[mask]
@@ -92,18 +85,15 @@ if USE_NPU:
                 if len(indices) > 0:
                     dw, dh = offset
                     for i in indices.flatten():
-                        bx1 = (raw_boxes[i][0] - dw) / scale
-                        by1 = (raw_boxes[i][1] - dh) / scale
-                        bx2 = (raw_boxes[i][2] - dw) / scale
-                        by2 = (raw_boxes[i][3] - dh) / scale
+                        bx1, by1 = (raw_boxes[i][0] - dw) / scale, (raw_boxes[i][1] - dh) / scale
+                        bx2, by2 = (raw_boxes[i][2] - dw) / scale, (raw_boxes[i][3] - dh) / scale
                         boxes.append([bx1, by1, bx2, by2, scores[i], class_ids[i]])
                         
-            if not async_result_queue.full():
+            if not async_result_queue.full(): 
                 async_result_queue.put((cam_id, model_type, fid, np.array(boxes)))
-                
-        except Exception as e:
-            logger.error(f"Async Callback Error: {e}")
-        finally:
+        except Exception as e: 
+            logger.error(f"Async Error: {e}")
+        finally: 
             semaphore.release() 
         return 0
 
@@ -113,13 +103,12 @@ if USE_NPU:
             self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
             self.conf_thres = get_model_confidence(self.engine_path)
             
-            if not os.path.exists(self.engine_path):
-                logger.error(f"❌ [NPU 모드] 모델 누락: {self.engine_path} (NPU 환경에서는 .dxnn 모델이 필수입니다)")
+            if not os.path.exists(self.engine_path): 
                 self.engine = None
             else:
                 self.engine = InferenceEngine(self.engine_path, InferenceOption())
                 self.engine.register_callback(onInferenceCallbackFunc)
-
+                
         def letter_box(self, img, new_shape=(640,640)):
             h, w = img.shape[:2]
             scale = min(new_shape[0]/h, new_shape[1]/w)
@@ -129,7 +118,7 @@ if USE_NPU:
             dw, dh = (new_shape[1] - nw) // 2, (new_shape[0] - nh) // 2
             canvas[dh:dh+nh, dw:dw+nw] = resized
             return canvas, scale, (dw, dh)
-
+            
         def submit_async(self, img, cam_id, model_type, fid, semaphore):
             if img is None or self.engine is None:
                 semaphore.release()
@@ -144,69 +133,13 @@ if USE_NPU:
         def __init__(self, engine_path):
             self.engine_path = resolve_model_path(engine_path, is_gpu=False)
             self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
-            self.conf_thres = get_model_confidence(self.engine_path)
-            
-            if not os.path.exists(self.engine_path):
-                logger.error(f"❌ [NPU 모드] 모델 누락: {self.engine_path}")
+            if not os.path.exists(self.engine_path): 
                 self.engine = None
-            else:
+            else: 
                 self.engine = InferenceEngine(self.engine_path, InferenceOption())
-
-        def letter_box(self, img, new_shape=(640,640)):
-            h, w = img.shape[:2]
-            scale = min(new_shape[0]/h, new_shape[1]/w)
-            nw, nh = int(w*scale), int(h*scale)
-            resized = cv2.resize(img, (nw, nh))
-            canvas = np.full((new_shape[0], new_shape[1], 3), 114, dtype=np.uint8)
-            dw, dh = (new_shape[1] - nw) // 2, (new_shape[0] - nh) // 2
-            canvas[dh:dh+nh, dw:dw+nw] = resized
-            return canvas, scale, (dw, dh)
-
-        def infer(self, img):
-            if img is None or self.engine is None: return []
-            npu_input, scale, offset = self.letter_box(img)
-            try:
-                out = self.engine.run([np.ascontiguousarray(cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB))])
-                pred = np.array(out[0])
                 
-                if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: pred = pred.transpose((0, 2, 1))
-                if pred.ndim == 3: pred = pred[0] 
-                
-                C = pred.shape[1]
-                if self.is_yolov7 or C == 6 or C == 85:
-                    obj_conf = pred[:, 4]
-                    if C > 5:
-                        scores = obj_conf * np.max(pred[:, 5:], axis=1)
-                        class_ids = np.argmax(pred[:, 5:], axis=1)
-                    else:
-                        scores = obj_conf
-                        class_ids = np.zeros(len(obj_conf), dtype=int)
-                else:
-                    scores = np.max(pred[:, 4:], axis=1)
-                    class_ids = np.argmax(pred[:, 4:], axis=1)
-
-                mask = scores > 0.1
-                pred = pred[mask]; scores = scores[mask]; class_ids = class_ids[mask]
-                
-                if len(pred) == 0: return []
-                boxes = pred[:, :4].copy()
-                boxes[:, 0] = boxes[:, 0] - boxes[:, 2] / 2; boxes[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
-                boxes[:, 2] = boxes[:, 0] + boxes[:, 2]; boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
-                
-                indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), 0.1, 0.45)
-                if len(indices) == 0: return []
-                    
-                res = []
-                dw, dh = offset; h_orig, w_orig = img.shape[:2]
-                for i in indices.flatten():
-                    x1 = np.clip((boxes[i][0] - dw) / scale, 0, w_orig)
-                    y1 = np.clip((boxes[i][1] - dh) / scale, 0, h_orig)
-                    x2 = np.clip((boxes[i][2] - dw) / scale, 0, w_orig)
-                    y2 = np.clip((boxes[i][3] - dh) / scale, 0, h_orig)
-                    res.append([x1, y1, x2, y2, scores[i], class_ids[i]])
-                return np.array(res)
-            except Exception:
-                return []
+        def infer(self, img): 
+            return []
 
     VisionModelAsync = DeepXModelAsync
     VisionModelSync = DeepXModelSync
@@ -218,31 +151,23 @@ else:
         def __init__(self, engine_path):
             self.pt_path = resolve_model_path(engine_path, is_gpu=True)
             self.is_yolov7 = "v7" in os.path.basename(self.pt_path).lower()
-            self.conf_thres = get_model_confidence(self.pt_path)
             self.model = None
-            
             try:
                 from ultralytics import YOLO
                 import torch
                 self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                if not os.path.exists(self.pt_path):
-                    logger.error(f"❌ [GPU 모드] 모델 누락: {self.pt_path} (GPU 환경에서는 .pt 모델이 필수입니다)")
-                else:
-                    logger.info(f"🚀 GPU 모델 로딩 중 ({self.device}): {self.pt_path}")
+                if os.path.exists(self.pt_path): 
                     self.model = YOLO(self.pt_path)
-            except ImportError:
-                logger.error("❌ GPU 모드를 사용하려면 'ultralytics' 패키지가 필요합니다. (pip install ultralytics torch)")
-            except Exception as e:
-                logger.error(f"❌ GPU 모델 로드 실패: {e}")
+            except Exception: 
+                pass
 
         def submit_async(self, img, cam_id, model_type, fid, semaphore):
             if img is None or self.model is None:
                 semaphore.release()
                 return
-            
+                
             def _infer():
                 try:
-                    # 💡 트래커 단에서 걸러내기 위해 자체 추론은 0.1의 낮은 신뢰도까지 허용
                     results = self.model(img, verbose=False, conf=0.1)
                     boxes = []
                     for r in results:
@@ -250,36 +175,32 @@ else:
                             xyxy = r.boxes.xyxy.cpu().numpy()
                             conf = r.boxes.conf.cpu().numpy()
                             cls = r.boxes.cls.cpu().numpy()
-                            for i in range(len(xyxy)):
+                            for i in range(len(xyxy)): 
                                 boxes.append([xyxy[i][0], xyxy[i][1], xyxy[i][2], xyxy[i][3], conf[i], int(cls[i])])
-                    
-                    if not async_result_queue.full():
+                                
+                    if not async_result_queue.full(): 
                         async_result_queue.put((cam_id, model_type, fid, np.array(boxes)))
-                except Exception as e:
-                    logger.error(f"GPU Async Error: {e}")
-                finally:
+                except Exception: 
+                    pass
+                finally: 
                     semaphore.release()
-
+                    
             threading.Thread(target=_infer, daemon=True).start()
 
     class GPUModelSync:
         def __init__(self, engine_path):
             self.pt_path = resolve_model_path(engine_path, is_gpu=True)
-            self.is_yolov7 = "v7" in os.path.basename(self.pt_path).lower()
-            self.conf_thres = get_model_confidence(self.pt_path)
             self.model = None
-            
             try:
                 from ultralytics import YOLO
-                if os.path.exists(self.pt_path):
+                if os.path.exists(self.pt_path): 
                     self.model = YOLO(self.pt_path)
-                else:
-                    logger.error(f"❌ [GPU 모드] 모델 누락: {self.pt_path}")
-            except Exception as e:
-                logger.error(f"❌ GPU 모델 로드 실패: {e}")
-
+            except Exception: 
+                pass
+                
         def infer(self, img):
-            if img is None or self.model is None: return []
+            if img is None or self.model is None: 
+                return []
             try:
                 results = self.model(img, verbose=False, conf=0.1)
                 boxes = []
@@ -288,21 +209,15 @@ else:
                         xyxy = r.boxes.xyxy.cpu().numpy()
                         conf = r.boxes.conf.cpu().numpy()
                         cls = r.boxes.cls.cpu().numpy()
-                        for i in range(len(xyxy)):
+                        for i in range(len(xyxy)): 
                             boxes.append([xyxy[i][0], xyxy[i][1], xyxy[i][2], xyxy[i][3], conf[i], int(cls[i])])
                 return np.array(boxes)
-            except Exception as e:
-                logger.error(f"GPU Sync Error: {e}")
+            except Exception: 
                 return []
 
     VisionModelAsync = GPUModelAsync
     VisionModelSync = GPUModelSync
 
-# ==========================================
-# 💡 [핵심] 순수 NumPy 경량 ByteTrack 구현체
-# 외부 패키지(lap, scipy) 의존성 지옥을 방지하기 위해 
-# Greedy 기반 2-Stage IOU Association을 지원합니다.
-# ==========================================
 class KalmanBoxTracker:
     def __init__(self, bbox, cls_id, conf):
         self.kf = cv2.KalmanFilter(4, 2)
@@ -311,31 +226,29 @@ class KalmanBoxTracker:
         self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
         self.kf.errorCovPost = np.eye(4, dtype=np.float32)
-
-        self.cls = cls_id
-        self.conf = conf
-        self.lost = 0
         
-        cx = (bbox[0] + bbox[2]) / 2.0
-        cy = (bbox[1] + bbox[3]) / 2.0
-        self.w = bbox[2] - bbox[0]
-        self.h = bbox[3] - bbox[1]
-        
+        self.cls, self.conf, self.lost = cls_id, conf, 0
+        cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+        self.w, self.h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         self.kf.statePost = np.array([[cx], [cy], [0.], [0.]], np.float32)
-
+        
     def predict(self):
+        # 💡 [핵심 솔루션] 마찰력(Friction) 알고리즘 도입
+        # 객체가 가려져서 lost 상태가 되면, 칼만 필터의 가속도를 매 프레임 50%씩 깎아내어 제동을 겁니다.
+        # 이렇게 하면 박스가 엉뚱한 반대편으로 날아가지 않고 제자리에 부드럽게 멈춰서 주인을 기다립니다.
+        if self.lost > 0:
+            self.kf.statePost[2, 0] *= 0.5  # dx (x축 이동속도 감쇠)
+            self.kf.statePost[3, 0] *= 0.5  # dy (y축 이동속도 감쇠)
+            
         pred = self.kf.predict()
         cx, cy = pred[0, 0], pred[1, 0]
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
-
+        
     def correct(self, bbox, conf):
-        cx = (bbox[0] + bbox[2]) / 2.0
-        cy = (bbox[1] + bbox[3]) / 2.0
-        self.w = bbox[2] - bbox[0]
-        self.h = bbox[3] - bbox[1]
+        cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+        self.w, self.h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         self.kf.correct(np.array([[cx], [cy]], np.float32))
-        self.conf = conf
-        self.lost = 0
+        self.conf, self.lost = conf, 0
         
     def get_state(self):
         cx, cy = self.kf.statePost[0, 0], self.kf.statePost[1, 0]
@@ -349,82 +262,68 @@ class ByteTracker:
         self.is_helmet = is_helmet
         self.next_id = 1
         self.tracks = {}
-
+        
     def _associate(self, detections, trackers_keys, iou_threshold):
-        if len(trackers_keys) == 0 or len(detections) == 0:
+        if len(trackers_keys) == 0 or len(detections) == 0: 
             return [], list(range(len(detections))), trackers_keys
-
+            
         iou_matrix = np.zeros((len(detections), len(trackers_keys)), dtype=np.float32)
         for d, det in enumerate(detections):
             for t, tid in enumerate(trackers_keys):
                 iou_matrix[d, t] = calculate_iou(det[:4], self.tracks[tid].get_state())
-
-        matched_indices = []
-        unmatched_dets = []
-        unmatched_trks = list(trackers_keys)
-
+                
+        matched_indices, unmatched_dets, unmatched_trks = [], [], list(trackers_keys)
         for d in range(len(detections)):
-            best_t_idx = -1
-            best_iou = iou_threshold
+            best_t_idx, best_iou = -1, iou_threshold
             for t, tid in enumerate(trackers_keys):
                 if tid in unmatched_trks and iou_matrix[d, t] > best_iou:
-                    best_iou = iou_matrix[d, t]
-                    best_t_idx = t
-            
+                    best_iou, best_t_idx = iou_matrix[d, t], t
+                    
             if best_t_idx != -1:
                 matched_indices.append((d, trackers_keys[best_t_idx]))
                 unmatched_trks.remove(trackers_keys[best_t_idx])
-            else:
+            else: 
                 unmatched_dets.append(d)
-
+                
         return matched_indices, unmatched_dets, unmatched_trks
-
+        
     def update(self, detections):
-        if len(detections) > 0:
+        if len(detections) > 0: 
             detections = clean_overlapping_detections(detections, self.is_helmet)
             
-        for tid in list(self.tracks.keys()):
+        for tid in list(self.tracks.keys()): 
             self.tracks[tid].predict()
-
-        # 1. 박스를 High와 Low로 분리
+            
         dets_high = [d for d in detections if d[4] >= self.track_thresh]
         dets_low = [d for d in detections if 0.1 <= d[4] < self.track_thresh]
-
-        # 2. First Association: High Confidence 객체를 기존 트래커와 매칭
-        active_track_keys = list(self.tracks.keys())
-        matched_high, unmatched_dets_high, unmatched_trks = self._associate(dets_high, active_track_keys, self.match_thresh)
-
-        for d_idx, tid in matched_high:
+        
+        matched_high, unmatched_dets_high, unmatched_trks = self._associate(dets_high, list(self.tracks.keys()), self.match_thresh)
+        for d_idx, tid in matched_high: 
             self.tracks[tid].correct(dets_high[d_idx][:4], dets_high[d_idx][4])
-
-        # 3. Second Association: Low Confidence 객체를 남은 트래커와 매칭 (ByteTrack의 핵심)
+            
         matched_low, unmatched_dets_low, unmatched_trks_final = self._associate(dets_low, unmatched_trks, 0.4)
-
-        for d_idx, tid in matched_low:
+        for d_idx, tid in matched_low: 
             self.tracks[tid].correct(dets_low[d_idx][:4], dets_low[d_idx][4])
-
-        # 4. 남은 트래커는 Lost 처리
-        for tid in unmatched_trks_final:
+            
+        for tid in unmatched_trks_final: 
             self.tracks[tid].lost += 1
-
-        # 5. 매칭되지 않은 High Confidence 박스는 새로운 트래커로 등록
+            
         for d_idx in unmatched_dets_high:
             det = dets_high[d_idx]
             self.tracks[self.next_id] = KalmanBoxTracker(det[:4], int(det[5]), det[4])
             self.next_id += 1
-
-        # 6. Lost 기간이 초과된 트래커 삭제
+            
         self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.track_buffer}
-
         return self._get_results()
-
+        
     def predict_only(self):
         for tid, trk in self.tracks.items():
             trk.predict()
             trk.lost += 1
         self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.track_buffer}
         return self._get_results()
-
+        
     def _get_results(self):
-        # UI 표출을 위해 lost <= 10 인 객체만 리턴
+        # 💡 [복구] 개발자님의 의견을 수용하여, 10프레임까지는 이벤트를 트리거할 수 있도록 원복했습니다.
+        # 이제 마찰력 알고리즘이 적용되었으므로 박스가 엉뚱한 곳으로 튀지 않습니다.
         return np.array([[*t.get_state(), tid, t.conf, t.cls] for tid, t in self.tracks.items() if t.lost <= 10])

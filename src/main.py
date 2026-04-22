@@ -18,7 +18,6 @@ from common import (SYS_CFG, CAMERA_LIST_FILE, CONFIG_COMMON_FILE, CONFIG_CAMERA
                     BATCH_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, setup_logging, load_rtsp_list_from_csv)
 from event import EVENT_REGISTRY
 
-# 💡 [핵심] 이제 환경 독립적인 통합 VisionModel 클래스를 임포트합니다.
 from ai_core import VisionModelAsync, VisionModelSync, async_result_queue
 from camera import Camera
 
@@ -148,7 +147,6 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
             cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
             cv2.putText(mosaic, str(idx + 1), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
             
-        # 💡 [핵심] 창 크기가 작게 나오는 문제를 방지하기 위해 WINDOW_NORMAL 적용 및 크기 강제 설정
         cv2.namedWindow("Select Cameras", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Select Cameras", 1280, 720)
         cv2.imshow("Select Cameras", mosaic)
@@ -174,7 +172,6 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
             ratio = 960 / width
             preview = cv2.resize(frame, (960, int(height * ratio)))
             
-            # 💡 [핵심] 개별 카메라 확인 창도 명시적으로 크기 지정
             win_name = "Camera Check"
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(win_name, 960, int(height * ratio))
@@ -211,7 +208,6 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
                     if input("    라인 추가? (y/n): ") != 'y':
                         break
             
-            # 기존 cctv_id 수동 입력 부분 제거 (아래에서 일괄 자동 처리됨)
             config_manager.set_config(ip, {
                 "url": url, 
                 "roi_poly_norm": roi_p, 
@@ -243,7 +239,6 @@ def prompt_runtime_options():
 def prepare_config_manager(rtsp_list):
     config_manager = ConfigManager(CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE)
     
-    # 💡 [핵심] rtsp_list에 있는 URL들을 json에 자동 병합 및 등록
     added_new = False
     for url in rtsp_list:
         ip = extract_ip(url)
@@ -256,7 +251,6 @@ def prepare_config_manager(rtsp_list):
             }
             added_new = True
 
-    # 💡 [핵심] cctv_id 1번부터 순차적으로 자동 부여
     for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
         config_manager.camera_configs[ip]["cctv_id"] = idx
         
@@ -265,11 +259,9 @@ def prepare_config_manager(rtsp_list):
         config_manager.config = config_manager.build_runtime_config()
         logger.info("✅ 새로운 RTSP 주소가 감지되어 자동으로 cameras.json에 등록 및 ID 번호 부여가 완료되었습니다.")
 
-    # 마법사 실행 여부는 선택사항으로 변경
     val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
     if val_setup == 'y':
         run_wizard_batch_mode(config_manager, rtsp_list)
-        # 마법사 종료 후 다시 한번 ID 정렬 보장
         for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
             config_manager.camera_configs[ip]["cctv_id"] = idx
         config_manager.save()
@@ -297,14 +289,13 @@ def main():
 
         engines_h = [VisionModelAsync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn")) for _ in range(3)]
         engines_g = [VisionModelAsync(SYS_CFG.get("models", {}).get("GENERAL", "models/YOLOV8M-1.dxnn")) for _ in range(3)]
-        face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/YOLOV7_Face-1.dxnn")) 
+        face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.dxnn")) 
         
         npu_semaphore = threading.Semaphore(18) 
 
         for i, rtsp in enumerate(rtsp_list):
             ip = extract_ip(rtsp)
             conf = config_manager.get_config(ip)
-            # 이벤트가 없어도 스트리밍은 띄울 수 있도록 조건 유연화 가능하나, 우선 기존 정책 유지
             if conf and conf.get('events'):
                 cams.append(Camera(ip, conf, face_engine, i % 3, len(cams) + 1, sensitivity))
         
@@ -314,6 +305,10 @@ def main():
         target_fps = SYS_CFG.get("REC_FPS", 30)
         dynamic_delay = 1.0 / target_fps
         loop_count = 0 
+        
+        # 💡 [핵심] Queue 병목 방지를 위한 상태 딕셔너리 (Lag 0초 보장)
+        pending_frames = {i: {'h': False, 'g': False} for i in range(len(cams))}
+        latest_applied_fid = {i: {'h': -1, 'g': -1} for i in range(len(cams))}
         
         logger.info("모니터링 시작 (종료: Ctrl+C 또는 'q')")
         
@@ -344,9 +339,13 @@ def main():
                         run_helmet = any("helmet" in h.required_models for h in c.handlers)
                         run_general = any("general" in h.required_models for h in c.handlers)
                         
-                        if run_helmet and npu_semaphore.acquire(blocking=False):
+                        # 💡 [핵심] 이전 결과가 리턴되지 않았다면 쿨하게 스킵 (지연시간 완전 차단)
+                        if run_helmet and not pending_frames[i]['h'] and npu_semaphore.acquire(blocking=False):
+                            pending_frames[i]['h'] = True
                             engines_h[engine_idx].submit_async(fr, i, "h", fid, npu_semaphore)
-                        if run_general and npu_semaphore.acquire(blocking=False):
+                            
+                        if run_general and not pending_frames[i]['g'] and npu_semaphore.acquire(blocking=False):
+                            pending_frames[i]['g'] = True
                             engines_g[engine_idx].submit_async(fr, i, "g", fid, npu_semaphore)
                             
                     c.last_submit_fid = fid
@@ -354,7 +353,12 @@ def main():
             while not async_result_queue.empty():
                 try:
                     c_id, model_type, res_fid, boxes = async_result_queue.get_nowait()
-                    cams[c_id].latest_npu[model_type] = boxes
+                    # 결과 도착 시 락 해제
+                    pending_frames[c_id][model_type] = False
+                    
+                    if res_fid > latest_applied_fid[c_id][model_type]:
+                        latest_applied_fid[c_id][model_type] = res_fid
+                        cams[c_id].latest_npu[model_type] = boxes
                 except queue.Empty:
                     break
 
@@ -365,7 +369,7 @@ def main():
                     if use_display and use_drawing:
                         final_imgs.append(c.draw(None, [], [], {}, connected=False))
                 else:
-                    c.recorder.update(frame)
+                    c.recorder.update(frame, fid)
                     t_h, t_g, alarms = c.run_logic(frame, fid)
                     
                     if use_display:
@@ -386,15 +390,17 @@ def main():
                 time.sleep(sleep_time)
 
     except KeyboardInterrupt:
-        logger.info("모니터링 중단.")
+        logger.info("모니터링 중단 (사용자 요청).")
     except Exception as e:
         logger.error(f"예외 발생: {e}")
         traceback.print_exc()
     finally:
+        logger.info("시스템 자원을 정리하고 안전하게 종료합니다...")
         for c in cams:
             c.stop()
         cv2.destroyAllWindows()
-        logger.info("[종료 완료]")
+        # 💡 [핵심] 스레드와 PyTorch 텐서가 엉키면서 발생하는 134 에러를 방지하는 명시적 강제 종료
+        os._exit(0)
 
 if __name__ == "__main__":
     main()
