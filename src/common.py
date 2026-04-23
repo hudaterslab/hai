@@ -51,6 +51,7 @@ ID_G_TRUCK = 7
 TARGET_VEHICLES = [ID_G_CAR, ID_G_BUS, ID_G_TRUCK]
 
 IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+# 👇 여기서 에러가 났습니다. 기기 내 파일에 이 변수가 존재하는지 반드시 확인하십시오.
 NAS_UPLOADER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 def deep_merge_dict(base, override):
@@ -81,7 +82,6 @@ def load_system_config():
             "GENERAL": "models/YOLOV8M-1.dxnn",
             "FACE": "models/YOLOV8M-Face.dxnn"
         },
-        # 💡 [핵심] 사용자가 직접 민감도를 제어할 수 있도록 초기값 세팅 보장
         "model_confidences": {
             "HELMET": 0.50,
             "GENERAL": 0.50,

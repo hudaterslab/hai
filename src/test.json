@@ -1959,5 +1959,44 @@
         "events": [
             "conveyor_crossing"
         ]
+    },
+    "2026_04_23_07_33_41_ch1_001.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "2026_04_23_07_50_36_ch10_010.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                754,
+                241
+            ],
+            [
+                646,
+                712
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_23_07_50_36_ch10_007.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                756,
+                233
+            ],
+            [
+                652,
+                715
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
     }
 }

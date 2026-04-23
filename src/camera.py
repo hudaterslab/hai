@@ -3,7 +3,6 @@ import numpy as np
 import time
 import datetime
 import threading
-import subprocess
 import queue
 import os
 import logging
@@ -14,17 +13,9 @@ from common import (
     ID_G_PERSON, ID_G_CAR, ID_G_BUS, ID_G_TRUCK, NAS_UPLOADER_POOL, _upload_to_nas_task 
 )
 from event import MotionDetector, EVENT_REGISTRY
-from ai_core import ByteTracker
+from ai_core import SORTTracker
 
 logger = logging.getLogger("VMS_SYSTEM")
-
-def get_stream_codec(url):
-    try:
-        cmd = ['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', url]
-        res = subprocess.check_output(cmd, text=True, timeout=5).strip().lower()
-        return "hevc" if "hevc" in res or "265" in res else "h264"
-    except Exception: 
-        return "h264"
 
 class FrameReader:
     def __init__(self, url, ip):
@@ -38,77 +29,46 @@ class FrameReader:
         self.last_frame_time = time.time()
         self.out_w = 640
         self.out_h = 360
-        self.frame_bytes = self.out_w * self.out_h * 3
-        self.process = None
+        
+        # 💡 [핵심] 타겟 FPS를 시스템 설정(또는 기본 10)으로 강제하여 디코딩 부하를 줄임
+        self.target_fps = SYS_CFG.get("REC_FPS", 10)
+        self.delay = 1.0 / self.target_fps
+        
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
+        # 💡 [핵심] OpenCV FFmpeg 백엔드 옵션: TCP 사용 및 지연/버퍼 최소화
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+        
         while self.running:
-            self.connected = False
-            if not self.url.startswith("rtsp://"):
-                cap = cv2.VideoCapture(self.url)
-                self.connected = True
-                fps = cap.get(cv2.CAP_PROP_FPS) or 30
-                delay = 1.0 / fps
-                while self.running and cap.isOpened():
-                    start_t = time.time()
-                    ret, frame = cap.read()
-                    if not ret:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        continue
-                    img = cv2.resize(frame, (self.out_w, self.out_h))
-                    with self.lock:
-                        self.frame = img
-                        self.fid += 1
-                        self.last_frame_time = time.time()
-                    elapsed = time.time() - start_t
-                    if delay > elapsed: 
-                        time.sleep(delay - elapsed)
-                cap.release()
-                self.connected = False
-                time.sleep(1)
-                continue
-                
-            codec = get_stream_codec(self.url)
-            if codec == "hevc":
-                pipeline = f"rtspsrc location={self.url} latency=300 drop-on-latency=true protocols=tcp ! rtph265depay ! h265parse ! decodebin ! videoconvert ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h} ! fdsink fd=1 sync=false"
-                cmd = ['gst-launch-1.0', '-q'] + pipeline.split()
-            else: 
-                cmd = ['ffmpeg', '-nostdin', '-rtsp_transport', 'tcp', '-loglevel', 'error', '-i', self.url, '-f', 'image2pipe', '-pix_fmt', 'bgr24', '-vcodec', 'rawvideo', '-an', '-s', f'{self.out_w}x{self.out_h}', '-']
-                
-            try:
-                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-                self.connected = True
-            except Exception:
-                time.sleep(STREAM_RECONNECT_DELAY_SEC)
-                continue
-                
-            while self.running:
-                raw = b''
-                while len(raw) < self.frame_bytes:
-                    if not self.running: 
-                        break
-                    chunk = self.process.stdout.read(self.frame_bytes - len(raw))
-                    if not chunk: 
-                        break
-                    raw += chunk
-                if len(raw) != self.frame_bytes: 
+            # subprocess 로직을 완전히 걷어내고 순수 OpenCV로 통합
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.connected = cap.isOpened()
+            
+            while self.running and cap.isOpened():
+                # 패킷 수신 (네트워크 버퍼를 즉각 비워 패킷 유실 방지)
+                ret = cap.grab()
+                if not ret:
                     break
-                img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
-                with self.lock:
-                    self.frame = img
-                    self.fid += 1
-                    self.last_frame_time = time.time()
                     
+                now = time.time()
+                # 우리가 원하는 타겟 FPS 간격이 되었을 때만 무거운 디코딩 수행
+                if now - self.last_frame_time >= self.delay:
+                    ret, frame = cap.retrieve()
+                    if ret:
+                        img = cv2.resize(frame, (self.out_w, self.out_h))
+                        with self.lock:
+                            self.frame = img
+                            self.fid += 1
+                            self.last_frame_time = now
+                            
+            if cap:
+                cap.release()
             self.connected = False
-            if self.process:
-                try: 
-                    self.process.kill()
-                except Exception: 
-                    pass
-                self.process = None
-            if self.running: 
+            
+            if self.running:
                 time.sleep(STREAM_RECONNECT_DELAY_SEC)
 
     def read(self):
@@ -117,13 +77,9 @@ class FrameReader:
             
     def stop(self, join_timeout=3.0):
         self.running = False
-        if self.process:
-            try: 
-                self.process.kill()
-            except Exception: 
-                pass
         if self.thread.is_alive(): 
             self.thread.join(timeout=join_timeout)
+
 
 class VideoRecorder:
     def __init__(self, ip, terminal_id="3"):
@@ -133,8 +89,12 @@ class VideoRecorder:
         self.record_end_time = 0
         self.current_event = "unknown"
         self.running = True
-        self.buffer = deque(maxlen=SYS_CFG.get("REC_FPS", 30) * SYS_CFG.get("REC_PRE_SEC", 3))
-        self.write_queue = queue.Queue(maxsize=SYS_CFG.get("REC_FPS", 30) * SYS_CFG.get("REC_PRE_SEC", 3) * 2)
+        
+        # FrameReader의 타겟 FPS와 녹화 FPS를 맞춰 배속 재생을 방지
+        self.fps = SYS_CFG.get("REC_FPS", 10)
+        self.buffer = deque(maxlen=self.fps * SYS_CFG.get("REC_PRE_SEC", 3))
+        self.write_queue = queue.Queue(maxsize=self.fps * SYS_CFG.get("REC_PRE_SEC", 3) * 2)
+        
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
         
@@ -155,7 +115,8 @@ class VideoRecorder:
         if frame is None: 
             return
         self.buffer.append(frame)
-        now = fid / 30.0
+        # FID는 이제 read FPS를 기준으로 증가하므로, 실제 시간에 맞게 조절
+        now = time.time() 
         if self.recording:
             if now > self.record_end_time:
                 self.recording = False
@@ -165,7 +126,7 @@ class VideoRecorder:
                 self._queue_frame(frame)
                 
     def trigger(self, event_name, fid):
-        now = fid / 30.0
+        now = time.time()
         self.record_end_time = now + SYS_CFG.get("REC_POST_SEC", 4)
         if not self.recording:
             logger.info(f"🎥 [녹화시작] {self.ip} - {event_name}")
@@ -195,7 +156,7 @@ class VideoRecorder:
                 dpath = os.path.join(EVENT_ROOT_DIR, "events", self.ip, "videos", self.current_event)
                 os.makedirs(dpath, exist_ok=True)
                 fpath = os.path.join(dpath, f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.ip}_{self.current_event}.mp4")
-                writer = cv2.VideoWriter(fpath, cv2.VideoWriter_fourcc(*'mp4v'), SYS_CFG.get("REC_FPS", 30), (frame.shape[1], frame.shape[0]))
+                writer = cv2.VideoWriter(fpath, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, (frame.shape[1], frame.shape[0]))
             writer.write(frame)
             
         if writer:
@@ -209,6 +170,7 @@ class VideoRecorder:
         self._queue_frame(None)
         if self.thread.is_alive(): 
             self.thread.join(timeout=3.0)
+
 
 class Camera:
     def __init__(self, ip, conf, face_engine, npu_id, cam_id, sensitivity):
@@ -230,13 +192,12 @@ class Camera:
         self.latest_npu = {'h': None, 'g': None}
         self.last_submit_fid = -1
         
-        # 💡 [핵심] JSON 설정값의 모델 민감도를 ByteTracker에 동적 주입 (Data Binding)
         hel_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.50)
         gen_conf = SYS_CFG.get("model_confidences", {}).get("GENERAL", 0.50)
         self.face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
         
-        self.helmet_tracker = ByteTracker(track_thresh=hel_conf, is_helmet=True)
-        self.general_tracker = ByteTracker(track_thresh=gen_conf, is_helmet=False)
+        self.helmet_tracker = SORTTracker(track_thresh=hel_conf, is_helmet=True)
+        self.general_tracker = SORTTracker(track_thresh=gen_conf, is_helmet=False)
         
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
@@ -268,7 +229,6 @@ class Camera:
             return image
         try:
             for fx1, fy1, fx2, fy2, fscore, _ in self.face_detector.infer(image):
-                # 💡 JSON 설정값(face_conf)과 동적 연동
                 if fscore <= self.face_conf: 
                     continue
                 fx1 = max(0, int(fx1))
@@ -302,11 +262,12 @@ class Camera:
             else: 
                 general_tracks = self.general_tracker.predict_only()
 
-            now = frame_id / 30.0
+            now = time.time()
             current_alarms = {}
             track_maps = {"helmet": {int(t[4]): int(t[6]) for t in helmet_tracks}, "general": {int(t[4]): int(t[6]) for t in general_tracks}}
             
             for handler in self.handlers:
+                # 이벤트 로직에서도 fid 대신 now(실제 시간) 기반으로 평가하도록 내부 호환 유지
                 for evt in handler.process(helmet_tracks, general_tracks, track_maps, motion_mask, frame, frame_id):
                     draw_tid = evt['tid'] + (0 if handler.required_models[0] == "helmet" else 10000)
                     self._trigger_event(frame, frame_id, draw_tid, handler.event_name, helmet_tracks if handler.required_models[0] == "helmet" else general_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))

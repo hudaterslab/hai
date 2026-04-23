@@ -1,0 +1,188 @@
+{
+    "test_video_2.mp4": {
+        "url": "/home/fishduke/Desktop/new_hai/test/test_video_2.mp4",
+        "cctv_id": 1,
+        "roi_poly_norm": [
+            [
+                0.020313,
+                0.122222
+            ],
+            [
+                0.013281,
+                0.972222
+            ],
+            [
+                0.722656,
+                0.944444
+            ],
+            [
+                0.673438,
+                0.088889
+            ]
+        ],
+        "roi_lines_norm": [],
+        "events": [
+            "signal_vehicle"
+        ]
+    },
+    "test_video_1.mp4": {
+        "url": "/home/fishduke/Desktop/new_hai/test/test_video_1.mp4",
+        "cctv_id": 2,
+        "roi_poly_norm": [
+            [
+                0.009375,
+                0.134722
+            ],
+            [
+                0.010937,
+                0.968056
+            ],
+            [
+                0.623437,
+                0.930556
+            ],
+            [
+                0.554688,
+                0.086111
+            ]
+        ],
+        "roi_lines_norm": [],
+        "events": [
+            "signal_vehicle"
+        ]
+    },
+    "illegal_parking_1.avi": {
+        "url": "/home/fishduke/Desktop/new_hai/test/illegal_parking_1.avi",
+        "cctv_id": 3,
+        "roi_poly_norm": [
+            [
+                0.491406,
+                0.295833
+            ],
+            [
+                0.264062,
+                0.684722
+            ],
+            [
+                0.55,
+                0.956944
+            ],
+            [
+                0.678125,
+                0.440278
+            ]
+        ],
+        "roi_lines_norm": [],
+        "events": [
+            "illegal_parking"
+        ]
+    },
+    "helmet_2.avi": {
+        "url": "/home/fishduke/Desktop/new_hai/test/helmet_2.avi",
+        "cctv_id": 4,
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "crossing_1.avi": {
+        "url": "/home/fishduke/Desktop/new_hai/test/crossing_1.avi",
+        "cctv_id": 5,
+        "roi_poly_norm": [],
+        "roi_lines_norm": [
+            [
+                0.535156,
+                0.345833
+            ],
+            [
+                0.496875,
+                0.986111
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "rtsp_url": {
+        "url": "rtsp_url",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 6
+    },
+    "170_9001": {
+        "url": "rtsp://192.168.1.170:9001/S.mp4",
+        "roi_poly_norm": [
+            [
+                0.239063,
+                0.173611
+            ],
+            [
+                0.129688,
+                0.618056
+            ],
+            [
+                0.30625,
+                0.716667
+            ],
+            [
+                0.417187,
+                0.245833
+            ]
+        ],
+        "roi_lines_norm": [],
+        "events": [
+            "illegal_parking"
+        ],
+        "cctv_id": 7
+    },
+    "170_9002": {
+        "url": "rtsp://192.168.1.170:9002/s.mp4",
+        "roi_poly_norm": [],
+        "roi_lines_norm": [
+            [
+                0.5,
+                0.129167
+            ],
+            [
+                0.640625,
+                0.973611
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ],
+        "cctv_id": 8
+    },
+    "170_9003": {
+        "url": "rtsp://192.168.1.170:9003/S.mp4",
+        "roi_poly_norm": [
+            [
+                0.032813,
+                0.123611
+            ],
+            [
+                0.010937,
+                0.719444
+            ],
+            [
+                0.207813,
+                0.745833
+            ],
+            [
+                0.33125,
+                0.255556
+            ],
+            [
+                0.290625,
+                0.116667
+            ]
+        ],
+        "roi_lines_norm": [],
+        "events": [
+            "signal_vehicle"
+        ],
+        "cctv_id": 9
+    }
+}

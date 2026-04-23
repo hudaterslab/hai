@@ -48,6 +48,7 @@ if USE_NPU:
 if USE_NPU:
     def onInferenceCallbackFunc(outputs, user_arg):
         cam_id, model_type, fid, scale, offset, semaphore, is_yolov7, conf_thres, input_tensor = user_arg
+        boxes = []
         try:
             pred = np.array(outputs[0], copy=True)
             if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
@@ -73,7 +74,6 @@ if USE_NPU:
             scores = scores[mask]
             class_ids = class_ids[mask]
             
-            boxes = []
             if len(pred) > 0:
                 raw_boxes = pred[:, :4].copy()
                 raw_boxes[:, 0] = raw_boxes[:, 0] - raw_boxes[:, 2] / 2
@@ -89,11 +89,12 @@ if USE_NPU:
                         bx2, by2 = (raw_boxes[i][2] - dw) / scale, (raw_boxes[i][3] - dh) / scale
                         boxes.append([bx1, by1, bx2, by2, scores[i], class_ids[i]])
                         
+        except Exception as e: 
+            logger.error(f"⚠️ NPU Async Error: {e}")
+        finally: 
+            # 💡 [핵심 보완] 에러가 났더라도 메인 루프 락을 풀기 위해 결과를 큐에 밀어넣음
             if not async_result_queue.full(): 
                 async_result_queue.put((cam_id, model_type, fid, np.array(boxes)))
-        except Exception as e: 
-            logger.error(f"Async Error: {e}")
-        finally: 
             semaphore.release() 
         return 0
 
@@ -145,7 +146,7 @@ if USE_NPU:
     VisionModelSync = DeepXModelSync
 
 else:
-    logger.info("🔵 NVIDIA GPU 모드 활성화: PyTorch(Ultralytics) 추론 엔진을 가동합니다.")
+    logger.info("🔵 NVIDIA GPU/CPU 모드 활성화: PyTorch(Ultralytics) 추론 엔진을 가동합니다.")
     
     class GPUModelAsync:
         def __init__(self, engine_path):
@@ -167,9 +168,9 @@ else:
                 return
                 
             def _infer():
+                boxes = []
                 try:
                     results = self.model(img, verbose=False, conf=0.1)
-                    boxes = []
                     for r in results:
                         if r.boxes is not None and len(r.boxes) > 0:
                             xyxy = r.boxes.xyxy.cpu().numpy()
@@ -177,12 +178,12 @@ else:
                             cls = r.boxes.cls.cpu().numpy()
                             for i in range(len(xyxy)): 
                                 boxes.append([xyxy[i][0], xyxy[i][1], xyxy[i][2], xyxy[i][3], conf[i], int(cls[i])])
-                                
+                except Exception as e: 
+                    logger.error(f"⚠️ PyTorch Inference Error (메모리 초과 예상): {e}")
+                finally: 
+                    # 💡 [핵심 보완] 에러가 났더라도 메인 루프 락을 풀기 위해 결과를 큐에 밀어넣음
                     if not async_result_queue.full(): 
                         async_result_queue.put((cam_id, model_type, fid, np.array(boxes)))
-                except Exception: 
-                    pass
-                finally: 
                     semaphore.release()
                     
             threading.Thread(target=_infer, daemon=True).start()
@@ -233,12 +234,9 @@ class KalmanBoxTracker:
         self.kf.statePost = np.array([[cx], [cy], [0.], [0.]], np.float32)
         
     def predict(self):
-        # 💡 [핵심 솔루션] 마찰력(Friction) 알고리즘 도입
-        # 객체가 가려져서 lost 상태가 되면, 칼만 필터의 가속도를 매 프레임 50%씩 깎아내어 제동을 겁니다.
-        # 이렇게 하면 박스가 엉뚱한 반대편으로 날아가지 않고 제자리에 부드럽게 멈춰서 주인을 기다립니다.
         if self.lost > 0:
-            self.kf.statePost[2, 0] *= 0.5  # dx (x축 이동속도 감쇠)
-            self.kf.statePost[3, 0] *= 0.5  # dy (y축 이동속도 감쇠)
+            self.kf.statePost[2, 0] *= 0.5  
+            self.kf.statePost[3, 0] *= 0.5  
             
         pred = self.kf.predict()
         cx, cy = pred[0, 0], pred[1, 0]
@@ -254,8 +252,8 @@ class KalmanBoxTracker:
         cx, cy = self.kf.statePost[0, 0], self.kf.statePost[1, 0]
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
 
-class ByteTracker:
-    def __init__(self, track_thresh=0.5, track_buffer=50, match_thresh=0.2, is_helmet=True):
+class SORTTracker:
+    def __init__(self, track_thresh=0.5, track_buffer=30, match_thresh=0.3, is_helmet=True):
         self.track_thresh = track_thresh
         self.track_buffer = track_buffer
         self.match_thresh = match_thresh
@@ -294,22 +292,18 @@ class ByteTracker:
         for tid in list(self.tracks.keys()): 
             self.tracks[tid].predict()
             
-        dets_high = [d for d in detections if d[4] >= self.track_thresh]
-        dets_low = [d for d in detections if 0.1 <= d[4] < self.track_thresh]
+        valid_dets = [d for d in detections if d[4] >= self.track_thresh]
         
-        matched_high, unmatched_dets_high, unmatched_trks = self._associate(dets_high, list(self.tracks.keys()), self.match_thresh)
-        for d_idx, tid in matched_high: 
-            self.tracks[tid].correct(dets_high[d_idx][:4], dets_high[d_idx][4])
+        matched, unmatched_dets, unmatched_trks = self._associate(valid_dets, list(self.tracks.keys()), self.match_thresh)
+        
+        for d_idx, tid in matched: 
+            self.tracks[tid].correct(valid_dets[d_idx][:4], valid_dets[d_idx][4])
             
-        matched_low, unmatched_dets_low, unmatched_trks_final = self._associate(dets_low, unmatched_trks, 0.4)
-        for d_idx, tid in matched_low: 
-            self.tracks[tid].correct(dets_low[d_idx][:4], dets_low[d_idx][4])
-            
-        for tid in unmatched_trks_final: 
+        for tid in unmatched_trks: 
             self.tracks[tid].lost += 1
             
-        for d_idx in unmatched_dets_high:
-            det = dets_high[d_idx]
+        for d_idx in unmatched_dets:
+            det = valid_dets[d_idx]
             self.tracks[self.next_id] = KalmanBoxTracker(det[:4], int(det[5]), det[4])
             self.next_id += 1
             
@@ -324,6 +318,4 @@ class ByteTracker:
         return self._get_results()
         
     def _get_results(self):
-        # 💡 [복구] 개발자님의 의견을 수용하여, 10프레임까지는 이벤트를 트리거할 수 있도록 원복했습니다.
-        # 이제 마찰력 알고리즘이 적용되었으므로 박스가 엉뚱한 곳으로 튀지 않습니다.
         return np.array([[*t.get_state(), tid, t.conf, t.cls] for tid, t in self.tracks.items() if t.lost <= 10])

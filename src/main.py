@@ -287,11 +287,13 @@ def main():
         sensitivity, use_display, use_drawing = prompt_runtime_options()
         config_manager = prepare_config_manager(rtsp_list)
 
-        engines_h = [VisionModelAsync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn")) for _ in range(3)]
-        engines_g = [VisionModelAsync(SYS_CFG.get("models", {}).get("GENERAL", "models/YOLOV8M-1.dxnn")) for _ in range(3)]
+        # 💡 [핵심 최적화] 라즈베리파이 메모리 터짐 방지를 위해 모델 인스턴스는 단 1개씩만 생성
+        engine_h = VisionModelAsync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
+        engine_g = VisionModelAsync(SYS_CFG.get("models", {}).get("GENERAL", "models/YOLOV8M-1.dxnn"))
         face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.dxnn")) 
         
-        npu_semaphore = threading.Semaphore(18) 
+        # 💡 [핵심 최적화] 스레드 폭주(Context Switching)를 막기 위해 동시 추론 세마포어를 4로 제한
+        npu_semaphore = threading.Semaphore(4) 
 
         for i, rtsp in enumerate(rtsp_list):
             ip = extract_ip(rtsp)
@@ -306,7 +308,6 @@ def main():
         dynamic_delay = 1.0 / target_fps
         loop_count = 0 
         
-        # 💡 [핵심] Queue 병목 방지를 위한 상태 딕셔너리 (Lag 0초 보장)
         pending_frames = {i: {'h': False, 'g': False} for i in range(len(cams))}
         latest_applied_fid = {i: {'h': -1, 'g': -1} for i in range(len(cams))}
         
@@ -334,26 +335,23 @@ def main():
                 fr, fid, connected = c.reader.read()
                 if fr is not None and connected and fid > c.last_submit_fid:
                     if fid % SYS_CFG.get("SKIP_FRAMES", 4) == 0:
-                        engine_idx = i % 3
-                        
                         run_helmet = any("helmet" in h.required_models for h in c.handlers)
                         run_general = any("general" in h.required_models for h in c.handlers)
                         
-                        # 💡 [핵심] 이전 결과가 리턴되지 않았다면 쿨하게 스킵 (지연시간 완전 차단)
+                        # 다중 리스트 대신 단일 엔진에 작업을 제출하도록 변경
                         if run_helmet and not pending_frames[i]['h'] and npu_semaphore.acquire(blocking=False):
                             pending_frames[i]['h'] = True
-                            engines_h[engine_idx].submit_async(fr, i, "h", fid, npu_semaphore)
+                            engine_h.submit_async(fr, i, "h", fid, npu_semaphore)
                             
                         if run_general and not pending_frames[i]['g'] and npu_semaphore.acquire(blocking=False):
                             pending_frames[i]['g'] = True
-                            engines_g[engine_idx].submit_async(fr, i, "g", fid, npu_semaphore)
+                            engine_g.submit_async(fr, i, "g", fid, npu_semaphore)
                             
                     c.last_submit_fid = fid
 
             while not async_result_queue.empty():
                 try:
                     c_id, model_type, res_fid, boxes = async_result_queue.get_nowait()
-                    # 결과 도착 시 락 해제
                     pending_frames[c_id][model_type] = False
                     
                     if res_fid > latest_applied_fid[c_id][model_type]:
@@ -399,7 +397,6 @@ def main():
         for c in cams:
             c.stop()
         cv2.destroyAllWindows()
-        # 💡 [핵심] 스레드와 PyTorch 텐서가 엉키면서 발생하는 134 에러를 방지하는 명시적 강제 종료
         os._exit(0)
 
 if __name__ == "__main__":
