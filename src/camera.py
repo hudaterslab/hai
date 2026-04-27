@@ -21,7 +21,6 @@ logger = logging.getLogger("VMS_SYSTEM")
 
 class FrameReader:
     def __init__(self, url, ip):
-        # 💡 [보안/버그 방어] URL 공백 및 특수문자 제거 
         self.url = url.replace(" ", "").replace("\n", "").replace("\r", "").strip()
         self.ip = ip
         self.lock = threading.Lock()
@@ -31,13 +30,17 @@ class FrameReader:
         self.connected = False
         self.last_frame_time = time.time()
         
-        # HEVC 스트림 비율을 고려하여 640x480으로 고정
         self.out_w = 640
         self.out_h = 480
         self.frame_bytes = self.out_w * self.out_h * 3
         
         self.target_fps = SYS_CFG.get("REC_FPS", 3)
         self.process = None
+        
+        # 💡 [핵심 보완] 디코딩 실패 추적 및 Fallback 제어 변수
+        self.use_gstreamer = True
+        self.gst_fail_count = 0
+        
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -45,61 +48,103 @@ class FrameReader:
         while self.running:
             self.connected = False
             
-            # 💡 [핵심 최적화] 전수 진단에서 살아남은 GStreamer avdec_h265 파이프라인 도입
-            # videorate 플러그인을 추가하여 GStreamer 레벨에서 3 FPS로 깎아서 파이썬에 전달합니다.
-            pipeline = (
-                f"rtspsrc location={self.url} latency=500 protocols=tcp ! "
-                f"rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! videorate ! "
-                f"video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! "
-                f"fdsink fd=1 sync=false"
-            )
-            
-            cmd = ['gst-launch-1.0', '-q'] + pipeline.split()
-            
-            try:
-                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-                self.connected = True
-                logger.info(f"🎥 [{self.ip}] GStreamer 방탄 파이프라인 연결 성공 (SW Decode, {self.target_fps}FPS)")
-            except Exception as e:
-                logger.error(f"⚠️ [{self.ip}] 프로세스 실행 실패: {e}")
-                time.sleep(STREAM_RECONNECT_DELAY_SEC)
-                continue
+            if self.use_gstreamer:
+                # 💡 [핵심 보완 1] decodebin을 사용하여 H.264 / H.265를 자동 탐지
+                pipeline = (
+                    f"rtspsrc location={self.url} latency=500 ! "
+                    f"decodebin ! videoconvert ! videorate ! "
+                    f"video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! "
+                    f"fdsink fd=1 sync=false"
+                )
                 
-            while self.running:
-                # 💡 [생존 로직] CPU가 폭주하면 파이프 읽기를 지연시켜 OOM 및 다운 방어
-                if psutil.cpu_percent(interval=None) > 95:
-                    time.sleep(0.05)
+                cmd = ['gst-launch-1.0', '-q'] + pipeline.split()
+                
+                try:
+                    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+                    logger.info(f"🎥 [{self.ip}] GStreamer 파이프라인 연결 시도 (Auto-Codec, {self.target_fps}FPS)")
+                except Exception as e:
+                    logger.error(f"⚠️ [{self.ip}] GStreamer 실행 실패: {e}")
+                    self.gst_fail_count += 1
+                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                    continue
                     
-                raw = b''
-                while len(raw) < self.frame_bytes:
-                    if not self.running: 
-                        break
-                    try:
-                        chunk = self.process.stdout.read(self.frame_bytes - len(raw))
-                        if not chunk: 
+                read_success = False
+                while self.running:
+                    if psutil.cpu_percent(interval=None) > 95:
+                        time.sleep(0.05)
+                        
+                    raw = b''
+                    while len(raw) < self.frame_bytes:
+                        if not self.running: 
                             break
-                        raw += chunk
-                    except Exception:
+                        try:
+                            chunk = self.process.stdout.read(self.frame_bytes - len(raw))
+                            if not chunk: 
+                                break
+                            raw += chunk
+                        except Exception:
+                            break
+                            
+                    if len(raw) != self.frame_bytes: 
                         break
                         
-                if len(raw) != self.frame_bytes: 
-                    break
+                    img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
+                    read_success = True
+                    self.connected = True
+                    self.gst_fail_count = 0  # 성공 시 실패 카운트 초기화
                     
-                # numpy 배열로 초고속 변환
-                img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
+                    with self.lock:
+                        self.frame = img
+                        self.fid += 1
+                        self.last_frame_time = time.time()
+                        
+                self.connected = False
+                if self.process:
+                    try: 
+                        self.process.kill()
+                    except Exception: 
+                        pass
+                    self.process = None
                 
-                with self.lock:
-                    self.frame = img
-                    self.fid += 1
-                    self.last_frame_time = time.time()
+                # 💡 [핵심 보완 2] 읽기 실패가 누적되면 OpenCV Fallback으로 강제 전환
+                if not read_success:
+                    self.gst_fail_count += 1
                     
-            self.connected = False
-            if self.process:
-                try: 
-                    self.process.kill()
-                except Exception: 
-                    pass
-                self.process = None
+                if self.gst_fail_count >= 2:
+                    logger.warning(f"⚠️ [{self.ip}] GStreamer 디코딩 연속 실패. OpenCV Fallback 모드로 전환합니다.")
+                    self.use_gstreamer = False
+                    
+            else:
+                # 💡 [핵심 보완 3] OpenCV Fallback (FFmpeg 백엔드 활용)
+                cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                # 지연 방지를 위해 버퍼를 최소화
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                
+                if not cap.isOpened():
+                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                    continue
+                    
+                logger.info(f"🎥 [{self.ip}] OpenCV Fallback 모드 연결 성공")
+                self.connected = True
+                
+                last_read_time = time.time()
+                while self.running:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    now = time.time()
+                    # OpenCV 모드에서는 직접 FPS 드랍 로직을 구현하여 CPU 부하를 방어합니다
+                    if now - last_read_time >= (1.0 / self.target_fps):
+                        frame = cv2.resize(frame, (self.out_w, self.out_h))
+                        with self.lock:
+                            self.frame = frame
+                            self.fid += 1
+                            self.last_frame_time = now
+                        last_read_time = now
+                        
+                cap.release()
+                self.connected = False
                 
             if self.running: 
                 time.sleep(STREAM_RECONNECT_DELAY_SEC)
@@ -225,7 +270,6 @@ class Camera:
         self.latest_npu = {'h': None, 'g': None}
         self.last_submit_fid = -1
         
-        # 💡 [핵심 보완] Time-Sync를 위한 프레임 버퍼 및 OOM 방지 임계값 (5초 분량)
         self.frame_buffer = {}
         self.max_buffer_frames = SYS_CFG.get("REC_FPS", 3) * 5
         
@@ -287,21 +331,18 @@ class Camera:
             self._update_runtime_roi(frame.shape)
             motion_mask = self.motion_det.apply(frame) 
             
-            # 💡 [핵심 보완] Time-Sync를 위해 현재 프레임을 버퍼에 기록
             self.frame_buffer[frame_id] = frame.copy()
             
-            # 💡 오래된 프레임 가비지 컬렉션 (OOM 완벽 방지)
             expired_keys = [k for k in self.frame_buffer.keys() if frame_id - k > self.max_buffer_frames]
             for k in expired_keys:
                 del self.frame_buffer[k]
-
-            eval_fid = frame_id
-
+                
+            eval_fid = frame_id 
+            
             if self.latest_npu['h'] is not None: 
-                # 튜플 압축 풀기
                 h_fid, h_boxes = self.latest_npu['h']
                 helmet_tracks = self.helmet_tracker.update(h_boxes)
-                eval_fid = h_fid  # 평가 시점을 과거의 추론 프레임 시점으로 롤백
+                eval_fid = h_fid
                 self.latest_npu['h'] = None
             else: 
                 helmet_tracks = self.helmet_tracker.predict_only()
@@ -309,7 +350,6 @@ class Camera:
             if self.latest_npu['g'] is not None: 
                 g_fid, g_boxes = self.latest_npu['g']
                 general_tracks = self.general_tracker.update(g_boxes)
-                # 헬멧과 제너럴 중 최신 결과를 기준으로 평가 (보통 g가 더 무거우므로 g_fid를 따름)
                 eval_fid = max(eval_fid, g_fid) if self.latest_npu['h'] is not None else g_fid
                 self.latest_npu['g'] = None
             else: 
@@ -320,7 +360,6 @@ class Camera:
             track_maps = {"helmet": {int(t[4]): int(t[6]) for t in helmet_tracks}, "general": {int(t[4]): int(t[6]) for t in general_tracks}}
             
             for handler in self.handlers:
-                # 💡 [핵심 보완] frame_id(현재)가 아닌 eval_fid(추론이 완료된 과거 시점)를 전달하여, 프레임 버퍼에서 정확한 과거 이미지를 꺼내도록 유도
                 for evt in handler.process(helmet_tracks, general_tracks, track_maps, motion_mask, frame, eval_fid):
                     draw_tid = evt['tid'] + (0 if handler.required_models[0] == "helmet" else 10000)
                     self._trigger_event(frame, frame_id, draw_tid, handler.event_name, helmet_tracks if handler.required_models[0] == "helmet" else general_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
@@ -346,7 +385,6 @@ class Camera:
         
         logger.warning(f"🚨 [CAM {self.cam_id}] {event_name} Detected! ID:{real_tid}")
         
-        # 💡 [핵심 보완] 라이브 프레임이 아닌, 이벤트가 평가된 정확한 시점(source_fid)의 원본 프레임을 복원
         source_fid = event_fid if event_fid is not None else frame_id
         source_frame = event_frame if event_frame is not None else self.frame_buffer.get(source_fid, frame)
         
