@@ -3,8 +3,9 @@
   "logging": {
     "dir": "./logs",
     "level": "INFO",
-    "retention_days": 14
+    "retention_days": 1
   },
+  "debug_mode": true,
   "event_config": {
     "intrusion": {
       "enabled": false,
@@ -43,8 +44,8 @@
     "GENERAL": 0.5,
     "FACE": 0.4
   },
-  "SKIP_FRAMES": 4,
-  "REC_FPS": 30,
+  "SKIP_FRAMES": 1,
+  "REC_FPS": 3,
   "REC_PRE_SEC": 3,
   "REC_POST_SEC": 4,
   "WATCHDOG_TIMEOUT": 30.0,

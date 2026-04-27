@@ -6,6 +6,8 @@ import threading
 import queue
 import os
 import logging
+import subprocess
+import psutil
 from collections import deque, defaultdict
 from common import (
     SYS_CFG, EVENT_ROOT_DIR, WATCHDOG_TIMEOUT, STREAM_RECONNECT_DELAY_SEC, 
@@ -19,7 +21,8 @@ logger = logging.getLogger("VMS_SYSTEM")
 
 class FrameReader:
     def __init__(self, url, ip):
-        self.url = url.replace(" ", "").strip()
+        # 💡 [보안/버그 방어] URL 공백 및 특수문자 제거 
+        self.url = url.replace(" ", "").replace("\n", "").replace("\r", "").strip()
         self.ip = ip
         self.lock = threading.Lock()
         self.frame = None
@@ -27,48 +30,78 @@ class FrameReader:
         self.running = True
         self.connected = False
         self.last_frame_time = time.time()
+        
+        # HEVC 스트림 비율을 고려하여 640x480으로 고정
         self.out_w = 640
-        self.out_h = 360
+        self.out_h = 480
+        self.frame_bytes = self.out_w * self.out_h * 3
         
-        # 💡 [핵심] 타겟 FPS를 시스템 설정(또는 기본 10)으로 강제하여 디코딩 부하를 줄임
-        self.target_fps = SYS_CFG.get("REC_FPS", 10)
-        self.delay = 1.0 / self.target_fps
-        
+        self.target_fps = SYS_CFG.get("REC_FPS", 3)
+        self.process = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
-        # 💡 [핵심] OpenCV FFmpeg 백엔드 옵션: TCP 사용 및 지연/버퍼 최소화
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
-        
         while self.running:
-            # subprocess 로직을 완전히 걷어내고 순수 OpenCV로 통합
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.connected = cap.isOpened()
-            
-            while self.running and cap.isOpened():
-                # 패킷 수신 (네트워크 버퍼를 즉각 비워 패킷 유실 방지)
-                ret = cap.grab()
-                if not ret:
-                    break
-                    
-                now = time.time()
-                # 우리가 원하는 타겟 FPS 간격이 되었을 때만 무거운 디코딩 수행
-                if now - self.last_frame_time >= self.delay:
-                    ret, frame = cap.retrieve()
-                    if ret:
-                        img = cv2.resize(frame, (self.out_w, self.out_h))
-                        with self.lock:
-                            self.frame = img
-                            self.fid += 1
-                            self.last_frame_time = now
-                            
-            if cap:
-                cap.release()
             self.connected = False
             
-            if self.running:
+            # 💡 [핵심 최적화] 전수 진단에서 살아남은 GStreamer avdec_h265 파이프라인 도입
+            # videorate 플러그인을 추가하여 GStreamer 레벨에서 3 FPS로 깎아서 파이썬에 전달합니다.
+            pipeline = (
+                f"rtspsrc location={self.url} latency=500 protocols=tcp ! "
+                f"rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! videorate ! "
+                f"video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! "
+                f"fdsink fd=1 sync=false"
+            )
+            
+            cmd = ['gst-launch-1.0', '-q'] + pipeline.split()
+            
+            try:
+                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+                self.connected = True
+                logger.info(f"🎥 [{self.ip}] GStreamer 방탄 파이프라인 연결 성공 (SW Decode, {self.target_fps}FPS)")
+            except Exception as e:
+                logger.error(f"⚠️ [{self.ip}] 프로세스 실행 실패: {e}")
+                time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                continue
+                
+            while self.running:
+                # 💡 [생존 로직] CPU가 폭주하면 파이프 읽기를 지연시켜 OOM 및 다운 방어
+                if psutil.cpu_percent(interval=None) > 95:
+                    time.sleep(0.05)
+                    
+                raw = b''
+                while len(raw) < self.frame_bytes:
+                    if not self.running: 
+                        break
+                    try:
+                        chunk = self.process.stdout.read(self.frame_bytes - len(raw))
+                        if not chunk: 
+                            break
+                        raw += chunk
+                    except Exception:
+                        break
+                        
+                if len(raw) != self.frame_bytes: 
+                    break
+                    
+                # numpy 배열로 초고속 변환
+                img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
+                
+                with self.lock:
+                    self.frame = img
+                    self.fid += 1
+                    self.last_frame_time = time.time()
+                    
+            self.connected = False
+            if self.process:
+                try: 
+                    self.process.kill()
+                except Exception: 
+                    pass
+                self.process = None
+                
+            if self.running: 
                 time.sleep(STREAM_RECONNECT_DELAY_SEC)
 
     def read(self):
@@ -77,9 +110,13 @@ class FrameReader:
             
     def stop(self, join_timeout=3.0):
         self.running = False
+        if self.process:
+            try: 
+                self.process.kill()
+            except Exception: 
+                pass
         if self.thread.is_alive(): 
             self.thread.join(timeout=join_timeout)
-
 
 class VideoRecorder:
     def __init__(self, ip, terminal_id="3"):
@@ -89,9 +126,7 @@ class VideoRecorder:
         self.record_end_time = 0
         self.current_event = "unknown"
         self.running = True
-        
-        # FrameReader의 타겟 FPS와 녹화 FPS를 맞춰 배속 재생을 방지
-        self.fps = SYS_CFG.get("REC_FPS", 10)
+        self.fps = SYS_CFG.get("REC_FPS", 3)
         self.buffer = deque(maxlen=self.fps * SYS_CFG.get("REC_PRE_SEC", 3))
         self.write_queue = queue.Queue(maxsize=self.fps * SYS_CFG.get("REC_PRE_SEC", 3) * 2)
         
@@ -115,7 +150,6 @@ class VideoRecorder:
         if frame is None: 
             return
         self.buffer.append(frame)
-        # FID는 이제 read FPS를 기준으로 증가하므로, 실제 시간에 맞게 조절
         now = time.time() 
         if self.recording:
             if now > self.record_end_time:
@@ -171,7 +205,6 @@ class VideoRecorder:
         if self.thread.is_alive(): 
             self.thread.join(timeout=3.0)
 
-
 class Camera:
     def __init__(self, ip, conf, face_engine, npu_id, cam_id, sensitivity):
         self.ip = ip
@@ -191,6 +224,10 @@ class Camera:
         self.cam_id = cam_id 
         self.latest_npu = {'h': None, 'g': None}
         self.last_submit_fid = -1
+        
+        # 💡 [핵심 보완] Time-Sync를 위한 프레임 버퍼 및 OOM 방지 임계값 (5초 분량)
+        self.frame_buffer = {}
+        self.max_buffer_frames = SYS_CFG.get("REC_FPS", 3) * 5
         
         hel_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.50)
         gen_conf = SYS_CFG.get("model_confidences", {}).get("GENERAL", 0.50)
@@ -250,14 +287,30 @@ class Camera:
             self._update_runtime_roi(frame.shape)
             motion_mask = self.motion_det.apply(frame) 
             
+            # 💡 [핵심 보완] Time-Sync를 위해 현재 프레임을 버퍼에 기록
+            self.frame_buffer[frame_id] = frame.copy()
+            
+            # 💡 오래된 프레임 가비지 컬렉션 (OOM 완벽 방지)
+            expired_keys = [k for k in self.frame_buffer.keys() if frame_id - k > self.max_buffer_frames]
+            for k in expired_keys:
+                del self.frame_buffer[k]
+
+            eval_fid = frame_id
+
             if self.latest_npu['h'] is not None: 
-                helmet_tracks = self.helmet_tracker.update(self.latest_npu['h'])
+                # 튜플 압축 풀기
+                h_fid, h_boxes = self.latest_npu['h']
+                helmet_tracks = self.helmet_tracker.update(h_boxes)
+                eval_fid = h_fid  # 평가 시점을 과거의 추론 프레임 시점으로 롤백
                 self.latest_npu['h'] = None
             else: 
                 helmet_tracks = self.helmet_tracker.predict_only()
                 
             if self.latest_npu['g'] is not None: 
-                general_tracks = self.general_tracker.update(self.latest_npu['g'])
+                g_fid, g_boxes = self.latest_npu['g']
+                general_tracks = self.general_tracker.update(g_boxes)
+                # 헬멧과 제너럴 중 최신 결과를 기준으로 평가 (보통 g가 더 무거우므로 g_fid를 따름)
+                eval_fid = max(eval_fid, g_fid) if self.latest_npu['h'] is not None else g_fid
                 self.latest_npu['g'] = None
             else: 
                 general_tracks = self.general_tracker.predict_only()
@@ -267,8 +320,8 @@ class Camera:
             track_maps = {"helmet": {int(t[4]): int(t[6]) for t in helmet_tracks}, "general": {int(t[4]): int(t[6]) for t in general_tracks}}
             
             for handler in self.handlers:
-                # 이벤트 로직에서도 fid 대신 now(실제 시간) 기반으로 평가하도록 내부 호환 유지
-                for evt in handler.process(helmet_tracks, general_tracks, track_maps, motion_mask, frame, frame_id):
+                # 💡 [핵심 보완] frame_id(현재)가 아닌 eval_fid(추론이 완료된 과거 시점)를 전달하여, 프레임 버퍼에서 정확한 과거 이미지를 꺼내도록 유도
+                for evt in handler.process(helmet_tracks, general_tracks, track_maps, motion_mask, frame, eval_fid):
                     draw_tid = evt['tid'] + (0 if handler.required_models[0] == "helmet" else 10000)
                     self._trigger_event(frame, frame_id, draw_tid, handler.event_name, helmet_tracks if handler.required_models[0] == "helmet" else general_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
                     current_alarms[draw_tid] = handler.event_name
@@ -292,8 +345,10 @@ class Camera:
             return
         
         logger.warning(f"🚨 [CAM {self.cam_id}] {event_name} Detected! ID:{real_tid}")
-        source_frame = event_frame if event_frame is not None else frame
+        
+        # 💡 [핵심 보완] 라이브 프레임이 아닌, 이벤트가 평가된 정확한 시점(source_fid)의 원본 프레임을 복원
         source_fid = event_fid if event_fid is not None else frame_id
+        source_frame = event_frame if event_frame is not None else self.frame_buffer.get(source_fid, frame)
         
         if event_frame is None:
             if source_fid not in self.face_blur_cache:
@@ -311,8 +366,8 @@ class Camera:
 
     def draw(self, frame, helmet_tracks, general_tracks, alarms, connected=True):
         if frame is None or not connected:
-            blank = np.zeros((360, 640, 3), dtype=np.uint8)
-            cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 1)
+            blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 1)
             return blank
             
         h_frame, w_frame = frame.shape[:2]

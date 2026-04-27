@@ -15,7 +15,9 @@ import requests
 import pytz
 import shutil
 import threading
-from logging.handlers import TimedRotatingFileHandler
+import queue
+import atexit
+from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
 from urllib.parse import urlsplit, unquote
 import concurrent.futures
 import warnings
@@ -50,9 +52,37 @@ ID_G_BUS = 5
 ID_G_TRUCK = 7
 TARGET_VEHICLES = [ID_G_CAR, ID_G_BUS, ID_G_TRUCK]
 
-IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-# 👇 여기서 에러가 났습니다. 기기 내 파일에 이 변수가 존재하는지 반드시 확인하십시오.
 NAS_UPLOADER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+LOG_LISTENER = None
+
+def graceful_shutdown():
+    global LOG_LISTENER
+    if LOG_LISTENER is not None:
+        try:
+            LOG_LISTENER.stop()
+        except Exception:
+            pass
+            
+    print("🔄 [SYSTEM] 백그라운드 I/O 작업을 안전하게 마무리하고 종료합니다...")
+    try:
+        IMAGE_SAVER_POOL.shutdown(wait=True)
+        NAS_UPLOADER_POOL.shutdown(wait=True)
+    except Exception:
+        pass
+
+atexit.register(graceful_shutdown)
+
+def get_warm_snapshot(camera_reader, timeout_sec=10):
+    start_time = time.time()
+    while time.time() - start_time < timeout_sec:
+        frame, fid, connected = camera_reader.read()
+        if frame is not None and isinstance(frame, np.ndarray):
+            return frame
+        time.sleep(0.5)
+    print(f"⚠️ [스냅샷 타임아웃] 카메라 영상 수신 실패. 더미 프레임을 반환합니다.")
+    return np.ones((480, 640, 3), dtype=np.uint8) * 128
 
 def deep_merge_dict(base, override):
     result = copy.deepcopy(base)
@@ -66,7 +96,8 @@ def deep_merge_dict(base, override):
 def load_system_config():
     default_config = {
         "terminal_id": "99999",
-        "logging": {"dir": os.path.join(PROJECT_ROOT, "logs"), "level": "INFO", "retention_days": 14},
+        "logging": {"dir": os.path.join(PROJECT_ROOT, "logs"), "level": "INFO", "retention_days": 1},
+        "debug_mode": False,
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
             "illegal_parking": {"enabled": False, "cooldown_sec": 600},
@@ -127,16 +158,21 @@ def _log_nas_sync_worker(terminal_id, log_dir):
             pass
 
 def setup_logging(common_conf):
+    global LOG_LISTENER
     raw_log_dir = str(common_conf.get("logging", {}).get("dir", os.path.join(PROJECT_ROOT, "logs")))
     log_dir = raw_log_dir if os.path.isabs(raw_log_dir) else os.path.join(PROJECT_ROOT, raw_log_dir)
     
-    level_name = str(common_conf.get("logging", {}).get("level", "INFO")).upper()
-    try: retention_days = int(common_conf.get("logging", {}).get("retention_days", 14))
-    except Exception: retention_days = 14
+    level_name = "DEBUG" if common_conf.get("debug_mode", False) else str(common_conf.get("logging", {}).get("level", "INFO")).upper()
         
     level = getattr(logging, level_name, logging.INFO)
     os.makedirs(log_dir, exist_ok=True)
     
+    if LOG_LISTENER is not None:
+        try:
+            LOG_LISTENER.stop()
+        except Exception:
+            pass
+            
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         try: handler.close()
@@ -145,16 +181,21 @@ def setup_logging(common_conf):
     logger.setLevel(level)
     formatter = logging.Formatter('%(asctime)s | %(levelname)-7s | [%(funcName)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     
-    fh = TimedRotatingFileHandler(os.path.join(log_dir, "cctv.log"), when="H", interval=1, backupCount=max(retention_days * 24, 0), encoding="utf-8")
+    fh = TimedRotatingFileHandler(os.path.join(log_dir, "cctv.log"), when="H", interval=1, backupCount=1, encoding="utf-8")
     fh.suffix = "%Y%m%d_%H"
     fh.setFormatter(formatter)
     fh.setLevel(level)
-    logger.addHandler(fh)
     
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
     sh.setLevel(level)
-    logger.addHandler(sh)
+    
+    log_queue = queue.Queue(maxsize=10000)
+    queue_handler = QueueHandler(log_queue)
+    logger.addHandler(queue_handler)
+    
+    LOG_LISTENER = QueueListener(log_queue, fh, sh, respect_handler_level=True)
+    LOG_LISTENER.start()
     
     terminal_id = common_conf.get("terminal_id", "99999")
     threading.Thread(target=_log_nas_sync_worker, args=(terminal_id, log_dir), daemon=True).start()
@@ -296,7 +337,10 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         with open(image_path, 'rb') as f:
             res = requests.post(url, data=data, files={"image": (os.path.basename(image_path), f, "image/jpeg")}, verify=False, timeout=10)
             if res.status_code == 200:
-                logger.info(f"🌐 [API 전송 성공] 이벤트: {event_name}")
+                # 💡 [핵심 보완] API 전송 결과 및 상세 페이로드 디버그 로깅
+                logger.info(f"🌐 [API 전송 완료] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name} | 객체:{len(bboxes) if bboxes else 0}건")
+                if SYS_CFG.get("debug_mode", False):
+                    logger.debug(f"[API_PAYLOAD] Endpoint: {url} | Payload: {json.dumps(data, ensure_ascii=False)}")
             else:
                 logger.error(f"⚠️ [API 전송 에러] 상태코드: {res.status_code} | 응답: {res.text}")
     except Exception as e: 

@@ -112,6 +112,10 @@ class CrossingDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.lines = [(self.roi_lines[i], self.roi_lines[i+1]) for i in range(len(self.roi_lines)-1)] if len(self.roi_lines) >= 2 else []
         self.prev, self.candidates = {}, {}
+        
+        # 💡 [핵심 보완] ID Ping-Pong 이력을 관리하기 위한 큐 (최근 4프레임 위치 저장)
+        self.pos_history = defaultdict(lambda: deque(maxlen=4))
+        
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
         self.distance_ratio = config.get("distance_ratio", 0.3)
         self.min_distance_px, self.candidate_ttl_sec = config.get("min_distance_px", 15), config.get("candidate_ttl_sec", 5.0)
@@ -129,13 +133,35 @@ class CrossingDetector(BaseEventDetector):
                 continue
                 
             x1, y1, x2, y2 = t[:4]
-            # 💡 [핵심 해결] 가림 현상 방어: 2/3 지점이 아닌 실제 박스 가장 하단부(허리/골반)를 횡단의 기준점으로 삼습니다.
             curr_pos = (int((x1 + x2) / 2), int(y2))
             
             obj_height = y2 - y1
             obj_width = max(1, x2 - x1)
             is_frame_out = (x1 <= 15) or (x2 >= SCREEN_WIDTH - 15) or (y1 <= 15) or (y2 >= SCREEN_HEIGHT - 15)
             
+            # 💡 [핵심 보완] 현재 위치를 히스토리에 기록
+            self.pos_history[tid].append(curr_pos)
+            
+            is_ping_pong = False
+            if len(self.pos_history[tid]) >= 3:
+                p_older = self.pos_history[tid][-3]  # T-2 시점 위치
+                p_prev = self.pos_history[tid][-2]   # T-1 시점 위치
+                p_curr = self.pos_history[tid][-1]   # T 시점 위치
+                
+                dist_jump = get_distance(p_curr, p_prev)
+                dist_return = get_distance(p_curr, p_older)
+                
+                # 패턴 감지: 이전 위치(T-1)로는 크게 튀었는데(너비의 50% 초과), 과거 위치(T-2)와는 매우 가깝다면(너비의 30% 미만)
+                if dist_jump > obj_width * 0.5 and dist_return < obj_width * 0.3:
+                    is_ping_pong = True
+            
+            # 핑퐁이 감지되면 이번 평가는 무시하고 위치만 갱신
+            if is_ping_pong:
+                self.prev[tid] = curr_pos
+                if tid in self.candidates:
+                    del self.candidates[tid]
+                continue
+
             if tid in self.prev and tid not in self.candidates:
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, self.prev[tid], curr_pos):
@@ -151,7 +177,6 @@ class CrossingDetector(BaseEventDetector):
                 moved_dist = get_distance(cand['crossing_pt'], curr_pos)
                 aspect_ratio = obj_height / obj_width
                 
-                # 💡 [Anti-Leaning 로직] 컨베이어 벨트에 가려져 비율이 정사각형에 가깝게 무너지면(AR < 1.2) 단순 상체 쏠림 작업으로 판단하고 무시합니다.
                 if aspect_ratio < 1.2:
                     self.prev[tid] = curr_pos
                     continue
@@ -159,7 +184,6 @@ class CrossingDetector(BaseEventDetector):
                 direction_ok = (cand['entry_side'] != 0 and ccw(cand['line'][0], cand['line'][1], curr_pos) != 0 and cand['entry_side'] * ccw(cand['line'][0], cand['line'][1], curr_pos) < 0) if self.direction_check else True
                 
                 if direction_ok:
-                    # 박스가 가려져 극단적으로 작아졌을 때 임계값마저 낮아지는 것을 막기 위해 최소 이동 거리를 40px로 고정
                     dynamic_threshold = max(40.0, obj_height * self.distance_ratio)
                     
                     if moved_dist > dynamic_threshold or is_frame_out:
@@ -170,11 +194,16 @@ class CrossingDetector(BaseEventDetector):
                     
             self.prev[tid] = curr_pos
             
+        # 가비지 컬렉션
         for tid in list(self.prev.keys()):
             if tid not in curr_ids:
                 del self.prev[tid]
                 if tid in self.candidates: 
                     del self.candidates[tid]
+        
+        for tid in list(self.pos_history.keys()):
+            if tid not in curr_ids:
+                del self.pos_history[tid]
                     
         return triggered
 

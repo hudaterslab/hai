@@ -6,9 +6,31 @@ import queue
 import logging
 import threading
 import subprocess
+import functools
 from common import clean_overlapping_detections, calculate_iou, SYS_CFG
 
 logger = logging.getLogger("VMS_SYSTEM")
+
+# 💡 [보완] system_config.json에서 debug_mode 플래그를 읽어옵니다.
+DEBUG_MODE = SYS_CFG.get("debug_mode", False)
+
+def trace_execution(func):
+    """주요 함수의 실행 시작과 종료, 소요 시간을 로깅하는 데코레이터 (Debug Mode 전용)"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not DEBUG_MODE:
+            return func(*args, **kwargs)
+            
+        start_time = time.time()
+        logger.debug(f"[START] {func.__name__} 실행 시작")
+        try:
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            elapsed = time.time() - start_time
+            logger.debug(f"[END] {func.__name__} 실행 완료 (소요시간: {elapsed:.4f}초)")
+            
+    return wrapper
 
 def get_model_confidence(engine_path, default_conf=0.45):
     conf_map = SYS_CFG.get("model_confidences", {})
@@ -46,6 +68,7 @@ if USE_NPU:
         logger.warning("🟡 NPU 임포트 실패. GPU 모드로 대체합니다.")
 
 if USE_NPU:
+    @trace_execution
     def onInferenceCallbackFunc(outputs, user_arg):
         cam_id, model_type, fid, scale, offset, semaphore, is_yolov7, conf_thres, input_tensor = user_arg
         boxes = []
@@ -69,7 +92,8 @@ if USE_NPU:
                 scores = np.max(pred[:, 4:], axis=1)
                 class_ids = np.argmax(pred[:, 4:], axis=1)
 
-            mask = scores > 0.1
+            # 💡 [핵심 보완] 하드코딩된 0.1 대신 Config의 conf_thres를 적용
+            mask = scores > conf_thres
             pred = pred[mask]
             scores = scores[mask]
             class_ids = class_ids[mask]
@@ -81,7 +105,8 @@ if USE_NPU:
                 raw_boxes[:, 2] = raw_boxes[:, 0] + raw_boxes[:, 2]
                 raw_boxes[:, 3] = raw_boxes[:, 1] + raw_boxes[:, 3]
                 
-                indices = cv2.dnn.NMSBoxes(raw_boxes.tolist(), scores.tolist(), 0.1, 0.45)
+                # 💡 [핵심 보완] NMSBox에서도 conf_thres를 적용하도록 수정
+                indices = cv2.dnn.NMSBoxes(raw_boxes.tolist(), scores.tolist(), conf_thres, 0.45)
                 if len(indices) > 0:
                     dw, dh = offset
                     for i in indices.flatten():
@@ -92,7 +117,6 @@ if USE_NPU:
         except Exception as e: 
             logger.error(f"⚠️ NPU Async Error: {e}")
         finally: 
-            # 💡 [핵심 보완] 에러가 났더라도 메인 루프 락을 풀기 위해 결과를 큐에 밀어넣음
             if not async_result_queue.full(): 
                 async_result_queue.put((cam_id, model_type, fid, np.array(boxes)))
             semaphore.release() 
@@ -120,6 +144,7 @@ if USE_NPU:
             canvas[dh:dh+nh, dw:dw+nw] = resized
             return canvas, scale, (dw, dh)
             
+        @trace_execution
         def submit_async(self, img, cam_id, model_type, fid, semaphore):
             if img is None or self.engine is None:
                 semaphore.release()
@@ -139,6 +164,7 @@ if USE_NPU:
             else: 
                 self.engine = InferenceEngine(self.engine_path, InferenceOption())
                 
+        @trace_execution
         def infer(self, img): 
             return []
 
@@ -152,6 +178,8 @@ else:
         def __init__(self, engine_path):
             self.pt_path = resolve_model_path(engine_path, is_gpu=True)
             self.is_yolov7 = "v7" in os.path.basename(self.pt_path).lower()
+            # 💡 [핵심 보완] GPU 모드에서도 conf_thres를 로드
+            self.conf_thres = get_model_confidence(self.pt_path)
             self.model = None
             try:
                 from ultralytics import YOLO
@@ -162,6 +190,7 @@ else:
             except Exception: 
                 pass
 
+        @trace_execution
         def submit_async(self, img, cam_id, model_type, fid, semaphore):
             if img is None or self.model is None:
                 semaphore.release()
@@ -170,7 +199,8 @@ else:
             def _infer():
                 boxes = []
                 try:
-                    results = self.model(img, verbose=False, conf=0.1)
+                    # 💡 [핵심 보완] conf=0.1 하드코딩 제거, conf_thres 변수 연결
+                    results = self.model(img, verbose=False, conf=self.conf_thres)
                     for r in results:
                         if r.boxes is not None and len(r.boxes) > 0:
                             xyxy = r.boxes.xyxy.cpu().numpy()
@@ -181,7 +211,6 @@ else:
                 except Exception as e: 
                     logger.error(f"⚠️ PyTorch Inference Error (메모리 초과 예상): {e}")
                 finally: 
-                    # 💡 [핵심 보완] 에러가 났더라도 메인 루프 락을 풀기 위해 결과를 큐에 밀어넣음
                     if not async_result_queue.full(): 
                         async_result_queue.put((cam_id, model_type, fid, np.array(boxes)))
                     semaphore.release()
@@ -191,6 +220,8 @@ else:
     class GPUModelSync:
         def __init__(self, engine_path):
             self.pt_path = resolve_model_path(engine_path, is_gpu=True)
+            # 💡 [핵심 보완] GPU 모드에서도 conf_thres를 로드
+            self.conf_thres = get_model_confidence(self.pt_path)
             self.model = None
             try:
                 from ultralytics import YOLO
@@ -199,11 +230,13 @@ else:
             except Exception: 
                 pass
                 
+        @trace_execution
         def infer(self, img):
             if img is None or self.model is None: 
                 return []
             try:
-                results = self.model(img, verbose=False, conf=0.1)
+                # 💡 [핵심 보완] conf=0.1 하드코딩 제거, conf_thres 변수 연결
+                results = self.model(img, verbose=False, conf=self.conf_thres)
                 boxes = []
                 for r in results:
                     if r.boxes is not None and len(r.boxes) > 0:
@@ -261,6 +294,7 @@ class SORTTracker:
         self.next_id = 1
         self.tracks = {}
         
+    @trace_execution
     def _associate(self, detections, trackers_keys, iou_threshold):
         if len(trackers_keys) == 0 or len(detections) == 0: 
             return [], list(range(len(detections))), trackers_keys
@@ -285,6 +319,7 @@ class SORTTracker:
                 
         return matched_indices, unmatched_dets, unmatched_trks
         
+    @trace_execution
     def update(self, detections):
         if len(detections) > 0: 
             detections = clean_overlapping_detections(detections, self.is_helmet)
@@ -310,6 +345,7 @@ class SORTTracker:
         self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.track_buffer}
         return self._get_results()
         
+    @trace_execution
     def predict_only(self):
         for tid, trk in self.tracks.items():
             trk.predict()

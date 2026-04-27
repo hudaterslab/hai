@@ -31,7 +31,7 @@ def get_system_metrics():
     cpu_temp = "N/A"
     chip_temp = "N/A"
     
-    # 1. CPU 온도 측정 (psutil 기반)
+    # 1. CPU 온도 측정 (psutil 기반 우선 확인)
     try:
         if hasattr(psutil, "sensors_temperatures"):
             temps = psutil.sensors_temperatures()
@@ -41,32 +41,22 @@ def get_system_metrics():
                     break
     except Exception: pass
     
-    # 1-1. 리눅스 환경 Fallback (라즈베리파이, 딥엑스 보드 등)
+    # 1-1. 리눅스 환경 Fallback (라즈베리파이, 딥엑스 보드 등에서 주로 사용)
     if cpu_temp == "N/A" and os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
         try:
             with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
                 cpu_temp = f"{int(f.read().strip()) / 1000.0:.1f}°C"
         except Exception: pass
 
-    # 2. 보조 프로세서(GPU/NPU) 온도 측정 시도
+    # 2. GPU/NPU 온도 측정 시도
     try:
-        # NVIDIA GPU 환경 (젯슨 또는 외장 그래픽)
+        # NVIDIA GPU 환경
         if shutil.which("nvidia-smi"):
             out = subprocess.check_output(["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"], stderr=subprocess.DEVNULL, text=True)
-            chip_temp = f"{out.strip()}°C (NV-GPU)"
-            
-        # 💡 [핵심 보완] 라즈베리파이 환경 (VideoCore GPU)
-        elif shutil.which("vcgencmd"):
-            out = subprocess.check_output(["vcgencmd", "measure_temp"], stderr=subprocess.DEVNULL, text=True)
-            # 출력 형식 예시: temp=45.0'C
-            temp_val = out.replace("temp=", "").replace("'C", "").strip()
-            chip_temp = f"{temp_val}°C (RPI-GPU)"
-            
-        # DeepX NPU 환경
+            chip_temp = f"{out.strip()}°C (GPU)"
+        # DeepX NPU (예비 연동: 환경에 따라 별도 CLI 스크립트 연결 필요)
         elif shutil.which("dxrt-cli"):
-            # DeepX의 경우 CLI 명령어 구조에 맞게 온도 파싱 로직을 여기에 구현하시면 됩니다.
             pass
-            
     except Exception: pass
     
     return cpu_usage, cpu_temp, chip_temp
