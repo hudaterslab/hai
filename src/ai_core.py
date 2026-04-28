@@ -286,7 +286,7 @@ class KalmanBoxTracker:
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
 
 class SORTTracker:
-    def __init__(self, track_thresh=0.5, track_buffer=30, match_thresh=0.3, is_helmet=True):
+    def __init__(self, track_thresh=0.5, track_buffer=10, match_thresh=0.3, is_helmet=True):
         self.track_thresh = track_thresh
         self.track_buffer = track_buffer
         self.match_thresh = match_thresh
