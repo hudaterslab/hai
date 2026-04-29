@@ -2609,5 +2609,19 @@
         "events": [
             "conveyor_crossing"
         ]
+    },
+    "2026_04_23_18_38_00_ch10_002.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "2026_04_24_22_35_00_ch7_000.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
     }
 }

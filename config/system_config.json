@@ -1,58 +1,58 @@
 {
-  "terminal_id": "99999",
-  "logging": {
-    "dir": "./logs",
-    "level": "INFO",
-    "retention_days": 1
-  },
-  "debug_mode": false,
-  "track_buffer_sec": 1.5,
-  "event_pre_log_sec": 2.0,
-  "event_post_log_sec": 2.0,
-  "event_config": {
-    "intrusion": {
-      "enabled": false,
-      "cooldown_sec": 600
+    "terminal_id": "99999",
+    "logging": {
+        "dir": "./logs",
+        "level": "INFO",
+        "retention_days": 1
     },
-    "illegal_parking": {
-      "enabled": false,
-      "cooldown_sec": 600,
-      "trigger_sec": 5.0,
-      "move_threshold_px": 30
+    "debug_mode": false,
+    "track_buffer_sec": 1.5,
+    "event_pre_log_sec": 2.0,
+    "event_post_log_sec": 2.0,
+    "event_config": {
+        "intrusion": {
+            "enabled": false,
+            "cooldown_sec": 600
+        },
+        "illegal_parking": {
+            "enabled": false,
+            "cooldown_sec": 600,
+            "trigger_sec": 5.0,
+            "move_threshold_px": 30
+        },
+        "no_helmet": {
+            "enabled": false,
+            "cooldown_sec": 600,
+            "blur_face": true,
+            "trigger_sec": 2.0
+        },
+        "conveyor_crossing": {
+            "enabled": false,
+            "cooldown_sec": 600,
+            "snapshot_mode": "crossing_moment",
+            "distance_ratio": 0.5,
+            "min_distance_px": 15,
+            "candidate_ttl_sec": 5.0,
+            "direction_check": true
+        },
+        "signal_vehicle": {
+            "enabled": false,
+            "cooldown_sec": 600,
+            "motion_threshold_ratio": 0.1
+        }
     },
-    "no_helmet": {
-      "enabled": false,
-      "cooldown_sec": 600,
-      "blur_face": true,
-      "trigger_sec": 2.0
+    "models": {
+        "MAIN": "models/hanjin_cctv.pt",
+        "FACE": "models/yolov8m-face.pt"
     },
-    "conveyor_crossing": {
-      "enabled": false,
-      "cooldown_sec": 600,
-      "snapshot_mode": "crossing_moment",
-      "distance_ratio": 0.5,
-      "min_distance_px": 15,
-      "candidate_ttl_sec": 5.0,
-      "direction_check": true
+    "model_confidences": {
+        "MAIN": 0.4,
+        "FACE": 0.35
     },
-    "signal_vehicle": {
-      "enabled": false,
-      "cooldown_sec": 600,
-      "motion_threshold_ratio": 0.10
-    }
-  },
-  "models": {
-    "MAIN": "models/hanjin_cctv.pt",
-    "FACE": "models/yolov8m-face.pt"
-  },
-  "model_confidences": {
-    "MAIN": 0.40,
-    "FACE": 0.35
-  },
-  "SKIP_FRAMES": 1,
-  "REC_FPS": 3,
-  "REC_PRE_SEC": 3,
-  "REC_POST_SEC": 4,
-  "WATCHDOG_TIMEOUT": 30.0,
-  "VISUAL_ALARM_DURATION": 5.0
+    "SKIP_FRAMES": 1,
+    "REC_FPS": 3,
+    "REC_PRE_SEC": 3,
+    "REC_POST_SEC": 4,
+    "WATCHDOG_TIMEOUT": 30.0,
+    "VISUAL_ALARM_DURATION": 5.0
 }

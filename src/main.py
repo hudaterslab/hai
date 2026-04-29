@@ -257,7 +257,6 @@ def main():
     
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
     
-    # 💡 [핵심 보완] 자동 스캔 로직 제거: 리스트가 비어있으면 즉시 오류 발생 및 종료
     if not rtsp_list:
         logger.error(f"❌ 설정된 카메라가 없습니다. '{CAMERA_LIST_FILE}' 파일에 RTSP 주소가 입력되어 있는지 확인하십시오.")
         print(f"\n[오류] '{CAMERA_LIST_FILE}' 파일에 카메라 RTSP 주소가 없습니다.")
@@ -272,12 +271,14 @@ def main():
 
         engine_main = VisionModelSync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.pt"))
         face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
+        # 💡 헬멧 전용 모델 로드 (config에 명시되거나 기본값 폴백)
+        engine_helmet = VisionModelSync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
         
         for i, rtsp in enumerate(rtsp_list):
             ip = extract_ip(rtsp)
             conf = config_manager.get_config(ip)
             if conf and conf.get('events'):
-                cams.append(Camera(ip, conf, face_engine, len(cams) + 1, sensitivity))
+                cams.append(Camera(ip, conf, face_engine, engine_helmet, len(cams) + 1, sensitivity))
         
         if not cams: return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
 
@@ -314,15 +315,22 @@ def main():
                     continue
                 
                 main_boxes = None
+                helmet_boxes = None
+                
                 if fid > c.last_submit_fid:
                     if fid % SYS_CFG.get("SKIP_FRAMES", 1) == 0:
                         main_boxes = engine_main.infer(frame)
+                        # 💡 헬멧 이벤트가 활성화된 경우에만 헬멧 모델 추론
+                        if "no_helmet" in c.events and c.helmet_detector:
+                            helmet_boxes = c.helmet_detector.infer(frame)
+                            
                     c.last_submit_fid = fid
                 
-                t_h, t_g, alarms = c.run_logic(frame, fid, main_boxes)
+                # 💡 두 트래커 업데이트 로직 수행
+                t_main, alarms = c.run_logic(frame, fid, main_boxes, helmet_boxes)
                 
                 if use_display:
-                    if use_drawing: final_imgs.append(cv2.resize(c.draw(frame, t_h, t_g, alarms, connected=True), (640, 360)))
+                    if use_drawing: final_imgs.append(cv2.resize(c.draw(frame, t_main, alarms, connected=True), (640, 360)))
                     else: final_imgs.append(cv2.resize(frame, (640, 360)))
 
             if use_display and final_imgs:

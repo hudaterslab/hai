@@ -1,2 +1,170 @@
 {
+    "80_8554_cam03": {
+        "url": "rtsp://100.69.103.80:8554/cam03",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 1
+    },
+    "80_8554_cam04": {
+        "url": "rtsp://100.69.103.80:8554/cam04",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 2
+    },
+    "80_8554_cam05": {
+        "url": "rtsp://100.69.103.80:8554/cam05",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 3
+    },
+    "80_8554_cam06": {
+        "url": "rtsp://100.69.103.80:8554/cam06",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 4
+    },
+    "80_8554_cam07": {
+        "url": "rtsp://100.69.103.80:8554/cam07",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 5
+    },
+    "80_8554_cam08": {
+        "url": "rtsp://100.69.103.80:8554/cam08",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 6
+    },
+    "80_8554_cam09": {
+        "url": "rtsp://100.69.103.80:8554/cam09",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 7
+    },
+    "80_8554_cam10": {
+        "url": "rtsp://100.69.103.80:8554/cam10",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 8
+    },
+    "80_8554_cam11": {
+        "url": "rtsp://100.69.103.80:8554/cam11",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 9
+    },
+    "80_8554_cam12": {
+        "url": "rtsp://100.69.103.80:8554/cam12",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 10
+    },
+    "80_8554_cam13": {
+        "url": "rtsp://100.69.103.80:8554/cam13",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 11
+    },
+    "80_8554_cam14": {
+        "url": "rtsp://100.69.103.80:8554/cam14",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 12
+    },
+    "80_8554_cam15": {
+        "url": "rtsp://100.69.103.80:8554/cam15",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 13
+    },
+    "80_8554_cam16": {
+        "url": "rtsp://100.69.103.80:8554/cam16",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 14
+    },
+    "80_8554_cam17": {
+        "url": "rtsp://100.69.103.80:8554/cam17",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 15
+    },
+    "80_8554_cam18": {
+        "url": "rtsp://100.69.103.80:8554/cam18",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 16
+    },
+    "80_8554_cam19": {
+        "url": "rtsp://100.69.103.80:8554/cam19",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 17
+    },
+    "80_8554_cam20": {
+        "url": "rtsp://100.69.103.80:8554/cam20",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 18
+    },
+    "80_8554_cam21": {
+        "url": "rtsp://100.69.103.80:8554/cam21",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 19
+    },
+    "80_8554_cam22": {
+        "url": "rtsp://100.69.103.80:8554/cam22",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 20
+    },
+    "80_8554_cam23": {
+        "url": "rtsp://100.69.103.80:8554/cam23",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 21
+    },
+    "80_8554_cam24": {
+        "url": "rtsp://100.69.103.80:8554/cam24",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 22
+    },
+    "80_8554_cam25": {
+        "url": "rtsp://100.69.103.80:8554/cam25",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 23
+    },
+    "80_8554_cam26": {
+        "url": "rtsp://100.69.103.80:8554/cam26",
+        "events": [],
+        "roi_poly_norm": [],
+        "roi_lines_norm": [],
+        "cctv_id": 24
+    }
 }

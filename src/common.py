@@ -95,7 +95,6 @@ def deep_merge_dict(base, override):
     return result
 
 def load_system_config():
-    # 💡 [핵심 보완] 하드코딩된 값들을 모두 설정 파일의 기본값으로 매핑
     default_config = {
         "terminal_id": "99999",
         "logging": {"dir": os.path.join(PROJECT_ROOT, "logs"), "level": "INFO", "retention_days": 1},
@@ -242,17 +241,23 @@ def load_rtsp_list_from_csv(csv_path):
     if not os.path.exists(csv_path): return []
     rtsp_list = []
     try:
-        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
-            sample = f.read(2048)
-            f.seek(0)
-            if csv.Sniffer().has_header(sample):
-                for row in csv.DictReader(f):
-                    url = sanitize_camera_url(row.get('url') or row.get('rtsp') or row.get('rtsp_url') or row.get('camera_url'))
-                    if url: rtsp_list.append(url)
-            else:
-                for row in csv.reader(f):
-                    if row and not row[0].startswith('#'): rtsp_list.append(sanitize_camera_url(row[0]))
-    except Exception: pass
+        with open(csv_path, 'r', encoding='utf-8-sig') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): 
+                    continue
+                
+                first_col = line.split(',')[0].strip()
+                if first_col.lower() in ['url', 'rtsp', 'rtsp_url', 'camera_url']:
+                    continue
+                    
+                url = sanitize_camera_url(first_col)
+                if url: 
+                    rtsp_list.append(url)
+    except Exception as e: 
+        logger.error(f"⚠️ [카메라 리스트 로드 실패]: {e}")
+        pass
+        
     unique = []
     for u in rtsp_list:
         if u not in unique: unique.append(u)

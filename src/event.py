@@ -4,7 +4,7 @@ import time
 import numpy as np
 from collections import defaultdict, deque
 from common import (
-    ID_H_NO_HELMET, ID_G_PERSON, TARGET_VEHICLES, 
+    ID_H_NO_HELMET, ID_G_PERSON, ID_PERSON_LOW, TARGET_VEHICLES, 
     SCREEN_WIDTH, SCREEN_HEIGHT, get_check_point, get_center_point, get_foot_point,
     get_distance, ccw, calculate_iou, SYS_CFG
 )
@@ -58,13 +58,13 @@ class BaseEventDetector:
         self.roi_lines = roi_lines or []
         self.fps = SYS_CFG.get("REC_FPS", 3)
         
-    def process(self, tracks, track_map, motion_mask, frame, fid): 
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs): 
         return []
 
 class IntrusionDetector(BaseEventDetector):
     event_name, menu_name, gui_name = "intrusion", "침입", "INTRUSION"
     
-    def process(self, tracks, track_map, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         if self.roi_poly.size == 0: 
             return triggered
@@ -82,12 +82,11 @@ class ParkingDetector(BaseEventDetector):
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
         self.states = defaultdict(lambda: {'start_fid': 0, 'pos': None})
-        # 💡 [핵심 보완] Config 값 파싱 (기본값 5.0초)
         trigger_sec = config.get("trigger_sec", 5.0)
         self.move_threshold = config.get("move_threshold_px", 30)
         self.trigger_fid_diff = int(trigger_sec * self.fps)
         
-    def process(self, tracks, track_map, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered, curr_ids = [], set()
         if self.roi_poly.size == 0: 
             return triggered
@@ -127,19 +126,22 @@ class CrossingDetector(BaseEventDetector):
     def _is_intersect(self, p1, p2, p3, p4): 
         return ccw(p1, p2, p3) * ccw(p1, p2, p4) <= 0 and ccw(p3, p4, p1) * ccw(p3, p4, p2) <= 0
         
-    def process(self, tracks, track_map, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered, curr_ids = [], set()
         for t in tracks:
             tid = int(t[4])
             curr_ids.add(tid)
-            if track_map.get(tid) != ID_G_PERSON: 
+            
+            # 💡 [핵심 수정] 전신(ID_G_PERSON) 대신 하반신(ID_PERSON_LOW) 객체만 타겟팅
+            if track_map.get(tid) != ID_PERSON_LOW: 
                 continue
                 
             x1, y1, x2, y2 = t[:4]
             obj_height = y2 - y1
             obj_width = max(1, x2 - x1)
             
-            curr_pos = (int((x1 + x2) / 2), int(y1 + obj_height * 0.2))
+            # 💡 [핵심 수정] 하반신 박스이므로 기준점을 발(y2에서 약간 위쪽)으로 재설정
+            curr_pos = (int((x1 + x2) / 2), int(y2 - obj_height * 0.1))
             is_frame_out = (x1 <= 15) or (x2 >= SCREEN_WIDTH - 15) or (y1 <= 15) or (y2 >= SCREEN_HEIGHT - 15)
             
             self.pos_history[tid].append(curr_pos)
@@ -206,10 +208,11 @@ class HelmetDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.states = {}
-        # 💡 [핵심 보완] Config 값 파싱 (기본값 2.0초)
-        trigger_sec = config.get("trigger_sec", 2.0)
+        # 💡 [핵심 보완] 탐지 깜빡임을 보정하기 위한 상태 머신 딕셔너리로 구조 변경
+        self.states = {} 
+        trigger_sec = config.get("trigger_sec", 3.0) # 기본 3초
         self.trigger_fid_diff = int(trigger_sec * self.fps)
+        self.grace_fid_diff = int(2.0 * self.fps) # 💡 객체를 놓쳐도 2초간은 타이머를 유지(초기화 방지)
         
     def _get_intersection_over_head_area(self, head_box, person_box):
         inter_area = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0])) * max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
@@ -218,27 +221,46 @@ class HelmetDetector(BaseEventDetector):
             return inter_area / head_area
         return 0
         
-    def process(self, tracks, track_map, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
-        no_helmets = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
+        helmet_tracks = kwargs.get('helmet_tracks', [])
+        
+        # 0: helmet, 1: head, 2: person
+        unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == 1]
         current_nh_person_ids = set()
         
-        for p in [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]:
-            p_tid, max_ioa, nh_box_match = int(p[4]), 0, None
-            for nh in no_helmets:
-                ioa = self._get_intersection_over_head_area(nh[:4], p[:4])
+        for p in tracks:
+            p_tid = int(p[4])
+            if track_map.get(p_tid) != ID_G_PERSON: 
+                continue
+                
+            max_ioa = 0
+            nh_box_match = None
+            
+            for head in unhelmeted_heads:
+                ioa = self._get_intersection_over_head_area(head[:4], p[:4])
                 if ioa > max_ioa: 
-                    max_ioa, nh_box_match = ioa, nh[:4]
+                    max_ioa = ioa
+                    nh_box_match = head[:4]
                     
             if max_ioa > 0.5:
                 current_nh_person_ids.add(p_tid)
+                
+                # 처음 미착용자를 발견한 경우 상태 등록
                 if p_tid not in self.states: 
-                    self.states[p_tid] = fid
-                elif fid - self.states[p_tid] >= self.trigger_fid_diff:
-                    triggered.append({'tid': p_tid, 'bbox': nh_box_match, 'frame': None, 'fid': fid})
+                    self.states[p_tid] = {'start_fid': fid, 'last_seen': fid, 'bbox': nh_box_match}
+                else:
+                    # 기존에 발견된 인원이면 마지막 발견 시점과 BBox 업데이트
+                    self.states[p_tid]['last_seen'] = fid
+                    self.states[p_tid]['bbox'] = nh_box_match
                     
+                # 최초 발견 시점으로부터 지정된 3초(프레임)가 경과했다면 이벤트 발생
+                if fid - self.states[p_tid]['start_fid'] >= self.trigger_fid_diff:
+                    triggered.append({'tid': p_tid, 'bbox': self.states[p_tid]['bbox'], 'frame': None, 'fid': fid})
+                    
+        # 💡 [상용화 핵심 로직] 당장 이번 프레임에서 안 보인다고 바로 초기화하지 않고, '유예 기간'을 넘겼을 때만 삭제
         for tid in list(self.states.keys()):
-            if tid not in current_nh_person_ids: 
+            if fid - self.states[tid]['last_seen'] > self.grace_fid_diff:
                 del self.states[tid]
                 
         return triggered
@@ -248,14 +270,13 @@ class SignalVehicleDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        # 💡 [핵심 보완] Config 값 파싱 (기본값 0.10)
         self.motion_threshold_ratio = config.get("motion_threshold_ratio", 0.10)
         self.vehicle_history = defaultdict(lambda: deque(maxlen=30)) 
         
     def _get_distance_point_to_rect(self, point, bbox): 
         return math.sqrt(max(bbox[0] - point[0], 0, point[0] - bbox[2])**2 + max(bbox[1] - point[1], 0, point[1] - bbox[3])**2)
         
-    def process(self, tracks, track_map, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered, current_vehicle_ids = [], set()
         if self.roi_poly.size == 0 or motion_mask is None: 
             return triggered

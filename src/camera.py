@@ -155,7 +155,8 @@ class FrameReader:
             self.thread.join(timeout=join_timeout)
 
 class Camera:
-    def __init__(self, ip, conf, face_engine, cam_id, sensitivity):
+    # 💡 헬멧 전용 모델(helmet_engine)을 주입받도록 시그니처 변경
+    def __init__(self, ip, conf, face_engine, helmet_engine, cam_id, sensitivity):
         self.ip = ip
         self.conf = conf 
         self.reader = FrameReader(conf['url'], ip)
@@ -169,20 +170,23 @@ class Camera:
         self.roi_lines = []
         self.events = conf.get('events', [])
         self.face_detector = face_engine
+        self.helmet_detector = helmet_engine  # 헬멧 전용 모델 추가
         self.cam_id = cam_id 
         self.last_submit_fid = -1
         
         main_conf = SYS_CFG.get("model_confidences", {}).get("MAIN", 0.40)
         self.face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
+        self.helmet_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.45) # 헬멧 Thres
         
         self.fps = SYS_CFG.get("REC_FPS", 3)
         self.skip = SYS_CFG.get("SKIP_FRAMES", 1)
         
-        # 💡 [핵심 보완] Config 값 파싱 (기본값 1.5초)
         track_buffer_sec = SYS_CFG.get("track_buffer_sec", 1.5)
         target_buffer = max(1, int(track_buffer_sec * (self.fps / self.skip)))
         
-        self.tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=True)
+        # 💡 [핵심 보완] Main 모델용 트래커와 Helmet 모델용 트래커를 완전히 분리
+        self.main_tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=False)
+        self.helmet_tracker = SORTTracker(track_thresh=self.helmet_conf, track_buffer=target_buffer, is_helmet=False)
         
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
@@ -195,7 +199,6 @@ class Camera:
         self.obj_history = {}
         self.delayed_logs = []
         
-        # 💡 [핵심 보완] Config 값 파싱 (지연 로깅 전후 시간)
         self.pre_log_sec = SYS_CFG.get("event_pre_log_sec", 2.0)
         self.post_log_sec = SYS_CFG.get("event_post_log_sec", 2.0)
         
@@ -237,7 +240,7 @@ class Camera:
             pass
         return image
 
-    def run_logic(self, frame, frame_id, main_boxes=None):
+    def run_logic(self, frame, frame_id, main_boxes=None, helmet_boxes=None):
         with self.config_lock:
             self._update_runtime_roi(frame.shape)
             motion_mask = self.motion_det.apply(frame) 
@@ -252,7 +255,6 @@ class Camera:
             remaining_logs = []
             for dlog in self.delayed_logs:
                 if frame_id >= dlog['target_fid_to_log']:
-                    # 💡 Config에 기반한 이전 객체 뷰 기록
                     before_fid = dlog['trigger_fid'] - int(self.pre_log_sec * self.fps)
                     before_count = self.obj_history.get(before_fid, "Unknown")
                     trigger_count = self.obj_history.get(dlog['trigger_fid'], "Unknown")
@@ -265,19 +267,29 @@ class Camera:
                     remaining_logs.append(dlog)
             self.delayed_logs = remaining_logs
             
+            # 메인 트래커 업데이트
             if main_boxes is not None and len(main_boxes) > 0:
-                tracks = self.tracker.update(np.array(main_boxes))
+                main_tracks = self.main_tracker.update(np.array(main_boxes))
             else:
-                tracks = self.tracker.predict_only()
+                main_tracks = self.main_tracker.predict_only()
+                
+            # 헬멧 트래커 업데이트 (별도 운용)
+            helmet_tracks = []
+            if self.helmet_detector and "no_helmet" in self.events:
+                if helmet_boxes is not None and len(helmet_boxes) > 0:
+                    helmet_tracks = self.helmet_tracker.update(np.array(helmet_boxes))
+                else:
+                    helmet_tracks = self.helmet_tracker.predict_only()
 
             now = time.time()
             current_alarms = {}
-            track_map = {int(t[4]): int(t[6]) for t in tracks}
+            track_map = {int(t[4]): int(t[6]) for t in main_tracks}
             
             for handler in self.handlers:
-                for evt in handler.process(tracks, track_map, motion_mask, frame, frame_id):
+                # 💡 Detector에 kwargs 형태로 helmet_tracks를 전달
+                for evt in handler.process(main_tracks, track_map, motion_mask, frame, frame_id, helmet_tracks=helmet_tracks):
                     draw_tid = evt['tid'] 
-                    self._trigger_event(frame, frame_id, draw_tid, handler.event_name, tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
+                    self._trigger_event(frame, frame_id, draw_tid, handler.event_name, main_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
                     current_alarms[draw_tid] = handler.event_name
             
             for tid, ename in current_alarms.items(): 
@@ -287,7 +299,7 @@ class Camera:
                 if now > self.visual_alarms[tid]['expire']: 
                     del self.visual_alarms[tid]
                     
-            return tracks, {tid: info['evt'] for tid, info in self.visual_alarms.items()}
+            return main_tracks, {tid: info['evt'] for tid, info in self.visual_alarms.items()}
 
     def _trigger_event(self, frame, frame_id, tid, event_name, tracks, now, event_frame=None, event_bbox=None, event_fid=None):
         real_tid = tid
@@ -301,7 +313,6 @@ class Camera:
         source_fid = event_fid if event_fid is not None else frame_id
         source_frame = event_frame if event_frame is not None else frame
         
-        # 💡 [핵심 보완] Config에 기반한 지연 로깅 배출 프레임 세팅
         self.delayed_logs.append({
             'event_name': event_name,
             'trigger_fid': source_fid,
