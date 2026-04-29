@@ -6,6 +6,9 @@
     "retention_days": 1
   },
   "debug_mode": false,
+  "track_buffer_sec": 1.5,
+  "event_pre_log_sec": 2.0,
+  "event_post_log_sec": 2.0,
   "event_config": {
     "intrusion": {
       "enabled": false,
@@ -13,12 +16,15 @@
     },
     "illegal_parking": {
       "enabled": false,
-      "cooldown_sec": 600
+      "cooldown_sec": 600,
+      "trigger_sec": 5.0,
+      "move_threshold_px": 30
     },
     "no_helmet": {
       "enabled": false,
       "cooldown_sec": 600,
-      "blur_face": true
+      "blur_face": true,
+      "trigger_sec": 2.0
     },
     "conveyor_crossing": {
       "enabled": false,
@@ -31,12 +37,13 @@
     },
     "signal_vehicle": {
       "enabled": false,
-      "cooldown_sec": 600
+      "cooldown_sec": 600,
+      "motion_threshold_ratio": 0.10
     }
   },
   "models": {
-    "MAIN": "models/hanjin_cctv.dxnn",
-    "FACE": "models/yolov8m-face.dxnn"
+    "MAIN": "models/hanjin_cctv.pt",
+    "FACE": "models/yolov8m-face.pt"
   },
   "model_confidences": {
     "MAIN": 0.40,

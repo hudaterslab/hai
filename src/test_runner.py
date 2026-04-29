@@ -12,12 +12,14 @@ except ImportError:
     print("⚠️ [오류] ultralytics 패키지가 설치되지 않았습니다. 'pip install ultralytics'를 실행하십시오.")
     sys.exit(1)
 
-# 로컬 임포트 
+# 로컬 임포트 (통합 모델의 ID 체계 반영)
 from common import (
-    ID_G_PERSON, ID_G_CAR, ID_G_PERSON, ID_H_NO_HELMET, ID_H_HELMET, TARGET_VEHICLES,
+    ID_G_PERSON, ID_H_HELMET, ID_PERSON_LOW, ID_REFLECTIVE_VEST,
+    ID_G_TRUCK, ID_H_NO_HELMET, ID_G_CAR, TARGET_VEHICLES,
     SCREEN_WIDTH, SCREEN_HEIGHT, SYS_CFG, get_center_point, get_distance
 )
 import event
+from ai_core import SORTTracker
 
 TEST_JSON_PATH = os.path.join(os.path.dirname(__file__), "test.json")
 TEST_VIDEO_DIR = "test"
@@ -31,49 +33,6 @@ def load_test_config():
 def save_test_config(config):
     with open(TEST_JSON_PATH, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
-
-# 💡 [핵심 추가] Tracking 단절 시 ID를 강제로 복구하는 Re-ID 클래스
-class TrackReID:
-    def __init__(self, max_lost=15, max_dist=100):
-        self.last_seen = {}
-        self.id_map = {}
-        self.max_lost = max_lost
-        self.max_dist = max_dist
-
-    def process(self, tracks, fid):
-        mapped_tracks = []
-        for t in tracks:
-            x1, y1, x2, y2, tid, cls_id, conf = t
-            tid = int(tid)
-            
-            # 기존에 맵핑된 이력이 있다면 기존 ID를 계승
-            while tid in self.id_map:
-                tid = self.id_map[tid]
-                
-            center = get_center_point(x1, y1, x2, y2)
-            
-            # 처음 보는 ID라면, 최근에 근처에서 잃어버린 ID가 있는지 탐색
-            if tid not in self.last_seen:
-                best_match = None
-                min_dist = self.max_dist
-                
-                for lost_id, data in self.last_seen.items():
-                    frames_lost = fid - data['fid']
-                    if 0 < frames_lost <= self.max_lost and data['cls'] == cls_id:
-                        l_center = get_center_point(*data['bbox'])
-                        dist = get_distance(center, l_center)
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_match = lost_id
-                            
-                if best_match is not None:
-                    self.id_map[tid] = best_match
-                    tid = best_match
-            
-            self.last_seen[tid] = {'bbox': (x1, y1, x2, y2), 'fid': fid, 'cls': cls_id}
-            mapped_tracks.append([x1, y1, x2, y2, float(tid), cls_id, conf])
-            
-        return mapped_tracks
 
 class ROIPicker:
     def __init__(self, frame, selected_events):
@@ -157,21 +116,9 @@ class ROIPicker:
         cv2.destroyWindow(self.window_name)
         return self.poly_points, self.line_points
 
-def parse_yolo_tracks(results):
-    tracks = []
-    if results and len(results) > 0 and results[0].boxes is not None and results[0].boxes.id is not None:
-        boxes = results[0].boxes.xyxy.cpu().numpy()
-        ids = results[0].boxes.id.cpu().numpy()
-        classes = results[0].boxes.cls.cpu().numpy()
-        confs = results[0].boxes.conf.cpu().numpy()
-        
-        for box, tid, cls, conf in zip(boxes, ids, classes, confs):
-            tracks.append([box[0], box[1], box[2], box[3], int(tid), int(cls), float(conf)])
-    return tracks
-
 def main():
-    general_model_path = os.path.join("..", "models", "YOLOV8M-1.pt")
-    helmet_model_path = os.path.join("..", "models", "helmet_3cls_v8.pt")
+    # 💡 [핵심 보완] 통합 단일 모델(hanjin_cctv) 로드
+    main_model_path = os.path.join("..", "models", "hanjin_cctv.pt")
 
     if not os.path.exists(TEST_VIDEO_DIR):
         print(f"⚠️ [에러] 테스트 폴더를 찾을 수 없습니다: {TEST_VIDEO_DIR}")
@@ -185,9 +132,13 @@ def main():
 
     all_configs = load_test_config()
 
-    print("⏳ AI 모델을 GPU 메모리에 로드 중입니다...")
-    model_general = YOLO(general_model_path)
-    model_helmet = YOLO(helmet_model_path) if os.path.exists(helmet_model_path) else None
+    print("⏳ AI 통합 모델을 메모리에 로드 중입니다...")
+    if not os.path.exists(main_model_path):
+        print(f"⚠️ [에러] 모델 파일을 찾을 수 없습니다: {main_model_path}")
+        return
+        
+    model_main = YOLO(main_model_path)
+    main_conf = SYS_CFG.get("model_confidences", {}).get("MAIN", 0.40)
 
     snapshot_queue = []
     MAX_SNAPSHOTS = 4  
@@ -195,7 +146,8 @@ def main():
     CANVAS_WIDTH = SCREEN_WIDTH + 640 
     CANVAS_HEIGHT = SCREEN_HEIGHT
 
-    base_skip_frames = SYS_CFG.get("SKIP_FRAMES", 4)
+    base_skip_frames = SYS_CFG.get("SKIP_FRAMES", 1)
+    target_fps = SYS_CFG.get("REC_FPS", 3)
 
     for video_filename in video_files:
         print(f"\n========================================================")
@@ -267,21 +219,19 @@ def main():
 
         while True:
             cap = cv2.VideoCapture(video_path)
-            
             video_fps = cap.get(cv2.CAP_PROP_FPS)
             active_skip_frames = base_skip_frames
             
             if video_fps > 0 and video_fps < 15:
-                print(f"⚠️ [알림] 영상 FPS가 {video_fps:.1f}로 매우 낮습니다. (이미 프레임 드롭된 영상)")
-                print("⚠️ 이중 드롭(Double Drop)을 방지하기 위해 프레임 스킵을 자동으로 끕니다.")
+                print(f"⚠️ [알림] 영상 FPS가 {video_fps:.1f}로 매우 낮습니다. 프레임 스킵을 자동 해제합니다.")
                 active_skip_frames = 0
 
             motion_detector = event.MotionDetector(sensitivity=5)
             trajectory_tracker = event.TrajectoryTracker(max_len=30)
             
-            # 💡 [핵심 연동] Re-ID 모듈 초기화
-            reid_general = TrackReID(max_lost=15, max_dist=100)
-            reid_helmet = TrackReID(max_lost=15, max_dist=100)
+            # 💡 [핵심 보완] 상용 환경과 동일한 자체 SORTTracker 사용 (track_buffer 동적 계산 1.5초 적용)
+            target_buffer = max(1, int(1.5 * (target_fps / max(1, active_skip_frames))))
+            tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=True)
             
             config_mock = {
                 "snapshot_mode": "crossing_moment", "distance_ratio": 0.3,
@@ -295,9 +245,6 @@ def main():
             if "conveyor_crossing" in active_events: detectors.append(event.CrossingDetector(config_mock, roi_lines=roi_lines))
             if "no_helmet" in active_events: detectors.append(event.HelmetDetector(config_mock))
             if "signal_vehicle" in active_events: detectors.append(event.SignalVehicleDetector(config_mock, roi_poly=roi_poly))
-
-            need_general = any("general" in getattr(d, 'required_models', []) for d in detectors)
-            need_helmet = any("helmet" in getattr(d, 'required_models', []) for d in detectors)
             
             fid = 0
             snapshot_cooldowns = {}
@@ -367,49 +314,38 @@ def main():
 
                 motion_mask = motion_detector.apply(frame)
 
-                general_tracks = []
-                if model_general and need_general:
-                    g_results = model_general.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, conf=0.15)
-                    raw_general_tracks = parse_yolo_tracks(g_results)
-                    
-                    # 💡 [핵심 연동] Re-ID 필터를 거쳐 끊어진 ID를 복구합니다.
-                    general_tracks = reid_general.process(raw_general_tracks, fid)
-                    
-                    for t in general_tracks:
-                        x1, y1, x2, y2, tid, cls_id, _ = t
-                        full_track_history[f"G_{int(tid)}"].append({
-                            "frame": fid,
-                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                            "class": int(cls_id)
-                        })
+                # 💡 [핵심 보완] Ultralytics 내장 트래커(model.track) 제거 후 단순 예측(predict) 및 SORTTracker 연동
+                results = model_main.predict(frame, verbose=False, conf=main_conf)
                 
-                helmet_tracks = []
-                if model_helmet and need_helmet:
-                    h_results = model_helmet.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, conf=0.20)
-                    raw_helmet_tracks = parse_yolo_tracks(h_results)
+                raw_boxes = []
+                for r in results:
+                    if r.boxes is not None and len(r.boxes) > 0:
+                        xyxy = r.boxes.xyxy.cpu().numpy()
+                        conf = r.boxes.conf.cpu().numpy()
+                        cls = r.boxes.cls.cpu().numpy()
+                        for i in range(len(xyxy)):
+                            raw_boxes.append([xyxy[i][0], xyxy[i][1], xyxy[i][2], xyxy[i][3], conf[i], int(cls[i])])
+                            
+                if len(raw_boxes) > 0:
+                    tracks = tracker.update(np.array(raw_boxes))
+                else:
+                    tracks = tracker.predict_only()
                     
-                    # 💡 [핵심 연동] 헬멧 모델에도 Re-ID 적용
-                    helmet_tracks = reid_helmet.process(raw_helmet_tracks, fid)
-                    
-                    for t in helmet_tracks:
-                        x1, y1, x2, y2, tid, cls_id, _ = t
-                        full_track_history[f"H_{int(tid)}"].append({
-                            "frame": fid,
-                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                            "class": int(cls_id)
-                        })
+                for t in tracks:
+                    x1, y1, x2, y2, tid, conf, cls_id = t
+                    full_track_history[f"T_{int(tid)}"].append({
+                        "frame": fid,
+                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                        "class": int(cls_id)
+                    })
 
-                track_maps = {
-                    "helmet": {int(t[4]): int(t[5]) for t in helmet_tracks},
-                    "general": {int(t[4]): int(t[5]) for t in general_tracks}
-                }
+                track_map = {int(t[4]): int(t[6]) for t in tracks}
 
-                trajectory_tracker.update_and_draw(display_frame, general_tracks)
+                trajectory_tracker.update_and_draw(display_frame, tracks)
 
                 for detector in detectors:
                     triggered_events = detector.process(
-                        helmet_tracks=helmet_tracks, general_tracks=general_tracks,
-                        track_maps=track_maps, motion_mask=motion_mask,
+                        tracks=tracks, track_map=track_map, motion_mask=motion_mask,
                         frame=frame, fid=fid
                     )
                     
@@ -452,40 +388,21 @@ def main():
                             if len(snapshot_queue) > MAX_SNAPSHOTS:
                                 snapshot_queue.pop()
 
-                for t in general_tracks:
-                    x1, y1, x2, y2, tid, cls_id, conf = map(float, t)
+                for t in tracks:
+                    x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
                     cls_id = int(cls_id)
-                    if cls_id == ID_G_PERSON:
-                        color = (0, 255, 0)
-                        label = f"P:{int(tid)} {conf:.2f}"
-                    elif cls_id in TARGET_VEHICLES:
-                        color = (255, 150, 0)
-                        label = f"V:{int(tid)} {conf:.2f}"
-                    else:
-                        color = (150, 150, 150)
-                        label = f"G_{cls_id}:{int(tid)} {conf:.2f}"
+                    
+                    if cls_id == ID_H_HELMET: color, label = (255, 0, 0), f"Helmet:{int(tid)}"
+                    elif cls_id == ID_H_NO_HELMET: color, label = (0, 0, 255), f"NoHelmet:{int(tid)}"
+                    elif cls_id == ID_G_PERSON: color, label = (0, 255, 0), f"Person:{int(tid)}"
+                    elif cls_id == ID_G_CAR: color, label = (255, 100, 0), f"Car:{int(tid)}"
+                    elif cls_id == ID_G_TRUCK: color, label = (255, 100, 0), f"Truck:{int(tid)}"
+                    elif cls_id == ID_PERSON_LOW: color, label = (0, 255, 100), f"LowBody:{int(tid)}"
+                    elif cls_id == ID_REFLECTIVE_VEST: color, label = (255, 255, 0), f"Vest:{int(tid)}"
+                    else: color, label = (255, 255, 255), f"OBJ:{int(tid)}"
                         
-                    cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 1)
-                    cv2.putText(display_frame, label, (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-                for t in helmet_tracks:
-                    x1, y1, x2, y2, tid, cls_id, conf = map(float, t)
-                    cls_id = int(cls_id)
-                    if cls_id == ID_H_HELMET:
-                        color = (255, 255, 0)
-                        label = f"H_ON:{int(tid)} {conf:.2f}"
-                    elif cls_id == ID_H_NO_HELMET:
-                        color = (0, 0, 255)
-                        label = f"H_OFF:{int(tid)} {conf:.2f}"
-                    elif cls_id == ID_H_PERSON:
-                        color = (255, 0, 255)
-                        label = f"HP:{int(tid)} {conf:.2f}"
-                    else:
-                        color = (200, 200, 200)
-                        label = f"H_{cls_id}:{int(tid)} {conf:.2f}"
-
                     cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                    cv2.putText(display_frame, label, (int(x1), int(y2)+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    cv2.putText(display_frame, f"{label} {conf:.2f}", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
                 if len(roi_poly) >= 3:
                     pts = np.array(roi_poly, np.int32).reshape((-1, 1, 2))

@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 from common import (
     ID_H_NO_HELMET, ID_G_PERSON, TARGET_VEHICLES, 
     SCREEN_WIDTH, SCREEN_HEIGHT, get_check_point, get_center_point, get_foot_point,
-    get_distance, ccw, calculate_iou
+    get_distance, ccw, calculate_iou, SYS_CFG
 )
 
 class TrajectoryTracker:
@@ -56,8 +56,8 @@ class BaseEventDetector:
         self.config = config
         self.roi_poly = np.array(roi_poly, dtype=np.int32) if roi_poly and len(roi_poly) >= 3 else np.empty((0, 2), dtype=np.int32)
         self.roi_lines = roi_lines or []
+        self.fps = SYS_CFG.get("REC_FPS", 3)
         
-    # 💡 [핵심 보완] 파라미터 통합: tracks, track_map
     def process(self, tracks, track_map, motion_mask, frame, fid): 
         return []
 
@@ -81,10 +81,14 @@ class ParkingDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.states = defaultdict(lambda: {'start': 0, 'pos': None})
+        self.states = defaultdict(lambda: {'start_fid': 0, 'pos': None})
+        # 💡 [핵심 보완] Config 값 파싱 (기본값 5.0초)
+        trigger_sec = config.get("trigger_sec", 5.0)
+        self.move_threshold = config.get("move_threshold_px", 30)
+        self.trigger_fid_diff = int(trigger_sec * self.fps)
         
     def process(self, tracks, track_map, motion_mask, frame, fid):
-        triggered, curr_ids, now = [], set(), time.time()
+        triggered, curr_ids = [], set()
         if self.roi_poly.size == 0: 
             return triggered
             
@@ -93,9 +97,9 @@ class ParkingDetector(BaseEventDetector):
             if track_map.get(tid) in TARGET_VEHICLES and cv2.pointPolygonTest(self.roi_poly, get_check_point(*t[:4]), False) >= 0:
                 curr_ids.add(tid)
                 c = get_center_point(*t[:4])
-                if self.states[tid]['start'] == 0 or get_distance(c, self.states[tid]['pos']) > 30:
-                    self.states[tid].update({'start': now, 'pos': c})
-                elif now - self.states[tid]['start'] > 5.0:
+                if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > self.move_threshold:
+                    self.states[tid].update({'start_fid': fid, 'pos': c})
+                elif fid - self.states[tid]['start_fid'] >= self.trigger_fid_diff:
                     triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
                     
         for tid in list(self.states.keys()):
@@ -115,15 +119,16 @@ class CrossingDetector(BaseEventDetector):
         self.pos_history = defaultdict(lambda: deque(maxlen=4))
         
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
-        self.distance_ratio = config.get("distance_ratio", 0.3)
-        self.min_distance_px, self.candidate_ttl_sec = config.get("min_distance_px", 15), config.get("candidate_ttl_sec", 5.0)
+        self.distance_ratio = config.get("distance_ratio", 0.5)
         self.direction_check = config.get("direction_check", True)
+        candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
+        self.ttl_fid_diff = int(candidate_ttl_sec * self.fps)
         
     def _is_intersect(self, p1, p2, p3, p4): 
         return ccw(p1, p2, p3) * ccw(p1, p2, p4) <= 0 and ccw(p3, p4, p1) * ccw(p3, p4, p2) <= 0
         
     def process(self, tracks, track_map, motion_mask, frame, fid):
-        triggered, curr_ids, now = [], set(), time.time()
+        triggered, curr_ids = [], set()
         for t in tracks:
             tid = int(t[4])
             curr_ids.add(tid)
@@ -161,7 +166,7 @@ class CrossingDetector(BaseEventDetector):
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, self.prev[tid], curr_pos):
                         self.candidates[tid] = {
-                            'crossing_pt': curr_pos, 'height': obj_height, 'timestamp': now, 'line': (p1, p2),
+                            'crossing_pt': curr_pos, 'height': obj_height, 'timestamp_fid': fid, 'line': (p1, p2),
                             'entry_side': ccw(p1, p2, self.prev[tid]), 'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
                             'bbox': tuple(t[:4]), 'fid': fid
                         }
@@ -178,7 +183,7 @@ class CrossingDetector(BaseEventDetector):
                     if moved_dist > dynamic_threshold or is_frame_out:
                         triggered.append({'tid': tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
                         del self.candidates[tid]
-                elif now - cand['timestamp'] > self.candidate_ttl_sec: 
+                elif fid - cand['timestamp_fid'] > self.ttl_fid_diff: 
                     del self.candidates[tid]
                     
             self.prev[tid] = curr_pos
@@ -201,7 +206,10 @@ class HelmetDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.states, self.trigger_delay = {}, 2.0
+        self.states = {}
+        # 💡 [핵심 보완] Config 값 파싱 (기본값 2.0초)
+        trigger_sec = config.get("trigger_sec", 2.0)
+        self.trigger_fid_diff = int(trigger_sec * self.fps)
         
     def _get_intersection_over_head_area(self, head_box, person_box):
         inter_area = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0])) * max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
@@ -211,8 +219,7 @@ class HelmetDetector(BaseEventDetector):
         return 0
         
     def process(self, tracks, track_map, motion_mask, frame, fid):
-        triggered, now = [], time.time() 
-        # 💡 하나의 통합된 트랙 리스트에서 필터링
+        triggered = []
         no_helmets = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
         current_nh_person_ids = set()
         
@@ -226,8 +233,8 @@ class HelmetDetector(BaseEventDetector):
             if max_ioa > 0.5:
                 current_nh_person_ids.add(p_tid)
                 if p_tid not in self.states: 
-                    self.states[p_tid] = now
-                elif now - self.states[p_tid] >= self.trigger_delay:
+                    self.states[p_tid] = fid
+                elif fid - self.states[p_tid] >= self.trigger_fid_diff:
                     triggered.append({'tid': p_tid, 'bbox': nh_box_match, 'frame': None, 'fid': fid})
                     
         for tid in list(self.states.keys()):
@@ -241,7 +248,9 @@ class SignalVehicleDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.motion_threshold_ratio, self.vehicle_history = 0.10, defaultdict(lambda: deque(maxlen=30)) 
+        # 💡 [핵심 보완] Config 값 파싱 (기본값 0.10)
+        self.motion_threshold_ratio = config.get("motion_threshold_ratio", 0.10)
+        self.vehicle_history = defaultdict(lambda: deque(maxlen=30)) 
         
     def _get_distance_point_to_rect(self, point, bbox): 
         return math.sqrt(max(bbox[0] - point[0], 0, point[0] - bbox[2])**2 + max(bbox[1] - point[1], 0, point[1] - bbox[3])**2)

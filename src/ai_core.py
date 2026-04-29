@@ -39,7 +39,6 @@ def get_model_confidence(engine_path, default_conf=0.45):
     else: 
         return conf_map.get("GENERAL", 0.50)
 
-# 💡 [핵심 보완] 설정 파일에 어떤 확장자가 적혀있든 무시하고, 현재 구동되는 하드웨어(GPU/NPU)에 맞는 확장자를 스스로 생성합니다.
 def resolve_model_path(engine_path, is_gpu=False):
     base_path = os.path.splitext(engine_path)[0]
     target_path = f"{base_path}.pt" if is_gpu else f"{base_path}.dxnn"
@@ -48,21 +47,37 @@ def resolve_model_path(engine_path, is_gpu=False):
         return target_path
     return os.path.join("models", os.path.basename(target_path))
 
+# 💡 [핵심 보완] NPU CLI 체크 실패 원인 명시화
 def check_deepx_npu():
     try: 
-        return subprocess.run(["dxrt-cli", "-i"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).returncode == 0
-    except Exception: 
+        res = subprocess.run(["dxrt-cli", "-i"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            return True
+        else:
+            logger.debug(f"[AI_CORE] dxrt-cli 실행 실패 코드: {res.returncode}")
+            return False
+    except FileNotFoundError:
+        logger.debug("[AI_CORE] dxrt-cli 명령어를 찾을 수 없습니다. (환경변수 PATH 확인 필요)")
+        return False
+    except Exception as e: 
+        logger.debug(f"[AI_CORE] NPU 체크 중 알 수 없는 에러: {e}")
         return False
 
 USE_NPU = check_deepx_npu()
 
+# 💡 [핵심 보완] 사일런트 폴백(Silent Fallback) 방지 및 원인 출력
 if USE_NPU:
     try:
         from dx_engine import InferenceEngine, InferenceOption
         logger.info("🟢 DeepX NPU 활성화: dx_engine을 가동합니다.")
-    except Exception:
+    except ImportError as e:
         USE_NPU = False
-        logger.warning("🟡 NPU 임포트 실패. GPU 모드로 대체합니다.")
+        logger.warning(f"🟡 [치명적] NPU 환경은 감지되었으나 패키지 임포트에 실패했습니다: {e} -> 가상환경(venv-dx-runtime) 내 dx_engine 설치를 확인하세요. GPU 모드로 강제 대체합니다.")
+    except Exception as e:
+        USE_NPU = False
+        logger.warning(f"🟡 NPU 초기화 중 에러 발생: {e} -> GPU 모드로 강제 대체합니다.")
+else:
+    logger.info("🔵 NPU 하드웨어가 감지되지 않아 GPU/CPU 모드로 시작합니다.")
 
 if USE_NPU:
     def onInferenceCallbackSync(outputs, user_arg):

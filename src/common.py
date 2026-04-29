@@ -95,30 +95,34 @@ def deep_merge_dict(base, override):
     return result
 
 def load_system_config():
+    # 💡 [핵심 보완] 하드코딩된 값들을 모두 설정 파일의 기본값으로 매핑
     default_config = {
         "terminal_id": "99999",
         "logging": {"dir": os.path.join(PROJECT_ROOT, "logs"), "level": "INFO", "retention_days": 1},
         "debug_mode": False,
+        "track_buffer_sec": 1.5,
+        "event_pre_log_sec": 2.0,
+        "event_post_log_sec": 2.0,
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
-            "illegal_parking": {"enabled": False, "cooldown_sec": 600},
-            "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True},
+            "illegal_parking": {"enabled": False, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_px": 30},
+            "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True, "trigger_sec": 2.0},
             "conveyor_crossing": {
-                "enabled": False, "cooldown_sec": 600, "snapshot_mode": "current_frame", 
+                "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", 
                 "distance_ratio": 0.5, "min_distance_px": 15, "candidate_ttl_sec": 5.0, "direction_check": True
             },
-            "signal_vehicle": {"enabled": False, "cooldown_sec": 600}
+            "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.10}
         },
         "models": {
-            "MAIN": "models/hanjin_cctv.dxnn",
-            "FACE": "models/yolov8m-face.dxnn"
+            "MAIN": "models/hanjin_cctv.pt",
+            "FACE": "models/yolov8m-face.pt"
         },
         "model_confidences": {
             "MAIN": 0.40,
             "FACE": 0.35
         },
-        "SKIP_FRAMES": 4,
-        "REC_FPS": 30,
+        "SKIP_FRAMES": 1,
+        "REC_FPS": 3,
         "REC_PRE_SEC": 3,
         "REC_POST_SEC": 4,
         "WATCHDOG_TIMEOUT": 30.0,
@@ -201,7 +205,6 @@ def setup_logging(common_conf):
 
 def sanitize_camera_url(url: str) -> str: return re.sub(r'\s+', '', (url or '').strip())
 
-# 💡 [핵심 보완] NVR 멀티플렉싱 환경을 위해 Path(경로) 정보를 추가로 파싱합니다.
 def parse_camera_endpoint(rtsp_url: str):
     clean_url = sanitize_camera_url(rtsp_url)
     if "://" not in clean_url: clean_url = f"rtsp://{clean_url}"
@@ -213,7 +216,6 @@ def parse_camera_endpoint(rtsp_url: str):
     path = parsed.path.strip("/")
     return clean_url, unquote(host.strip()), port.strip(), path
 
-# 💡 [핵심 보완] 동일 IP/포트라도 Path(cam03, cam04)가 다르면 완전히 다른 카메라 ID로 식별합니다.
 def extract_ip(rtsp_url: str) -> str:
     try:
         _, host, port, path = parse_camera_endpoint(rtsp_url)

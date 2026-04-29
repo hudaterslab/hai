@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 from common import (
     ID_H_NO_HELMET, ID_G_PERSON, TARGET_VEHICLES, 
     SCREEN_WIDTH, SCREEN_HEIGHT, get_check_point, get_center_point, get_foot_point,
-    get_distance, ccw, calculate_iou
+    get_distance, ccw, calculate_iou, SYS_CFG
 )
 
 class TrajectoryTracker:
@@ -56,6 +56,8 @@ class BaseEventDetector:
         self.config = config
         self.roi_poly = np.array(roi_poly, dtype=np.int32) if roi_poly and len(roi_poly) >= 3 else np.empty((0, 2), dtype=np.int32)
         self.roi_lines = roi_lines or []
+        # 💡 [핵심 보완] 모든 이벤트 감지기에서 FPS를 가져와 논리적 시간(FID) 계산에 사용합니다.
+        self.fps = SYS_CFG.get("REC_FPS", 3)
         
     def process(self, tracks, track_map, motion_mask, frame, fid): 
         return []
@@ -80,10 +82,12 @@ class ParkingDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.states = defaultdict(lambda: {'start': 0, 'pos': None})
+        self.states = defaultdict(lambda: {'start_fid': 0, 'pos': None})
+        # 💡 주정차 5초 기준을 프레임 격차(FID Diff)로 환산 (예: 5초 * 3FPS = 15 프레임의 시각적 증거 필요)
+        self.trigger_fid_diff = int(5.0 * self.fps)
         
     def process(self, tracks, track_map, motion_mask, frame, fid):
-        triggered, curr_ids, now = [], set(), time.time()
+        triggered, curr_ids = [], set()
         if self.roi_poly.size == 0: 
             return triggered
             
@@ -92,9 +96,9 @@ class ParkingDetector(BaseEventDetector):
             if track_map.get(tid) in TARGET_VEHICLES and cv2.pointPolygonTest(self.roi_poly, get_check_point(*t[:4]), False) >= 0:
                 curr_ids.add(tid)
                 c = get_center_point(*t[:4])
-                if self.states[tid]['start'] == 0 or get_distance(c, self.states[tid]['pos']) > 30:
-                    self.states[tid].update({'start': now, 'pos': c})
-                elif now - self.states[tid]['start'] > 5.0:
+                if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > 30:
+                    self.states[tid].update({'start_fid': fid, 'pos': c})
+                elif fid - self.states[tid]['start_fid'] >= self.trigger_fid_diff:
                     triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
                     
         for tid in list(self.states.keys()):
@@ -115,14 +119,16 @@ class CrossingDetector(BaseEventDetector):
         
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
         self.distance_ratio = config.get("distance_ratio", 0.3)
-        self.min_distance_px, self.candidate_ttl_sec = config.get("min_distance_px", 15), config.get("candidate_ttl_sec", 5.0)
         self.direction_check = config.get("direction_check", True)
+        # 💡 후보 유지 시간(5.0초)을 FID 갭으로 환산
+        candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
+        self.ttl_fid_diff = int(candidate_ttl_sec * self.fps)
         
     def _is_intersect(self, p1, p2, p3, p4): 
         return ccw(p1, p2, p3) * ccw(p1, p2, p4) <= 0 and ccw(p3, p4, p1) * ccw(p3, p4, p2) <= 0
         
     def process(self, tracks, track_map, motion_mask, frame, fid):
-        triggered, curr_ids, now = [], set(), time.time()
+        triggered, curr_ids = [], set()
         for t in tracks:
             tid = int(t[4])
             curr_ids.add(tid)
@@ -160,7 +166,7 @@ class CrossingDetector(BaseEventDetector):
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, self.prev[tid], curr_pos):
                         self.candidates[tid] = {
-                            'crossing_pt': curr_pos, 'height': obj_height, 'timestamp': now, 'line': (p1, p2),
+                            'crossing_pt': curr_pos, 'height': obj_height, 'timestamp_fid': fid, 'line': (p1, p2),
                             'entry_side': ccw(p1, p2, self.prev[tid]), 'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
                             'bbox': tuple(t[:4]), 'fid': fid
                         }
@@ -177,7 +183,8 @@ class CrossingDetector(BaseEventDetector):
                     if moved_dist > dynamic_threshold or is_frame_out:
                         triggered.append({'tid': tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
                         del self.candidates[tid]
-                elif now - cand['timestamp'] > self.candidate_ttl_sec: 
+                # 💡 FID 기반 만료 확인
+                elif fid - cand['timestamp_fid'] > self.ttl_fid_diff: 
                     del self.candidates[tid]
                     
             self.prev[tid] = curr_pos
@@ -200,7 +207,10 @@ class HelmetDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.states, self.trigger_delay = {}, 2.0
+        self.states = {}
+        # 💡 [핵심 보완] 설정하신 2초를 타겟 FID Diff로 변환 (예: 2초 * 3FPS = 6프레임 연속 미착용 시 트리거)
+        self.trigger_delay_sec = 2.0
+        self.trigger_fid_diff = int(self.trigger_delay_sec * self.fps)
         
     def _get_intersection_over_head_area(self, head_box, person_box):
         inter_area = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0])) * max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
@@ -210,7 +220,7 @@ class HelmetDetector(BaseEventDetector):
         return 0
         
     def process(self, tracks, track_map, motion_mask, frame, fid):
-        triggered, now = [], time.time() 
+        triggered = []
         no_helmets = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
         current_nh_person_ids = set()
         
@@ -224,8 +234,9 @@ class HelmetDetector(BaseEventDetector):
             if max_ioa > 0.5:
                 current_nh_person_ids.add(p_tid)
                 if p_tid not in self.states: 
-                    self.states[p_tid] = now
-                elif now - self.states[p_tid] >= self.trigger_delay:
+                    # 💡 time.time() 대신 FID 기록
+                    self.states[p_tid] = fid
+                elif fid - self.states[p_tid] >= self.trigger_fid_diff:
                     triggered.append({'tid': p_tid, 'bbox': nh_box_match, 'frame': None, 'fid': fid})
                     
         for tid in list(self.states.keys()):

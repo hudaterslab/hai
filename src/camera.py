@@ -154,7 +154,6 @@ class FrameReader:
         if self.thread.is_alive(): 
             self.thread.join(timeout=join_timeout)
 
-
 class Camera:
     def __init__(self, ip, conf, face_engine, cam_id, sensitivity):
         self.ip = ip
@@ -178,9 +177,11 @@ class Camera:
         
         self.fps = SYS_CFG.get("REC_FPS", 3)
         self.skip = SYS_CFG.get("SKIP_FRAMES", 1)
-        target_buffer = max(1, int(1.5 * (self.fps / self.skip)))
         
-        # 💡 [핵심 보완] 단일 트래커로 대통합
+        # 💡 [핵심 보완] Config 값 파싱 (기본값 1.5초)
+        track_buffer_sec = SYS_CFG.get("track_buffer_sec", 1.5)
+        target_buffer = max(1, int(track_buffer_sec * (self.fps / self.skip)))
+        
         self.tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=True)
         
         self.alerted = defaultdict(set)
@@ -193,6 +194,10 @@ class Camera:
         
         self.obj_history = {}
         self.delayed_logs = []
+        
+        # 💡 [핵심 보완] Config 값 파싱 (지연 로깅 전후 시간)
+        self.pre_log_sec = SYS_CFG.get("event_pre_log_sec", 2.0)
+        self.post_log_sec = SYS_CFG.get("event_post_log_sec", 2.0)
         
         self.init_handlers()
 
@@ -247,19 +252,19 @@ class Camera:
             remaining_logs = []
             for dlog in self.delayed_logs:
                 if frame_id >= dlog['target_fid_to_log']:
-                    before_fid = dlog['trigger_fid'] - (2 * self.fps)
+                    # 💡 Config에 기반한 이전 객체 뷰 기록
+                    before_fid = dlog['trigger_fid'] - int(self.pre_log_sec * self.fps)
                     before_count = self.obj_history.get(before_fid, "Unknown")
                     trigger_count = self.obj_history.get(dlog['trigger_fid'], "Unknown")
                     after_count = current_obj_count
                     
                     logger.info(f"🚨 [EVENT] CAM:{self.cam_id} | Type:{dlog['event_name']} | "
                                 f"Triggered At:{dlog['time_str']} | "
-                                f"Obj Count -> -2s: {before_count} | 0s: {trigger_count} | +2s: {after_count}")
+                                f"Obj Count -> -{self.pre_log_sec}s: {before_count} | 0s: {trigger_count} | +{self.post_log_sec}s: {after_count}")
                 else:
                     remaining_logs.append(dlog)
             self.delayed_logs = remaining_logs
             
-            # 💡 [핵심 보완] 하나의 트래커로 몽땅 밀어 넣습니다.
             if main_boxes is not None and len(main_boxes) > 0:
                 tracks = self.tracker.update(np.array(main_boxes))
             else:
@@ -270,9 +275,7 @@ class Camera:
             track_map = {int(t[4]): int(t[6]) for t in tracks}
             
             for handler in self.handlers:
-                # 단일 tracks 리스트 전달
                 for evt in handler.process(tracks, track_map, motion_mask, frame, frame_id):
-                    # +10000 꼼수 완전 삭제
                     draw_tid = evt['tid'] 
                     self._trigger_event(frame, frame_id, draw_tid, handler.event_name, tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
                     current_alarms[draw_tid] = handler.event_name
@@ -298,10 +301,11 @@ class Camera:
         source_fid = event_fid if event_fid is not None else frame_id
         source_frame = event_frame if event_frame is not None else frame
         
+        # 💡 [핵심 보완] Config에 기반한 지연 로깅 배출 프레임 세팅
         self.delayed_logs.append({
             'event_name': event_name,
             'trigger_fid': source_fid,
-            'target_fid_to_log': source_fid + (2 * self.fps),
+            'target_fid_to_log': source_fid + int(self.post_log_sec * self.fps),
             'time_str': datetime.datetime.now().strftime('%H:%M:%S')
         })
         
@@ -337,7 +341,6 @@ class Camera:
             for i in range(0, len(self.roi_lines) - 1, 2): 
                 cv2.line(frame, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0,0,255), 1)
         
-        # 💡 [핵심 보완] 분리되어 있던 그리기 루프 대통합 (1번의 루프로 모든 클래스 처리)
         for t in tracks:
             tid = int(t[4])
             cls_id = int(t[6])
