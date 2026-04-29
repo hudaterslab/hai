@@ -19,7 +19,6 @@ from ai_core import SORTTracker
 logger = logging.getLogger("VMS_SYSTEM")
 
 class FrameReader:
-    # 💡 [핵심 상용화 기술] 클래스 변수로 성공한 디코딩 전략을 전역 공유
     _best_strategy_idx = 0 
 
     def __init__(self, url, ip):
@@ -43,7 +42,6 @@ class FrameReader:
         self.thread.start()
 
     def _get_strategies(self):
-        # 현장에서 가장 빈번하게 사용되는 강건한 파이프라인 순서
         return [
             {'type': 'gst', 'name': 'Generic TCP (decodebin)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! decodebin ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
             {'type': 'gst', 'name': 'H.265 TCP (Explicit)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
@@ -60,7 +58,6 @@ class FrameReader:
             tested_count = 0
             success = False
 
-            # 모든 전략을 순회하며 시도
             while tested_count < len(strategies) and self.running:
                 strategy = strategies[current_idx]
                 logger.info(f"[CAM {self.ip}] 연결 시도 중... 전략: {strategy['name']}")
@@ -68,11 +65,9 @@ class FrameReader:
                 success = self._try_strategy(strategy)
                 
                 if success:
-                    # 💡 성공 시 해당 전략을 다른 카메라들도 우선 사용하도록 전역 캐싱 
                     FrameReader._best_strategy_idx = current_idx
                     break
                 else:
-                    # 실패 시 다음 전략으로 이동
                     current_idx = (current_idx + 1) % len(strategies)
                     tested_count += 1
                     time.sleep(1.0)
@@ -85,7 +80,7 @@ class FrameReader:
                 time.sleep(10)
 
     def _try_strategy(self, strategy):
-        invalid_count = 0
+        start_time = time.time()
         valid_frames_read = 0
         
         if strategy['type'] == 'gst':
@@ -115,18 +110,22 @@ class FrameReader:
                     
                 img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
                 
-                # 💡 [핵심 보완] 회색(128)이나 흑백(0) 가짜 프레임 필터링
+                # 💡 [핵심 보완] 회색 실루엣(P/B-frame)과 I-frame을 분산(std)으로 명확히 구분
                 mean_val = np.mean(img)
-                if mean_val <= 1.0 or mean_val == 128.0:
-                    invalid_count += 1
-                    if invalid_count > 5:  # 가짜 프레임 연속 발생 시 해당 전략 폐기
+                std_val = np.std(img)
+                
+                # 깨진 프레임: 너무 어둡거나(mean<=1), 회색이면서 픽셀 변화가 거의 없는 경우(std<15)
+                is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
+                
+                if is_corrupted:
+                    # I-frame이 오기까지 최대 15초간 끈질기게 대기
+                    if time.time() - start_time > 15.0:
                         self._kill_process()
                         return False
                     continue
                 
                 valid_frames_read += 1
                 self.connected = True
-                invalid_count = 0
                 
                 with self.lock:
                     self.frame = img
@@ -151,16 +150,17 @@ class FrameReader:
                     frame = cv2.resize(frame, (self.out_w, self.out_h))
                     
                     mean_val = np.mean(frame)
-                    if mean_val <= 1.0 or mean_val == 128.0:
-                        invalid_count += 1
-                        if invalid_count > 5:
+                    std_val = np.std(frame)
+                    is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
+                    
+                    if is_corrupted:
+                        if time.time() - start_time > 15.0:
                             cap.release()
                             return False
                         continue
                         
                     valid_frames_read += 1
                     self.connected = True
-                    invalid_count = 0
                     
                     with self.lock:
                         self.frame = frame
@@ -171,8 +171,6 @@ class FrameReader:
             cap.release()
             
         self.connected = False
-        # 최소 10프레임 이상 정상 수신했다면 네트워크 단절로 간주하고 동일 전략 재시도 (True 반환)
-        # 몇 프레임 못 받고 끊겼다면 전략 실패로 간주 (False 반환)
         return valid_frames_read > 10
 
     def _kill_process(self):

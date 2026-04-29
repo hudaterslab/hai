@@ -123,7 +123,6 @@ def main():
     auto_next = True if auto_next_input == 'y' else False
     print("=" * 60)
 
-    # 💡 [핵심 보완] 실행 위치와 상관없이 무조건 올바른 절대 경로를 매핑
     def get_abs_path(cfg_path):
         if os.path.isabs(cfg_path): return cfg_path
         return os.path.join(PROJECT_ROOT, cfg_path)
@@ -141,7 +140,6 @@ def main():
     engine_face = VisionModelSync(face_path)
     engine_helmet = VisionModelSync(helmet_path)
 
-    # 💡 [상용화 디버깅] 메모리에 실제 모델이 로드되었는지 강제 검증 (사일런트 페일 방지)
     def check_engine(engine, name):
         loaded = False
         if hasattr(engine, 'model') and engine.model is not None: loaded = True
@@ -186,11 +184,22 @@ def main():
                 print(f"🛠️ [{video_filename}] 설정 마법사 실행")
                 print(f"========================================================")
                 cap = cv2.VideoCapture(video_path)
-                ret, first_frame = cap.read()
+                
+                # 💡 [핵심 보완] 로컬 영상 파일이더라도 앞부분이 깨져있을 수 있으므로 정상 프레임을 찾을 때까지 스킵
+                first_frame = None
+                for _ in range(30): # 최대 30프레임 검사
+                    ret, frame = cap.read()
+                    if not ret: break
+                    mean_val = np.mean(frame)
+                    std_val = np.std(frame)
+                    if std_val >= 15.0 and mean_val > 1.0:
+                        first_frame = frame
+                        break
+                        
                 cap.release()
                 
-                if not ret: 
-                    print(f"⚠️ 영상을 읽을 수 없습니다. 건너뜁니다.")
+                if first_frame is None: 
+                    print(f"⚠️ 영상을 읽을 수 없습니다 (유효한 프레임 없음). 건너뜁니다.")
                     break
                     
                 first_frame = cv2.resize(first_frame, (SCREEN_WIDTH, SCREEN_HEIGHT))

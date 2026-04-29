@@ -58,17 +58,21 @@ def get_system_metrics():
     return cpu_usage, cpu_temp, chip_temp
 
 def capture_snapshot_clean(url):
-    # 💡 [상용화 핵심] 더 이상 무작정 128 회색 화면을 넘기지 않습니다.
-    # 적응형 디코더가 여러 파이프라인을 시도할 시간을 충분히(최대 15초) 주고 진짜 프레임만 검출합니다.
     temp_reader = FrameReader(url, ip="snapshot_test")
     start_time = time.time()
     valid_frame = None
     
-    while time.time() - start_time < 15.0:
+    # 💡 I-frame 수신까지 충분히 기다림 (최대 20초)
+    while time.time() - start_time < 20.0:
         frame, _, connected = temp_reader.read()
         if connected and frame is not None:
             mean_val = np.mean(frame)
-            if mean_val > 1.0 and mean_val != 128.0:
+            std_val = np.std(frame)
+            
+            # 💡 [핵심 검증] 픽셀 분산(std)이 15 이상인 진짜 화면일 때만 통과
+            is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
+            
+            if not is_corrupted:
                 valid_frame = frame
                 break
         time.sleep(0.5)
