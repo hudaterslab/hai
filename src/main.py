@@ -62,16 +62,12 @@ def capture_snapshot_clean(url):
     start_time = time.time()
     valid_frame = None
     
-    # 💡 I-frame 수신까지 충분히 기다림 (최대 20초)
     while time.time() - start_time < 20.0:
         frame, _, connected = temp_reader.read()
         if connected and frame is not None:
             mean_val = np.mean(frame)
             std_val = np.std(frame)
-            
-            # 💡 [핵심 검증] 픽셀 분산(std)이 15 이상인 진짜 화면일 때만 통과
             is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
-            
             if not is_corrupted:
                 valid_frame = frame
                 break
@@ -326,7 +322,8 @@ def main():
                 frame, fid, connected = c.reader.read()
                 if frame is None or not connected: 
                     if use_display and use_drawing:
-                        final_imgs.append(c.draw(None, [], [], {}, connected=False))
+                        # 💡 [버그 수정됨] frame이 없을 때 넘겨주는 인자 수를 정확히 3개(frame, tracks, alarms)로 맞춤
+                        final_imgs.append(c.draw(None, [], {}, connected=False))
                     continue
                 
                 main_boxes = None

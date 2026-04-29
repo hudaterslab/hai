@@ -31,7 +31,7 @@
             "cooldown_sec": 600,
             "snapshot_mode": "crossing_moment",
             "distance_ratio": 0.5,
-            "min_distance_px": 15,
+            "min_distance_px": 5,
             "candidate_ttl_sec": 5.0,
             "direction_check": true
         },
@@ -46,7 +46,7 @@
         "FACE": "models/yolov8m-face.pt"
     },
     "model_confidences": {
-        "MAIN": 0.4,
+        "MAIN": 0.2,
         "FACE": 0.35
     },
     "SKIP_FRAMES": 1,

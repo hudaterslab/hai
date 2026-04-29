@@ -115,90 +115,124 @@ class CrossingDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.lines = [(self.roi_lines[i], self.roi_lines[i+1]) for i in range(len(self.roi_lines)-1)] if len(self.roi_lines) >= 2 else []
         self.prev, self.candidates = {}, {}
-        self.pos_history = defaultdict(lambda: deque(maxlen=4))
         
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
         self.distance_ratio = config.get("distance_ratio", 0.5)
         self.direction_check = config.get("direction_check", True)
+        self.min_crossing_angle = config.get("min_crossing_angle", 20.0) 
+        
         candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
         self.ttl_fid_diff = int(candidate_ttl_sec * self.fps)
         
     def _is_intersect(self, p1, p2, p3, p4): 
         return ccw(p1, p2, p3) * ccw(p1, p2, p4) <= 0 and ccw(p3, p4, p1) * ccw(p3, p4, p2) <= 0
+
+    def _get_crossing_angle(self, p1, p2, prev_pos, curr_pos):
+        lx, ly = p2[0] - p1[0], p2[1] - p1[1]
+        mx, my = curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1]
+        if mx == 0 and my == 0: return 0.0
+        dot = lx * mx + ly * my
+        cross = lx * my - ly * mx
+        angle_rad = math.atan2(abs(cross), abs(dot))
+        return math.degrees(angle_rad)
+
+    def _get_line_intersection(self, p1, p2, p3, p4):
+        """두 선분(ROI Line과 객체 이동 궤적)의 정확한 수학적 교차점을 반환"""
+        x1, y1 = p1; x2, y2 = p2
+        x3, y3 = p3; x4, y4 = p4
+        denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+        if denom == 0: return p4
+        px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom
+        py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom
+        return (int(px), int(py))
+
+    def _get_intersection_over_lowbody_area(self, low_box, person_box):
+        inter_area = max(0, min(low_box[2], person_box[2]) - max(low_box[0], person_box[0])) * max(0, min(low_box[3], person_box[3]) - max(low_box[1], person_box[1]))
+        low_area = (low_box[2] - low_box[0]) * (low_box[3] - low_box[1])
+        if low_area != 0: return inter_area / low_area
+        return 0
         
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered, curr_ids = [], set()
-        for t in tracks:
-            tid = int(t[4])
-            curr_ids.add(tid)
+        
+        persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
+        low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
+        
+        for p in persons:
+            p_tid = int(p[4])
+            curr_ids.add(p_tid)
             
-            # 💡 [핵심 수정] 전신(ID_G_PERSON) 대신 하반신(ID_PERSON_LOW) 객체만 타겟팅
-            if track_map.get(tid) != ID_PERSON_LOW: 
+            best_low_box = None
+            max_ioa = 0
+            for lb in low_bodies:
+                ioa = self._get_intersection_over_lowbody_area(lb[:4], p[:4])
+                if ioa > max_ioa:
+                    max_ioa = ioa
+                    best_low_box = lb[:4]
+                    
+            if max_ioa < 0.3 or best_low_box is None:
                 continue
                 
-            x1, y1, x2, y2 = t[:4]
-            obj_height = y2 - y1
-            obj_width = max(1, x2 - x1)
+            lx1, ly1, lx2, ly2 = best_low_box
+            obj_height = max(1, ly2 - ly1)
             
-            # 💡 [핵심 수정] 하반신 박스이므로 기준점을 발(y2에서 약간 위쪽)으로 재설정
-            curr_pos = (int((x1 + x2) / 2), int(y2 - obj_height * 0.1))
-            is_frame_out = (x1 <= 15) or (x2 >= SCREEN_WIDTH - 15) or (y1 <= 15) or (y2 >= SCREEN_HEIGHT - 15)
+            curr_pos = (int((lx1 + lx2) / 2), int(ly2 - obj_height * 0.1))
+            is_frame_out = (lx1 <= 15) or (lx2 >= SCREEN_WIDTH - 15) or (ly1 <= 15) or (ly2 >= SCREEN_HEIGHT - 15)
             
-            self.pos_history[tid].append(curr_pos)
-            
-            is_ping_pong = False
-            if len(self.pos_history[tid]) >= 3:
-                p_older = self.pos_history[tid][-3]
-                p_prev = self.pos_history[tid][-2] 
-                p_curr = self.pos_history[tid][-1] 
-                
-                dist_jump = get_distance(p_curr, p_prev)
-                dist_return = get_distance(p_curr, p_older)
-                
-                if dist_jump > obj_width * 0.5 and dist_return < obj_width * 0.3:
-                    is_ping_pong = True
-            
-            if is_ping_pong:
-                self.prev[tid] = curr_pos
-                if tid in self.candidates:
-                    del self.candidates[tid]
-                continue
-
-            if tid in self.prev and tid not in self.candidates:
+            # 파이프라인 1, 2: 교차 및 진입 각도 확인
+            if p_tid in self.prev and p_tid not in self.candidates:
                 for p1, p2 in self.lines:
-                    if self._is_intersect(p1, p2, self.prev[tid], curr_pos):
-                        self.candidates[tid] = {
-                            'crossing_pt': curr_pos, 'height': obj_height, 'timestamp_fid': fid, 'line': (p1, p2),
-                            'entry_side': ccw(p1, p2, self.prev[tid]), 'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
-                            'bbox': tuple(t[:4]), 'fid': fid
-                        }
+                    if self._is_intersect(p1, p2, self.prev[p_tid], curr_pos):
+                        cross_angle = self._get_crossing_angle(p1, p2, self.prev[p_tid], curr_pos)
+                        
+                        if cross_angle >= self.min_crossing_angle:
+                            # 💡 3 FPS 간극 보완: 실제 교차점을 계산하여 정확한 시작점 지정
+                            cross_pt = self._get_line_intersection(p1, p2, self.prev[p_tid], curr_pos)
+                            self.candidates[p_tid] = {
+                                'crossing_pt': cross_pt, 
+                                'height': obj_height, 
+                                'timestamp_fid': fid, 
+                                'line': (p1, p2),
+                                'entry_side': ccw(p1, p2, self.prev[p_tid]), 
+                                'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
+                                'bbox': tuple(p[:4]), 
+                                'fid': fid
+                            }
                         break
                         
-            if tid in self.candidates:
-                cand = self.candidates[tid]
+            # 파이프라인 3, 4: 충분한 이탈 거리 확인 및 이벤트 발생
+            if p_tid in self.candidates:
+                cand = self.candidates[p_tid]
+                
+                # 💡 수학적으로 산출된 정확한 교차점부터 현재 위치까지의 거리 측정
                 moved_dist = get_distance(cand['crossing_pt'], curr_pos)
                 
-                direction_ok = (cand['entry_side'] != 0 and ccw(cand['line'][0], cand['line'][1], curr_pos) != 0 and cand['entry_side'] * ccw(cand['line'][0], cand['line'][1], curr_pos) < 0) if self.direction_check else True
+                direction_ok = True
+                if self.direction_check:
+                    curr_side = ccw(cand['line'][0], cand['line'][1], curr_pos)
+                    if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
+                        direction_ok = True
+                    else:
+                        direction_ok = False
                 
                 if direction_ok:
-                    dynamic_threshold = max(40.0, obj_height * self.distance_ratio)
-                    if moved_dist > dynamic_threshold or is_frame_out:
-                        triggered.append({'tid': tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
-                        del self.candidates[tid]
-                elif fid - cand['timestamp_fid'] > self.ttl_fid_diff: 
-                    del self.candidates[tid]
+                    # 💡 하반신 기준 3 FPS 특성에 맞춰 임계값 보정 (하반신 높이의 30% 또는 최소 15픽셀)
+                    dynamic_threshold = max(5.0, cand['height'] * 0.2)
                     
-            self.prev[tid] = curr_pos
+                    # 조건을 만족하면 다음 프레임을 기다리지 않고 즉각(동일 프레임 내) 이벤트 트리거
+                    if moved_dist >= dynamic_threshold or is_frame_out:
+                        triggered.append({'tid': p_tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
+                        del self.candidates[p_tid]
+                elif fid - cand['timestamp_fid'] > self.ttl_fid_diff: 
+                    del self.candidates[p_tid]
+                    
+            self.prev[p_tid] = curr_pos
             
         for tid in list(self.prev.keys()):
             if tid not in curr_ids:
                 del self.prev[tid]
                 if tid in self.candidates: 
                     del self.candidates[tid]
-        
-        for tid in list(self.pos_history.keys()):
-            if tid not in curr_ids:
-                del self.pos_history[tid]
                     
         return triggered
 
@@ -208,11 +242,10 @@ class HelmetDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        # 💡 [핵심 보완] 탐지 깜빡임을 보정하기 위한 상태 머신 딕셔너리로 구조 변경
         self.states = {} 
-        trigger_sec = config.get("trigger_sec", 3.0) # 기본 3초
+        trigger_sec = config.get("trigger_sec", 3.0) 
         self.trigger_fid_diff = int(trigger_sec * self.fps)
-        self.grace_fid_diff = int(2.0 * self.fps) # 💡 객체를 놓쳐도 2초간은 타이머를 유지(초기화 방지)
+        self.grace_fid_diff = int(2.0 * self.fps) 
         
     def _get_intersection_over_head_area(self, head_box, person_box):
         inter_area = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0])) * max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
@@ -225,7 +258,6 @@ class HelmetDetector(BaseEventDetector):
         triggered = []
         helmet_tracks = kwargs.get('helmet_tracks', [])
         
-        # 0: helmet, 1: head, 2: person
         unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == 1]
         current_nh_person_ids = set()
         
@@ -246,19 +278,15 @@ class HelmetDetector(BaseEventDetector):
             if max_ioa > 0.5:
                 current_nh_person_ids.add(p_tid)
                 
-                # 처음 미착용자를 발견한 경우 상태 등록
                 if p_tid not in self.states: 
                     self.states[p_tid] = {'start_fid': fid, 'last_seen': fid, 'bbox': nh_box_match}
                 else:
-                    # 기존에 발견된 인원이면 마지막 발견 시점과 BBox 업데이트
                     self.states[p_tid]['last_seen'] = fid
                     self.states[p_tid]['bbox'] = nh_box_match
                     
-                # 최초 발견 시점으로부터 지정된 3초(프레임)가 경과했다면 이벤트 발생
                 if fid - self.states[p_tid]['start_fid'] >= self.trigger_fid_diff:
                     triggered.append({'tid': p_tid, 'bbox': self.states[p_tid]['bbox'], 'frame': None, 'fid': fid})
                     
-        # 💡 [상용화 핵심 로직] 당장 이번 프레임에서 안 보인다고 바로 초기화하지 않고, '유예 기간'을 넘겼을 때만 삭제
         for tid in list(self.states.keys()):
             if fid - self.states[tid]['last_seen'] > self.grace_fid_diff:
                 del self.states[tid]

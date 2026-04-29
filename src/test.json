@@ -1,20 +1,4 @@
 {
-    "crossing_1.avi": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                681,
-                253
-            ],
-            [
-                636,
-                685
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
     "20260416_191941_41_554_conveyor_crossing.mp4": {
         "roi_poly": [],
         "roi_lines": [
@@ -1944,22 +1928,6 @@
             "no_helmet"
         ]
     },
-    "2026_04_22_07_51_53_ch2_0200_0230.mp4": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                667,
-                123
-            ],
-            [
-                885,
-                691
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
     "2026_04_23_07_33_41_ch1_001.mp4": {
         "roi_poly": [],
         "roi_lines": [],
@@ -2013,22 +1981,6 @@
             [
                 645,
                 543
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
-    "2026_04_23_07_50_36_ch10_001.mp4": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                756,
-                237
-            ],
-            [
-                653,
-                706
             ]
         ],
         "events": [
@@ -2185,22 +2137,6 @@
             [
                 649,
                 719
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
-    "2026_04_28_09_43_52_ch11_001.mp4": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                412,
-                19
-            ],
-            [
-                605,
-                716
             ]
         ],
         "events": [
@@ -2386,22 +2322,6 @@
             "no_helmet"
         ]
     },
-    "2026_04_28_13_35_28_ch4_004.mp4": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                540,
-                11
-            ],
-            [
-                826,
-                711
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
     "2026_04_24_18_28_00_ch15_004.mp4": {
         "roi_poly": [],
         "roi_lines": [],
@@ -2442,22 +2362,6 @@
             "conveyor_crossing"
         ]
     },
-    "2026_04_28_13_35_28_ch4_003.mp4": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                604,
-                164
-            ],
-            [
-                814,
-                706
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
     "2026_04_22_19_35_00_ch7_000.mp4": {
         "roi_poly": [
             [
@@ -2486,22 +2390,6 @@
             "conveyor_crossing"
         ]
     },
-    "2026_04_28_13_35_28_ch4_001.mp4": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                577,
-                102
-            ],
-            [
-                815,
-                702
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
     "2026_04_24_18_28_00_ch15_003.mp4": {
         "roi_poly": [],
         "roi_lines": [],
@@ -2519,22 +2407,6 @@
             [
                 811,
                 701
-            ]
-        ],
-        "events": [
-            "conveyor_crossing"
-        ]
-    },
-    "2026_04_17_07_13_00_ch4_000.mp4": {
-        "roi_poly": [],
-        "roi_lines": [
-            [
-                569,
-                83
-            ],
-            [
-                815,
-                699
             ]
         ],
         "events": [
@@ -2654,16 +2526,393 @@
             "no_helmet"
         ]
     },
+    "20260406_195128_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                201,
+                99
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260406_211121_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                529,
+                2
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260407_002539_9_554_no_helmet.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260407_101119_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                328,
+                297
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260407_162958_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                295,
+                97
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260407_203818_14_554_no_helmet.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260408_034048_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                692,
+                253
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260408_074737_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                406,
+                112
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260408_082107_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                248,
+                140
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260408_163059_9_554_no_helmet.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260408_163154_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                338,
+                66
+            ]
+        ],
+        "roi_lines": [],
+        "events": []
+    },
+    "20260408_201445_7_554_no_helmet.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": []
+    },
+    "20260409_062035_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                88,
+                172
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_063036_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                225,
+                131
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_090714_14_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                340,
+                168
+            ],
+            [
+                775,
+                366
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_162922_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                1085,
+                343
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_164724_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                880,
+                164
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_195604_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                460,
+                237
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_210829_7_554_no_helmet.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_221435_7_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                640,
+                184
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260409_221513_14_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                409,
+                132
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "20260410_155226_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                592,
+                35
+            ]
+        ],
+        "roi_lines": [],
+        "events": []
+    },
+    "20260413_170835_9_554_no_helmet.mp4": {
+        "roi_poly": [
+            [
+                861,
+                227
+            ]
+        ],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "2026_04_17_07_13_00_ch4_000.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                363,
+                105
+            ],
+            [
+                366,
+                698
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_28_13_35_28_ch4_001.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                316,
+                214
+            ],
+            [
+                302,
+                691
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_28_13_35_28_ch4_003.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                349,
+                166
+            ],
+            [
+                326,
+                593
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
     "2026_04_28_13_35_28_ch4_002.mp4": {
         "roi_poly": [],
         "roi_lines": [
             [
-                545,
-                40
+                1175,
+                329
             ],
             [
-                828,
-                708
+                894,
+                655
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "crossing_1.avi": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                761,
+                427
+            ],
+            [
+                819,
+                703
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_28_13_35_28_ch4_004.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                260,
+                287
+            ],
+            [
+                229,
+                703
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_22_07_51_53_ch2_0200_0230.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                583,
+                137
+            ],
+            [
+                667,
+                697
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_23_07_50_36_ch10_001.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                342,
+                451
+            ],
+            [
+                790,
+                508
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_28_09_43_52_ch11_001.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                596,
+                62
+            ],
+            [
+                662,
+                688
             ]
         ],
         "events": [

@@ -6,7 +6,6 @@ import numpy as np
 import time
 from collections import defaultdict
 
-# 💡 단말기 코어를 그대로 사용 (PROJECT_ROOT 추가)
 from common import (
     PROJECT_ROOT,
     ID_G_PERSON, ID_H_HELMET, ID_PERSON_LOW, ID_REFLECTIVE_VEST,
@@ -30,7 +29,6 @@ def save_test_config(config):
         json.dump(config, f, indent=4, ensure_ascii=False)
 
 def apply_face_blur(image, face_detector, face_conf):
-    """단말기의 얼굴 모자이크 로직 시뮬레이션"""
     if face_detector is None or image is None: 
         return image
     res = image.copy()
@@ -166,6 +164,7 @@ def main():
     CANVAS_HEIGHT = SCREEN_HEIGHT
 
     base_skip_frames = SYS_CFG.get("SKIP_FRAMES", 1)
+    # 💡 [버그 수정] 다시 단말과 완벽히 동일한 REC_FPS(3)를 따르도록 원복했습니다.
     target_fps = SYS_CFG.get("REC_FPS", 3)
 
     force_quit_all = False
@@ -185,9 +184,8 @@ def main():
                 print(f"========================================================")
                 cap = cv2.VideoCapture(video_path)
                 
-                # 💡 [핵심 보완] 로컬 영상 파일이더라도 앞부분이 깨져있을 수 있으므로 정상 프레임을 찾을 때까지 스킵
                 first_frame = None
-                for _ in range(30): # 최대 30프레임 검사
+                for _ in range(30):
                     ret, frame = cap.read()
                     if not ret: break
                     mean_val = np.mean(frame)
