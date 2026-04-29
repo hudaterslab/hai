@@ -57,21 +57,21 @@ class BaseEventDetector:
         self.roi_poly = np.array(roi_poly, dtype=np.int32) if roi_poly and len(roi_poly) >= 3 else np.empty((0, 2), dtype=np.int32)
         self.roi_lines = roi_lines or []
         
-    def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid): 
+    # 💡 [핵심 보완] 파라미터 통합: tracks, track_map
+    def process(self, tracks, track_map, motion_mask, frame, fid): 
         return []
 
 class IntrusionDetector(BaseEventDetector):
     event_name, menu_name, gui_name = "intrusion", "침입", "INTRUSION"
     
-    def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid):
         triggered = []
         if self.roi_poly.size == 0: 
             return triggered
             
-        g_map = track_maps["general"]
-        for t in general_tracks:
+        for t in tracks:
             tid = int(t[4])
-            if g_map.get(tid) == ID_G_PERSON and cv2.pointPolygonTest(self.roi_poly, get_foot_point(*t[:4]), False) >= 0:
+            if track_map.get(tid) == ID_G_PERSON and cv2.pointPolygonTest(self.roi_poly, get_foot_point(*t[:4]), False) >= 0:
                 triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
                 
         return triggered
@@ -83,15 +83,14 @@ class ParkingDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.states = defaultdict(lambda: {'start': 0, 'pos': None})
         
-    def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid):
         triggered, curr_ids, now = [], set(), time.time()
         if self.roi_poly.size == 0: 
             return triggered
             
-        g_map = track_maps["general"]
-        for t in general_tracks:
+        for t in tracks:
             tid = int(t[4])
-            if g_map.get(tid) in TARGET_VEHICLES and cv2.pointPolygonTest(self.roi_poly, get_check_point(*t[:4]), False) >= 0:
+            if track_map.get(tid) in TARGET_VEHICLES and cv2.pointPolygonTest(self.roi_poly, get_check_point(*t[:4]), False) >= 0:
                 curr_ids.add(tid)
                 c = get_center_point(*t[:4])
                 if self.states[tid]['start'] == 0 or get_distance(c, self.states[tid]['pos']) > 30:
@@ -116,7 +115,6 @@ class CrossingDetector(BaseEventDetector):
         self.pos_history = defaultdict(lambda: deque(maxlen=4))
         
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
-        # distance_ratio는 이제 '선으로부터 넘어간 깊이(Penetration)'의 기준으로 사용됩니다.
         self.distance_ratio = config.get("distance_ratio", 0.3)
         self.min_distance_px, self.candidate_ttl_sec = config.get("min_distance_px", 15), config.get("candidate_ttl_sec", 5.0)
         self.direction_check = config.get("direction_check", True)
@@ -124,27 +122,19 @@ class CrossingDetector(BaseEventDetector):
     def _is_intersect(self, p1, p2, p3, p4): 
         return ccw(p1, p2, p3) * ccw(p1, p2, p4) <= 0 and ccw(p3, p4, p1) * ccw(p3, p4, p2) <= 0
         
-    # 💡 [핵심 추가] 점과 직선 사이의 수직 거리를 구하는 수학 공식
-    def _dist_to_line(self, pt, p1, p2):
-        num = abs((p2[0] - p1[0])*(p1[1] - pt[1]) - (p1[0] - pt[0])*(p2[1] - p1[1]))
-        den = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
-        return num / den if den > 0 else 0
-        
-    def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
-        triggered, curr_ids, now, g_map = [], set(), time.time(), track_maps["general"]
-        for t in general_tracks:
+    def process(self, tracks, track_map, motion_mask, frame, fid):
+        triggered, curr_ids, now = [], set(), time.time()
+        for t in tracks:
             tid = int(t[4])
             curr_ids.add(tid)
-            if g_map.get(tid) != ID_G_PERSON: 
+            if track_map.get(tid) != ID_G_PERSON: 
                 continue
                 
             x1, y1, x2, y2 = t[:4]
             obj_height = y2 - y1
             obj_width = max(1, x2 - x1)
             
-            # 💡 [핵심 원복] 팔을 뻗는 모션에 속지 않도록 기준점을 다시 발끝(y2) 하단 중앙으로 원복
-            curr_pos = (int((x1 + x2) / 2), int(y2))
-            
+            curr_pos = (int((x1 + x2) / 2), int(y1 + obj_height * 0.2))
             is_frame_out = (x1 <= 15) or (x2 >= SCREEN_WIDTH - 15) or (y1 <= 15) or (y2 >= SCREEN_HEIGHT - 15)
             
             self.pos_history[tid].append(curr_pos)
@@ -179,19 +169,13 @@ class CrossingDetector(BaseEventDetector):
                         
             if tid in self.candidates:
                 cand = self.candidates[tid]
-                
-                # 💡 [핵심 보완] 넘어간 선으로부터 현재 발끝까지의 '침투 깊이(수직 거리)'를 계산
-                penetration_depth = self._dist_to_line(curr_pos, cand['line'][0], cand['line'][1])
-                
-                # 가로 비율(Aspect Ratio) 방어 로직은 삭제되었으므로 택배 상자 병합으로 인한 가로 팽창에도 횡단을 정상 감지합니다.
+                moved_dist = get_distance(cand['crossing_pt'], curr_pos)
                 
                 direction_ok = (cand['entry_side'] != 0 and ccw(cand['line'][0], cand['line'][1], curr_pos) != 0 and cand['entry_side'] * ccw(cand['line'][0], cand['line'][1], curr_pos) < 0) if self.direction_check else True
                 
                 if direction_ok:
-                    # 침투 깊이가 객체 너비의 일정 비율(기본 30%) 또는 최소 30픽셀 이상일 때만 진짜 횡단으로 간주
-                    dynamic_threshold = max(30.0, obj_width * self.distance_ratio)
-                    
-                    if penetration_depth > dynamic_threshold or is_frame_out:
+                    dynamic_threshold = max(40.0, obj_height * self.distance_ratio)
+                    if moved_dist > dynamic_threshold or is_frame_out:
                         triggered.append({'tid': tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
                         del self.candidates[tid]
                 elif now - cand['timestamp'] > self.candidate_ttl_sec: 
@@ -226,12 +210,13 @@ class HelmetDetector(BaseEventDetector):
             return inter_area / head_area
         return 0
         
-    def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
+    def process(self, tracks, track_map, motion_mask, frame, fid):
         triggered, now = [], time.time() 
-        no_helmets = [t for t in helmet_tracks if track_maps["helmet"].get(int(t[4])) == ID_H_NO_HELMET]
+        # 💡 하나의 통합된 트랙 리스트에서 필터링
+        no_helmets = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
         current_nh_person_ids = set()
         
-        for p in [t for t in general_tracks if track_maps["general"].get(int(t[4])) == ID_G_PERSON]:
+        for p in [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]:
             p_tid, max_ioa, nh_box_match = int(p[4]), 0, None
             for nh in no_helmets:
                 ioa = self._get_intersection_over_head_area(nh[:4], p[:4])
@@ -261,17 +246,17 @@ class SignalVehicleDetector(BaseEventDetector):
     def _get_distance_point_to_rect(self, point, bbox): 
         return math.sqrt(max(bbox[0] - point[0], 0, point[0] - bbox[2])**2 + max(bbox[1] - point[1], 0, point[1] - bbox[3])**2)
         
-    def process(self, helmet_tracks, general_tracks, track_maps, motion_mask, frame, fid):
-        triggered, current_vehicle_ids, g_map = [], set(), track_maps["general"]
+    def process(self, tracks, track_map, motion_mask, frame, fid):
+        triggered, current_vehicle_ids = [], set()
         if self.roi_poly.size == 0 or motion_mask is None: 
             return triggered
             
         scale_x, scale_y = 640 / SCREEN_WIDTH, 360 / SCREEN_HEIGHT
-        people_points = [get_foot_point(*t[:4]) for t in general_tracks if g_map.get(int(t[4])) == ID_G_PERSON]
+        people_points = [get_foot_point(*t[:4]) for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         
-        for t in general_tracks:
+        for t in tracks:
             tid = int(t[4])
-            if g_map.get(tid) not in TARGET_VEHICLES: 
+            if track_map.get(tid) not in TARGET_VEHICLES: 
                 continue
                 
             current_vehicle_ids.add(tid)

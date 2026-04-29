@@ -5,7 +5,7 @@
     "level": "INFO",
     "retention_days": 1
   },
-  "debug_mode": true,
+  "debug_mode": false,
   "event_config": {
     "intrusion": {
       "enabled": false,
@@ -35,14 +35,12 @@
     }
   },
   "models": {
-    "HELMET": "models/helmet_3cls_v8.dxnn",
-    "GENERAL": "models/YOLOV8M-1.dxnn",
+    "MAIN": "models/hanjin_cctv.dxnn",
     "FACE": "models/yolov8m-face.dxnn"
   },
   "model_confidences": {
-    "HELMET": 0.2,
-    "GENERAL": 0.5,
-    "FACE": 0.4
+    "MAIN": 0.40,
+    "FACE": 0.35
   },
   "SKIP_FRAMES": 1,
   "REC_FPS": 3,

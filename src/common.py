@@ -43,14 +43,17 @@ STREAM_RECONNECT_DELAY_SEC = 2.0
 STREAM_BROKEN_RETRY_DELAY_SEC = 1.0
 WATCHDOG_TIMEOUT = 30.0
 
-ID_H_HELMET = 0
-ID_H_NO_HELMET = 1
-ID_H_PERSON = 2
+# 💡 [핵심 보완] hanjin_cctv.dxnn 신규 클래스 맵핑
 ID_G_PERSON = 0
-ID_G_CAR = 2
-ID_G_BUS = 5
-ID_G_TRUCK = 7
-TARGET_VEHICLES = [ID_G_CAR, ID_G_BUS, ID_G_TRUCK]
+ID_H_HELMET = 1
+ID_PERSON_LOW = 2
+ID_REFLECTIVE_VEST = 3
+ID_G_TRUCK = 4
+ID_H_NO_HELMET = 5
+ID_G_CAR = 6
+
+# 💡 버스 제거 후 트럭 및 일반차량만 타겟팅
+TARGET_VEHICLES = [ID_G_TRUCK, ID_G_CAR]
 
 NAS_UPLOADER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -109,13 +112,11 @@ def load_system_config():
             "signal_vehicle": {"enabled": False, "cooldown_sec": 600}
         },
         "models": {
-            "HELMET": "models/helmet_3cls_v8.dxnn",
-            "GENERAL": "models/YOLOV8M-1.dxnn",
-            "FACE": "models/YOLOV8M-Face.dxnn"
+            "MAIN": "models/hanjin_cctv.dxnn",
+            "FACE": "models/yolov8m-face.dxnn"
         },
         "model_confidences": {
-            "HELMET": 0.50,
-            "GENERAL": 0.50,
+            "MAIN": 0.40,
             "FACE": 0.35
         },
         "SKIP_FRAMES": 4,
@@ -337,7 +338,6 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         with open(image_path, 'rb') as f:
             res = requests.post(url, data=data, files={"image": (os.path.basename(image_path), f, "image/jpeg")}, verify=False, timeout=10)
             if res.status_code == 200:
-                # 💡 [핵심 보완] API 전송 결과 및 상세 페이로드 디버그 로깅
                 logger.info(f"🌐 [API 전송 완료] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name} | 객체:{len(bboxes) if bboxes else 0}건")
                 if SYS_CFG.get("debug_mode", False):
                     logger.debug(f"[API_PAYLOAD] Endpoint: {url} | Payload: {json.dumps(data, ensure_ascii=False)}")
