@@ -3,7 +3,6 @@ import numpy as np
 import time
 import datetime
 import threading
-import queue
 import os
 import logging
 import subprocess
@@ -12,8 +11,7 @@ from collections import deque, defaultdict
 from common import (
     SYS_CFG, EVENT_ROOT_DIR, WATCHDOG_TIMEOUT, STREAM_RECONNECT_DELAY_SEC, 
     denormalize_roi_points, save_event_image_with_mark, ID_H_HELMET, ID_H_NO_HELMET, 
-    ID_G_PERSON, ID_G_CAR, ID_G_TRUCK, ID_PERSON_LOW, ID_REFLECTIVE_VEST,
-    NAS_UPLOADER_POOL, _upload_to_nas_task 
+    ID_G_PERSON, ID_G_CAR, ID_G_TRUCK, ID_PERSON_LOW, ID_REFLECTIVE_VEST
 )
 from event import MotionDetector, EVENT_REGISTRY
 from ai_core import SORTTracker
@@ -21,6 +19,9 @@ from ai_core import SORTTracker
 logger = logging.getLogger("VMS_SYSTEM")
 
 class FrameReader:
+    # 💡 [핵심 상용화 기술] 클래스 변수로 성공한 디코딩 전략을 전역 공유
+    _best_strategy_idx = 0 
+
     def __init__(self, url, ip):
         self.url = url.replace(" ", "").replace("\n", "").replace("\r", "").strip()
         self.ip = ip
@@ -38,107 +39,147 @@ class FrameReader:
         self.target_fps = SYS_CFG.get("REC_FPS", 3)
         self.process = None
         
-        self.use_gstreamer = True
-        self.gst_fail_count = 0
-        
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
+    def _get_strategies(self):
+        # 현장에서 가장 빈번하게 사용되는 강건한 파이프라인 순서
+        return [
+            {'type': 'gst', 'name': 'Generic TCP (decodebin)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! decodebin ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
+            {'type': 'gst', 'name': 'H.265 TCP (Explicit)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
+            {'type': 'gst', 'name': 'H.264 TCP (Explicit)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
+            {'type': 'cv2', 'name': 'OpenCV FFmpeg (Native fallback)', 'pipe': None}
+        ]
+
     def _run(self):
+        strategies = self._get_strategies()
+        
         while self.running:
             self.connected = False
+            current_idx = FrameReader._best_strategy_idx
+            tested_count = 0
+            success = False
+
+            # 모든 전략을 순회하며 시도
+            while tested_count < len(strategies) and self.running:
+                strategy = strategies[current_idx]
+                logger.info(f"[CAM {self.ip}] 연결 시도 중... 전략: {strategy['name']}")
+                
+                success = self._try_strategy(strategy)
+                
+                if success:
+                    # 💡 성공 시 해당 전략을 다른 카메라들도 우선 사용하도록 전역 캐싱 
+                    FrameReader._best_strategy_idx = current_idx
+                    break
+                else:
+                    # 실패 시 다음 전략으로 이동
+                    current_idx = (current_idx + 1) % len(strategies)
+                    tested_count += 1
+                    time.sleep(1.0)
             
-            if self.use_gstreamer:
-                pipeline = (
-                    f"rtspsrc location={self.url} latency=500 ! "
-                    f"decodebin ! videoconvert ! videorate ! "
-                    f"video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! "
-                    f"fdsink fd=1 sync=false"
-                )
+            if not self.running:
+                break
                 
-                cmd = ['gst-launch-1.0', '-q'] + pipeline.split()
+            if not success:
+                logger.error(f"[CAM {self.ip}] 모든 디코딩 전략 실패. 10초 후 재시도합니다.")
+                time.sleep(10)
+
+    def _try_strategy(self, strategy):
+        invalid_count = 0
+        valid_frames_read = 0
+        
+        if strategy['type'] == 'gst':
+            cmd = ['gst-launch-1.0', '-q'] + strategy['pipe'].split()
+            try:
+                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+            except Exception as e:
+                logger.error(f"[CAM {self.ip}] Subprocess GStreamer 에러: {e}")
+                return False
                 
-                try:
-                    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-                except Exception:
-                    self.gst_fail_count += 1
-                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
-                    continue
+            while self.running:
+                if psutil.cpu_percent(interval=None) > 95:
+                    time.sleep(0.05)
                     
-                read_success = False
-                while self.running:
-                    if psutil.cpu_percent(interval=None) > 95:
-                        time.sleep(0.05)
-                        
-                    raw = b''
-                    while len(raw) < self.frame_bytes:
-                        if not self.running: 
-                            break
-                        try:
-                            chunk = self.process.stdout.read(self.frame_bytes - len(raw))
-                            if not chunk: 
-                                break
-                            raw += chunk
-                        except Exception:
-                            break
-                            
-                    if len(raw) != self.frame_bytes: 
+                raw = b''
+                while len(raw) < self.frame_bytes:
+                    if not self.running: break
+                    try:
+                        chunk = self.process.stdout.read(self.frame_bytes - len(raw))
+                        if not chunk: break
+                        raw += chunk
+                    except Exception:
                         break
                         
-                    img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
-                    read_success = True
+                if len(raw) != self.frame_bytes: 
+                    break
+                    
+                img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
+                
+                # 💡 [핵심 보완] 회색(128)이나 흑백(0) 가짜 프레임 필터링
+                mean_val = np.mean(img)
+                if mean_val <= 1.0 or mean_val == 128.0:
+                    invalid_count += 1
+                    if invalid_count > 5:  # 가짜 프레임 연속 발생 시 해당 전략 폐기
+                        self._kill_process()
+                        return False
+                    continue
+                
+                valid_frames_read += 1
+                self.connected = True
+                invalid_count = 0
+                
+                with self.lock:
+                    self.frame = img
+                    self.fid += 1
+                    self.last_frame_time = time.time()
+                    
+            self._kill_process()
+            
+        elif strategy['type'] == 'cv2':
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+            if not cap.isOpened():
+                return False
+                
+            last_read_time = time.time()
+            while self.running:
+                ret, frame = cap.read()
+                if not ret: break
+                
+                now = time.time()
+                if now - last_read_time >= (1.0 / self.target_fps):
+                    frame = cv2.resize(frame, (self.out_w, self.out_h))
+                    
+                    mean_val = np.mean(frame)
+                    if mean_val <= 1.0 or mean_val == 128.0:
+                        invalid_count += 1
+                        if invalid_count > 5:
+                            cap.release()
+                            return False
+                        continue
+                        
+                    valid_frames_read += 1
                     self.connected = True
-                    self.gst_fail_count = 0 
+                    invalid_count = 0
                     
                     with self.lock:
-                        self.frame = img
+                        self.frame = frame
                         self.fid += 1
-                        self.last_frame_time = time.time()
-                        
-                self.connected = False
-                if self.process:
-                    try: 
-                        self.process.kill()
-                    except Exception: 
-                        pass
-                    self.process = None
-                
-                if not read_success:
-                    self.gst_fail_count += 1
+                        self.last_frame_time = now
+                    last_read_time = now
                     
-                if self.gst_fail_count >= 2:
-                    self.use_gstreamer = False
-                    
-            else:
-                cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-                
-                if not cap.isOpened():
-                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
-                    continue
-                    
-                self.connected = True
-                
-                last_read_time = time.time()
-                while self.running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    now = time.time()
-                    if now - last_read_time >= (1.0 / self.target_fps):
-                        frame = cv2.resize(frame, (self.out_w, self.out_h))
-                        with self.lock:
-                            self.frame = frame
-                            self.fid += 1
-                            self.last_frame_time = now
-                        last_read_time = now
-                        
-                cap.release()
-                self.connected = False
-                
-            if self.running: 
-                time.sleep(STREAM_RECONNECT_DELAY_SEC)
+            cap.release()
+            
+        self.connected = False
+        # 최소 10프레임 이상 정상 수신했다면 네트워크 단절로 간주하고 동일 전략 재시도 (True 반환)
+        # 몇 프레임 못 받고 끊겼다면 전략 실패로 간주 (False 반환)
+        return valid_frames_read > 10
+
+    def _kill_process(self):
+        if self.process:
+            try: self.process.kill()
+            except Exception: pass
+            self.process = None
 
     def read(self):
         with self.lock: 
@@ -146,16 +187,11 @@ class FrameReader:
             
     def stop(self, join_timeout=3.0):
         self.running = False
-        if self.process:
-            try: 
-                self.process.kill()
-            except Exception: 
-                pass
+        self._kill_process()
         if self.thread.is_alive(): 
             self.thread.join(timeout=join_timeout)
 
 class Camera:
-    # 💡 헬멧 전용 모델(helmet_engine)을 주입받도록 시그니처 변경
     def __init__(self, ip, conf, face_engine, helmet_engine, cam_id, sensitivity):
         self.ip = ip
         self.conf = conf 
@@ -170,13 +206,13 @@ class Camera:
         self.roi_lines = []
         self.events = conf.get('events', [])
         self.face_detector = face_engine
-        self.helmet_detector = helmet_engine  # 헬멧 전용 모델 추가
+        self.helmet_detector = helmet_engine  
         self.cam_id = cam_id 
         self.last_submit_fid = -1
         
         main_conf = SYS_CFG.get("model_confidences", {}).get("MAIN", 0.40)
         self.face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
-        self.helmet_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.45) # 헬멧 Thres
+        self.helmet_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.45) 
         
         self.fps = SYS_CFG.get("REC_FPS", 3)
         self.skip = SYS_CFG.get("SKIP_FRAMES", 1)
@@ -184,7 +220,6 @@ class Camera:
         track_buffer_sec = SYS_CFG.get("track_buffer_sec", 1.5)
         target_buffer = max(1, int(track_buffer_sec * (self.fps / self.skip)))
         
-        # 💡 [핵심 보완] Main 모델용 트래커와 Helmet 모델용 트래커를 완전히 분리
         self.main_tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=False)
         self.helmet_tracker = SORTTracker(track_thresh=self.helmet_conf, track_buffer=target_buffer, is_helmet=False)
         
@@ -267,13 +302,11 @@ class Camera:
                     remaining_logs.append(dlog)
             self.delayed_logs = remaining_logs
             
-            # 메인 트래커 업데이트
             if main_boxes is not None and len(main_boxes) > 0:
                 main_tracks = self.main_tracker.update(np.array(main_boxes))
             else:
                 main_tracks = self.main_tracker.predict_only()
                 
-            # 헬멧 트래커 업데이트 (별도 운용)
             helmet_tracks = []
             if self.helmet_detector and "no_helmet" in self.events:
                 if helmet_boxes is not None and len(helmet_boxes) > 0:
@@ -286,7 +319,6 @@ class Camera:
             track_map = {int(t[4]): int(t[6]) for t in main_tracks}
             
             for handler in self.handlers:
-                # 💡 Detector에 kwargs 형태로 helmet_tracks를 전달
                 for evt in handler.process(main_tracks, track_map, motion_mask, frame, frame_id, helmet_tracks=helmet_tracks):
                     draw_tid = evt['tid'] 
                     self._trigger_event(frame, frame_id, draw_tid, handler.event_name, main_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))

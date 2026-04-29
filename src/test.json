@@ -2623,5 +2623,51 @@
         "events": [
             "no_helmet"
         ]
+    },
+    "2026_04_17_07_18_00_ch4_001.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                603,
+                161
+            ],
+            [
+                820,
+                713
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_22_19_35_00_ch7_001.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "2026_04_24_18_28_00_ch15_005.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "2026_04_28_13_35_28_ch4_002.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                545,
+                40
+            ],
+            [
+                828,
+                708
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
     }
 }

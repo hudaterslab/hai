@@ -16,7 +16,7 @@ import shutil
 
 from common import (SYS_CFG, CAMERA_LIST_FILE, CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE, 
                     ConfigManager, create_mosaic_image, extract_ip, normalize_roi_points, 
-                    BATCH_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, setup_logging, load_rtsp_list_from_csv, get_warm_snapshot,
+                    BATCH_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, setup_logging, load_rtsp_list_from_csv,
                     save_json_file)
 from event import EVENT_REGISTRY
 from ai_core import VisionModelSync
@@ -58,11 +58,23 @@ def get_system_metrics():
     return cpu_usage, cpu_temp, chip_temp
 
 def capture_snapshot_clean(url):
+    # 💡 [상용화 핵심] 더 이상 무작정 128 회색 화면을 넘기지 않습니다.
+    # 적응형 디코더가 여러 파이프라인을 시도할 시간을 충분히(최대 15초) 주고 진짜 프레임만 검출합니다.
     temp_reader = FrameReader(url, ip="snapshot_test")
-    frame = get_warm_snapshot(temp_reader, timeout_sec=10)
+    start_time = time.time()
+    valid_frame = None
+    
+    while time.time() - start_time < 15.0:
+        frame, _, connected = temp_reader.read()
+        if connected and frame is not None:
+            mean_val = np.mean(frame)
+            if mean_val > 1.0 and mean_val != 128.0:
+                valid_frame = frame
+                break
+        time.sleep(0.5)
+        
     temp_reader.stop()
-    if frame is not None and np.mean(frame) == 128: return None
-    return frame
+    return valid_frame
 
 def get_roi_points_scaled(frame, title, mode="poly"):
     pts = []
@@ -271,7 +283,6 @@ def main():
 
         engine_main = VisionModelSync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.pt"))
         face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
-        # 💡 헬멧 전용 모델 로드 (config에 명시되거나 기본값 폴백)
         engine_helmet = VisionModelSync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
         
         for i, rtsp in enumerate(rtsp_list):
@@ -320,13 +331,11 @@ def main():
                 if fid > c.last_submit_fid:
                     if fid % SYS_CFG.get("SKIP_FRAMES", 1) == 0:
                         main_boxes = engine_main.infer(frame)
-                        # 💡 헬멧 이벤트가 활성화된 경우에만 헬멧 모델 추론
                         if "no_helmet" in c.events and c.helmet_detector:
                             helmet_boxes = c.helmet_detector.infer(frame)
                             
                     c.last_submit_fid = fid
                 
-                # 💡 두 트래커 업데이트 로직 수행
                 t_main, alarms = c.run_logic(frame, fid, main_boxes, helmet_boxes)
                 
                 if use_display:
