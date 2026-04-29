@@ -64,30 +64,6 @@ def capture_snapshot_clean(url):
     if frame is not None and np.mean(frame) == 128: return None
     return frame
 
-def check_rtsp_stream(url):
-    cap = cv2.VideoCapture(url)
-    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 1500)
-    ret = cap.isOpened()
-    cap.release()
-    return url if ret else None
-
-def auto_discover_cameras():
-    logger.info("📡 네트워크 카메라 자동 스캔 중... (192.168.1.170:9001~9040)")
-    targets = [f"rtsp://192.168.1.170:{port}/S.mp4" for port in range(9001, 9041)]
-    valid_urls = []
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        for future in concurrent.futures.as_completed([executor.submit(check_rtsp_stream, u) for u in targets]):
-            if future.result():
-                valid_urls.append(future.result())
-                
-    if valid_urls:
-        with open(CAMERA_LIST_FILE, 'w', encoding='utf-8-sig', newline='') as f:
-            csv.writer(f).writerows([["rtsp_url"]] + [[u] for u in valid_urls])
-        logger.info(f"✅ 총 {len(valid_urls)}대의 카메라가 발견되어 cameras.csv를 생성했습니다.")
-        
-    return valid_urls
-
 def get_roi_points_scaled(frame, title, mode="poly"):
     pts = []
     orig_h, orig_w = frame.shape[:2]
@@ -262,7 +238,6 @@ def prepare_config_manager(rtsp_list):
     if added_new:
         config_manager.save()
         config_manager.config = config_manager.build_runtime_config()
-        print("✅ 새로운 RTSP 주소가 감지되어 자동으로 cameras.json에 등록 및 ID 번호 부여가 완료되었습니다.")
 
     val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
     if val_setup == 'y':
@@ -281,9 +256,13 @@ def main():
     logger.info("="*60)
     
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
+    
+    # 💡 [핵심 보완] 자동 스캔 로직 제거: 리스트가 비어있으면 즉시 오류 발생 및 종료
     if not rtsp_list:
-        rtsp_list = auto_discover_cameras()
-        if not rtsp_list: return logger.error("네트워크에 카메라가 없습니다.")
+        logger.error(f"❌ 설정된 카메라가 없습니다. '{CAMERA_LIST_FILE}' 파일에 RTSP 주소가 입력되어 있는지 확인하십시오.")
+        print(f"\n[오류] '{CAMERA_LIST_FILE}' 파일에 카메라 RTSP 주소가 없습니다.")
+        print("프로그램을 종료합니다.")
+        sys.exit(1)
 
     cams = [] 
     
@@ -291,8 +270,8 @@ def main():
         sensitivity, use_display, use_drawing = prompt_runtime_options()
         config_manager = prepare_config_manager(rtsp_list)
 
-        engine_main = VisionModelSync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.dxnn"))
-        face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.dxnn")) 
+        engine_main = VisionModelSync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.pt"))
+        face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
         
         for i, rtsp in enumerate(rtsp_list):
             ip = extract_ip(rtsp)
@@ -319,7 +298,6 @@ def main():
                 
             dynamic_delay = 1.0 / target_fps
 
-            # 💡 [핵심 보완] 깔끔하고 텍스트를 최소화한 헬스체크 Heartbeat 로깅
             if loop_count % (target_fps * 10) == 0:
                 active_cams = sum(1 for c in cams if c.reader.connected)
                 logger.info(f"💓 [STATUS] Active Cams: {active_cams}/{len(cams)} | CPU: {cpu_usage}% ({cpu_temp}) | CHIP: {chip_temp}")
@@ -334,8 +312,6 @@ def main():
                     if use_display and use_drawing:
                         final_imgs.append(c.draw(None, [], [], {}, connected=False))
                     continue
-                
-                # 💡 [핵심 보완] 비디오 레코더 연동 부분이 삭제되어 I/O 병목이 소멸되었습니다.
                 
                 main_boxes = None
                 if fid > c.last_submit_fid:
