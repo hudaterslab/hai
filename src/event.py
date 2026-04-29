@@ -83,7 +83,9 @@ class ParkingDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.states = defaultdict(lambda: {'start_fid': 0, 'pos': None})
         trigger_sec = config.get("trigger_sec", 5.0)
-        self.move_threshold = config.get("move_threshold_px", 30)
+        
+        # 💡 [보완] 절대 픽셀(px) 기준을 제거하고 차량 크기 대비 비율(ratio)로 변경 (기본 10%)
+        self.move_threshold_ratio = config.get("move_threshold_ratio", 0.1)
         self.trigger_fid_diff = int(trigger_sec * self.fps)
         
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
@@ -95,8 +97,14 @@ class ParkingDetector(BaseEventDetector):
             tid = int(t[4])
             if track_map.get(tid) in TARGET_VEHICLES and cv2.pointPolygonTest(self.roi_poly, get_check_point(*t[:4]), False) >= 0:
                 curr_ids.add(tid)
-                c = get_center_point(*t[:4])
-                if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > self.move_threshold:
+                x1, y1, x2, y2 = t[:4]
+                c = get_center_point(x1, y1, x2, y2)
+                vehicle_size = max(x2 - x1, y2 - y1)
+                
+                # 차량 BBOX 크기에 비례하여 이동 허용치 계산
+                dynamic_move_threshold = vehicle_size * self.move_threshold_ratio
+                
+                if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > dynamic_move_threshold:
                     self.states[tid].update({'start_fid': fid, 'pos': c})
                 elif fid - self.states[tid]['start_fid'] >= self.trigger_fid_diff:
                     triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
@@ -117,7 +125,8 @@ class CrossingDetector(BaseEventDetector):
         self.prev, self.candidates = {}, {}
         
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
-        self.distance_ratio = config.get("distance_ratio", 0.5)
+        # 💡 [보완] Config에서 비율값을 받아오며 기본값 0.2 (20%) 적용
+        self.distance_ratio = config.get("distance_ratio", 0.2) 
         self.direction_check = config.get("direction_check", True)
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0) 
         
@@ -127,17 +136,7 @@ class CrossingDetector(BaseEventDetector):
     def _is_intersect(self, p1, p2, p3, p4): 
         return ccw(p1, p2, p3) * ccw(p1, p2, p4) <= 0 and ccw(p3, p4, p1) * ccw(p3, p4, p2) <= 0
 
-    def _get_crossing_angle(self, p1, p2, prev_pos, curr_pos):
-        lx, ly = p2[0] - p1[0], p2[1] - p1[1]
-        mx, my = curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1]
-        if mx == 0 and my == 0: return 0.0
-        dot = lx * mx + ly * my
-        cross = lx * my - ly * mx
-        angle_rad = math.atan2(abs(cross), abs(dot))
-        return math.degrees(angle_rad)
-
     def _get_line_intersection(self, p1, p2, p3, p4):
-        """두 선분(ROI Line과 객체 이동 궤적)의 정확한 수학적 교차점을 반환"""
         x1, y1 = p1; x2, y2 = p2
         x3, y3 = p3; x4, y4 = p4
         denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
@@ -145,6 +144,14 @@ class CrossingDetector(BaseEventDetector):
         px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom
         py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom
         return (int(px), int(py))
+
+    def _get_perpendicular_distance(self, p1, p2, pt):
+        x1, y1 = p1
+        x2, y2 = p2
+        x0, y0 = pt
+        num = abs((x2 - x1) * (y1 - y0) - (x1 - x0) * (y2 - y1))
+        den = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+        return num / den if den > 0 else 0
 
     def _get_intersection_over_lowbody_area(self, low_box, person_box):
         inter_area = max(0, min(low_box[2], person_box[2]) - max(low_box[0], person_box[0])) * max(0, min(low_box[3], person_box[3]) - max(low_box[1], person_box[1]))
@@ -162,6 +169,10 @@ class CrossingDetector(BaseEventDetector):
             p_tid = int(p[4])
             curr_ids.add(p_tid)
             
+            # 💡 [핵심 보완] 전신(Person) BBOX의 높이를 횡단 판단 기준으로 확보
+            px1, py1, px2, py2 = p[:4]
+            person_height = max(1, py2 - py1)
+            
             best_low_box = None
             max_ioa = 0
             for lb in low_bodies:
@@ -174,55 +185,44 @@ class CrossingDetector(BaseEventDetector):
                 continue
                 
             lx1, ly1, lx2, ly2 = best_low_box
-            obj_height = max(1, ly2 - ly1)
+            low_height = max(1, ly2 - ly1)
             
-            curr_pos = (int((lx1 + lx2) / 2), int(ly2 - obj_height * 0.1))
+            curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
             is_frame_out = (lx1 <= 15) or (lx2 >= SCREEN_WIDTH - 15) or (ly1 <= 15) or (ly2 >= SCREEN_HEIGHT - 15)
             
-            # 파이프라인 1, 2: 교차 및 진입 각도 확인
             if p_tid in self.prev and p_tid not in self.candidates:
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, self.prev[p_tid], curr_pos):
-                        cross_angle = self._get_crossing_angle(p1, p2, self.prev[p_tid], curr_pos)
-                        
-                        if cross_angle >= self.min_crossing_angle:
-                            # 💡 3 FPS 간극 보완: 실제 교차점을 계산하여 정확한 시작점 지정
-                            cross_pt = self._get_line_intersection(p1, p2, self.prev[p_tid], curr_pos)
-                            self.candidates[p_tid] = {
-                                'crossing_pt': cross_pt, 
-                                'height': obj_height, 
-                                'timestamp_fid': fid, 
-                                'line': (p1, p2),
-                                'entry_side': ccw(p1, p2, self.prev[p_tid]), 
-                                'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
-                                'bbox': tuple(p[:4]), 
-                                'fid': fid
-                            }
+                        cross_pt = self._get_line_intersection(p1, p2, self.prev[p_tid], curr_pos)
+                        self.candidates[p_tid] = {
+                            'crossing_pt': cross_pt, 
+                            'person_height': person_height,  # 💡 전신의 높이 저장
+                            'timestamp_fid': fid, 
+                            'line': (p1, p2),
+                            'entry_side': ccw(p1, p2, self.prev[p_tid]), 
+                            'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
+                            'bbox': tuple(p[:4]), 
+                            'fid': fid
+                        }
                         break
                         
-            # 파이프라인 3, 4: 충분한 이탈 거리 확인 및 이벤트 발생
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
+                p1, p2 = cand['line']
                 
-                # 💡 수학적으로 산출된 정확한 교차점부터 현재 위치까지의 거리 측정
-                moved_dist = get_distance(cand['crossing_pt'], curr_pos)
+                curr_side = ccw(p1, p2, curr_pos)
                 
-                direction_ok = True
-                if self.direction_check:
-                    curr_side = ccw(cand['line'][0], cand['line'][1], curr_pos)
-                    if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
-                        direction_ok = True
-                    else:
-                        direction_ok = False
-                
-                if direction_ok:
-                    # 💡 하반신 기준 3 FPS 특성에 맞춰 임계값 보정 (하반신 높이의 30% 또는 최소 15픽셀)
-                    dynamic_threshold = max(5.0, cand['height'] * 0.2)
+                if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
                     
-                    # 조건을 만족하면 다음 프레임을 기다리지 않고 즉각(동일 프레임 내) 이벤트 트리거
-                    if moved_dist >= dynamic_threshold or is_frame_out:
+                    perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
+                    
+                    # 💡 [핵심 보완] 하반신이 아닌 전신(Person) BBOX 높이 기준 지정된 비율(20%) 계산
+                    dynamic_threshold = cand['person_height'] * self.distance_ratio
+                    
+                    if perp_dist >= dynamic_threshold or is_frame_out:
                         triggered.append({'tid': p_tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
                         del self.candidates[p_tid]
+                        
                 elif fid - cand['timestamp_fid'] > self.ttl_fid_diff: 
                     del self.candidates[p_tid]
                     
@@ -325,7 +325,7 @@ class SignalVehicleDetector(BaseEventDetector):
             
             if len(self.vehicle_history[tid]) > 0:
                 prev_foot = self.vehicle_history[tid][-1]
-                dynamic_jump_threshold = max(60.0, vehicle_size * 0.6)
+                dynamic_jump_threshold = vehicle_size * 0.6
                 
                 if get_distance(prev_foot, foot_center) > dynamic_jump_threshold:
                     self.vehicle_history[tid].clear()
@@ -339,7 +339,7 @@ class SignalVehicleDetector(BaseEventDetector):
                 end_x, end_y = sum(p[0] for p in history_list[-3:])/3.0, sum(p[1] for p in history_list[-3:])/3.0
                 smoothed_dist = get_distance((start_x, start_y), (end_x, end_y))
                 
-                dynamic_move_threshold = max(40.0, vehicle_size * 0.15)
+                dynamic_move_threshold = vehicle_size * 0.15
                 
                 if smoothed_dist >= dynamic_move_threshold and cv2.pointPolygonTest(self.roi_poly, get_center_point(x1, y1, x2, y2), False) >= 0:
                     mx1, my1, mx2, my2 = max(0, int(x1 * scale_x)), max(0, int(y1 * scale_y)), min(640, int(x2 * scale_x)), min(360, int(y2 * scale_y))

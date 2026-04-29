@@ -11,7 +11,8 @@ from collections import deque, defaultdict
 from common import (
     SYS_CFG, EVENT_ROOT_DIR, WATCHDOG_TIMEOUT, STREAM_RECONNECT_DELAY_SEC, 
     denormalize_roi_points, save_event_image_with_mark, ID_H_HELMET, ID_H_NO_HELMET, 
-    ID_G_PERSON, ID_G_CAR, ID_G_TRUCK, ID_PERSON_LOW, ID_REFLECTIVE_VEST
+    ID_G_PERSON, ID_G_CAR, ID_G_TRUCK, ID_PERSON_LOW, ID_REFLECTIVE_VEST,
+    calculate_iou  # 💡 [핵심 보완] BBOX 스냅핑을 위한 IoU 계산 함수 임포트
 )
 from event import MotionDetector, EVENT_REGISTRY
 from ai_core import SORTTracker
@@ -38,146 +39,107 @@ class FrameReader:
         self.target_fps = SYS_CFG.get("REC_FPS", 3)
         self.process = None
         
+        self.use_gstreamer = True
+        self.gst_fail_count = 0
+        
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def _get_strategies(self):
-        return [
-            {'type': 'gst', 'name': 'Generic TCP (decodebin)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! decodebin ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
-            {'type': 'gst', 'name': 'H.265 TCP (Explicit)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
-            {'type': 'gst', 'name': 'H.264 TCP (Explicit)', 'pipe': f"rtspsrc location={self.url} latency=500 protocols=tcp ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! fdsink fd=1 sync=false"},
-            {'type': 'cv2', 'name': 'OpenCV FFmpeg (Native fallback)', 'pipe': None}
-        ]
-
     def _run(self):
-        strategies = self._get_strategies()
-        
         while self.running:
             self.connected = False
-            current_idx = FrameReader._best_strategy_idx
-            tested_count = 0
-            success = False
-
-            while tested_count < len(strategies) and self.running:
-                strategy = strategies[current_idx]
-                logger.info(f"[CAM {self.ip}] 연결 시도 중... 전략: {strategy['name']}")
-                
-                success = self._try_strategy(strategy)
-                
-                if success:
-                    FrameReader._best_strategy_idx = current_idx
-                    break
-                else:
-                    current_idx = (current_idx + 1) % len(strategies)
-                    tested_count += 1
-                    time.sleep(1.0)
             
-            if not self.running:
-                break
+            if self.use_gstreamer:
+                pipeline = (
+                    f"rtspsrc location={self.url} latency=500 ! "
+                    f"decodebin ! videoconvert ! videorate ! "
+                    f"video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! "
+                    f"fdsink fd=1 sync=false"
+                )
                 
-            if not success:
-                logger.error(f"[CAM {self.ip}] 모든 디코딩 전략 실패. 10초 후 재시도합니다.")
-                time.sleep(10)
-
-    def _try_strategy(self, strategy):
-        start_time = time.time()
-        valid_frames_read = 0
-        
-        if strategy['type'] == 'gst':
-            cmd = ['gst-launch-1.0', '-q'] + strategy['pipe'].split()
-            try:
-                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-            except Exception as e:
-                logger.error(f"[CAM {self.ip}] Subprocess GStreamer 에러: {e}")
-                return False
+                cmd = ['gst-launch-1.0', '-q'] + pipeline.split()
                 
-            while self.running:
-                if psutil.cpu_percent(interval=None) > 95:
-                    time.sleep(0.05)
+                try:
+                    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+                except Exception:
+                    self.gst_fail_count += 1
+                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                    continue
                     
-                raw = b''
-                while len(raw) < self.frame_bytes:
-                    if not self.running: break
-                    try:
-                        chunk = self.process.stdout.read(self.frame_bytes - len(raw))
-                        if not chunk: break
-                        raw += chunk
-                    except Exception:
+                read_success = False
+                while self.running:
+                    if psutil.cpu_percent(interval=None) > 95:
+                        time.sleep(0.05)
+                        
+                    raw = b''
+                    while len(raw) < self.frame_bytes:
+                        if not self.running: 
+                            break
+                        try:
+                            chunk = self.process.stdout.read(self.frame_bytes - len(raw))
+                            if not chunk: 
+                                break
+                            raw += chunk
+                        except Exception:
+                            break
+                            
+                    if len(raw) != self.frame_bytes: 
                         break
                         
-                if len(raw) != self.frame_bytes: 
-                    break
-                    
-                img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
-                
-                # 💡 [핵심 보완] 회색 실루엣(P/B-frame)과 I-frame을 분산(std)으로 명확히 구분
-                mean_val = np.mean(img)
-                std_val = np.std(img)
-                
-                # 깨진 프레임: 너무 어둡거나(mean<=1), 회색이면서 픽셀 변화가 거의 없는 경우(std<15)
-                is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
-                
-                if is_corrupted:
-                    # I-frame이 오기까지 최대 15초간 끈질기게 대기
-                    if time.time() - start_time > 15.0:
-                        self._kill_process()
-                        return False
-                    continue
-                
-                valid_frames_read += 1
-                self.connected = True
-                
-                with self.lock:
-                    self.frame = img
-                    self.fid += 1
-                    self.last_frame_time = time.time()
-                    
-            self._kill_process()
-            
-        elif strategy['type'] == 'cv2':
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-            if not cap.isOpened():
-                return False
-                
-            last_read_time = time.time()
-            while self.running:
-                ret, frame = cap.read()
-                if not ret: break
-                
-                now = time.time()
-                if now - last_read_time >= (1.0 / self.target_fps):
-                    frame = cv2.resize(frame, (self.out_w, self.out_h))
-                    
-                    mean_val = np.mean(frame)
-                    std_val = np.std(frame)
-                    is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
-                    
-                    if is_corrupted:
-                        if time.time() - start_time > 15.0:
-                            cap.release()
-                            return False
-                        continue
-                        
-                    valid_frames_read += 1
+                    img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
+                    read_success = True
                     self.connected = True
+                    self.gst_fail_count = 0 
                     
                     with self.lock:
-                        self.frame = frame
+                        self.frame = img
                         self.fid += 1
-                        self.last_frame_time = now
-                    last_read_time = now
+                        self.last_frame_time = time.time()
+                        
+                self.connected = False
+                if self.process:
+                    try: 
+                        self.process.kill()
+                    except Exception: 
+                        pass
+                    self.process = None
+                
+                if not read_success:
+                    self.gst_fail_count += 1
                     
-            cap.release()
-            
-        self.connected = False
-        return valid_frames_read > 10
-
-    def _kill_process(self):
-        if self.process:
-            try: self.process.kill()
-            except Exception: pass
-            self.process = None
+                if self.gst_fail_count >= 2:
+                    self.use_gstreamer = False
+                    
+            else:
+                cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                
+                if not cap.isOpened():
+                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                    continue
+                    
+                self.connected = True
+                
+                last_read_time = time.time()
+                while self.running:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    now = time.time()
+                    if now - last_read_time >= (1.0 / self.target_fps):
+                        frame = cv2.resize(frame, (self.out_w, self.out_h))
+                        with self.lock:
+                            self.frame = frame
+                            self.fid += 1
+                            self.last_frame_time = now
+                        last_read_time = now
+                        
+                cap.release()
+                self.connected = False
+                
+            if self.running: 
+                time.sleep(STREAM_RECONNECT_DELAY_SEC)
 
     def read(self):
         with self.lock: 
@@ -185,7 +147,11 @@ class FrameReader:
             
     def stop(self, join_timeout=3.0):
         self.running = False
-        self._kill_process()
+        if self.process:
+            try: 
+                self.process.kill()
+            except Exception: 
+                pass
         if self.thread.is_alive(): 
             self.thread.join(timeout=join_timeout)
 
@@ -273,6 +239,36 @@ class Camera:
             pass
         return image
 
+    def _snap_tracks_to_raw(self, tracks, raw_boxes):
+        """
+        💡 [상용화 핵심 로직] 저프레임 환경에서 칼만 필터의 위치 지연(Lag) 현상을 보정합니다.
+        트래커가 예측한 BBOX를 원본 YOLO 탐지 BBOX에 강력하게 달라붙도록(Snap) 강제 조정합니다.
+        """
+        if raw_boxes is None or len(raw_boxes) == 0 or len(tracks) == 0:
+            return tracks
+            
+        snapped_tracks = []
+        for t in tracks:
+            tx1, ty1, tx2, ty2, tid, conf, cls_id = t
+            best_iou = 0
+            best_raw = None
+            
+            # 현재 트랙(클래스 일치)과 가장 많이 겹치는 실제 탐지 BBOX 찾기
+            for rb in raw_boxes:
+                if int(rb[5]) == int(cls_id):
+                    iou = calculate_iou((tx1, ty1, tx2, ty2), rb[:4])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_raw = rb
+                        
+            # 저프레임 예측 오차를 고려해 IoU가 단 5%만 겹쳐도 동일 객체로 간주하고 원본 BBOX 좌표 채택
+            if best_iou > 0.05 and best_raw is not None:
+                snapped_tracks.append([best_raw[0], best_raw[1], best_raw[2], best_raw[3], tid, best_raw[4], cls_id])
+            else:
+                snapped_tracks.append(t)
+                
+        return snapped_tracks
+
     def run_logic(self, frame, frame_id, main_boxes=None, helmet_boxes=None):
         with self.config_lock:
             self._update_runtime_roi(frame.shape)
@@ -300,10 +296,9 @@ class Camera:
                     remaining_logs.append(dlog)
             self.delayed_logs = remaining_logs
             
-            if main_boxes is not None and len(main_boxes) > 0:
-                main_tracks = self.main_tracker.update(np.array(main_boxes))
-            else:
-                main_tracks = self.main_tracker.predict_only()
+            # 트래커 업데이트 후 원본 좌표로 Snap(교정)
+            main_tracks = self.main_tracker.update(np.array(main_boxes)) if main_boxes is not None and len(main_boxes) > 0 else self.main_tracker.predict_only()
+            main_tracks = self._snap_tracks_to_raw(main_tracks, main_boxes)
                 
             helmet_tracks = []
             if self.helmet_detector and "no_helmet" in self.events:
@@ -311,6 +306,7 @@ class Camera:
                     helmet_tracks = self.helmet_tracker.update(np.array(helmet_boxes))
                 else:
                     helmet_tracks = self.helmet_tracker.predict_only()
+                helmet_tracks = self._snap_tracks_to_raw(helmet_tracks, helmet_boxes)
 
             now = time.time()
             current_alarms = {}
@@ -383,8 +379,8 @@ class Camera:
                 cv2.line(frame, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0,0,255), 1)
         
         for t in tracks:
-            tid = int(t[4])
-            cls_id = int(t[6])
+            x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
+            tid, cls_id = int(tid), int(cls_id)
             
             if cls_id == ID_H_HELMET: color, label = (255, 0, 0), "Helmet"
             elif cls_id == ID_H_NO_HELMET: color, label = (0, 0, 255), "No-Helmet"
@@ -398,8 +394,8 @@ class Camera:
             if tid in alarms: color, label = (0, 0, 255), f"ALARM: {label}"
                 
             thickness = 2 if tid in alarms else 1
-            cv2.rectangle(frame, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
-            cv2.putText(frame, f"{label} [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
+            cv2.putText(frame, f"{label} [{tid}]", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             
         cv2.rectangle(frame, (0, 0), (60, 40), (0, 0, 0), -1)
         cv2.putText(frame, f"C{self.cam_id}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
