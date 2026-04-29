@@ -14,7 +14,7 @@ except ImportError:
 
 # 로컬 임포트 
 from common import (
-    ID_G_PERSON, ID_G_CAR, ID_H_PERSON, ID_H_NO_HELMET, ID_H_HELMET, TARGET_VEHICLES,
+    ID_G_PERSON, ID_G_CAR, ID_G_PERSON, ID_H_NO_HELMET, ID_H_HELMET, TARGET_VEHICLES,
     SCREEN_WIDTH, SCREEN_HEIGHT, SYS_CFG, get_center_point, get_distance
 )
 import event

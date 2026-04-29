@@ -15,3 +15,5 @@ tmux ls
 
 # tmux 세션 종료
 tmux kill-session -t hai
+
+curl -L https://huggingface.co -o hanjin_cctv.dxnn

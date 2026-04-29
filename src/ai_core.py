@@ -39,9 +39,12 @@ def get_model_confidence(engine_path, default_conf=0.45):
     else: 
         return conf_map.get("GENERAL", 0.50)
 
+# 💡 [핵심 보완] 설정 파일에 어떤 확장자가 적혀있든 무시하고, 현재 구동되는 하드웨어(GPU/NPU)에 맞는 확장자를 스스로 생성합니다.
 def resolve_model_path(engine_path, is_gpu=False):
-    target_path = engine_path.replace(".dxnn", ".pt") if is_gpu else engine_path.replace(".pt", ".dxnn")
-    if os.path.exists(target_path): 
+    base_path = os.path.splitext(engine_path)[0]
+    target_path = f"{base_path}.pt" if is_gpu else f"{base_path}.dxnn"
+
+    if os.path.exists(target_path):
         return target_path
     return os.path.join("models", os.path.basename(target_path))
 
@@ -62,7 +65,6 @@ if USE_NPU:
         logger.warning("🟡 NPU 임포트 실패. GPU 모드로 대체합니다.")
 
 if USE_NPU:
-    # 💡 [핵심 보완] 비동기 콜백을 동기 이벤트(Event)로 묶어주는 역할로 변경
     def onInferenceCallbackSync(outputs, user_arg):
         event, result_list, is_yolov7, conf_thres, scale, offset = user_arg
         boxes = []
@@ -110,7 +112,7 @@ if USE_NPU:
             logger.error(f"⚠️ NPU Sync Error: {e}")
         finally: 
             result_list.append(boxes)
-            event.set() # 💡 메인 루프의 Blocking을 풀어줌
+            event.set()
         return 0
 
     class DeepXModelSync:
@@ -150,7 +152,6 @@ if USE_NPU:
             user_arg = (event, result_list, self.is_yolov7, self.conf_thres, scale, offset)
             
             self.engine.run_async([input_tensor], user_arg=user_arg)
-            # 💡 [핵심 보완] 콜백이 끝날 때까지 여기서 대기합니다 (Sync Mode 전환)
             event.wait(timeout=2.0)
             
             if result_list:
@@ -227,7 +228,7 @@ class KalmanBoxTracker:
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
 
 class SORTTracker:
-    def __init__(self, track_thresh=0.5, track_buffer=5, match_thresh=0.3, is_helmet=True):
+    def __init__(self, track_thresh=0.5, track_buffer=30, match_thresh=0.3, is_helmet=True):
         self.track_thresh = track_thresh
         self.track_buffer = track_buffer
         self.match_thresh = match_thresh

@@ -1,440 +1,309 @@
-import os
-import sys
-import time
-import gc
 import cv2
-import numpy as np
-import psutil
-import threading
-import queue
-import csv
-import concurrent.futures
-import logging
-import traceback
 import math
-import shutil
+import time
+import numpy as np
+from collections import defaultdict, deque
+from common import (
+    ID_H_NO_HELMET, ID_G_PERSON, TARGET_VEHICLES, 
+    SCREEN_WIDTH, SCREEN_HEIGHT, get_check_point, get_center_point, get_foot_point,
+    get_distance, ccw, calculate_iou
+)
 
-from common import (SYS_CFG, CAMERA_LIST_FILE, CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE, 
-                    ConfigManager, create_mosaic_image, extract_ip, normalize_roi_points, 
-                    BATCH_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, setup_logging, load_rtsp_list_from_csv, get_warm_snapshot)
-from event import EVENT_REGISTRY
+class TrajectoryTracker:
+    def __init__(self, max_len=30):
+        self.history = defaultdict(lambda: deque(maxlen=max_len))
+        self.colors = {}
 
-from ai_core import VisionModelAsync, VisionModelSync, async_result_queue
-from camera import Camera
-from camera import FrameReader
-
-logger = logging.getLogger("VMS_SYSTEM")
-
-# 💡 [핵심 보완] 하드웨어 시스템 메트릭 추출 함수 (CPU 온도 및 Chip 온도 지원)
-def get_system_metrics():
-    cpu_usage = psutil.cpu_percent(interval=None)
-    cpu_temp = "N/A"
-    chip_temp = "N/A"
-    
-    # 1. CPU 온도 측정 (psutil 기반 우선 확인)
-    try:
-        if hasattr(psutil, "sensors_temperatures"):
-            temps = psutil.sensors_temperatures()
-            for name in ['cpu_thermal', 'cpu-thermal', 'coretemp', 'k10temp', 'soc_therm']:
-                if name in temps and temps[name]:
-                    cpu_temp = f"{temps[name][0].current:.1f}°C"
-                    break
-    except Exception: pass
-    
-    # 1-1. 리눅스 환경 Fallback (라즈베리파이, 딥엑스 보드 등에서 주로 사용)
-    if cpu_temp == "N/A" and os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-                cpu_temp = f"{int(f.read().strip()) / 1000.0:.1f}°C"
-        except Exception: pass
-
-    # 2. GPU/NPU 온도 측정 시도
-    try:
-        # NVIDIA GPU 환경
-        if shutil.which("nvidia-smi"):
-            out = subprocess.check_output(["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"], stderr=subprocess.DEVNULL, text=True)
-            chip_temp = f"{out.strip()}°C (GPU)"
-        # DeepX NPU (예비 연동: 환경에 따라 별도 CLI 스크립트 연결 필요)
-        elif shutil.which("dxrt-cli"):
-            pass
-    except Exception: pass
-    
-    return cpu_usage, cpu_temp, chip_temp
-
-def capture_snapshot_clean(url):
-    temp_reader = FrameReader(url, ip="snapshot_test")
-    frame = get_warm_snapshot(temp_reader, timeout_sec=10)
-    temp_reader.stop()
-    
-    if frame is not None and np.mean(frame) == 128:
-        return None
-        
-    return frame
-
-def check_rtsp_stream(url):
-    cap = cv2.VideoCapture(url)
-    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 1500)
-    ret = cap.isOpened()
-    cap.release()
-    return url if ret else None
-
-def auto_discover_cameras():
-    logger.info("📡 네트워크 카메라 자동 스캔 중... (192.168.1.170:9001~9040)")
-    targets = [f"rtsp://192.168.1.170:{port}/S.mp4" for port in range(9001, 9041)]
-    valid_urls = []
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        for future in concurrent.futures.as_completed([executor.submit(check_rtsp_stream, u) for u in targets]):
-            if future.result():
-                valid_urls.append(future.result())
+    def update_and_draw(self, frame, tracks):
+        curr_ids = set()
+        for t in tracks:
+            x1, y1, x2, y2, tid, cls_id, conf = t
+            tid = int(tid)
+            curr_ids.add(tid)
+            center = get_foot_point(x1, y1, x2, y2)
+            self.history[tid].append(center)
+            
+            if tid not in self.colors:
+                np.random.seed(tid)
+                self.colors[tid] = tuple([int(c) for c in np.random.randint(50, 255, 3)])
                 
-    if valid_urls:
-        with open(CAMERA_LIST_FILE, 'w', encoding='utf-8-sig', newline='') as f:
-            csv.writer(f).writerows([["rtsp_url"]] + [[u] for u in valid_urls])
-        logger.info(f"✅ 총 {len(valid_urls)}대의 카메라가 발견되어 cameras.csv를 생성했습니다.")
-        
-    return valid_urls
-
-def get_roi_points_scaled(frame, title, mode="poly"):
-    pts = []
-    orig_h, orig_w = frame.shape[:2]
-    disp_w = 960
-    scale = disp_w / orig_w
-    disp_h = int(orig_h * scale)
-    disp_frame = cv2.resize(frame, (disp_w, disp_h))
-    
-    wname = "ROI Setup Window"
-    cv2.namedWindow(wname, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(wname, disp_w, disp_h)
-    
-    def mouse_cb(e, x, y, f, p):
-        if e == cv2.EVENT_LBUTTONDOWN:
-            if mode == "line" and len(pts) >= 2:
-                return
-            pts.append([int(x / scale), int(y / scale)])
-            
-    cv2.setMouseCallback(wname, mouse_cb)
-    logger.info(f"[{title}] 그리기 모드. 점을 찍고 Enter(완료) 또는 ESC(취소). Line 모드는 2점.")
-    
-    while True:
-        temp = disp_frame.copy()
-        dp = [[int(p[0] * scale), int(p[1] * scale)] for p in pts]
-        
-        cv2.putText(temp, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
-        if mode == "line":
-            if len(dp) == 1:
-                cv2.circle(temp, tuple(dp[0]), 5, (0, 0, 255), -1)
-            elif len(dp) == 2:
-                cv2.line(temp, tuple(dp[0]), tuple(dp[1]), (0, 0, 255), 2)
-        else:
-            if len(dp) > 0:
-                cv2.polylines(temp, [np.array(dp, np.int32)], True, (0, 255, 0), 2)
+            pts = list(self.history[tid])
+            for i in range(1, len(pts)):
+                cv2.line(frame, pts[i-1], pts[i], self.colors[tid], 2)
                 
-        cv2.imshow(wname, temp)
-        k = cv2.waitKey(1)
-        
-        if k == 13:
-            break 
-        if k == 27:
-            pts = []
-            break 
-        if mode == "line" and len(pts) == 2:
-            cv2.waitKey(500)
-            break
-            
-    cv2.destroyWindow(wname)
-    return normalize_roi_points(pts, orig_w, orig_h)
+        for tid in list(self.history.keys()):
+            if tid not in curr_ids: 
+                del self.history[tid]
 
-def run_wizard_batch_mode(config_manager, rtsp_list):
-    total = len(rtsp_list)
-    if total == 0:
-        return logger.warning("설정할 카메라가 없습니다.")
+class MotionDetector:
+    def __init__(self, sensitivity):
+        self.threshold = 100 - ((sensitivity - 1) * 9) 
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=self.threshold, detectShadows=True)
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         
-    available_events = list(EVENT_REGISTRY.values())
-    menu_str = " ".join([f"{i+1}.{evt.menu_name}" for i, evt in enumerate(available_events)])
+    def apply(self, frame):
+        if frame is None: 
+            return None
+        small_frame = cv2.resize(frame, (640, 360))
+        fg_mask = self.bg_subtractor.apply(small_frame)
+        return cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
+
+class BaseEventDetector:
+    event_name, menu_name, gui_name = "base", "BASE", "BASE"
+    required_models, roi_type = ["general"], "polygon"
     
-    for i in range(0, total, BATCH_SIZE):
-        batch_urls = rtsp_list[i : i + BATCH_SIZE]
-        frames = []
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        self.config = config
+        self.roi_poly = np.array(roi_poly, dtype=np.int32) if roi_poly and len(roi_poly) >= 3 else np.empty((0, 2), dtype=np.int32)
+        self.roi_lines = roi_lines or []
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
-            frames = list(executor.map(capture_snapshot_clean, batch_urls))
+    def process(self, tracks, track_map, motion_mask, frame, fid): 
+        return []
+
+class IntrusionDetector(BaseEventDetector):
+    event_name, menu_name, gui_name = "intrusion", "침입", "INTRUSION"
+    
+    def process(self, tracks, track_map, motion_mask, frame, fid):
+        triggered = []
+        if self.roi_poly.size == 0: 
+            return triggered
             
-        display_frames = []
-        for idx, frm in enumerate(frames):
-            if frm is None:
-                blk = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(blk, "Conn Fail", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                display_frames.append(blk)
-            else:
-                display_frames.append(frm)
+        for t in tracks:
+            tid = int(t[4])
+            if track_map.get(tid) == ID_G_PERSON and cv2.pointPolygonTest(self.roi_poly, get_foot_point(*t[:4]), False) >= 0:
+                triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
                 
-        mosaic = create_mosaic_image(display_frames)
-        cols = max(1, math.ceil(math.sqrt(len(display_frames))))
-        cw = SCREEN_WIDTH // cols
-        ch = SCREEN_HEIGHT // max(1, math.ceil(len(display_frames) / cols))
+        return triggered
+
+class ParkingDetector(BaseEventDetector):
+    event_name, menu_name, gui_name = "illegal_parking", "주정차", "PARKING"
+    
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        self.states = defaultdict(lambda: {'start': 0, 'pos': None})
         
-        for idx in range(len(display_frames)):
-            r, c = divmod(idx, cols)
-            cx, cy = c * cw, r * ch
-            cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
-            cv2.putText(mosaic, str(idx + 1), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
+    def process(self, tracks, track_map, motion_mask, frame, fid):
+        triggered, curr_ids, now = [], set(), time.time()
+        if self.roi_poly.size == 0: 
+            return triggered
             
-        cv2.namedWindow("Select Cameras", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Select Cameras", 1280, 720)
-        cv2.imshow("Select Cameras", mosaic)
-        cv2.waitKey(1)
+        for t in tracks:
+            tid = int(t[4])
+            if track_map.get(tid) in TARGET_VEHICLES and cv2.pointPolygonTest(self.roi_poly, get_check_point(*t[:4]), False) >= 0:
+                curr_ids.add(tid)
+                c = get_center_point(*t[:4])
+                if self.states[tid]['start'] == 0 or get_distance(c, self.states[tid]['pos']) > 30:
+                    self.states[tid].update({'start': now, 'pos': c})
+                elif now - self.states[tid]['start'] > 5.0:
+                    triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
+                    
+        for tid in list(self.states.keys()):
+            if tid not in curr_ids: 
+                del self.states[tid]
+                
+        return triggered
+
+class CrossingDetector(BaseEventDetector):
+    event_name, menu_name, gui_name = "conveyor_crossing", "횡단", "CROSSING"
+    roi_type = "line"
+    
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        self.lines = [(self.roi_lines[i], self.roi_lines[i+1]) for i in range(len(self.roi_lines)-1)] if len(self.roi_lines) >= 2 else []
+        self.prev, self.candidates = {}, {}
+        self.pos_history = defaultdict(lambda: deque(maxlen=4))
         
-        sel = input(">> 선택 (예: 1,3,5): ").strip()
-        selected_indices = []
-        if sel:
-            for n in [int(s.strip()) for s in sel.split(',') if s.strip().isdigit()]:
-                if 1 <= n <= len(batch_urls):
-                    selected_indices.append(i + (n - 1))
-        cv2.destroyWindow("Select Cameras")
+        self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
+        self.distance_ratio = config.get("distance_ratio", 0.3)
+        self.min_distance_px, self.candidate_ttl_sec = config.get("min_distance_px", 15), config.get("candidate_ttl_sec", 5.0)
+        self.direction_check = config.get("direction_check", True)
         
-        for idx in selected_indices:
-            url = rtsp_list[idx].strip()
-            ip = extract_ip(url)
-            frame = capture_snapshot_clean(url)
-            
-            if frame is None:
+    def _is_intersect(self, p1, p2, p3, p4): 
+        return ccw(p1, p2, p3) * ccw(p1, p2, p4) <= 0 and ccw(p3, p4, p1) * ccw(p3, p4, p2) <= 0
+        
+    def process(self, tracks, track_map, motion_mask, frame, fid):
+        triggered, curr_ids, now = [], set(), time.time()
+        for t in tracks:
+            tid = int(t[4])
+            curr_ids.add(tid)
+            if track_map.get(tid) != ID_G_PERSON: 
                 continue
                 
-            height, width = frame.shape[:2]
-            ratio = 960 / width
-            preview = cv2.resize(frame, (960, int(height * ratio)))
+            x1, y1, x2, y2 = t[:4]
+            obj_height = y2 - y1
+            obj_width = max(1, x2 - x1)
             
-            win_name = "Camera Check"
-            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(win_name, 960, int(height * ratio))
-            cv2.imshow(win_name, preview)
-            cv2.moveWindow(win_name, 100, 100)
-            cv2.waitKey(1)
+            curr_pos = (int((x1 + x2) / 2), int(y1 + obj_height * 0.2))
+            is_frame_out = (x1 <= 15) or (x2 >= SCREEN_WIDTH - 15) or (y1 <= 15) or (y2 >= SCREEN_HEIGHT - 15)
             
-            print(f"[{ip}]")
-            print(menu_str)
-            sel = input(">> 이벤트 선택 (예: 1,4,5): ")
-            cv2.destroyWindow(win_name)
+            self.pos_history[tid].append(curr_pos)
             
-            events = []
-            needs_poly = False
-            needs_line = False
-            
-            for evt_idx, evt_class in enumerate(available_events):
-                if str(evt_idx + 1) in sel:
-                    events.append(evt_class.event_name)
-                    if evt_class.roi_type == "polygon": needs_poly = True
-                    if evt_class.roi_type == "line": needs_line = True
-            
-            roi_p = []
-            roi_l = []
-            
-            if needs_poly:
-                roi_p = get_roi_points_scaled(frame, "Polygon")
+            is_ping_pong = False
+            if len(self.pos_history[tid]) >= 3:
+                p_older = self.pos_history[tid][-3]
+                p_prev = self.pos_history[tid][-2] 
+                p_curr = self.pos_history[tid][-1] 
                 
-            if needs_line:
-                while True:
-                    l = get_roi_points_scaled(frame, "Line", mode="line")
-                    if len(l) == 2:
-                        roi_l.extend(l)
-                    if input("    라인 추가? (y/n): ") != 'y':
+                dist_jump = get_distance(p_curr, p_prev)
+                dist_return = get_distance(p_curr, p_older)
+                
+                if dist_jump > obj_width * 0.5 and dist_return < obj_width * 0.3:
+                    is_ping_pong = True
+            
+            if is_ping_pong:
+                self.prev[tid] = curr_pos
+                if tid in self.candidates:
+                    del self.candidates[tid]
+                continue
+
+            if tid in self.prev and tid not in self.candidates:
+                for p1, p2 in self.lines:
+                    if self._is_intersect(p1, p2, self.prev[tid], curr_pos):
+                        self.candidates[tid] = {
+                            'crossing_pt': curr_pos, 'height': obj_height, 'timestamp': now, 'line': (p1, p2),
+                            'entry_side': ccw(p1, p2, self.prev[tid]), 'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
+                            'bbox': tuple(t[:4]), 'fid': fid
+                        }
                         break
-            
-            config_manager.set_config(ip, {
-                "url": url, 
-                "roi_poly_norm": roi_p, 
-                "roi_lines_norm": roi_l, 
-                "events": events
-            })
-
-def prompt_runtime_options():
-    sensitivity = 5
-    try:
-        val = input(">> 움직임 감지 민감도 설정 (1-10, 엔터시 기본값 5): ")
-        if val.strip():
-            sensitivity = max(1, min(10, int(val)))
-    except Exception:
-        pass
-        
-    val_disp = input(">> 모니터링 화면(GUI)을 출력하시겠습니까? (y/N, 기본값 y): ").strip().lower()
-    use_display = False if val_disp == 'n' else True
-    
-    use_drawing = True
-    if use_display:
-        val_draw = input(">> 화면에 박스 및 텍스트(시각화)를 그리시겠습니까? (y/N, 기본값 y): ").strip().lower()
-        use_drawing = False if val_draw == 'n' else True
-    else:
-        use_drawing = False
-        
-    return sensitivity, use_display, use_drawing
-
-def prepare_config_manager(rtsp_list):
-    config_manager = ConfigManager(CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE)
-    
-    added_new = False
-    for url in rtsp_list:
-        ip = extract_ip(url)
-        if ip not in config_manager.camera_configs:
-            config_manager.camera_configs[ip] = {
-                "url": url,
-                "events": [],
-                "roi_poly_norm": [],
-                "roi_lines_norm": []
-            }
-            added_new = True
-
-    for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
-        config_manager.camera_configs[ip]["cctv_id"] = idx
-        
-    if added_new:
-        config_manager.save()
-        config_manager.config = config_manager.build_runtime_config()
-        logger.info("✅ 새로운 RTSP 주소가 감지되어 자동으로 cameras.json에 등록 및 ID 번호 부여가 완료되었습니다.")
-
-    val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
-    if val_setup == 'y':
-        run_wizard_batch_mode(config_manager, rtsp_list)
-        for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
-            config_manager.camera_configs[ip]["cctv_id"] = idx
-        config_manager.save()
-        config_manager.config = config_manager.build_runtime_config()
-            
-    return config_manager
-
-def main():
-    setup_logging(SYS_CFG)
-    logger.info("="*60)
-    logger.info("🚀 [VMS 시스템] 모듈형 Async 프로덕션 부팅")
-    logger.info("="*60)
-    
-    rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
-    if not rtsp_list:
-        rtsp_list = auto_discover_cameras()
-        if not rtsp_list:
-            return logger.error("네트워크에 카메라가 없습니다.")
-
-    cams = [] 
-    
-    try:
-        sensitivity, use_display, use_drawing = prompt_runtime_options()
-        config_manager = prepare_config_manager(rtsp_list)
-
-        engine_h = VisionModelAsync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
-        engine_g = VisionModelAsync(SYS_CFG.get("models", {}).get("GENERAL", "models/YOLOV8M-1.dxnn"))
-        face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.dxnn")) 
-        
-        npu_semaphore = threading.Semaphore(4) 
-
-        for i, rtsp in enumerate(rtsp_list):
-            ip = extract_ip(rtsp)
-            conf = config_manager.get_config(ip)
-            if conf and conf.get('events'):
-                cams.append(Camera(ip, conf, face_engine, i % 3, len(cams) + 1, sensitivity))
-        
-        if not cams:
-            return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
-
-        target_fps = SYS_CFG.get("REC_FPS", 30)
-        dynamic_delay = 1.0 / target_fps
-        loop_count = 0 
-        
-        pending_frames = {i: {'h': False, 'g': False} for i in range(len(cams))}
-        latest_applied_fid = {i: {'h': -1, 'g': -1} for i in range(len(cams))}
-        
-        logger.info("모니터링 시작 (종료: Ctrl+C 또는 'q')")
-        
-        while True:
-            start_time = time.time()
-            
-            # 💡 [핵심 보완] CPU 과부하 및 온도 측정
-            cpu_usage, cpu_temp, chip_temp = get_system_metrics()
-            
-            if cpu_usage > 85:
-                # CPU가 위험 수치에 도달하면 경고를 남기고 FPS를 강제로 깎아 장비를 보호합니다.
-                logger.warning(f"⚠️ [SYSTEM] CPU 사용량 위험 수치 도달: {cpu_usage}% (CPU 온도: {cpu_temp}) - 프레임 드랍이 발생할 수 있습니다.")
-                target_fps = max(5, target_fps - 2)
-            elif cpu_usage < 60:
-                target_fps = min(SYS_CFG.get("REC_FPS", 30), target_fps + 1)
-                
-            dynamic_delay = 1.0 / target_fps
-
-            if loop_count % (target_fps * 10) == 0:
-                # 💡 [핵심 보완] 주기적으로 시스템 헬스(하드웨어 온도 포함)를 로깅
-                logger.info(f"💓 [HEARTBEAT] CAM {sum(1 for c in cams if c.reader.connected)}/{len(cams)} | CPU: {cpu_usage}% ({cpu_temp}) | CHIP: {chip_temp}")
-                
-            loop_count += 1
-            if loop_count % 300 == 0:
-                gc.collect()
-            
-            for i, c in enumerate(cams):
-                fr, fid, connected = c.reader.read()
-                if fr is not None and connected and fid > c.last_submit_fid:
-                    if fid % SYS_CFG.get("SKIP_FRAMES", 4) == 0:
-                        run_helmet = any("helmet" in h.required_models for h in c.handlers)
-                        run_general = any("general" in h.required_models for h in c.handlers)
                         
-                        if run_helmet and not pending_frames[i]['h'] and npu_semaphore.acquire(blocking=False):
-                            pending_frames[i]['h'] = True
-                            engine_h.submit_async(fr, i, "h", fid, npu_semaphore)
-                            
-                        if run_general and not pending_frames[i]['g'] and npu_semaphore.acquire(blocking=False):
-                            pending_frames[i]['g'] = True
-                            engine_g.submit_async(fr, i, "g", fid, npu_semaphore)
-                            
-                    c.last_submit_fid = fid
-
-            while not async_result_queue.empty():
-                try:
-                    c_id, model_type, res_fid, boxes = async_result_queue.get_nowait()
-                    pending_frames[c_id][model_type] = False
+            if tid in self.candidates:
+                cand = self.candidates[tid]
+                moved_dist = get_distance(cand['crossing_pt'], curr_pos)
+                
+                direction_ok = (cand['entry_side'] != 0 and ccw(cand['line'][0], cand['line'][1], curr_pos) != 0 and cand['entry_side'] * ccw(cand['line'][0], cand['line'][1], curr_pos) < 0) if self.direction_check else True
+                
+                if direction_ok:
+                    dynamic_threshold = max(40.0, obj_height * self.distance_ratio)
+                    if moved_dist > dynamic_threshold or is_frame_out:
+                        triggered.append({'tid': tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
+                        del self.candidates[tid]
+                elif now - cand['timestamp'] > self.candidate_ttl_sec: 
+                    del self.candidates[tid]
                     
-                    if res_fid > latest_applied_fid[c_id][model_type]:
-                        latest_applied_fid[c_id][model_type] = res_fid
-                        # 이전 단계에서 합의한 튜플 구조 적용
-                        cams[c_id].latest_npu[model_type] = (res_fid, boxes)
-                except queue.Empty:
-                    break
-
-            final_imgs = []
-            for idx, c in enumerate(cams):
-                frame, fid, connected = c.reader.read()
-                if frame is None or not connected: 
-                    if use_display and use_drawing:
-                        final_imgs.append(c.draw(None, [], [], {}, connected=False))
-                else:
-                    c.recorder.update(frame, fid)
-                    t_h, t_g, alarms = c.run_logic(frame, fid)
+            self.prev[tid] = curr_pos
+            
+        for tid in list(self.prev.keys()):
+            if tid not in curr_ids:
+                del self.prev[tid]
+                if tid in self.candidates: 
+                    del self.candidates[tid]
+        
+        for tid in list(self.pos_history.keys()):
+            if tid not in curr_ids:
+                del self.pos_history[tid]
                     
-                    if use_display:
-                        if use_drawing:
-                            final_imgs.append(cv2.resize(c.draw(frame, t_h, t_g, alarms, connected=True), (640, 360)))
-                        else:
-                            final_imgs.append(cv2.resize(frame, (640, 360)))
+        return triggered
 
-            if use_display and final_imgs:
-                mosaic = create_mosaic_image(final_imgs)
-                if mosaic is not None:
-                    cv2.imshow("VMS Monitor", mosaic)
-                if cv2.waitKey(1) == ord('q'):
-                    break
+class HelmetDetector(BaseEventDetector):
+    event_name, menu_name, gui_name = "no_helmet", "안전모", "NO-HELMET"
+    required_models, roi_type = ["helmet", "general"], "none"
+    
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        self.states, self.trigger_delay = {}, 2.0
+        
+    def _get_intersection_over_head_area(self, head_box, person_box):
+        inter_area = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0])) * max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
+        head_area = (head_box[2] - head_box[0]) * (head_box[3] - head_box[1])
+        if head_area != 0:
+            return inter_area / head_area
+        return 0
+        
+    def process(self, tracks, track_map, motion_mask, frame, fid):
+        triggered, now = [], time.time() 
+        no_helmets = [t for t in tracks if track_map.get(int(t[4])) == ID_H_NO_HELMET]
+        current_nh_person_ids = set()
+        
+        for p in [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]:
+            p_tid, max_ioa, nh_box_match = int(p[4]), 0, None
+            for nh in no_helmets:
+                ioa = self._get_intersection_over_head_area(nh[:4], p[:4])
+                if ioa > max_ioa: 
+                    max_ioa, nh_box_match = ioa, nh[:4]
+                    
+            if max_ioa > 0.5:
+                current_nh_person_ids.add(p_tid)
+                if p_tid not in self.states: 
+                    self.states[p_tid] = now
+                elif now - self.states[p_tid] >= self.trigger_delay:
+                    triggered.append({'tid': p_tid, 'bbox': nh_box_match, 'frame': None, 'fid': fid})
+                    
+        for tid in list(self.states.keys()):
+            if tid not in current_nh_person_ids: 
+                del self.states[tid]
+                
+        return triggered
 
-            sleep_time = dynamic_delay - (time.time() - start_time)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+class SignalVehicleDetector(BaseEventDetector):
+    event_name, menu_name, gui_name = "signal_vehicle", "신호수차량감지", "NO-SIGNAL"
+    
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        self.motion_threshold_ratio, self.vehicle_history = 0.10, defaultdict(lambda: deque(maxlen=30)) 
+        
+    def _get_distance_point_to_rect(self, point, bbox): 
+        return math.sqrt(max(bbox[0] - point[0], 0, point[0] - bbox[2])**2 + max(bbox[1] - point[1], 0, point[1] - bbox[3])**2)
+        
+    def process(self, tracks, track_map, motion_mask, frame, fid):
+        triggered, current_vehicle_ids = [], set()
+        if self.roi_poly.size == 0 or motion_mask is None: 
+            return triggered
+            
+        scale_x, scale_y = 640 / SCREEN_WIDTH, 360 / SCREEN_HEIGHT
+        people_points = [get_foot_point(*t[:4]) for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
+        
+        for t in tracks:
+            tid = int(t[4])
+            if track_map.get(tid) not in TARGET_VEHICLES: 
+                continue
+                
+            current_vehicle_ids.add(tid)
+            x1, y1, x2, y2 = t[:4]
+            
+            foot_center = get_foot_point(x1, y1, x2, y2)
+            vehicle_size = max(x2 - x1, y2 - y1)
+            
+            if len(self.vehicle_history[tid]) > 0:
+                prev_foot = self.vehicle_history[tid][-1]
+                dynamic_jump_threshold = max(60.0, vehicle_size * 0.6)
+                
+                if get_distance(prev_foot, foot_center) > dynamic_jump_threshold:
+                    self.vehicle_history[tid].clear()
+                    continue
+                    
+            self.vehicle_history[tid].append(foot_center)
+            
+            history_list = list(self.vehicle_history[tid])
+            if len(history_list) > 5:
+                start_x, start_y = sum(p[0] for p in history_list[:3])/3.0, sum(p[1] for p in history_list[:3])/3.0
+                end_x, end_y = sum(p[0] for p in history_list[-3:])/3.0, sum(p[1] for p in history_list[-3:])/3.0
+                smoothed_dist = get_distance((start_x, start_y), (end_x, end_y))
+                
+                dynamic_move_threshold = max(40.0, vehicle_size * 0.15)
+                
+                if smoothed_dist >= dynamic_move_threshold and cv2.pointPolygonTest(self.roi_poly, get_center_point(x1, y1, x2, y2), False) >= 0:
+                    mx1, my1, mx2, my2 = max(0, int(x1 * scale_x)), max(0, int(y1 * scale_y)), min(640, int(x2 * scale_x)), min(360, int(y2 * scale_y))
+                    
+                    if mx2 > mx1 and my2 > my1:
+                        car_roi_mask = motion_mask[my1:my2, mx1:mx2]
+                        _, motion_only = cv2.threshold(car_roi_mask, 250, 255, cv2.THRESH_BINARY)
+                        total_pixels = (mx2 - mx1) * (my2 - my1)
+                        
+                        if total_pixels > 0 and (cv2.countNonZero(motion_only) / total_pixels) > self.motion_threshold_ratio:
+                            if not any(self._get_distance_point_to_rect(pp, (x1, y1, x2, y2)) < vehicle_size * 1.5 for pp in people_points):
+                                triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
+                                self.vehicle_history[tid].clear()
+                                
+        for tid in list(self.vehicle_history.keys()):
+            if tid not in current_vehicle_ids: 
+                del self.vehicle_history[tid]
+                
+        return triggered
 
-    except KeyboardInterrupt:
-        logger.info("모니터링 중단 (사용자 요청).")
-    except Exception as e:
-        logger.error(f"예외 발생: {e}")
-        traceback.print_exc()
-    finally:
-        logger.info("시스템 자원을 정리하고 안전하게 종료합니다...")
-        for c in cams:
-            c.stop()
-        cv2.destroyAllWindows()
-        os._exit(0)
-
-if __name__ == "__main__":
-    main()
+EVENT_REGISTRY = {
+    IntrusionDetector.event_name: IntrusionDetector, 
+    ParkingDetector.event_name: ParkingDetector, 
+    CrossingDetector.event_name: CrossingDetector, 
+    HelmetDetector.event_name: HelmetDetector, 
+    SignalVehicleDetector.event_name: SignalVehicleDetector
+}

@@ -43,7 +43,6 @@ STREAM_RECONNECT_DELAY_SEC = 2.0
 STREAM_BROKEN_RETRY_DELAY_SEC = 1.0
 WATCHDOG_TIMEOUT = 30.0
 
-# 💡 [핵심 보완] hanjin_cctv.dxnn 신규 클래스 맵핑
 ID_G_PERSON = 0
 ID_H_HELMET = 1
 ID_PERSON_LOW = 2
@@ -52,7 +51,6 @@ ID_G_TRUCK = 4
 ID_H_NO_HELMET = 5
 ID_G_CAR = 6
 
-# 💡 버스 제거 후 트럭 및 일반차량만 타겟팅
 TARGET_VEHICLES = [ID_G_TRUCK, ID_G_CAR]
 
 NAS_UPLOADER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -203,6 +201,30 @@ def setup_logging(common_conf):
 
 def sanitize_camera_url(url: str) -> str: return re.sub(r'\s+', '', (url or '').strip())
 
+# 💡 [핵심 보완] NVR 멀티플렉싱 환경을 위해 Path(경로) 정보를 추가로 파싱합니다.
+def parse_camera_endpoint(rtsp_url: str):
+    clean_url = sanitize_camera_url(rtsp_url)
+    if "://" not in clean_url: clean_url = f"rtsp://{clean_url}"
+    parsed = urlsplit(clean_url)
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    host_port = netloc.strip("[]")
+    if ":" in host_port and host_port.count(":") == 1: host, port = host_port.split(":", 1)
+    else: host, port = host_port, ""
+    path = parsed.path.strip("/")
+    return clean_url, unquote(host.strip()), port.strip(), path
+
+# 💡 [핵심 보완] 동일 IP/포트라도 Path(cam03, cam04)가 다르면 완전히 다른 카메라 ID로 식별합니다.
+def extract_ip(rtsp_url: str) -> str:
+    try:
+        _, host, port, path = parse_camera_endpoint(rtsp_url)
+        host_tail = host.split(".")[-1]
+        uid = f"{host_tail}_{port}" if port else host_tail
+        if path:
+            safe_path = re.sub(r'[^a-zA-Z0-9]', '_', path)
+            uid = f"{uid}_{safe_path}"
+        return uid
+    except Exception: return "unknown_cam"
+
 def load_json_file(path, default, expected_type=None, return_meta=False):
     if not os.path.exists(path): return (copy.deepcopy(default), "missing") if return_meta else copy.deepcopy(default)
     try:
@@ -213,23 +235,6 @@ def load_json_file(path, default, expected_type=None, return_meta=False):
 def save_json_file(path, data):
     if os.path.dirname(path): os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4, ensure_ascii=False)
-
-def parse_camera_endpoint(rtsp_url: str):
-    clean_url = sanitize_camera_url(rtsp_url)
-    if "://" not in clean_url: clean_url = f"rtsp://{clean_url}"
-    parsed = urlsplit(clean_url)
-    netloc = parsed.netloc.rsplit("@", 1)[-1]
-    host_port = netloc.strip("[]")
-    if ":" in host_port and host_port.count(":") == 1: host, port = host_port.split(":", 1)
-    else: host, port = host_port, ""
-    return clean_url, unquote(host.strip()), port.strip()
-
-def extract_ip(rtsp_url: str) -> str:
-    try:
-        _, host, port = parse_camera_endpoint(rtsp_url)
-        host_tail = host.split(".")[-1]
-        return f"{host_tail}_{port}" if port else host_tail
-    except Exception: return "unknown_cam"
 
 def load_rtsp_list_from_csv(csv_path):
     if not os.path.exists(csv_path): return []

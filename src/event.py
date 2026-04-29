@@ -4,7 +4,7 @@ import time
 import numpy as np
 from collections import defaultdict, deque
 from common import (
-    ID_H_NO_HELMET, ID_H_PERSON, ID_G_PERSON, TARGET_VEHICLES, 
+    ID_H_NO_HELMET, ID_G_PERSON, TARGET_VEHICLES, 
     SCREEN_WIDTH, SCREEN_HEIGHT, get_check_point, get_center_point, get_foot_point,
     get_distance, ccw, calculate_iou
 )
