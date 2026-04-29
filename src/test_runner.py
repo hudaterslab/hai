@@ -17,6 +17,7 @@ from ai_core import VisionModelSync, SORTTracker
 
 TEST_JSON_PATH = os.path.join(os.path.dirname(__file__), "test.json")
 TEST_VIDEO_DIR = "test"
+DEBUG_LOG_DIR = os.path.join(PROJECT_ROOT, "debug_logs")
 
 def load_test_config():
     if os.path.exists(TEST_JSON_PATH):
@@ -108,6 +109,7 @@ def main():
         print(f"⚠️ [에러] 테스트 폴더를 찾을 수 없습니다: {TEST_VIDEO_DIR}")
         return
 
+    os.makedirs(DEBUG_LOG_DIR, exist_ok=True)
     video_files = sorted([f for f in os.listdir(TEST_VIDEO_DIR) if f.lower().endswith(('.avi', '.mp4', '.mkv'))])
     
     if not video_files:
@@ -130,9 +132,6 @@ def main():
     helmet_path = get_abs_path(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
 
     print("\n⏳ AI 통합 모델 및 헬멧/얼굴 모델을 메모리에 로드 중입니다...")
-    print(f" - MAIN 타겟: {main_path}")
-    print(f" - FACE 타겟: {face_path}")
-    print(f" - HELMET 타겟: {helmet_path}")
     
     engine_main = VisionModelSync(main_path)
     engine_face = VisionModelSync(face_path)
@@ -164,7 +163,6 @@ def main():
     CANVAS_HEIGHT = SCREEN_HEIGHT
 
     base_skip_frames = SYS_CFG.get("SKIP_FRAMES", 1)
-    # 💡 [버그 수정] 다시 단말과 완벽히 동일한 REC_FPS(3)를 따르도록 원복했습니다.
     target_fps = SYS_CFG.get("REC_FPS", 3)
 
     force_quit_all = False
@@ -197,7 +195,7 @@ def main():
                 cap.release()
                 
                 if first_frame is None: 
-                    print(f"⚠️ 영상을 읽을 수 없습니다 (유효한 프레임 없음). 건너뜁니다.")
+                    print(f"⚠️ 영상을 읽을 수 없습니다. 건너뜁니다.")
                     break
                     
                 first_frame = cv2.resize(first_frame, (SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -234,7 +232,8 @@ def main():
             native_fps = cap.get(cv2.CAP_PROP_FPS)
             frame_interval = max(1, int(round(native_fps / target_fps))) if native_fps > 0 else 1
             
-            print(f"\n▶️ [{video_filename}] 재생 시작. (n: 다음, r: 재시작, c: 설정 초기화(재설정), q: 종료, 1/2/3: 배속)")
+            print(f"\n▶️ [{video_filename}] 재생 시작.")
+            print(f"   [조작] Space: 일시정지/재생 | f: 1프레임 이동(정지중) | n: 다음 | r: 재시작 | c: 재설정 | q: 종료 | 1/2/3: 배속")
             print(f"⚙️ 원본 FPS: {native_fps:.1f} -> 설정 FPS: {target_fps} (Frame Interval: {frame_interval})")
 
             active_skip_frames = base_skip_frames
@@ -254,162 +253,221 @@ def main():
             raw_fid = 0
             simulated_fid = 0
             snapshot_cooldowns = {}
+            persistent_alarms = {} # 💡 영구 박제되는 이벤트 객체 저장소
+            global_track_history = defaultdict(dict) # 💡 포렌식 분석을 위한 전체 궤적 기록 [tid][fid] = bbox
+            
             last_canvas = None
             play_delay = 30 
             speed_text = "1x"
             
             action = "next" 
+            is_paused = False
+            advance_one_frame = False
 
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    if last_canvas is not None:
-                        overlay = last_canvas.copy()
-                        cv2.rectangle(overlay, (320, 0), (SCREEN_WIDTH + 320, CANVAS_HEIGHT), (0, 0, 0), -1)
-                        cv2.addWeighted(overlay, 0.6, last_canvas, 0.4, 0, last_canvas)
-                        cv2.putText(last_canvas, "VIDEO ENDED", (320 + SCREEN_WIDTH//2 - 150, CANVAS_HEIGHT//2 - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
-                        cv2.putText(last_canvas, "Press 'n': Next | 'r': Replay | 'c': Reconfig | 'q': Quit", (320 + SCREEN_WIDTH//2 - 280, CANVAS_HEIGHT//2 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                        cv2.imshow("CCTV Event Test Runner", last_canvas)
-                        
-                        if auto_next:
-                            cv2.waitKey(1000)
-                            action = "next"
-                        else:
-                            while True:
-                                k = cv2.waitKey(0) & 0xFF
-                                if k == ord('q'): action = "quit"; break
-                                elif k == ord('n') or k == 27: action = "next"; break
-                                elif k == ord('r'): action = "replay"; break
-                                elif k == ord('c'): action = "reconfig"; break
-                    break
+                # 💡 VCR 컨트롤: 일시정지가 아닐 때, 혹은 1프레임 이동 명령이 떨어졌을 때만 프레임을 읽음
+                if not is_paused or advance_one_frame:
+                    ret, frame = cap.read()
+                    advance_one_frame = False
                     
-                raw_fid += 1
-                
-                if raw_fid % frame_interval != 0:
-                    continue
-
-                simulated_fid += 1
-                
-                frame = cv2.resize(frame, (SCREEN_WIDTH, SCREEN_HEIGHT))
-                display_frame = frame.copy()
-                motion_mask = motion_detector.apply(frame)
-
-                main_boxes = []
-                helmet_boxes = []
-                if active_skip_frames == 0 or (simulated_fid - 1) % (active_skip_frames + 1) == 0:
-                    main_boxes = engine_main.infer(frame)
-                    if "no_helmet" in active_events:
-                        helmet_boxes = engine_helmet.infer(frame)
-                
-                main_tracks = tracker_main.update(np.array(main_boxes)) if len(main_boxes) > 0 else tracker_main.predict_only()
-                helmet_tracks = tracker_helmet.update(np.array(helmet_boxes)) if len(helmet_boxes) > 0 else tracker_helmet.predict_only()
-                    
-                track_map = {int(t[4]): int(t[6]) for t in main_tracks}
-                trajectory_tracker.update_and_draw(display_frame, main_tracks)
-
-                for detector in detectors:
-                    triggered_events = detector.process(
-                        tracks=main_tracks, track_map=track_map, motion_mask=motion_mask,
-                        frame=frame, fid=simulated_fid, helmet_tracks=helmet_tracks
-                    )
-                    
-                    for evt in triggered_events:
-                        tid = evt['tid']
-                        bbox = evt['bbox']
-                        x1, y1, x2, y2 = map(int, bbox)
-                        
-                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
-                        cv2.putText(display_frame, f"EVENT: {detector.event_name}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
-
-                        evt_key = (detector.event_name, tid)
-                        current_time = time.time()
-                        
-                        if evt_key not in snapshot_cooldowns or (current_time - snapshot_cooldowns[evt_key] > 5.0):
-                            snapshot_cooldowns[evt_key] = current_time
-                            print(f"[🔥 새 이벤트 발생] {detector.event_name} | ID: {tid} | Frame: {simulated_fid} (Raw: {raw_fid})")
+                    if not ret:
+                        if last_canvas is not None:
+                            overlay = last_canvas.copy()
+                            cv2.rectangle(overlay, (320, 0), (SCREEN_WIDTH + 320, CANVAS_HEIGHT), (0, 0, 0), -1)
+                            cv2.addWeighted(overlay, 0.6, last_canvas, 0.4, 0, last_canvas)
+                            cv2.putText(last_canvas, "VIDEO ENDED", (320 + SCREEN_WIDTH//2 - 150, CANVAS_HEIGHT//2 - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                            cv2.putText(last_canvas, "Press 'n': Next | 'r': Replay | 'c': Reconfig | 'q': Quit", (320 + SCREEN_WIDTH//2 - 280, CANVAS_HEIGHT//2 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                            cv2.imshow("CCTV Event Test Runner", last_canvas)
                             
-                            base_snap_frame = evt.get('frame')
-                            if base_snap_frame is None: base_snap_frame = frame.copy()
-                            else: base_snap_frame = base_snap_frame.copy()
+                            if auto_next:
+                                cv2.waitKey(1000)
+                                action = "next"
+                            else:
+                                while True:
+                                    k = cv2.waitKey(0) & 0xFF
+                                    if k == ord('q'): action = "quit"; break
+                                    elif k == ord('n') or k == 27: action = "next"; break
+                                    elif k == ord('r'): action = "replay"; break
+                                    elif k == ord('c'): action = "reconfig"; break
+                        break
+                        
+                    raw_fid += 1
+                    
+                    if raw_fid % frame_interval != 0:
+                        continue
+
+                    simulated_fid += 1
+                    
+                    frame = cv2.resize(frame, (SCREEN_WIDTH, SCREEN_HEIGHT))
+                    display_frame = frame.copy()
+                    motion_mask = motion_detector.apply(frame)
+
+                    main_boxes = []
+                    helmet_boxes = []
+                    if active_skip_frames == 0 or (simulated_fid - 1) % (active_skip_frames + 1) == 0:
+                        main_boxes = engine_main.infer(frame)
+                        if "no_helmet" in active_events:
+                            helmet_boxes = engine_helmet.infer(frame)
+                    
+                    main_tracks = tracker_main.update(np.array(main_boxes)) if len(main_boxes) > 0 else tracker_main.predict_only()
+                    helmet_tracks = tracker_helmet.update(np.array(helmet_boxes)) if len(helmet_boxes) > 0 else tracker_helmet.predict_only()
+                        
+                    track_map = {int(t[4]): int(t[6]) for t in main_tracks}
+                    trajectory_tracker.update_and_draw(display_frame, main_tracks)
+
+                    # 💡 디버그용 프레임별 궤적 저장
+                    for t in main_tracks:
+                        tid = int(t[4])
+                        global_track_history[tid][simulated_fid] = [float(x) for x in t[:4]]
+
+                    for detector in detectors:
+                        triggered_events = detector.process(
+                            tracks=main_tracks, track_map=track_map, motion_mask=motion_mask,
+                            frame=frame, fid=simulated_fid, helmet_tracks=helmet_tracks
+                        )
+                        
+                        for evt in triggered_events:
+                            tid = evt['tid']
+                            bbox = evt['bbox']
+                            x1, y1, x2, y2 = map(int, bbox)
+                            
+                            # 💡 객체 영구 박제 등록
+                            persistent_alarms[tid] = detector.event_name
+                            
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
+                            cv2.putText(display_frame, f"EVENT: {detector.event_name}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
+                            evt_key = (detector.event_name, tid)
+                            current_time = time.time()
+                            
+                            if evt_key not in snapshot_cooldowns or (current_time - snapshot_cooldowns[evt_key] > 5.0):
+                                snapshot_cooldowns[evt_key] = current_time
+                                print(f"[🔥 새 이벤트 발생] {detector.event_name} | ID: {tid} | Frame: {simulated_fid} (Raw: {raw_fid})")
                                 
-                            blurred_snap = apply_face_blur(base_snap_frame, engine_face, face_conf)
-                            
-                            cv2.rectangle(blurred_snap, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                            now_str = time.strftime('%H:%M:%S')
-                            cv2.putText(blurred_snap, f"{detector.event_name} ID:{tid}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                            
-                            new_snap = cv2.resize(blurred_snap, (320, 180))
-                            snapshot_queue.insert(0, new_snap)
-                            if len(snapshot_queue) > MAX_SNAPSHOTS:
-                                snapshot_queue.pop()
+                                # 💡 오작동 증명용 JSON 데이터 자동 추출
+                                log_data = {
+                                    "video_file": video_filename,
+                                    "event_name": detector.event_name,
+                                    "trigger_fid": simulated_fid,
+                                    "tid": tid,
+                                    "roi_poly": roi_poly,
+                                    "roi_lines": roi_lines,
+                                    "track_history": global_track_history[tid]
+                                }
+                                log_path = os.path.join(DEBUG_LOG_DIR, f"{video_filename}_{detector.event_name}_tid{tid}.json")
+                                try:
+                                    with open(log_path, 'w', encoding='utf-8') as lf:
+                                        json.dump(log_data, lf, indent=4, ensure_ascii=False)
+                                    print(f"   💾 [디버그 로그 저장 완료] {log_path}")
+                                except Exception as e:
+                                    print(f"   ⚠️ 디버그 로그 저장 실패: {e}")
 
-                for t in main_tracks:
-                    x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
-                    cls_id = int(cls_id)
-                    
-                    if cls_id in [ID_H_HELMET, ID_H_NO_HELMET]:
-                        continue 
-                        
-                    color, label = (255, 255, 255), f"OBJ:{int(tid)}"
-                    if cls_id == ID_G_PERSON: color, label = (0, 255, 0), f"Person:{int(tid)}"
-                    elif cls_id == ID_G_CAR: color, label = (255, 100, 0), f"Car:{int(tid)}"
-                    elif cls_id == ID_G_TRUCK: color, label = (255, 100, 0), f"Truck:{int(tid)}"
-                    elif cls_id == ID_PERSON_LOW: color, label = (0, 255, 100), f"LowBody:{int(tid)}"
-                    elif cls_id == ID_REFLECTIVE_VEST: color, label = (255, 255, 0), f"Vest:{int(tid)}"
-                        
-                    cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                    cv2.putText(display_frame, f"{label} {conf:.2f}", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                                base_snap_frame = evt.get('frame')
+                                if base_snap_frame is None: base_snap_frame = frame.copy()
+                                else: base_snap_frame = base_snap_frame.copy()
+                                    
+                                blurred_snap = apply_face_blur(base_snap_frame, engine_face, face_conf)
+                                
+                                cv2.rectangle(blurred_snap, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                                cv2.putText(blurred_snap, f"{detector.event_name} ID:{tid}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                
+                                new_snap = cv2.resize(blurred_snap, (320, 180))
+                                snapshot_queue.insert(0, new_snap)
+                                if len(snapshot_queue) > MAX_SNAPSHOTS:
+                                    snapshot_queue.pop()
 
-                if "no_helmet" in active_events:
-                    for t in helmet_tracks:
+                    for t in main_tracks:
                         x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
-                        cls_id = int(cls_id)
+                        tid, cls_id = int(tid), int(cls_id)
                         
-                        if cls_id == 0: color, label = (255, 200, 0), f"Helmet(H):{int(tid)}"
-                        elif cls_id == 1: color, label = (0, 0, 255), f"Head(H):{int(tid)}"
-                        else: continue
+                        if cls_id in [ID_H_HELMET, ID_H_NO_HELMET]:
+                            continue 
                             
-                        cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                        cv2.putText(display_frame, f"{label} {conf:.2f}", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        if cls_id == ID_G_PERSON: color, label = (0, 255, 0), "Person"
+                        elif cls_id == ID_G_CAR: color, label = (255, 100, 0), "Car"
+                        elif cls_id == ID_G_TRUCK: color, label = (255, 100, 0), "Truck"
+                        elif cls_id == ID_PERSON_LOW: color, label = (0, 255, 100), "LowBody"
+                        elif cls_id == ID_REFLECTIVE_VEST: color, label = (255, 255, 0), "Vest"
+                        else: color, label = (255, 255, 255), "OBJ"
+                        
+                        # 💡 이벤트 발생 객체는 영구적으로 붉은색 BBOX 유지
+                        if tid in persistent_alarms: 
+                            color, label = (0, 0, 255), f"ALARM: {persistent_alarms[tid]}"
+                            
+                        thickness = 3 if tid in persistent_alarms else 1
+                        cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
+                        cv2.putText(display_frame, f"{label} [{tid}]", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-                if len(roi_poly) >= 3:
-                    pts = np.array(roi_poly, np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(display_frame, [pts], isClosed=True, color=(255, 255, 0), thickness=2)
+                    if "no_helmet" in active_events:
+                        for t in helmet_tracks:
+                            x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
+                            tid, cls_id = int(tid), int(cls_id)
+                            
+                            if cls_id == 0: color, label = (255, 0, 0), "Helmet"
+                            elif cls_id == 1: color, label = (0, 0, 255), "No-Helmet"
+                            else: continue
+                                
+                            cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 1)
+                            cv2.putText(display_frame, f"{label} [{tid}]", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+                    if len(roi_poly) >= 3:
+                        pts = np.array(roi_poly, np.int32).reshape((-1, 1, 2))
+                        cv2.polylines(display_frame, [pts], isClosed=True, color=(0, 255, 255), thickness=1)
+                        
+                    if len(roi_lines) >= 2:
+                        for i in range(0, len(roi_lines) - 1, 2): 
+                            cv2.line(display_frame, tuple(roi_lines[i]), tuple(roi_lines[i+1]), (0, 0, 255), 1)
+                                
+                    cv2.rectangle(display_frame, (0, 0), (60, 40), (0, 0, 0), -1)
+                    cv2.putText(display_frame, "TEST", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     
-                if len(roi_lines) >= 2:
-                    pts = np.array(roi_lines, np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(display_frame, [pts], isClosed=False, color=(0, 255, 255), thickness=2)
-                            
-                ui_text = f"Speed: {speed_text} | FPS Sim: {target_fps} | Skip: {active_skip_frames} | Press 'c' to Reconfig"
-                cv2.rectangle(display_frame, (10, 10), (700, 45), (0, 0, 0), -1)
-                cv2.putText(display_frame, ui_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    active_alarm_names = set(persistent_alarms.values())
+                    for i, detector in enumerate(detectors):
+                        if detector.event_name in active_alarm_names:
+                            color, text = (0, 0, 255), f"[!] {detector.gui_name}"
+                        else:
+                            color, text = (0, 255, 0), f" -  {detector.gui_name}"
+                        cv2.putText(display_frame, text, (10, SCREEN_HEIGHT - 15 - (len(detectors)-1-i)*20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-                canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype=np.uint8)
-                canvas[0:SCREEN_HEIGHT, 320:SCREEN_WIDTH + 320] = display_frame
+                    status_str = "PAUSED" if is_paused else "PLAYING"
+                    ui_text = f"[{status_str}] Speed: {speed_text} | FPS: {target_fps} | [Space] Play/Pause | [f] Frame Step"
+                    cv2.rectangle(display_frame, (70, 0), (800, 30), (0, 0, 0), -1)
+                    cv2.putText(display_frame, ui_text, (80, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if not is_paused else (0, 0, 255), 1)
 
-                if motion_mask is not None:
-                    mask_resized = cv2.resize(cv2.cvtColor(motion_mask, cv2.COLOR_GRAY2BGR), (320, 180))
-                    canvas[0:180, SCREEN_WIDTH + 320:CANVAS_WIDTH] = mask_resized
-                    cv2.rectangle(canvas, (SCREEN_WIDTH + 320, 0), (CANVAS_WIDTH, 180), (255, 0, 0), 2)
-                    cv2.putText(canvas, "[ MOTION MASK ]", (SCREEN_WIDTH + 330, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                    canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype=np.uint8)
+                    canvas[0:SCREEN_HEIGHT, 320:SCREEN_WIDTH + 320] = display_frame
 
-                for idx in range(MAX_SNAPSHOTS):
-                    y_offset = idx * 180
-                    if idx < len(snapshot_queue):
-                        snap = snapshot_queue[idx]
-                        canvas[y_offset:y_offset+180, 0:320] = snap
-                        cv2.rectangle(canvas, (0, y_offset), (320, y_offset+180), (0, 255, 255), 2)
-                        cv2.putText(canvas, f"[ API BLUR SNAP {idx+1} ]", (10, y_offset + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    else:
-                        cv2.rectangle(canvas, (0, y_offset), (320, y_offset+180), (40, 40, 40), -1)
-                        cv2.rectangle(canvas, (0, y_offset), (320, y_offset+180), (100, 100, 100), 2)
-                        cv2.putText(canvas, f"EMPTY SLOT {idx+1}", (100, y_offset + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
+                    if motion_mask is not None:
+                        mask_resized = cv2.resize(cv2.cvtColor(motion_mask, cv2.COLOR_GRAY2BGR), (320, 180))
+                        canvas[0:180, SCREEN_WIDTH + 320:CANVAS_WIDTH] = mask_resized
+                        cv2.rectangle(canvas, (SCREEN_WIDTH + 320, 0), (CANVAS_WIDTH, 180), (255, 0, 0), 2)
+                        cv2.putText(canvas, "[ MOTION MASK ]", (SCREEN_WIDTH + 330, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-                last_canvas = canvas.copy()
-                cv2.imshow("CCTV Event Test Runner", canvas)
+                    for idx in range(MAX_SNAPSHOTS):
+                        y_offset = idx * 180
+                        if idx < len(snapshot_queue):
+                            snap = snapshot_queue[idx]
+                            canvas[y_offset:y_offset+180, 0:320] = snap
+                            cv2.rectangle(canvas, (0, y_offset), (320, y_offset+180), (0, 255, 255), 2)
+                            cv2.putText(canvas, f"[ API BLUR SNAP {idx+1} ]", (10, y_offset + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        else:
+                            cv2.rectangle(canvas, (0, y_offset), (320, y_offset+180), (40, 40, 40), -1)
+                            cv2.rectangle(canvas, (0, y_offset), (320, y_offset+180), (100, 100, 100), 2)
+                            cv2.putText(canvas, f"EMPTY SLOT {idx+1}", (100, y_offset + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
+
+                    last_canvas = canvas.copy()
                 
-                key = cv2.waitKey(play_delay) & 0xFF
-                if key == ord('q'): action = "quit"; break
+                # 💡 Canvas 표출 및 Key 입력 대기 (일시정지 상태면 무한 대기)
+                cv2.imshow("CCTV Event Test Runner", last_canvas)
+                
+                wait_time = 0 if is_paused else play_delay
+                key = cv2.waitKey(wait_time) & 0xFF
+                
+                if key == ord(' '): 
+                    is_paused = not is_paused
+                elif key == ord('f'): 
+                    if is_paused: advance_one_frame = True
+                elif key == ord('q'): action = "quit"; break
                 elif key == ord('n'): action = "next"; break
                 elif key == ord('r'): action = "replay"; break
                 elif key == ord('c'): action = "reconfig"; break

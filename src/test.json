@@ -2918,5 +2918,37 @@
         "events": [
             "conveyor_crossing"
         ]
+    },
+    "2026_04_28_10_38_15_ch4_000.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                548,
+                35
+            ],
+            [
+                817,
+                706
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_30_07_04_15_ch4_000.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                569,
+                83
+            ],
+            [
+                822,
+                708
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
     }
 }

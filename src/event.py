@@ -20,7 +20,7 @@ class TrajectoryTracker:
             x1, y1, x2, y2, tid, cls_id, conf = t
             tid = int(tid)
             curr_ids.add(tid)
-            center = get_foot_point(x1, y1, x2, y2)
+            center = get_check_point(x1, y1, x2, y2)
             self.history[tid].append(center)
             
             if tid not in self.colors:
@@ -83,8 +83,6 @@ class ParkingDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.states = defaultdict(lambda: {'start_fid': 0, 'pos': None})
         trigger_sec = config.get("trigger_sec", 5.0)
-        
-        # 💡 [보완] 절대 픽셀(px) 기준을 제거하고 차량 크기 대비 비율(ratio)로 변경 (기본 10%)
         self.move_threshold_ratio = config.get("move_threshold_ratio", 0.1)
         self.trigger_fid_diff = int(trigger_sec * self.fps)
         
@@ -101,7 +99,6 @@ class ParkingDetector(BaseEventDetector):
                 c = get_center_point(x1, y1, x2, y2)
                 vehicle_size = max(x2 - x1, y2 - y1)
                 
-                # 차량 BBOX 크기에 비례하여 이동 허용치 계산
                 dynamic_move_threshold = vehicle_size * self.move_threshold_ratio
                 
                 if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > dynamic_move_threshold:
@@ -124,8 +121,10 @@ class CrossingDetector(BaseEventDetector):
         self.lines = [(self.roi_lines[i], self.roi_lines[i+1]) for i in range(len(self.roi_lines)-1)] if len(self.roi_lines) >= 2 else []
         self.prev, self.candidates = {}, {}
         
+        self.lb_offsets = {}
+        self.lb_last_height = {}
+        
         self.snapshot_mode = config.get("snapshot_mode", "crossing_moment")
-        # 💡 [보완] Config에서 비율값을 받아오며 기본값 0.2 (20%) 적용
         self.distance_ratio = config.get("distance_ratio", 0.2) 
         self.direction_check = config.get("direction_check", True)
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0) 
@@ -153,6 +152,15 @@ class CrossingDetector(BaseEventDetector):
         den = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
         return num / den if den > 0 else 0
 
+    def _get_crossing_angle(self, p1, p2, prev_pos, curr_pos):
+        lx, ly = p2[0] - p1[0], p2[1] - p1[1]
+        mx, my = curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1]
+        if mx == 0 and my == 0: return 0.0
+        dot = lx * mx + ly * my
+        cross = lx * my - ly * mx
+        angle_rad = math.atan2(abs(cross), abs(dot))
+        return math.degrees(angle_rad)
+
     def _get_intersection_over_lowbody_area(self, low_box, person_box):
         inter_area = max(0, min(low_box[2], person_box[2]) - max(low_box[0], person_box[0])) * max(0, min(low_box[3], person_box[3]) - max(low_box[1], person_box[1]))
         low_area = (low_box[2] - low_box[0]) * (low_box[3] - low_box[1])
@@ -169,41 +177,75 @@ class CrossingDetector(BaseEventDetector):
             p_tid = int(p[4])
             curr_ids.add(p_tid)
             
-            # 💡 [핵심 보완] 전신(Person) BBOX의 높이를 횡단 판단 기준으로 확보
             px1, py1, px2, py2 = p[:4]
             person_height = max(1, py2 - py1)
+            p_foot = (int((px1 + px2) / 2), int(py2))
             
             best_low_box = None
             max_ioa = 0
             for lb in low_bodies:
+                lx1, ly1, lx2, ly2 = lb[:4]
+                lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+                
+                if lcy < py1 + person_height * 0.4: continue
+                if lcx < px1 - 20 or lcx > px2 + 20: continue
+                
                 ioa = self._get_intersection_over_lowbody_area(lb[:4], p[:4])
                 if ioa > max_ioa:
                     max_ioa = ioa
                     best_low_box = lb[:4]
                     
-            if max_ioa < 0.3 or best_low_box is None:
-                continue
+            if max_ioa >= 0.4 and best_low_box is not None:
+                lx1, ly1, lx2, ly2 = best_low_box
+                low_height = max(1, ly2 - ly1)
+                curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
                 
-            lx1, ly1, lx2, ly2 = best_low_box
-            low_height = max(1, ly2 - ly1)
+                self.lb_offsets[p_tid] = (curr_pos[0] - p_foot[0], curr_pos[1] - p_foot[1])
+                self.lb_last_height[p_tid] = low_height
+                event_bbox = tuple(best_low_box)
+            else:
+                if p_tid in self.lb_offsets:
+                    ox, oy = self.lb_offsets[p_tid]
+                    curr_pos = (p_foot[0] + ox, p_foot[1] + oy)
+                    low_height = self.lb_last_height.get(p_tid, person_height * 0.4)
+                    event_bbox = (px1, py2 - low_height, px2, py2)
+                else:
+                    continue
+                    
+            # 💡 [핵심 보완] 물리적 이동 한계 적용 (텔레포트 차단)
+            # 1.5배 -> 0.4배 (40%)로 대폭 강화. 0.3초 만에 자기 키의 40% 이상을 도약하는 것은 물리적으로 불가.
+            if p_tid in self.prev:
+                jump_dist = get_distance(self.prev[p_tid], curr_pos)
+                if jump_dist > person_height * 0.4:
+                    # 불가능한 도약을 감지하면 즉시 궤적과 후보군을 초기화하여 오탐을 찢어버림
+                    del self.prev[p_tid]
+                    if p_tid in self.candidates: del self.candidates[p_tid]
+                    if p_tid in self.lb_offsets: del self.lb_offsets[p_tid]
+                    self.prev[p_tid] = curr_pos
+                    continue
+                    
+            is_frame_out = (curr_pos[0] <= 15) or (curr_pos[0] >= SCREEN_WIDTH - 15) or (curr_pos[1] <= 15) or (curr_pos[1] >= SCREEN_HEIGHT - 15)
             
-            curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
-            is_frame_out = (lx1 <= 15) or (lx2 >= SCREEN_WIDTH - 15) or (ly1 <= 15) or (ly2 >= SCREEN_HEIGHT - 15)
+            if frame is not None:
+                cv2.circle(frame, curr_pos, 6, (255, 0, 255), -1) 
             
             if p_tid in self.prev and p_tid not in self.candidates:
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, self.prev[p_tid], curr_pos):
                         cross_pt = self._get_line_intersection(p1, p2, self.prev[p_tid], curr_pos)
-                        self.candidates[p_tid] = {
-                            'crossing_pt': cross_pt, 
-                            'person_height': person_height,  # 💡 전신의 높이 저장
-                            'timestamp_fid': fid, 
-                            'line': (p1, p2),
-                            'entry_side': ccw(p1, p2, self.prev[p_tid]), 
-                            'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
-                            'bbox': tuple(p[:4]), 
-                            'fid': fid
-                        }
+                        cross_angle = self._get_crossing_angle(p1, p2, self.prev[p_tid], curr_pos)
+                        
+                        if cross_angle >= self.min_crossing_angle:
+                            self.candidates[p_tid] = {
+                                'crossing_pt': cross_pt, 
+                                'person_height': person_height, 
+                                'timestamp_fid': fid, 
+                                'line': (p1, p2),
+                                'entry_side': ccw(p1, p2, self.prev[p_tid]), 
+                                'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
+                                'bbox': event_bbox, 
+                                'fid': fid
+                            }
                         break
                         
             if p_tid in self.candidates:
@@ -215,8 +257,6 @@ class CrossingDetector(BaseEventDetector):
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
                     
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
-                    
-                    # 💡 [핵심 보완] 하반신이 아닌 전신(Person) BBOX 높이 기준 지정된 비율(20%) 계산
                     dynamic_threshold = cand['person_height'] * self.distance_ratio
                     
                     if perp_dist >= dynamic_threshold or is_frame_out:
@@ -231,8 +271,9 @@ class CrossingDetector(BaseEventDetector):
         for tid in list(self.prev.keys()):
             if tid not in curr_ids:
                 del self.prev[tid]
-                if tid in self.candidates: 
-                    del self.candidates[tid]
+                if tid in self.candidates: del self.candidates[tid]
+                if tid in self.lb_offsets: del self.lb_offsets[tid]
+                if tid in self.lb_last_height: del self.lb_last_height[tid]
                     
         return triggered
 
