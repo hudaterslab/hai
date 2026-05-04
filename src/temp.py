@@ -5,7 +5,6 @@ import time
 import queue
 import logging
 import threading
-import concurrent.futures
 import functools
 from common import clean_overlapping_detections, calculate_iou, SYS_CFG
 
@@ -21,7 +20,8 @@ def trace_execution(func):
         start_time = time.time()
         logger.debug(f"[START] {func.__name__} 실행 시작")
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            return result
         finally:
             elapsed = time.time() - start_time
             logger.debug(f"[END] {func.__name__} 실행 완료 (소요시간: {elapsed:.4f}초)")
@@ -30,104 +30,82 @@ def trace_execution(func):
 def get_model_confidence(engine_path, default_conf=0.45):
     conf_map = SYS_CFG.get("model_confidences", {})
     ep_lower = engine_path.lower()
-    if "face" in ep_lower: return conf_map.get("FACE", 0.35)
-    elif "hanjin" in ep_lower or "main" in ep_lower: return conf_map.get("MAIN", 0.40)
-    else: return conf_map.get("GENERAL", 0.50)
+    
+    if "face" in ep_lower: 
+        return conf_map.get("FACE", 0.35)
+    elif "hanjin" in ep_lower or "main" in ep_lower: 
+        return conf_map.get("MAIN", 0.40)
+    else: 
+        return conf_map.get("GENERAL", 0.50)
 
 def resolve_model_path(engine_path, is_gpu=False):
     base_path = os.path.splitext(engine_path)[0]
     target_path = f"{base_path}.pt" if is_gpu else f"{base_path}.dxnn"
-    if os.path.exists(target_path): return target_path
+
+    if os.path.exists(target_path):
+        return target_path
     return os.path.join("models", os.path.basename(target_path))
 
+# 💡 요구사항 1 반영: 서브프로세스(CLI) 의존성 제거, Native Import 테스트로 엔진 체크 안정화
 def check_deepx_npu():
     try: 
         import dx_engine
+        # 라이브러리 로드가 정상적이면 NPU 구동 가능 환경으로 판별
         return True
+    except ImportError as e:
+        logger.debug(f"[AI_CORE] dx_engine 임포트 실패 (NPU 미지원 환경): {e}")
+        return False
     except Exception as e: 
-        logger.debug(f"[AI_CORE] NPU 미지원 환경 (dx_engine 로드 실패): {e}")
+        logger.debug(f"[AI_CORE] NPU 초기화 중 알 수 없는 에러: {e}")
         return False
 
-# 초고속 Vectorized Numpy NMS (CPU 과부하 방지 - Sync/Async 공통 사용)
+# 💡 요구사항 2 반영: 순수 Numpy 기반 초고속 Vectorized NMS 구현 (파이썬 리스트 변환 병목 제거)
 def fast_numpy_nms(boxes, scores, iou_threshold):
-    if len(boxes) == 0: return []
-    x1, y1 = boxes[:, 0], boxes[:, 1]
-    x2, y2 = boxes[:, 2], boxes[:, 3]
+    if len(boxes) == 0:
+        return []
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
     areas = (x2 - x1) * (y2 - y1)
+    
     order = scores.argsort()[::-1]
     keep = []
     
     while order.size > 0:
         i = order[0]
         keep.append(i)
+        
         xx1 = np.maximum(x1[i], x1[order[1:]])
         yy1 = np.maximum(y1[i], y1[order[1:]])
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
+        
         w = np.maximum(0.0, xx2 - xx1)
         h = np.maximum(0.0, yy2 - yy1)
         inter = w * h
+        
         iou = inter / (areas[i] + areas[order[1:]] - inter)
         inds = np.where(iou <= iou_threshold)[0]
         order = order[inds + 1]
+        
     return keep
 
 USE_NPU = check_deepx_npu()
 
 if USE_NPU:
     from dx_engine import InferenceEngine, InferenceOption
-    logger.info("🟢 DeepX NPU 활성화: Sync/Async 통합 엔진 가동")
+    logger.info("🟢 DeepX NPU 활성화: dx_engine을 가동합니다.")
 
-    # --- 1. 비동기 콜백 (프로덕션용) ---
-    def onInferenceCallbackAsync(outputs, user_arg):
-        context, result_queue, is_yolov7, conf_thres, scale, offset = user_arg
-        boxes = []
-        try:
-            pred = np.array(outputs[0], copy=True)
-            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: pred = pred.transpose((0, 2, 1))
-            if pred.ndim == 3: pred = pred[0] 
-            
-            C = pred.shape[1]
-            if is_yolov7 or C == 6 or C == 85:
-                obj_conf = pred[:, 4]
-                if C > 5:
-                    scores = obj_conf * np.max(pred[:, 5:], axis=1)
-                    class_ids = np.argmax(pred[:, 5:], axis=1)
-                else:
-                    scores, class_ids = obj_conf, np.zeros(len(obj_conf), dtype=int)
-            else:
-                scores, class_ids = np.max(pred[:, 4:], axis=1), np.argmax(pred[:, 4:], axis=1)
-
-            mask = scores > conf_thres
-            pred, scores, class_ids = pred[mask], scores[mask], class_ids[mask]
-            
-            if len(pred) > 0:
-                raw_boxes = pred[:, :4].copy()
-                raw_boxes[:, 0] = raw_boxes[:, 0] - raw_boxes[:, 2] / 2
-                raw_boxes[:, 1] = raw_boxes[:, 1] - raw_boxes[:, 3] / 2
-                raw_boxes[:, 2] = raw_boxes[:, 0] + raw_boxes[:, 2]
-                raw_boxes[:, 3] = raw_boxes[:, 1] + raw_boxes[:, 3]
-                
-                indices = fast_numpy_nms(raw_boxes, scores, 0.45)
-                dw, dh = offset
-                for i in indices:
-                    bx1, by1 = (raw_boxes[i][0] - dw) / scale, (raw_boxes[i][1] - dh) / scale
-                    bx2, by2 = (raw_boxes[i][2] - dw) / scale, (raw_boxes[i][3] - dh) / scale
-                    boxes.append([bx1, by1, bx2, by2, float(scores[i]), int(class_ids[i])])
-        except Exception as e: 
-            logger.error(f"⚠️ NPU Async Error: {e}")
-        finally: 
-            result_queue.put({'context': context, 'boxes': boxes})
-        return 0
-
-    # --- 2. 동기 콜백 (테스트 러너용) ---
     def onInferenceCallbackSync(outputs, user_arg):
         event, result_list, is_yolov7, conf_thres, scale, offset = user_arg
         boxes = []
         try:
             pred = np.array(outputs[0], copy=True)
-            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: pred = pred.transpose((0, 2, 1))
-            if pred.ndim == 3: pred = pred[0] 
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
+                pred = pred.transpose((0, 2, 1))
+            if pred.ndim == 3: 
+                pred = pred[0] 
             
             C = pred.shape[1]
             if is_yolov7 or C == 6 or C == 85:
@@ -154,7 +132,9 @@ if USE_NPU:
                 raw_boxes[:, 2] = raw_boxes[:, 0] + raw_boxes[:, 2]
                 raw_boxes[:, 3] = raw_boxes[:, 1] + raw_boxes[:, 3]
                 
+                # Numpy 고속 NMS 적용 (CPU 과부하 방지)
                 indices = fast_numpy_nms(raw_boxes, scores, 0.45)
+                
                 if len(indices) > 0:
                     dw, dh = offset
                     for i in indices:
@@ -169,41 +149,6 @@ if USE_NPU:
             event.set()
         return 0
 
-    class DeepXModelAsync:
-        def __init__(self, engine_path):
-            self.engine_path = resolve_model_path(engine_path, is_gpu=False)
-            self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
-            self.conf_thres = get_model_confidence(self.engine_path)
-            self.result_queue = queue.Queue()
-            
-            if os.path.exists(self.engine_path):
-                self.engine = InferenceEngine(self.engine_path, InferenceOption())
-                self.engine.register_callback(onInferenceCallbackAsync)
-            else:
-                self.engine = None
-                
-        def letter_box(self, img, new_shape=(640,640)):
-            h, w = img.shape[:2]
-            scale = min(new_shape[0]/h, new_shape[1]/w)
-            nw, nh = int(w*scale), int(h*scale)
-            resized = cv2.resize(img, (nw, nh))
-            canvas = np.full((new_shape[0], new_shape[1], 3), 114, dtype=np.uint8)
-            dw, dh = (new_shape[1] - nw) // 2, (new_shape[0] - nh) // 2
-            canvas[dh:dh+nh, dw:dw+nw] = resized
-            return canvas, scale, (dw, dh)
-            
-        @trace_execution
-        def infer_async(self, img, context):
-            if img is None or self.engine is None: return
-            npu_input, scale, offset = self.letter_box(img)
-            input_tensor = np.ascontiguousarray(cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB))
-            user_arg = (context, self.result_queue, self.is_yolov7, self.conf_thres, scale, offset)
-            self.engine.run_async([input_tensor], user_arg=user_arg)
-            
-        def get_result(self):
-            try: return self.result_queue.get_nowait()
-            except queue.Empty: return None
-
     class DeepXModelSync:
         def __init__(self, engine_path):
             self.engine_path = resolve_model_path(engine_path, is_gpu=False)
@@ -212,9 +157,11 @@ if USE_NPU:
             
             if not os.path.exists(self.engine_path): 
                 self.engine = None
+                if DEBUG_MODE: logger.debug(f"[AI_CORE] NPU 모델 로드 실패 (파일 없음): {self.engine_path}")
             else:
                 self.engine = InferenceEngine(self.engine_path, InferenceOption())
                 self.engine.register_callback(onInferenceCallbackSync)
+                if DEBUG_MODE: logger.debug(f"[AI_CORE] NPU 동기 모델 초기화 완료 (Thres: {self.conf_thres}): {self.engine_path}")
                 
         def letter_box(self, img, new_shape=(640,640)):
             h, w = img.shape[:2]
@@ -245,43 +192,9 @@ if USE_NPU:
                 return result_list[0]
             return []
 
-    VisionModelAsync = DeepXModelAsync
     VisionModelSync = DeepXModelSync
 
 else:
-    class GPUModelAsync:
-        def __init__(self, engine_path):
-            self.pt_path = resolve_model_path(engine_path, is_gpu=True)
-            self.conf_thres = get_model_confidence(self.pt_path)
-            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-            self.result_queue = queue.Queue()
-            self.model = None
-            try:
-                from ultralytics import YOLO
-                if os.path.exists(self.pt_path): self.model = YOLO(self.pt_path)
-            except Exception: pass
-            
-        def _infer_thread(self, img, context):
-            try:
-                results = self.model(img, verbose=False, conf=self.conf_thres)
-                boxes = []
-                for r in results:
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        xyxy, conf, cls = r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy(), r.boxes.cls.cpu().numpy()
-                        for i in range(len(xyxy)): boxes.append([xyxy[i][0], xyxy[i][1], xyxy[i][2], xyxy[i][3], float(conf[i]), int(cls[i])])
-                self.result_queue.put({'context': context, 'boxes': boxes})
-            except Exception:
-                self.result_queue.put({'context': context, 'boxes': []})
-
-        @trace_execution
-        def infer_async(self, img, context):
-            if img is None or self.model is None: return
-            self.pool.submit(self._infer_thread, img, context)
-            
-        def get_result(self):
-            try: return self.result_queue.get_nowait()
-            except queue.Empty: return None
-
     class GPUModelSync:
         def __init__(self, engine_path):
             self.pt_path = resolve_model_path(engine_path, is_gpu=True)
@@ -291,6 +204,7 @@ else:
                 from ultralytics import YOLO
                 if os.path.exists(self.pt_path): 
                     self.model = YOLO(self.pt_path)
+                    if DEBUG_MODE: logger.debug(f"[AI_CORE] GPU/CPU 폴백 모델 로드 완료: {self.pt_path}")
             except Exception: 
                 pass
                 
@@ -312,7 +226,6 @@ else:
             except Exception: 
                 return []
 
-    VisionModelAsync = GPUModelAsync
     VisionModelSync = GPUModelSync
 
 class KalmanBoxTracker:
@@ -333,6 +246,7 @@ class KalmanBoxTracker:
         if self.lost > 0:
             self.kf.statePost[2, 0] *= 0.5  
             self.kf.statePost[3, 0] *= 0.5  
+            
         pred = self.kf.predict()
         cx, cy = pred[0, 0], pred[1, 0]
         return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
@@ -359,6 +273,7 @@ class SORTTracker:
     def _associate(self, detections, trackers_keys, iou_threshold):
         if len(trackers_keys) == 0 or len(detections) == 0: 
             return [], list(range(len(detections))), trackers_keys
+            
         iou_matrix = np.zeros((len(detections), len(trackers_keys)), dtype=np.float32)
         for d, det in enumerate(detections):
             for t, tid in enumerate(trackers_keys):
@@ -370,23 +285,32 @@ class SORTTracker:
             for t, tid in enumerate(trackers_keys):
                 if tid in unmatched_trks and iou_matrix[d, t] > best_iou:
                     best_iou, best_t_idx = iou_matrix[d, t], t
+                    
             if best_t_idx != -1:
                 matched_indices.append((d, trackers_keys[best_t_idx]))
                 unmatched_trks.remove(trackers_keys[best_t_idx])
             else: 
                 unmatched_dets.append(d)
+                
         return matched_indices, unmatched_dets, unmatched_trks
         
     def update(self, detections):
         if len(detections) > 0: 
             detections = clean_overlapping_detections(detections, self.is_helmet)
-        for tid in list(self.tracks.keys()): self.tracks[tid].predict()
+            
+        for tid in list(self.tracks.keys()): 
+            self.tracks[tid].predict()
             
         valid_dets = [d for d in detections if d[4] >= self.track_thresh]
+        
         matched, unmatched_dets, unmatched_trks = self._associate(valid_dets, list(self.tracks.keys()), self.match_thresh)
         
-        for d_idx, tid in matched: self.tracks[tid].correct(valid_dets[d_idx][:4], valid_dets[d_idx][4])
-        for tid in unmatched_trks: self.tracks[tid].lost += 1
+        for d_idx, tid in matched: 
+            self.tracks[tid].correct(valid_dets[d_idx][:4], valid_dets[d_idx][4])
+            
+        for tid in unmatched_trks: 
+            self.tracks[tid].lost += 1
+            
         for d_idx in unmatched_dets:
             det = valid_dets[d_idx]
             self.tracks[self.next_id] = KalmanBoxTracker(det[:4], int(det[5]), det[4])

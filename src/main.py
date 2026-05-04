@@ -11,13 +11,14 @@ import logging
 import traceback
 import math
 import shutil
+import subprocess
 
 from common import (SYS_CFG, CAMERA_LIST_FILE, CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE, 
                     ConfigManager, create_mosaic_image, extract_ip, normalize_roi_points, 
                     BATCH_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, setup_logging, load_rtsp_list_from_csv,
                     save_json_file)
 from event import EVENT_REGISTRY
-from ai_core import VisionModelSync
+from ai_core import VisionModelAsync
 from camera import Camera
 
 logger = logging.getLogger("VMS_SYSTEM")
@@ -258,18 +259,29 @@ def prepare_config_manager(rtsp_list):
 
     return config_manager
 
+# 💡 raw_boxes 단일 처리 라우팅으로 함수 간소화
+def process_async_results(c, fid, raw_boxes, use_drawing):
+    buffered_frame = c.get_buffered_frame(fid)
+    if buffered_frame is None: return
+    
+    t_main, alarms = c.run_logic(buffered_frame, fid, raw_boxes)
+    
+    if use_drawing:
+        drawn = c.draw(buffered_frame, t_main, alarms, connected=True)
+        c.latest_display_frame = cv2.resize(drawn, (640, 360))
+    else:
+        c.latest_display_frame = cv2.resize(buffered_frame, (640, 360))
+
 def main():
     setup_logging(SYS_CFG)
     logger.info("="*60)
-    logger.info("🚀 [VMS 시스템] 모듈형 Sync(통합모델) 프로덕션 부팅")
+    logger.info("🚀 [VMS 시스템] 모듈형 Async(원패스 통합모델) 프로덕션 부팅")
     logger.info("="*60)
     
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
     
     if not rtsp_list:
         logger.error(f"❌ 설정된 카메라가 없습니다. '{CAMERA_LIST_FILE}' 파일에 RTSP 주소가 입력되어 있는지 확인하십시오.")
-        print(f"\n[오류] '{CAMERA_LIST_FILE}' 파일에 카메라 RTSP 주소가 없습니다.")
-        print("프로그램을 종료합니다.")
         sys.exit(1)
 
     cams = [] 
@@ -278,9 +290,9 @@ def main():
         sensitivity, use_display, use_drawing = prompt_runtime_options()
         config_manager = prepare_config_manager(rtsp_list)
 
-        engine_main = VisionModelSync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.pt"))
-        face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
-        engine_helmet = VisionModelSync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
+        # 💡 통합 모델(GWKIM) 로드
+        engine_main = VisionModelAsync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv_gwkim.dxnn"))
+        face_engine = VisionModelAsync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
         
         logger.info("카메라 백그라운드 리더 스레드를 초기화합니다...")
         
@@ -289,7 +301,7 @@ def main():
             conf = config_manager.get_config(ip)
             if not conf:
                 conf = {"url": rtsp, "events": []}
-            cams.append(Camera(ip, conf, face_engine, engine_helmet, len(cams) + 1, sensitivity))
+            cams.append(Camera(ip, conf, face_engine, len(cams) + 1, sensitivity))
 
         val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
         if val_setup == 'y':
@@ -317,7 +329,7 @@ def main():
         dynamic_delay = 1.0 / target_fps
         loop_count = 0 
         
-        logger.info("모니터링 시작 (종료: Ctrl+C 또는 'q')")
+        logger.info("모니터링 시작 (Async One-Pass Pipeline 가동 - 종료: Ctrl+C 또는 'q')")
         
         while True:
             start_time = time.time()
@@ -337,35 +349,39 @@ def main():
             loop_count += 1
             if loop_count % 300 == 0: gc.collect()
             
-            final_imgs = []
-            for idx, c in enumerate(cams):
+            # 1. 큐에 프레임 입력
+            for c in cams:
                 frame, fid, connected = c.reader.read()
-                if frame is None or not connected: 
+                if not connected:
                     if use_display and use_drawing:
-                        final_imgs.append(c.draw(None, [], {}, connected=False))
+                        c.latest_display_frame = c.draw(None, [], {}, connected=False)
                     continue
                 
-                main_boxes = None
-                helmet_boxes = None
-                
-                if fid > c.last_submit_fid:
+                if frame is not None and fid > c.last_submit_fid:
                     if fid % SYS_CFG.get("SKIP_FRAMES", 1) == 0:
-                        main_boxes = engine_main.infer(frame)
-                        if "no_helmet" in c.events and c.helmet_detector:
-                            helmet_boxes = c.helmet_detector.infer(frame)
-                            
+                        c.buffer_frame(fid, frame)
+                        engine_main.infer_async(frame, context={'cam_id': c.cam_id, 'fid': fid})
                     c.last_submit_fid = fid
-                
-                t_main, alarms = c.run_logic(frame, fid, main_boxes, helmet_boxes)
-                
-                if use_display:
-                    if use_drawing: final_imgs.append(cv2.resize(c.draw(frame, t_main, alarms, connected=True), (640, 360)))
-                    else: final_imgs.append(cv2.resize(frame, (640, 360)))
 
-            if use_display and final_imgs:
-                mosaic = create_mosaic_image(final_imgs)
-                if mosaic is not None: cv2.imshow("VMS Monitor", mosaic)
-                if cv2.waitKey(1) == ord('q'): break
+            # 2. 결과 폴링 및 즉시 처리 (2차 모델 대기 큐 제거)
+            while True:
+                res = engine_main.get_result()
+                if not res: break
+                
+                cam_id, fid = res['context']['cam_id'], res['context']['fid']
+                raw_boxes = res['boxes']
+                
+                c = next((cam for cam in cams if cam.cam_id == cam_id), None)
+                if c:
+                    process_async_results(c, fid, raw_boxes, use_drawing)
+
+            # 3. 디스플레이 렌더링
+            if use_display:
+                final_imgs = [c.latest_display_frame for c in cams if c.latest_display_frame is not None]
+                if final_imgs:
+                    mosaic = create_mosaic_image(final_imgs)
+                    if mosaic is not None: cv2.imshow("VMS Monitor", mosaic)
+                    if cv2.waitKey(1) == ord('q'): break
 
             sleep_time = dynamic_delay - (time.time() - start_time)
             if sleep_time > 0: time.sleep(sleep_time)

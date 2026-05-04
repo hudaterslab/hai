@@ -127,15 +127,14 @@ def main():
         if os.path.isabs(cfg_path): return cfg_path
         return os.path.join(PROJECT_ROOT, cfg_path)
 
-    main_path = get_abs_path(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.pt"))
+    # 💡 통합 모델만 로드 (경로를 dxnn / pt 맞춰서 세팅)
+    main_path = get_abs_path(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.dxnn"))
     face_path = get_abs_path(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt"))
-    helmet_path = get_abs_path(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
 
-    print("\n⏳ AI 통합 모델 및 헬멧/얼굴 모델을 메모리에 로드 중입니다...")
+    print("\n⏳ 통합 모델 및 얼굴 모델을 메모리에 로드 중입니다...")
     
     engine_main = VisionModelSync(main_path)
     engine_face = VisionModelSync(face_path)
-    engine_helmet = VisionModelSync(helmet_path)
 
     def check_engine(engine, name):
         loaded = False
@@ -145,12 +144,11 @@ def main():
             print(f"❌ [치명적 오류] {name} 모델 로드 실패! (경로 미스매치 또는 패키지 오류)")
         return loaded
         
-    main_ok = check_engine(engine_main, "MAIN (hanjin_cctv)")
-    helmet_ok = check_engine(engine_helmet, "HELMET (helmet_3cls_v8)")
+    main_ok = check_engine(engine_main, "MAIN")
     check_engine(engine_face, "FACE")
     
     if not main_ok:
-        print("⚠️ 주의: BBOX가 하나도 렌더링되지 않는 원인입니다. 코덱, 경로, 또는 ultralytics 설치 상태를 점검하십시오.")
+        print("⚠️ 주의: BBOX가 하나도 렌더링되지 않는 원인입니다. 코덱, 경로, 또는 환경을 점검하십시오.")
 
     main_conf = SYS_CFG.get("model_confidences", {}).get("MAIN", 0.40)
     face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
@@ -163,7 +161,7 @@ def main():
     CANVAS_HEIGHT = SCREEN_HEIGHT
 
     base_skip_frames = SYS_CFG.get("SKIP_FRAMES", 1)
-    target_fps = 30 #SYS_CFG.get("REC_FPS", 3)
+    target_fps = 5 
 
     force_quit_all = False
 
@@ -242,8 +240,9 @@ def main():
             
             target_buffer = max(1, int(SYS_CFG.get("track_buffer_sec", 1.5) * (target_fps / max(1, active_skip_frames))))
             
+            # 💡 추적기는 분리 유지 (ID Switch 방지)
             tracker_main = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=False)
-            tracker_helmet = SORTTracker(track_thresh=helmet_conf, track_buffer=target_buffer, is_helmet=False)
+            tracker_helmet = SORTTracker(track_thresh=helmet_conf, track_buffer=target_buffer, is_helmet=True)
             
             detectors = []
             for evt_name in active_events:
@@ -253,8 +252,8 @@ def main():
             raw_fid = 0
             simulated_fid = 0
             snapshot_cooldowns = {}
-            persistent_alarms = {} # 💡 영구 박제되는 이벤트 객체 저장소
-            global_track_history = defaultdict(dict) # 💡 포렌식 분석을 위한 전체 궤적 기록 [tid][fid] = bbox
+            persistent_alarms = {} 
+            global_track_history = defaultdict(dict) 
             
             last_canvas = None
             play_delay = 30 
@@ -265,7 +264,6 @@ def main():
             advance_one_frame = False
 
             while True:
-                # 💡 VCR 컨트롤: 일시정지가 아닐 때, 혹은 1프레임 이동 명령이 떨어졌을 때만 프레임을 읽음
                 if not is_paused or advance_one_frame:
                     ret, frame = cap.read()
                     advance_one_frame = False
@@ -304,10 +302,16 @@ def main():
 
                     main_boxes = []
                     helmet_boxes = []
+                    
+                    # 💡 원패스 추론 후 다이렉트 분할 (맵핑 제거)
                     if active_skip_frames == 0 or (simulated_fid - 1) % (active_skip_frames + 1) == 0:
-                        main_boxes = engine_main.infer(frame)
-                        if "no_helmet" in active_events:
-                            helmet_boxes = engine_helmet.infer(frame)
+                        raw_boxes = engine_main.infer(frame)
+                        for b in raw_boxes:
+                            cls_id = int(b[5])
+                            if cls_id in (ID_H_HELMET, ID_H_NO_HELMET):
+                                helmet_boxes.append(b)
+                            else:
+                                main_boxes.append(b)
                     
                     main_tracks = tracker_main.update(np.array(main_boxes)) if len(main_boxes) > 0 else tracker_main.predict_only()
                     helmet_tracks = tracker_helmet.update(np.array(helmet_boxes)) if len(helmet_boxes) > 0 else tracker_helmet.predict_only()
@@ -315,7 +319,6 @@ def main():
                     track_map = {int(t[4]): int(t[6]) for t in main_tracks}
                     trajectory_tracker.update_and_draw(display_frame, main_tracks)
 
-                    # 💡 디버그용 프레임별 궤적 저장
                     for t in main_tracks:
                         tid = int(t[4])
                         global_track_history[tid][simulated_fid] = [float(x) for x in t[:4]]
@@ -331,7 +334,6 @@ def main():
                             bbox = evt['bbox']
                             x1, y1, x2, y2 = map(int, bbox)
                             
-                            # 💡 객체 영구 박제 등록
                             persistent_alarms[tid] = detector.event_name
                             
                             cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
@@ -344,7 +346,6 @@ def main():
                                 snapshot_cooldowns[evt_key] = current_time
                                 print(f"[🔥 새 이벤트 발생] {detector.event_name} | ID: {tid} | Frame: {simulated_fid} (Raw: {raw_fid})")
                                 
-                                # 💡 오작동 증명용 JSON 데이터 자동 추출
                                 log_data = {
                                     "video_file": video_filename,
                                     "event_name": detector.event_name,
@@ -380,9 +381,6 @@ def main():
                         x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
                         tid, cls_id = int(tid), int(cls_id)
                         
-                        if cls_id in [ID_H_HELMET, ID_H_NO_HELMET]:
-                            continue 
-                            
                         if cls_id == ID_G_PERSON: color, label = (0, 255, 0), "Person"
                         elif cls_id == ID_G_CAR: color, label = (255, 100, 0), "Car"
                         elif cls_id == ID_G_TRUCK: color, label = (255, 100, 0), "Truck"
@@ -390,7 +388,6 @@ def main():
                         elif cls_id == ID_REFLECTIVE_VEST: color, label = (255, 255, 0), "Vest"
                         else: color, label = (255, 255, 255), "OBJ"
                         
-                        # 💡 이벤트 발생 객체는 영구적으로 붉은색 BBOX 유지
                         if tid in persistent_alarms: 
                             color, label = (0, 0, 255), f"ALARM: {persistent_alarms[tid]}"
                             
@@ -403,8 +400,8 @@ def main():
                             x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
                             tid, cls_id = int(tid), int(cls_id)
                             
-                            if cls_id == 0: color, label = (255, 0, 0), "Helmet"
-                            elif cls_id == 1: color, label = (0, 0, 255), "No-Helmet"
+                            if cls_id == ID_H_HELMET: color, label = (255, 0, 0), "Helmet"
+                            elif cls_id == ID_H_NO_HELMET: color, label = (0, 0, 255), "No-Helmet"
                             else: continue
                                 
                             cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 1)
@@ -457,7 +454,6 @@ def main():
 
                     last_canvas = canvas.copy()
                 
-                # 💡 Canvas 표출 및 Key 입력 대기 (일시정지 상태면 무한 대기)
                 cv2.imshow("CCTV Event Test Runner", last_canvas)
                 
                 wait_time = 0 if is_paused else play_delay

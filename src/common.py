@@ -41,13 +41,14 @@ STREAM_RECONNECT_DELAY_SEC = 2.0
 STREAM_BROKEN_RETRY_DELAY_SEC = 1.0
 WATCHDOG_TIMEOUT = 30.0
 
-ID_G_PERSON = 0
-ID_H_HELMET = 1
-ID_PERSON_LOW = 2
-ID_REFLECTIVE_VEST = 3
-ID_G_TRUCK = 4
-ID_H_NO_HELMET = 5
-ID_G_CAR = 6
+# 💡 새 모델에 맞춰 전역 ID 초기화
+ID_H_HELMET = 0         # 0: helmet
+ID_H_NO_HELMET = 1      # 1: head (no-helmet)
+ID_G_PERSON = 2         # 2: person
+ID_G_CAR = 3            # 3: car
+ID_PERSON_LOW = 4       # 4: low body
+ID_REFLECTIVE_VEST = 5  # 5: signal man
+ID_G_TRUCK = 6          # 6: truck
 
 TARGET_VEHICLES = [ID_G_TRUCK, ID_G_CAR]
 
@@ -101,7 +102,7 @@ def load_system_config():
             "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.10}
         },
         "models": {
-            "MAIN": "models/hanjin_cctv.pt",
+            "MAIN": "models/hanjin_cctv.dxnn",
             "FACE": "models/yolov8m-face.pt"
         },
         "model_confidences": {
@@ -141,7 +142,6 @@ def _log_nas_sync_worker(terminal_id, log_dir):
             if os.path.exists(nas_root): 
                 nas_log_dir = os.path.join(nas_root, str(terminal_id), "logs")
                 os.makedirs(nas_log_dir, exist_ok=True)
-                import queue # For logging internal usage if needed locally
                 for f in os.listdir(log_dir):
                     if f.startswith("cctv.log"):
                         shutil.copy2(os.path.join(log_dir, f), nas_log_dir)
@@ -236,11 +236,9 @@ def load_rtsp_list_from_csv(csv_path):
                 line = line.strip()
                 if not line or line.startswith('#'): 
                     continue
-                
                 first_col = line.split(',')[0].strip()
                 if first_col.lower() in ['url', 'rtsp', 'rtsp_url', 'camera_url']:
                     continue
-                    
                 url = sanitize_camera_url(first_col)
                 if url: 
                     rtsp_list.append(url)
@@ -341,8 +339,6 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
             res = requests.post(url, data=data, files={"image": (os.path.basename(image_path), f, "image/jpeg")}, verify=False, timeout=10)
             if res.status_code == 200:
                 logger.info(f"🌐 [API 전송 완료] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name} | 객체:{len(bboxes) if bboxes else 0}건")
-                if SYS_CFG.get("debug_mode", False):
-                    logger.debug(f"[API_PAYLOAD] Endpoint: {url} | Payload: {json.dumps(data, ensure_ascii=False)}")
             else:
                 logger.error(f"⚠️ [API 전송 에러] 상태코드: {res.status_code} | 응답: {res.text}")
     except Exception as e: 
@@ -457,9 +453,7 @@ class ConfigManager:
         camera_only = copy.deepcopy(data)
         camera_only.pop("terminal_id", None)
         camera_only.pop("event_config", None)
-        
         if "url" in camera_only: camera_only["url"] = sanitize_camera_url(camera_only["url"])
-            
         try: camera_only["cctv_id"] = int(camera_only.get("cctv_id", 1))
         except Exception: camera_only["cctv_id"] = 1
             

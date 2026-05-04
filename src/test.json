@@ -2980,5 +2980,21 @@
         "events": [
             "conveyor_crossing"
         ]
+    },
+    "2026_04_28_10_19_48_ch16_001.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                688,
+                127
+            ],
+            [
+                756,
+                710
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
     }
 }

@@ -48,18 +48,17 @@ class FrameReader:
             self.connected = False
             
             if self.use_hw_engine:
-                # 🚀 [핵심 보완] 90k fps 버그 및 프레임 깨짐 방어 로직 적용
                 cmd = [
                     'ffmpeg',
                     '-hide_banner', '-loglevel', 'error',
                     '-hwaccel', 'drm',
                     '-rtsp_transport', 'tcp',              
                     '-stimeout', '5000000',
-                    '-fflags', 'nobuffer+discardcorrupt',  # 🚀 깨진 데이터(I-Frame 유실) 버려서 초록/회색 화면 방지
-                    '-flags', 'low_delay',                 # 🚀 딜레이 최소화
+                    '-fflags', 'nobuffer+discardcorrupt',  
+                    '-flags', 'low_delay',                 
                     '-i', self.url,
                     '-vf', f'scale={self.out_w}:{self.out_h}', 
-                    '-r', str(self.target_fps),            # 🚀 90k fps 파이프 폭주 버그 방어 (강제 프레임 고정)
+                    '-r', str(self.target_fps),            
                     '-f', 'image2pipe',
                     '-pix_fmt', 'bgr24',
                     '-vcodec', 'rawvideo',
@@ -163,7 +162,7 @@ class FrameReader:
             self.thread.join(timeout=join_timeout)
 
 class Camera:
-    def __init__(self, ip, conf, face_engine, helmet_engine, cam_id, sensitivity):
+    def __init__(self, ip, conf, face_engine, cam_id, sensitivity):
         self.ip = ip
         self.conf = conf 
         self.reader = FrameReader(conf['url'], ip)
@@ -177,7 +176,6 @@ class Camera:
         self.roi_lines = []
         self.events = conf.get('events', [])
         self.face_detector = face_engine
-        self.helmet_detector = helmet_engine  
         self.cam_id = cam_id 
         self.last_submit_fid = -1
         
@@ -208,7 +206,21 @@ class Camera:
         self.pre_log_sec = SYS_CFG.get("event_pre_log_sec", 2.0)
         self.post_log_sec = SYS_CFG.get("event_post_log_sec", 2.0)
         
+        self.frame_buffer = {}
+        self.latest_display_frame = None
+        
         self.init_handlers()
+
+    def buffer_frame(self, fid, frame):
+        self.frame_buffer[fid] = frame.copy()
+        buffer_limit = self.fps * 5
+        keys = list(self.frame_buffer.keys())
+        for k in keys:
+            if fid - k > buffer_limit:
+                del self.frame_buffer[k]
+                
+    def get_buffered_frame(self, fid):
+        return self.frame_buffer.get(fid, None)
 
     def _update_runtime_roi(self, frame_shape):
         if not self.using_normalized_roi or self.roi_frame_shape == frame_shape[:2]: 
@@ -270,12 +282,24 @@ class Camera:
                 
         return snapped_tracks
 
-    def run_logic(self, frame, frame_id, main_boxes=None, helmet_boxes=None):
+    # 💡 불필요한 클래스 맵핑 제거: 원본 박스를 곧바로 헬멧(0, 1)과 일반 객체로 다이렉트 분할 (속도 최적화)
+    def run_logic(self, frame, frame_id, raw_boxes=None):
         with self.config_lock:
             self._update_runtime_roi(frame.shape)
             motion_mask = self.motion_det.apply(frame) 
             
-            current_obj_count = len(main_boxes) if main_boxes is not None else 0
+            main_boxes = []
+            helmet_boxes = []
+            
+            if raw_boxes is not None:
+                for b in raw_boxes:
+                    cls_raw = int(b[5])
+                    if cls_raw in (ID_H_HELMET, ID_H_NO_HELMET):
+                        helmet_boxes.append(b)
+                    else:
+                        main_boxes.append(b)
+            
+            current_obj_count = len(main_boxes)
             self.obj_history[frame_id] = current_obj_count
             
             for k in list(self.obj_history.keys()):
@@ -297,15 +321,12 @@ class Camera:
                     remaining_logs.append(dlog)
             self.delayed_logs = remaining_logs
             
-            main_tracks = self.main_tracker.update(np.array(main_boxes)) if main_boxes is not None and len(main_boxes) > 0 else self.main_tracker.predict_only()
+            main_tracks = self.main_tracker.update(np.array(main_boxes)) if len(main_boxes) > 0 else self.main_tracker.predict_only()
             main_tracks = self._snap_tracks_to_raw(main_tracks, main_boxes)
                 
             helmet_tracks = []
-            if self.helmet_detector and "no_helmet" in self.events:
-                if helmet_boxes is not None and len(helmet_boxes) > 0:
-                    helmet_tracks = self.helmet_tracker.update(np.array(helmet_boxes))
-                else:
-                    helmet_tracks = self.helmet_tracker.predict_only()
+            if "no_helmet" in self.events:
+                helmet_tracks = self.helmet_tracker.update(np.array(helmet_boxes)) if len(helmet_boxes) > 0 else self.helmet_tracker.predict_only()
                 helmet_tracks = self._snap_tracks_to_raw(helmet_tracks, helmet_boxes)
 
             now = time.time()

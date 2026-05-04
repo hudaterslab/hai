@@ -47,9 +47,9 @@
         "HELMET": "models/helmet_3cls_v8.dxnn"
     },
     "model_confidences": {
-        "MAIN": 0.01,
+        "MAIN": 0.3,
         "FACE": 0.2,
-        "HELMET": 0.15
+        "HELMET": 0.2
     },
     "SKIP_FRAMES": 1,
     "REC_FPS": 3,
