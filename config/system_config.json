@@ -30,10 +30,10 @@
             "enabled": false,
             "cooldown_sec": 600,
             "snapshot_mode": "crossing_moment",
-            "distance_ratio": 0.2,
+            "distance_ratio": 0.01,
             "min_crossing_angle": 20.0,
             "candidate_ttl_sec": 5.0,
-            "direction_check": true
+            "direction_check": false
         },
         "signal_vehicle": {
             "enabled": false,
@@ -47,9 +47,9 @@
         "HELMET": "models/helmet_3cls_v8.dxnn"
     },
     "model_confidences": {
-        "MAIN": 0.4,
+        "MAIN": 0.01,
         "FACE": 0.2,
-        "HELMET": 0.45
+        "HELMET": 0.15
     },
     "SKIP_FRAMES": 1,
     "REC_FPS": 3,

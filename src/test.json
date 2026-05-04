@@ -2950,5 +2950,35 @@
         "events": [
             "conveyor_crossing"
         ]
+    },
+    "2026_04_28_10_19_48_ch16_000.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "no_helmet"
+        ]
+    },
+    "2026_04_28_09_14_40_ch4_000.mp4": {
+        "roi_poly": [],
+        "roi_lines": [],
+        "events": [
+            "conveyor_crossing"
+        ]
+    },
+    "2026_04_27_09_14_40_ch4_000.mp4": {
+        "roi_poly": [],
+        "roi_lines": [
+            [
+                637,
+                223
+            ],
+            [
+                693,
+                685
+            ]
+        ],
+        "events": [
+            "conveyor_crossing"
+        ]
     }
 }

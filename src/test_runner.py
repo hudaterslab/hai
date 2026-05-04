@@ -163,7 +163,7 @@ def main():
     CANVAS_HEIGHT = SCREEN_HEIGHT
 
     base_skip_frames = SYS_CFG.get("SKIP_FRAMES", 1)
-    target_fps = SYS_CFG.get("REC_FPS", 3)
+    target_fps = 30 #SYS_CFG.get("REC_FPS", 3)
 
     force_quit_all = False
 

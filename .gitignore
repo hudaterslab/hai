@@ -9,7 +9,9 @@ logs/*
 *.engine
 *.dxnn
 CCTV_EVENT_ALERT/events
-
+config/system_config.json
+config/cameras.json
+debug_logs
 # Local runtime/config files
 cameras.csv
 config

@@ -6,8 +6,6 @@ import cv2
 import numpy as np
 import psutil
 import threading
-import queue
-import csv
 import concurrent.futures
 import logging
 import traceback
@@ -21,7 +19,6 @@ from common import (SYS_CFG, CAMERA_LIST_FILE, CONFIG_COMMON_FILE, CONFIG_CAMERA
 from event import EVENT_REGISTRY
 from ai_core import VisionModelSync
 from camera import Camera
-from camera import FrameReader
 
 logger = logging.getLogger("VMS_SYSTEM")
 
@@ -57,13 +54,13 @@ def get_system_metrics():
     
     return cpu_usage, cpu_temp, chip_temp
 
-def capture_snapshot_clean(url):
-    temp_reader = FrameReader(url, ip="snapshot_test")
+def capture_snapshot_clean(camera_obj):
     start_time = time.time()
     valid_frame = None
     
     while time.time() - start_time < 20.0:
-        frame, _, connected = temp_reader.read()
+        frame, _, connected = camera_obj.reader.read()
+        
         if connected and frame is not None:
             mean_val = np.mean(frame)
             std_val = np.std(frame)
@@ -73,7 +70,6 @@ def capture_snapshot_clean(url):
                 break
         time.sleep(0.5)
         
-    temp_reader.stop()
     return valid_frame
 
 def get_roi_points_scaled(frame, title, mode="poly"):
@@ -120,18 +116,19 @@ def get_roi_points_scaled(frame, title, mode="poly"):
     cv2.destroyWindow(wname)
     return normalize_roi_points(pts, orig_w, orig_h)
 
-def run_wizard_batch_mode(config_manager, rtsp_list):
-    total = len(rtsp_list)
+def run_wizard_batch_mode(config_manager, active_cameras):
+    total = len(active_cameras)
     if total == 0: return logger.warning("설정할 카메라가 없습니다.")
         
     available_events = list(EVENT_REGISTRY.values())
     menu_str = " ".join([f"{i+1}.{evt.menu_name}" for i, evt in enumerate(available_events)])
     
     for i in range(0, total, BATCH_SIZE):
-        batch_urls = rtsp_list[i : i + BATCH_SIZE]
+        batch_cams = active_cameras[i : i + BATCH_SIZE]
         frames = []
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
-            frames = list(executor.map(capture_snapshot_clean, batch_urls))
+            frames = list(executor.map(capture_snapshot_clean, batch_cams))
             
         display_frames = []
         for idx, frm in enumerate(frames):
@@ -162,13 +159,15 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
         selected_indices = []
         if sel:
             for n in [int(s.strip()) for s in sel.split(',') if s.strip().isdigit()]:
-                if 1 <= n <= len(batch_urls): selected_indices.append(i + (n - 1))
+                if 1 <= n <= len(batch_cams): selected_indices.append(i + (n - 1))
         cv2.destroyWindow("Select Cameras")
         
         for idx in selected_indices:
-            url = rtsp_list[idx].strip()
-            ip = extract_ip(url)
-            frame = capture_snapshot_clean(url)
+            cam = active_cameras[idx]
+            ip = cam.ip
+            url = cam.reader.url
+            frame = capture_snapshot_clean(cam)
+            
             if frame is None: continue
                 
             height, width = frame.shape[:2]
@@ -206,6 +205,12 @@ def run_wizard_batch_mode(config_manager, rtsp_list):
                     if input("    라인 추가? (y/n): ") != 'y': break
             
             config_manager.set_config(ip, {"url": url, "roi_poly_norm": roi_p, "roi_lines_norm": roi_l, "events": events})
+            
+            cam.events = events
+            cam.roi_poly_norm = roi_p
+            cam.roi_lines_norm = roi_l
+            cam.using_normalized_roi = bool(roi_p or roi_l)
+            cam.init_handlers()
 
 def prompt_runtime_options():
     current_terminal_id = str(SYS_CFG.get("terminal_id", "99999"))
@@ -251,14 +256,6 @@ def prepare_config_manager(rtsp_list):
         config_manager.save()
         config_manager.config = config_manager.build_runtime_config()
 
-    val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
-    if val_setup == 'y':
-        run_wizard_batch_mode(config_manager, rtsp_list)
-        for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
-            config_manager.camera_configs[ip]["cctv_id"] = idx
-        config_manager.save()
-        config_manager.config = config_manager.build_runtime_config()
-            
     return config_manager
 
 def main():
@@ -285,13 +282,36 @@ def main():
         face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
         engine_helmet = VisionModelSync(SYS_CFG.get("models", {}).get("HELMET", "models/helmet_3cls_v8.dxnn"))
         
+        logger.info("카메라 백그라운드 리더 스레드를 초기화합니다...")
+        
         for i, rtsp in enumerate(rtsp_list):
             ip = extract_ip(rtsp)
             conf = config_manager.get_config(ip)
-            if conf and conf.get('events'):
-                cams.append(Camera(ip, conf, face_engine, engine_helmet, len(cams) + 1, sensitivity))
+            if not conf:
+                conf = {"url": rtsp, "events": []}
+            cams.append(Camera(ip, conf, face_engine, engine_helmet, len(cams) + 1, sensitivity))
+
+        val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
+        if val_setup == 'y':
+            print("카메라 스트림 안정화를 위해 3초 대기합니다...")
+            time.sleep(3)
+            run_wizard_batch_mode(config_manager, cams)
+            
+            for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
+                config_manager.camera_configs[ip]["cctv_id"] = idx
+            config_manager.save()
+            config_manager.config = config_manager.build_runtime_config()
+            
+        active_cams = [c for c in cams if len(c.events) > 0]
+        inactive_cams = [c for c in cams if len(c.events) == 0]
         
-        if not cams: return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
+        for c in inactive_cams:
+            c.stop()
+            
+        cams = active_cams
+
+        if not cams: 
+            return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
 
         target_fps = SYS_CFG.get("REC_FPS", 30)
         dynamic_delay = 1.0 / target_fps
@@ -311,8 +331,8 @@ def main():
             dynamic_delay = 1.0 / target_fps
 
             if loop_count % (target_fps * 10) == 0:
-                active_cams = sum(1 for c in cams if c.reader.connected)
-                logger.info(f"💓 [STATUS] Active Cams: {active_cams}/{len(cams)} | CPU: {cpu_usage}% ({cpu_temp}) | CHIP: {chip_temp}")
+                alive_cams = sum(1 for c in cams if c.reader.connected)
+                logger.info(f"💓 [STATUS] Active Cams: {alive_cams}/{len(cams)} | CPU: {cpu_usage}% ({cpu_temp}) | CHIP: {chip_temp}")
                 
             loop_count += 1
             if loop_count % 300 == 0: gc.collect()
@@ -322,7 +342,6 @@ def main():
                 frame, fid, connected = c.reader.read()
                 if frame is None or not connected: 
                     if use_display and use_drawing:
-                        # 💡 [버그 수정됨] frame이 없을 때 넘겨주는 인자 수를 정확히 3개(frame, tracks, alarms)로 맞춤
                         final_imgs.append(c.draw(None, [], {}, connected=False))
                     continue
                 

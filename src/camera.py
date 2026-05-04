@@ -12,7 +12,7 @@ from common import (
     SYS_CFG, EVENT_ROOT_DIR, WATCHDOG_TIMEOUT, STREAM_RECONNECT_DELAY_SEC, 
     denormalize_roi_points, save_event_image_with_mark, ID_H_HELMET, ID_H_NO_HELMET, 
     ID_G_PERSON, ID_G_CAR, ID_G_TRUCK, ID_PERSON_LOW, ID_REFLECTIVE_VEST,
-    calculate_iou  # 💡 [핵심 보완] BBOX 스냅핑을 위한 IoU 계산 함수 임포트
+    calculate_iou
 )
 from event import MotionDetector, EVENT_REGISTRY
 from ai_core import SORTTracker
@@ -20,8 +20,6 @@ from ai_core import SORTTracker
 logger = logging.getLogger("VMS_SYSTEM")
 
 class FrameReader:
-    _best_strategy_idx = 0 
-
     def __init__(self, url, ip):
         self.url = url.replace(" ", "").replace("\n", "").replace("\r", "").strip()
         self.ip = ip
@@ -39,8 +37,8 @@ class FrameReader:
         self.target_fps = SYS_CFG.get("REC_FPS", 3)
         self.process = None
         
-        self.use_gstreamer = True
-        self.gst_fail_count = 0
+        self.use_hw_engine = True
+        self.hw_fail_count = 0
         
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -49,20 +47,29 @@ class FrameReader:
         while self.running:
             self.connected = False
             
-            if self.use_gstreamer:
-                pipeline = (
-                    f"rtspsrc location={self.url} latency=500 ! "
-                    f"decodebin ! videoconvert ! videorate ! "
-                    f"video/x-raw,format=BGR,width={self.out_w},height={self.out_h},framerate={self.target_fps}/1 ! "
-                    f"fdsink fd=1 sync=false"
-                )
-                
-                cmd = ['gst-launch-1.0', '-q'] + pipeline.split()
+            if self.use_hw_engine:
+                # 🚀 [핵심 보완] 90k fps 버그 및 프레임 깨짐 방어 로직 적용
+                cmd = [
+                    'ffmpeg',
+                    '-hide_banner', '-loglevel', 'error',
+                    '-hwaccel', 'drm',
+                    '-rtsp_transport', 'tcp',              
+                    '-stimeout', '5000000',
+                    '-fflags', 'nobuffer+discardcorrupt',  # 🚀 깨진 데이터(I-Frame 유실) 버려서 초록/회색 화면 방지
+                    '-flags', 'low_delay',                 # 🚀 딜레이 최소화
+                    '-i', self.url,
+                    '-vf', f'scale={self.out_w}:{self.out_h}', 
+                    '-r', str(self.target_fps),            # 🚀 90k fps 파이프 폭주 버그 방어 (강제 프레임 고정)
+                    '-f', 'image2pipe',
+                    '-pix_fmt', 'bgr24',
+                    '-vcodec', 'rawvideo',
+                    '-'
+                ]
                 
                 try:
                     self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
                 except Exception:
-                    self.gst_fail_count += 1
+                    self.hw_fail_count += 1
                     time.sleep(STREAM_RECONNECT_DELAY_SEC)
                     continue
                     
@@ -89,7 +96,7 @@ class FrameReader:
                     img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
                     read_success = True
                     self.connected = True
-                    self.gst_fail_count = 0 
+                    self.hw_fail_count = 0 
                     
                     with self.lock:
                         self.frame = img
@@ -105,10 +112,10 @@ class FrameReader:
                     self.process = None
                 
                 if not read_success:
-                    self.gst_fail_count += 1
+                    self.hw_fail_count += 1
                     
-                if self.gst_fail_count >= 2:
-                    self.use_gstreamer = False
+                if self.hw_fail_count >= 2:
+                    self.use_hw_engine = False
                     
             else:
                 cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
@@ -185,7 +192,7 @@ class Camera:
         target_buffer = max(1, int(track_buffer_sec * (self.fps / self.skip)))
         
         self.main_tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=False)
-        self.helmet_tracker = SORTTracker(track_thresh=self.helmet_conf, track_buffer=target_buffer, is_helmet=False)
+        self.helmet_tracker = SORTTracker(track_thresh=self.helmet_conf, track_buffer=target_buffer, is_helmet=True)
         
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
@@ -240,10 +247,6 @@ class Camera:
         return image
 
     def _snap_tracks_to_raw(self, tracks, raw_boxes):
-        """
-        💡 [상용화 핵심 로직] 저프레임 환경에서 칼만 필터의 위치 지연(Lag) 현상을 보정합니다.
-        트래커가 예측한 BBOX를 원본 YOLO 탐지 BBOX에 강력하게 달라붙도록(Snap) 강제 조정합니다.
-        """
         if raw_boxes is None or len(raw_boxes) == 0 or len(tracks) == 0:
             return tracks
             
@@ -253,7 +256,6 @@ class Camera:
             best_iou = 0
             best_raw = None
             
-            # 현재 트랙(클래스 일치)과 가장 많이 겹치는 실제 탐지 BBOX 찾기
             for rb in raw_boxes:
                 if int(rb[5]) == int(cls_id):
                     iou = calculate_iou((tx1, ty1, tx2, ty2), rb[:4])
@@ -261,7 +263,6 @@ class Camera:
                         best_iou = iou
                         best_raw = rb
                         
-            # 저프레임 예측 오차를 고려해 IoU가 단 5%만 겹쳐도 동일 객체로 간주하고 원본 BBOX 좌표 채택
             if best_iou > 0.05 and best_raw is not None:
                 snapped_tracks.append([best_raw[0], best_raw[1], best_raw[2], best_raw[3], tid, best_raw[4], cls_id])
             else:
@@ -296,7 +297,6 @@ class Camera:
                     remaining_logs.append(dlog)
             self.delayed_logs = remaining_logs
             
-            # 트래커 업데이트 후 원본 좌표로 Snap(교정)
             main_tracks = self.main_tracker.update(np.array(main_boxes)) if main_boxes is not None and len(main_boxes) > 0 else self.main_tracker.predict_only()
             main_tracks = self._snap_tracks_to_raw(main_tracks, main_boxes)
                 
@@ -313,7 +313,7 @@ class Camera:
             track_map = {int(t[4]): int(t[6]) for t in main_tracks}
             
             for handler in self.handlers:
-                for evt in handler.process(main_tracks, track_map, motion_mask, frame, frame_id, helmet_tracks=helmet_tracks):
+                for evt in handler.process(main_tracks, track_map, motion_mask, frame, frame_id, helmet_tracks=helmet_tracks, raw_helmet_boxes=helmet_boxes):
                     draw_tid = evt['tid'] 
                     self._trigger_event(frame, frame_id, draw_tid, handler.event_name, main_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
                     current_alarms[draw_tid] = handler.event_name

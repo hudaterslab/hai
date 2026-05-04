@@ -102,9 +102,21 @@ class ParkingDetector(BaseEventDetector):
                 dynamic_move_threshold = vehicle_size * self.move_threshold_ratio
                 
                 if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > dynamic_move_threshold:
-                    self.states[tid].update({'start_fid': fid, 'pos': c})
+                    # 💡 [핵심 보완] 주정차도 최초 멈춘 순간의 깨끗한 BBOX와 프레임을 박제
+                    self.states[tid].update({
+                        'start_fid': fid, 
+                        'pos': c,
+                        'bbox': t[:4],
+                        'frame': frame.copy() if frame is not None else None,
+                        'fid': fid
+                    })
                 elif fid - self.states[tid]['start_fid'] >= self.trigger_fid_diff:
-                    triggered.append({'tid': tid, 'bbox': t[:4], 'frame': None, 'fid': fid})
+                    triggered.append({
+                        'tid': tid, 
+                        'bbox': self.states[tid].get('bbox', t[:4]), 
+                        'frame': self.states[tid].get('frame', None), 
+                        'fid': self.states[tid].get('fid', fid)
+                    })
                     
         for tid in list(self.states.keys()):
             if tid not in curr_ids: 
@@ -212,12 +224,9 @@ class CrossingDetector(BaseEventDetector):
                 else:
                     continue
                     
-            # 💡 [핵심 보완] 물리적 이동 한계 적용 (텔레포트 차단)
-            # 1.5배 -> 0.4배 (40%)로 대폭 강화. 0.3초 만에 자기 키의 40% 이상을 도약하는 것은 물리적으로 불가.
             if p_tid in self.prev:
                 jump_dist = get_distance(self.prev[p_tid], curr_pos)
                 if jump_dist > person_height * 0.4:
-                    # 불가능한 도약을 감지하면 즉시 궤적과 후보군을 초기화하여 오탐을 찢어버림
                     del self.prev[p_tid]
                     if p_tid in self.candidates: del self.candidates[p_tid]
                     if p_tid in self.lb_offsets: del self.lb_offsets[p_tid]
@@ -307,26 +316,53 @@ class HelmetDetector(BaseEventDetector):
             if track_map.get(p_tid) != ID_G_PERSON: 
                 continue
                 
+            px1, py1, px2, py2 = p[:4]
+            person_height = max(1, py2 - py1)
+            person_width = max(1, px2 - px1)
+
             max_ioa = 0
             nh_box_match = None
             
             for head in unhelmeted_heads:
+                hx1, hy1, hx2, hy2 = head[:4]
+                hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+
+                # 💡 [핵심 방어 1] 해부학적 필터: 머리는 전신의 상단 40% 이내에 위치해야 함 (허공, 배꼽 박스 무시)
+                if hcy > py1 + person_height * 0.4:
+                    continue
+                # 💡 [핵심 방어 2] 수평 필터: 머리는 전신의 좌우 폭(15% 마진) 안에 있어야 함
+                margin = person_width * 0.15
+                if hcx < px1 - margin or hcx > px2 + margin:
+                    continue
+
                 ioa = self._get_intersection_over_head_area(head[:4], p[:4])
                 if ioa > max_ioa: 
                     max_ioa = ioa
                     nh_box_match = head[:4]
                     
-            if max_ioa > 0.5:
+            if max_ioa >= 0.5 and nh_box_match is not None:
                 current_nh_person_ids.add(p_tid)
                 
                 if p_tid not in self.states: 
-                    self.states[p_tid] = {'start_fid': fid, 'last_seen': fid, 'bbox': nh_box_match}
+                    # 💡 [핵심 보완] Snapshot Freezing: 발견 즉시 깨끗한 원본 BBOX와 프레임을 박제함
+                    self.states[p_tid] = {
+                        'start_fid': fid, 
+                        'last_seen': fid, 
+                        'bbox': nh_box_match,
+                        'frame': frame.copy() if frame is not None else None,
+                        'fid': fid
+                    }
                 else:
                     self.states[p_tid]['last_seen'] = fid
-                    self.states[p_tid]['bbox'] = nh_box_match
+                    # ※ 주의: 3초 대기 중 추적기 예측으로 튀어버린 박스가 들어가지 않도록 프레임/BBOX를 의도적으로 갱신하지 않음
                     
                 if fid - self.states[p_tid]['start_fid'] >= self.trigger_fid_diff:
-                    triggered.append({'tid': p_tid, 'bbox': self.states[p_tid]['bbox'], 'frame': None, 'fid': fid})
+                    triggered.append({
+                        'tid': p_tid, 
+                        'bbox': self.states[p_tid]['bbox'], 
+                        'frame': self.states[p_tid]['frame'], 
+                        'fid': self.states[p_tid]['fid']
+                    })
                     
         for tid in list(self.states.keys()):
             if fid - self.states[tid]['last_seen'] > self.grace_fid_diff:

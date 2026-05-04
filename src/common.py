@@ -2,7 +2,6 @@ import os
 import sys
 import copy
 import json
-import csv
 import cv2
 import math
 import numpy as np
@@ -15,7 +14,6 @@ import requests
 import pytz
 import shutil
 import threading
-import queue
 import atexit
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
 from urllib.parse import urlsplit, unquote
@@ -74,16 +72,6 @@ def graceful_shutdown():
         pass
 
 atexit.register(graceful_shutdown)
-
-def get_warm_snapshot(camera_reader, timeout_sec=10):
-    start_time = time.time()
-    while time.time() - start_time < timeout_sec:
-        frame, fid, connected = camera_reader.read()
-        if frame is not None and isinstance(frame, np.ndarray):
-            return frame
-        time.sleep(0.5)
-    print(f"⚠️ [스냅샷 타임아웃] 카메라 영상 수신 실패. 더미 프레임을 반환합니다.")
-    return np.ones((480, 640, 3), dtype=np.uint8) * 128
 
 def deep_merge_dict(base, override):
     result = copy.deepcopy(base)
@@ -153,6 +141,7 @@ def _log_nas_sync_worker(terminal_id, log_dir):
             if os.path.exists(nas_root): 
                 nas_log_dir = os.path.join(nas_root, str(terminal_id), "logs")
                 os.makedirs(nas_log_dir, exist_ok=True)
+                import queue # For logging internal usage if needed locally
                 for f in os.listdir(log_dir):
                     if f.startswith("cctv.log"):
                         shutil.copy2(os.path.join(log_dir, f), nas_log_dir)
@@ -161,6 +150,7 @@ def _log_nas_sync_worker(terminal_id, log_dir):
 
 def setup_logging(common_conf):
     global LOG_LISTENER
+    import queue
     raw_log_dir = str(common_conf.get("logging", {}).get("dir", os.path.join(PROJECT_ROOT, "logs")))
     log_dir = raw_log_dir if os.path.isabs(raw_log_dir) else os.path.join(PROJECT_ROOT, raw_log_dir)
     
