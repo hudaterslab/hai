@@ -1300,7 +1300,11 @@ class Camera:
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
         self.visual_alarms = {}
-        
+
+        from collections import deque
+        self.fps_queue = deque(maxlen=30)
+        self.current_fps = 0.0
+
         self.roi_poly_norm = conf.get('roi_poly_norm', [])
         self.roi_lines_norm = conf.get('roi_lines_norm', [])
         self.roi_poly = []
@@ -1363,9 +1367,17 @@ class Camera:
         return blur_img
 
     def run_logic(self, fr, fid, d_main_res, d_helmet_res):
-        
+
         if fr is None:
             return [], [], {}
+
+        # [추가] 이동 평균 FPS 계산 로직
+        now_t = time.time()
+        self.fps_queue.append(now_t)
+        if len(self.fps_queue) > 1:
+            time_diff = self.fps_queue[-1] - self.fps_queue[0]
+            self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
+
         self._update_runtime_roi(fr.shape)
         motion_mask = self.motion_det.apply(fr)
 
@@ -1470,9 +1482,12 @@ class Camera:
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # 상단 오버레이 (카메라 정보 및 상태)
-        cv2.rectangle(fr, (0, 0), (100, 100), (0, 0, 0), -1) 
-        cv2.putText(fr, f"{self.cam_id}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 255), 6)
+        cv2.rectangle(fr, (0, 0), (220, 100), (0, 0, 0), -1) 
+        cv2.putText(fr, f"CAM {self.cam_id}", (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+        
+        # FPS 수치에 따라 색상 변경 (10 미만이면 붉은색 경고)
+        fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
+        cv2.putText(fr, f"FPS: {self.current_fps:.1f}", (15, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.0, fps_color, 2)
         
         active_alarms = set(alarms.values())
         menu_height = len(self.events) * 40 + 10
