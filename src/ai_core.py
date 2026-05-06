@@ -48,7 +48,6 @@ def check_deepx_npu():
         logger.debug(f"[AI_CORE] NPU 미지원 환경 (dx_engine 로드 실패): {e}")
         return False
 
-# 초고속 Vectorized Numpy NMS (CPU 과부하 방지 - Sync/Async 공통 사용)
 def fast_numpy_nms(boxes, scores, iou_threshold):
     if len(boxes) == 0: return []
     x1, y1 = boxes[:, 0], boxes[:, 1]
@@ -78,9 +77,9 @@ if USE_NPU:
     from dx_engine import InferenceEngine, InferenceOption
     logger.info("🟢 DeepX NPU 활성화: Sync/Async 통합 엔진 가동")
 
-    # --- 1. 비동기 콜백 (프로덕션용) ---
     def onInferenceCallbackAsync(outputs, user_arg):
-        context, result_queue, is_yolov7, conf_thres, scale, offset = user_arg
+        # 💡 마지막 인자(_)로 전달된 input_tensor가 여기서 비로소 메모리 해제됨
+        context, result_queue, is_yolov7, conf_thres, scale, offset, _ = user_arg
         boxes = []
         try:
             pred = np.array(outputs[0], copy=True)
@@ -120,9 +119,8 @@ if USE_NPU:
             result_queue.put({'context': context, 'boxes': boxes})
         return 0
 
-    # --- 2. 동기 콜백 (테스트 러너용) ---
     def onInferenceCallbackSync(outputs, user_arg):
-        event, result_list, is_yolov7, conf_thres, scale, offset = user_arg
+        event, result_list, is_yolov7, conf_thres, scale, offset, _ = user_arg
         boxes = []
         try:
             pred = np.array(outputs[0], copy=True)
@@ -197,7 +195,9 @@ if USE_NPU:
             if img is None or self.engine is None: return
             npu_input, scale, offset = self.letter_box(img)
             input_tensor = np.ascontiguousarray(cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB))
-            user_arg = (context, self.result_queue, self.is_yolov7, self.conf_thres, scale, offset)
+            
+            # 💡 핵심 방어: Python GC가 DMA 연산 중인 텐서 메모리를 삭제하지 못하도록 user_arg에 묶어 생명주기 연장
+            user_arg = (context, self.result_queue, self.is_yolov7, self.conf_thres, scale, offset, input_tensor)
             self.engine.run_async([input_tensor], user_arg=user_arg)
             
         def get_result(self):
@@ -236,8 +236,9 @@ if USE_NPU:
             
             event = threading.Event()
             result_list = []
-            user_arg = (event, result_list, self.is_yolov7, self.conf_thres, scale, offset)
             
+            # 💡 동기 모드에서도 동일한 메모리 보호막 적용
+            user_arg = (event, result_list, self.is_yolov7, self.conf_thres, scale, offset, input_tensor)
             self.engine.run_async([input_tensor], user_arg=user_arg)
             event.wait(timeout=2.0)
             

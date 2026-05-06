@@ -5,7 +5,7 @@ import datetime
 import threading
 import os
 import logging
-import subprocess
+import re
 import psutil
 from collections import deque, defaultdict
 from common import (
@@ -21,7 +21,9 @@ logger = logging.getLogger("VMS_SYSTEM")
 
 class FrameReader:
     def __init__(self, url, ip):
-        self.url = url.replace(" ", "").replace("\n", "").replace("\r", "").strip()
+        # 💡 핵심 방어: 정규식을 이용해 RTSP URL 내의 모든 공백 문자, 탭, 줄바꿈 완전 파기
+        clean_url = re.sub(r'\s+', '', url)
+        self.url = clean_url
         self.ip = ip
         self.lock = threading.Lock()
         self.frame = None
@@ -39,13 +41,11 @@ class FrameReader:
         self.thread.start()
 
     def _run(self):
-        # 💡 OpenCV FFmpeg 백엔드 최적화 환경변수 주입 (TCP 강제, 타임아웃 설정)
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
         
         while self.running:
             self.connected = False
             
-            # 💡 서브프로세스 제거 및 OpenCV VideoCapture 단일화 적용
             cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
             
@@ -66,7 +66,6 @@ class FrameReader:
                     break
                 
                 now = time.time()
-                # 💡 목표 FPS에 맞춘 프레임 솎아내기 (CPU 연산 낭비 방지)
                 if now - last_read_time >= (1.0 / self.target_fps):
                     try:
                         frame = cv2.resize(frame, (self.out_w, self.out_h))
