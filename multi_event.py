@@ -763,6 +763,8 @@ class ParkingDetector(BaseEventDetector):
                 
         return triggered
 
+import math
+
 class CrossingDetector(BaseEventDetector):
     gui_name = "CROSSING"
     
@@ -778,6 +780,7 @@ class CrossingDetector(BaseEventDetector):
         self.lb_offsets = {}
         self.lb_last_height = {}
         
+        # 선분과 궤적이 이루는 최소 교차 각도 (이 각도보다 얕게 들어오면 무시)
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
         
@@ -793,6 +796,28 @@ class CrossingDetector(BaseEventDetector):
         den = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
         if den == 0: return 0
         return abs((p2[0] - p1[0]) * (p1[1] - pt[1]) - (p1[0] - pt[0]) * (p2[1] - p1[1])) / den
+
+    def _get_angle_between_lines(self, line1, line2):
+        """두 선분(ROI 선분과 객체의 이동 궤적) 사이의 예각을 계산합니다."""
+        dx1 = line1[1][0] - line1[0][0]
+        dy1 = line1[1][1] - line1[0][1]
+        dx2 = line2[1][0] - line2[0][0]
+        dy2 = line2[1][1] - line2[0][1]
+        
+        dot_product = dx1 * dx2 + dy1 * dy2
+        mag1 = math.sqrt(dx1**2 + dy1**2)
+        mag2 = math.sqrt(dx2**2 + dy2**2)
+        
+        if mag1 * mag2 == 0:
+            return 0.0
+            
+        cos_theta = max(-1.0, min(1.0, dot_product / (mag1 * mag2)))
+        angle = math.degrees(math.acos(cos_theta))
+        
+        # 항상 90도 이하의 예각을 반환
+        if angle > 90:
+            angle = 180 - angle
+        return angle
 
     def _get_intersection_over_lowbody_area(self, box1, box2):
         """IoA 계산: 하체 면적 대비 교차 면적 비율"""
@@ -867,17 +892,23 @@ class CrossingDetector(BaseEventDetector):
 
             # 후보 등록 (선분을 교차한 순간)
             if p_tid in self.prev and p_tid not in self.candidates:
+                trajectory = (self.prev[p_tid], curr_pos)
+                
                 for p1, p2 in self.lines:
-                    if self._is_intersect(p1, p2, self.prev[p_tid], curr_pos):
-                        self.candidates[p_tid] = {
-                            'person_height': person_height, 
-                            'timestamp_fid': fid, 
-                            'line': (p1, p2), 
-                            'entry_side': ccw(p1, p2, self.prev[p_tid]), 
-                            'bbox': event_bbox, 
-                            'frame': frame.copy() if frame is not None else None,
-                            'fid': fid
-                        }
+                    if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
+                        # 교차 각도 검사: 선분과 너무 평행하게 걷는 경우(오탐) 필터링
+                        cross_angle = self._get_angle_between_lines((p1, p2), trajectory)
+                        
+                        if cross_angle >= self.min_crossing_angle:
+                            self.candidates[p_tid] = {
+                                'person_height': person_height, 
+                                'timestamp_fid': fid, 
+                                'line': (p1, p2), 
+                                'entry_side': ccw(p1, p2, trajectory[0]), 
+                                'bbox': event_bbox, 
+                                'frame': frame.copy() if frame is not None else None,
+                                'fid': fid
+                            }
                         break
             
             # 최종 이벤트 트리거 (선분을 완전히 넘어선 후)
@@ -888,7 +919,15 @@ class CrossingDetector(BaseEventDetector):
                 
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
-                    dynamic_threshold = cand['person_height'] * self.distance_ratio
+                    
+                    # 선분의 절대 기울기 계산 (수평=0도, 수직=90도)
+                    dx = abs(p2[0] - p1[0])
+                    dy = abs(p2[1] - p1[1])
+                    line_tilt_angle = math.degrees(math.atan2(dy, dx))
+                    
+                    # 기울기가 클수록(수직에 가까울수록) 최대 1.5배까지 요구 거리를 늘림 (원근 왜곡 보상)
+                    tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
+                    dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
                     
                     if perp_dist >= dynamic_threshold:
                         triggered.append({
@@ -913,7 +952,7 @@ class CrossingDetector(BaseEventDetector):
                 if tid in self.lb_last_height: del self.lb_last_height[tid]
                 
         return triggered
-
+    
 class HelmetDetector(BaseEventDetector):
     gui_name = "NO-HELMET"
     
