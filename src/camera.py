@@ -7,6 +7,7 @@ import queue
 import os
 import logging
 import re
+from urllib.parse import unquote # 💡 추가: URL 인코딩 해제
 from collections import deque, defaultdict
 from common import (
     SYS_CFG, EVENT_ROOT_DIR, WATCHDOG_TIMEOUT, STREAM_RECONNECT_DELAY_SEC, 
@@ -20,8 +21,11 @@ logger = logging.getLogger("VMS_SYSTEM")
 
 class FrameReader:
     def __init__(self, url, ip):
-        clean_url = url.encode('ascii', 'ignore').decode('ascii')
-        self.url = re.sub(r'\s+', '', clean_url.strip())
+        # 💡 강력한 URL 멸균: %20 등 인코딩 문자를 실제 문자로 치환 후, 모든 종류의 공백과 보이지 않는 유니코드 문자 파쇄
+        raw_url = unquote(url)
+        clean_url = re.sub(r'[\s\u200B\u200C\u200D\uFEFF]+', '', raw_url.strip())
+        
+        self.url = clean_url
         self.ip = ip
         self.lock = threading.Lock()
         self.frame = None
@@ -86,7 +90,6 @@ class FrameReader:
                 return None, self.fid, False
             return self.frame, self.fid, self.connected
 
-# 💡 영상 녹화기 (VideoRecorder) 부활
 class VideoRecorder:
     def __init__(self, ip):
         self.ip = ip
@@ -173,12 +176,10 @@ class Camera:
         self.config_lock = threading.Lock() 
         self.motion_det = MotionDetector(sensitivity)
         
-        # 💡 VideoRecorder를 Camera 객체 내부에 부착
         self.recorder = VideoRecorder(ip)
         
         self.init_handlers()
 
-    # 💡 multi_event.py 방식의 스레드 재생성 로직 원복
     def process_frame(self):
         fr, fid, connected = self.reader.read()
         if fr is None and not connected:
@@ -292,9 +293,7 @@ class Camera:
             
         save_event_image_with_mark(saved_img, self.ip, event_name, bbox, real_tid, terminal_id=self.terminal_id, cctv_id=self.cctv_id)
         
-        # 💡 이벤트 발생 시 비디오 레코더 녹화 트리거
         self.recorder.trigger(event_name)
-        
         self.alerted[tid].add(event_name)
         self.last_evt_t[event_name] = now
 
@@ -333,7 +332,6 @@ class Camera:
         cv2.rectangle(frame, (0, 0), (60, 40), (0, 0, 0), -1)
         cv2.putText(frame, f"C{self.cam_id}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
-        # 💡 녹화 중 표시기(REC) 추가
         if self.recorder.recording:
             cv2.circle(frame, (w_frame - 30, 30), 10, (0, 0, 255), -1)
             cv2.putText(frame, "REC", (w_frame - 80, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)

@@ -7,6 +7,13 @@ from common import clean_overlapping_detections, calculate_iou, SYS_CFG
 
 logger = logging.getLogger("VMS_SYSTEM")
 
+# 💡 복원: JSON 설정에 .pt로 기재되어 있어도 NPU 구동 시 .dxnn으로 강제 치환하는 풀프루프 방어막
+def resolve_model_path(engine_path):
+    base_path = os.path.splitext(engine_path)[0]
+    target_path = f"{base_path}.dxnn"
+    if os.path.exists(target_path): return target_path
+    return os.path.join("models", os.path.basename(target_path))
+
 def check_deepx_npu():
     try: 
         import dx_engine
@@ -23,7 +30,8 @@ if USE_NPU:
 
     class VisionModelSync:
         def __init__(self, engine_path):
-            self.engine_path = engine_path
+            # 💡 모델 경로 자동 치환 적용
+            self.engine_path = resolve_model_path(engine_path)
             self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
             self.conf_thres = 0.35 if "face" in self.engine_path.lower() else 0.40
             
@@ -51,7 +59,6 @@ if USE_NPU:
             npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
             
             try:
-                # 💡 비동기 큐 없이 엔진에 직접 밀어넣고(run) 결과를 동기적으로 받아옵니다.
                 output_tensor = self.engine.run([npu_input_rgb])
                 pred = np.array(output_tensor[0], copy=True)
                 
@@ -125,7 +132,6 @@ else:
                 return boxes
             except: return []
 
-# 기존의 객체 추적기(Tracker) 로직 그대로 유지
 class KalmanBoxTracker:
     def __init__(self, bbox, cls_id, conf):
         self.kf = cv2.KalmanFilter(4, 2)
