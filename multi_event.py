@@ -177,25 +177,23 @@ def sanitize_camera_url(url: str) -> str:
         return re.sub(r'\s+', '', str(url).strip())
 
 def extract_ip(rtsp_url: str) -> str:
-    """RTSP URL에서 식별용 IP 또는 Hostname을 추출합니다."""
+    """RTSP URL에서 식별용 고유 ID(IP+Channel)를 추출합니다."""
     try:
         clean_url = sanitize_camera_url(rtsp_url)
         if "://" not in clean_url:
             clean_url = f"rtsp://{clean_url}"
-        parsed = urlsplit(clean_url)
-        netloc = parsed.netloc.rsplit("@", 1)[-1]
-        host_port = netloc.strip("[]")
-        
-        if ":" in host_port and host_port.count(":") == 1:
-            host, port = host_port.split(":", 1)
-        else:
-            host, port = host_port, ""
             
-        host_tail = host.split(".")[-1]
-        uid = f"{host_tail}_{port}" if port else host_tail
-        return uid
+        parsed = urlsplit(clean_url)
+        host = parsed.netloc.rsplit("@", 1)[-1].strip("[]").split(":")[0].split(".")[-1]
+        
+        # Path와 Query(채널 정보 등)를 포함하여 고유한 키 생성
+        path = re.sub(r'[^a-zA-Z0-9]', '_', parsed.path)
+        query = re.sub(r'[^a-zA-Z0-9]', '_', parsed.query)
+        
+        uid = f"{host}{path}_{query}".strip('_')
+        return uid if uid else "unknown_cam"
     except Exception as e:
-        logger.warning(f"IP 추출 실패: {e} | input={rtsp_url!r}")
+        logger.warning(f"고유 식별자 추출 실패: {e}")
         return "unknown_cam"
 
 def load_rtsp_list_from_csv(csv_path):
@@ -1205,11 +1203,11 @@ def run_wizard_batch_mode(rtsp_list):
                     roi_l = []
                     
                     if any(e in events for e in ["intrusion", "illegal_parking", "signal_vehicle"]): 
-                        roi_p = get_roi_points_scaled(frames[n-1], "Polygon")
+                        roi_p = get_roi_points_scaled(frames[n-1], f"Polygon - CAM: {ip}")
                         
                     if "conveyor_crossing" in events:
                         while True:
-                            l = get_roi_points_scaled(frames[n-1], "Line", mode="line")
+                            l = get_roi_points_scaled(frames[n-1], f"Line - CAM: {ip}", mode="line")
                             if len(l) == 2: 
                                 roi_l.extend(l)
                             if input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y': 
@@ -1499,6 +1497,16 @@ def main():
         except Exception as e: 
             logger.error(f"cameras.json 로드 실패: {e}")
             pass
+        # [수정] 설정 마법사 강제 호출 인터페이스 추가
+        reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? (y/n): ").strip().lower()
+        if reset_ans == 'y':
+            logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
+            camera_configs = run_wizard_batch_mode(rtsp_list)
+            try:
+                with open(config_file, 'w', encoding='utf-8') as f: 
+                    json.dump(camera_configs, f, indent=4)
+            except:
+                pass
     else:
         logger.warning("설정 파일(cameras.json)이 없어 터미널 마법사를 실행합니다.")
         camera_configs = run_wizard_batch_mode(rtsp_list)
