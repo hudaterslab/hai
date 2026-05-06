@@ -41,14 +41,13 @@ STREAM_RECONNECT_DELAY_SEC = 2.0
 STREAM_BROKEN_RETRY_DELAY_SEC = 1.0
 WATCHDOG_TIMEOUT = 30.0
 
-# 💡 새 모델에 맞춰 전역 ID 초기화
-ID_H_HELMET = 0         # 0: helmet
-ID_H_NO_HELMET = 1      # 1: head (no-helmet)
-ID_G_PERSON = 2         # 2: person
-ID_G_CAR = 3            # 3: car
-ID_PERSON_LOW = 4       # 4: low body
-ID_REFLECTIVE_VEST = 5  # 5: signal man
-ID_G_TRUCK = 6          # 6: truck
+ID_H_HELMET = 0         
+ID_H_NO_HELMET = 1      
+ID_G_PERSON = 2         
+ID_G_CAR = 3            
+ID_PERSON_LOW = 4       
+ID_REFLECTIVE_VEST = 5  
+ID_G_TRUCK = 6          
 
 TARGET_VEHICLES = [ID_G_TRUCK, ID_G_CAR]
 
@@ -192,7 +191,14 @@ def setup_logging(common_conf):
     terminal_id = common_conf.get("terminal_id", "99999")
     threading.Thread(target=_log_nas_sync_worker, args=(terminal_id, log_dir), daemon=True).start()
 
-def sanitize_camera_url(url: str) -> str: return re.sub(r'\s+', '', (url or '').strip())
+# 💡 핵심 방어 로직: 눈에 보이지 않는 유니코드 불순물까지 물리적으로 소멸시킴
+def sanitize_camera_url(url: str) -> str: 
+    if not url: return ""
+    try:
+        clean_url = url.encode('ascii', 'ignore').decode('ascii')
+        return re.sub(r'\s+', '', clean_url.strip())
+    except Exception:
+        return re.sub(r'\s+', '', str(url).strip())
 
 def parse_camera_endpoint(rtsp_url: str):
     clean_url = sanitize_camera_url(rtsp_url)
@@ -434,6 +440,7 @@ class ConfigManager:
             conf["event_config"] = effective_event_config
             conf["events"] = [name for name, evt_conf in effective_event_config.items() if evt_conf.get("enabled", False)]
             
+            # 💡 캐시에서 불러올 때도 다시 한번 유니코드 파쇄
             if "url" in conf: conf["url"] = sanitize_camera_url(conf["url"])
             conf["terminal_id"] = str(conf.get("terminal_id", self.common_config.get("terminal_id", "99999")))
             

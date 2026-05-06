@@ -361,7 +361,8 @@ def main():
                         continue
                         
                     std_val = np.std(frame)
-                    if std_val < 10.0:  # 극도로 단조로운 이미지(깨진 화면) 드롭
+                    # 💡 방어 임계값을 10.0에서 2.0으로 대폭 하향 조정 (어두운 화면 등 오탐 방지)
+                    if std_val < 2.0:  
                         logger.debug(f"[CAM {c.cam_id}] Corrupted/Blank frame detected (std={std_val:.1f}). Dropping frame {fid}.")
                         continue
 

@@ -1,367 +1,406 @@
+import os
+import sys
+import time
+import gc
 import cv2
 import numpy as np
-import time
-import datetime
-import threading
-import os
-import logging
-import subprocess
 import psutil
-from collections import deque, defaultdict
-from common import (
-    SYS_CFG, EVENT_ROOT_DIR, WATCHDOG_TIMEOUT, STREAM_RECONNECT_DELAY_SEC, 
-    denormalize_roi_points, save_event_image_with_mark, ID_H_HELMET, ID_H_NO_HELMET, 
-    ID_G_PERSON, ID_G_CAR, ID_G_TRUCK, ID_PERSON_LOW, ID_REFLECTIVE_VEST,
-    calculate_iou
-)
-from event import MotionDetector, EVENT_REGISTRY
-from ai_core import SORTTracker
+import threading
+import concurrent.futures
+import logging
+import traceback
+import math
+import shutil
+import subprocess
+
+from common import (SYS_CFG, CAMERA_LIST_FILE, CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE, 
+                    ConfigManager, create_mosaic_image, extract_ip, normalize_roi_points, 
+                    BATCH_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, setup_logging, load_rtsp_list_from_csv,
+                    save_json_file)
+from event import EVENT_REGISTRY
+from ai_core import VisionModelAsync
+from camera import Camera
 
 logger = logging.getLogger("VMS_SYSTEM")
 
-class FrameReader:
-    def __init__(self, url, ip):
-        self.url = url.replace(" ", "").replace("\n", "").replace("\r", "").strip()
-        self.ip = ip
-        self.lock = threading.Lock()
-        self.frame = None
-        self.fid = 0
-        self.running = True
-        self.connected = False
-        self.last_frame_time = time.time()
-        
-        self.out_w = 640
-        self.out_h = 480
-        
-        self.target_fps = SYS_CFG.get("REC_FPS", 3)
-        
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-
-    def _run(self):
-        # 💡 OpenCV FFmpeg 백엔드 최적화 환경변수 주입 (TCP 강제, 타임아웃 설정)
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
-        
-        while self.running:
-            self.connected = False
-            
-            # 💡 서브프로세스 제거 및 OpenCV VideoCapture 단일화 적용
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-            
-            if not cap.isOpened():
-                time.sleep(STREAM_RECONNECT_DELAY_SEC)
-                continue
-                
-            self.connected = True
-            logger.info(f"[{self.ip}] 스트림 연결 성공 (OpenCV VideoCapture)")
-            
-            last_read_time = time.time()
-            
-            while self.running:
-                ret, frame = cap.read()
-                
-                if not ret:
-                    logger.warning(f"[{self.ip}] 프레임 수신 실패, 재연결을 시도합니다.")
+def get_system_metrics():
+    cpu_usage = psutil.cpu_percent(interval=None)
+    cpu_temp = "N/A"
+    chip_temp = "N/A"
+    
+    try:
+        if hasattr(psutil, "sensors_temperatures"):
+            temps = psutil.sensors_temperatures()
+            for name in ['cpu_thermal', 'cpu-thermal', 'coretemp', 'k10temp', 'soc_therm']:
+                if name in temps and temps[name]:
+                    cpu_temp = f"{temps[name][0].current:.1f}°C"
                     break
-                
-                now = time.time()
-                # 💡 목표 FPS에 맞춘 프레임 솎아내기 (CPU 연산 낭비 방지)
-                if now - last_read_time >= (1.0 / self.target_fps):
-                    try:
-                        frame = cv2.resize(frame, (self.out_w, self.out_h))
-                        with self.lock:
-                            self.frame = frame
-                            self.fid += 1
-                            self.last_frame_time = now
-                        last_read_time = now
-                    except Exception as e:
-                        logger.debug(f"[{self.ip}] 프레임 리사이즈/할당 에러: {e}")
-                        break
-                    
-            cap.release()
-            self.connected = False
-            
-            if self.running: 
-                time.sleep(STREAM_RECONNECT_DELAY_SEC)
-
-    def read(self):
-        with self.lock: 
-            return (None, self.fid, False) if time.time() - self.last_frame_time > WATCHDOG_TIMEOUT else (self.frame, self.fid, self.connected)
-            
-    def stop(self, join_timeout=3.0):
-        self.running = False
-        if self.thread.is_alive(): 
-            self.thread.join(timeout=join_timeout)
-
-class Camera:
-    def __init__(self, ip, conf, face_engine, cam_id, sensitivity):
-        self.ip = ip
-        self.conf = conf 
-        self.reader = FrameReader(conf['url'], ip)
-        self.terminal_id = str(conf.get('terminal_id', SYS_CFG.get("terminal_id", "99999")))
-        self.cctv_id = int(conf.get('cctv_id', 1))
-        self.event_config = conf.get('event_config', {})
-        self.roi_poly_norm = conf.get('roi_poly_norm', [])
-        self.roi_lines_norm = conf.get('roi_lines_norm', [])
-        self.using_normalized_roi = bool(self.roi_poly_norm or self.roi_lines_norm)
-        self.roi_poly = []
-        self.roi_lines = []
-        self.events = conf.get('events', [])
-        self.face_detector = face_engine
-        self.cam_id = cam_id 
-        self.last_submit_fid = -1
-        
-        main_conf = SYS_CFG.get("model_confidences", {}).get("MAIN", 0.40)
-        self.face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
-        self.helmet_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.45) 
-        
-        self.fps = SYS_CFG.get("REC_FPS", 3)
-        self.skip = SYS_CFG.get("SKIP_FRAMES", 1)
-        
-        track_buffer_sec = SYS_CFG.get("track_buffer_sec", 1.5)
-        target_buffer = max(1, int(track_buffer_sec * (self.fps / self.skip)))
-        
-        self.main_tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=False)
-        self.helmet_tracker = SORTTracker(track_thresh=self.helmet_conf, track_buffer=target_buffer, is_helmet=True)
-        
-        self.alerted = defaultdict(set)
-        self.last_evt_t = {}
-        self.visual_alarms = {}
-        self.face_blur_cache = {}
-        self.roi_frame_shape = None
-        self.config_lock = threading.Lock() 
-        self.motion_det = MotionDetector(sensitivity)
-        
-        self.obj_history = {}
-        self.delayed_logs = []
-        
-        self.pre_log_sec = SYS_CFG.get("event_pre_log_sec", 2.0)
-        self.post_log_sec = SYS_CFG.get("event_post_log_sec", 2.0)
-        
-        self.frame_buffer = {}
-        self.latest_display_frame = None
-        
-        self.init_handlers()
-
-    def buffer_frame(self, fid, frame):
-        self.frame_buffer[fid] = frame.copy()
-        buffer_limit = self.fps * 5
-        keys = list(self.frame_buffer.keys())
-        for k in keys:
-            if fid - k > buffer_limit:
-                del self.frame_buffer[k]
-                
-    def get_buffered_frame(self, fid):
-        return self.frame_buffer.get(fid, None)
-
-    def _update_runtime_roi(self, frame_shape):
-        if not self.using_normalized_roi or self.roi_frame_shape == frame_shape[:2]: 
-            return
-        h, w = frame_shape[:2]
-        self.roi_poly = denormalize_roi_points(self.roi_poly_norm, w, h)
-        self.roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h)
-        self.roi_frame_shape = frame_shape[:2]
-        self.init_handlers()
-
-    def init_handlers(self):
-        self.handlers = []
-        for evt in self.events:
-            if evt in EVENT_REGISTRY:
-                self.handlers.append(EVENT_REGISTRY[evt](self.event_config.get(evt, {}), self.roi_poly, self.roi_lines))
-
-    def _apply_face_blur(self, image):
-        if self.face_detector is None: 
-            return image
+    except Exception: pass
+    
+    if cpu_temp == "N/A" and os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
         try:
-            for fx1, fy1, fx2, fy2, fscore, _ in self.face_detector.infer(image):
-                if fscore <= self.face_conf: 
-                    continue
-                fx1 = max(0, int(fx1))
-                fy1 = max(0, int(fy1))
-                fx2 = int(fx2)
-                fy2 = int(fy2)
-                fh = fy2 - fy1
-                fw = fx2 - fx1
-                if fw > image.shape[1] * 0.8 or fh > image.shape[0] * 0.8 or image[fy1:fy2, fx1:fx2].size == 0: 
-                    continue
-                small = cv2.resize(image[fy1:fy2, fx1:fx2], (fw // 15 + 1, fh // 15 + 1), interpolation=cv2.INTER_LINEAR)
-                image[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
-        except Exception: 
-            pass
-        return image
+            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                cpu_temp = f"{int(f.read().strip()) / 1000.0:.1f}°C"
+        except Exception: pass
 
-    def _snap_tracks_to_raw(self, tracks, raw_boxes):
-        if raw_boxes is None or len(raw_boxes) == 0 or len(tracks) == 0:
-            return tracks
+    try:
+        if shutil.which("nvidia-smi"):
+            out = subprocess.check_output(["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"], stderr=subprocess.DEVNULL, text=True)
+            chip_temp = f"{out.strip()}°C (NV-GPU)"
+        elif shutil.which("vcgencmd"):
+            out = subprocess.check_output(["vcgencmd", "measure_temp"], stderr=subprocess.DEVNULL, text=True)
+            temp_val = out.replace("temp=", "").replace("'C", "").strip()
+            chip_temp = f"{temp_val}°C (RPI-GPU)"
+    except Exception: pass
+    
+    return cpu_usage, cpu_temp, chip_temp
+
+def capture_snapshot_clean(camera_obj):
+    start_time = time.time()
+    valid_frame = None
+    
+    while time.time() - start_time < 20.0:
+        frame, _, connected = camera_obj.reader.read()
+        
+        if connected and frame is not None:
+            mean_val = np.mean(frame)
+            std_val = np.std(frame)
+            is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
+            if not is_corrupted:
+                valid_frame = frame
+                break
+        time.sleep(0.5)
+        
+    return valid_frame
+
+def get_roi_points_scaled(frame, title, mode="poly"):
+    pts = []
+    orig_h, orig_w = frame.shape[:2]
+    disp_w = 960
+    scale = disp_w / orig_w
+    disp_h = int(orig_h * scale)
+    disp_frame = cv2.resize(frame, (disp_w, disp_h))
+    
+    wname = "ROI Setup Window"
+    cv2.namedWindow(wname, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(wname, disp_w, disp_h)
+    
+    def mouse_cb(e, x, y, f, p):
+        if e == cv2.EVENT_LBUTTONDOWN:
+            if mode == "line" and len(pts) >= 2: return
+            pts.append([int(x / scale), int(y / scale)])
             
-        snapped_tracks = []
-        for t in tracks:
-            tx1, ty1, tx2, ty2, tid, conf, cls_id = t
-            best_iou = 0
-            best_raw = None
+    cv2.setMouseCallback(wname, mouse_cb)
+    print(f"[{title}] 그리기 모드. 점을 찍고 Enter(완료) 또는 ESC(취소). Line 모드는 2점.")
+    
+    while True:
+        temp = disp_frame.copy()
+        dp = [[int(p[0] * scale), int(p[1] * scale)] for p in pts]
+        cv2.putText(temp, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        if mode == "line":
+            if len(dp) == 1: cv2.circle(temp, tuple(dp[0]), 5, (0, 0, 255), -1)
+            elif len(dp) == 2: cv2.line(temp, tuple(dp[0]), tuple(dp[1]), (0, 0, 255), 2)
+        else:
+            if len(dp) > 0: cv2.polylines(temp, [np.array(dp, np.int32)], True, (0, 255, 0), 2)
+                
+        cv2.imshow(wname, temp)
+        k = cv2.waitKey(1)
+        if k == 13: break 
+        if k == 27:
+            pts = []
+            break 
+        if mode == "line" and len(pts) == 2:
+            cv2.waitKey(500)
+            break
             
-            for rb in raw_boxes:
-                if int(rb[5]) == int(cls_id):
-                    iou = calculate_iou((tx1, ty1, tx2, ty2), rb[:4])
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_raw = rb
+    cv2.destroyWindow(wname)
+    return normalize_roi_points(pts, orig_w, orig_h)
+
+def run_wizard_batch_mode(config_manager, active_cameras):
+    total = len(active_cameras)
+    if total == 0: return logger.warning("설정할 카메라가 없습니다.")
+        
+    available_events = list(EVENT_REGISTRY.values())
+    menu_str = " ".join([f"{i+1}.{evt.menu_name}" for i, evt in enumerate(available_events)])
+    
+    for i in range(0, total, BATCH_SIZE):
+        batch_cams = active_cameras[i : i + BATCH_SIZE]
+        frames = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
+            frames = list(executor.map(capture_snapshot_clean, batch_cams))
+            
+        display_frames = []
+        for idx, frm in enumerate(frames):
+            if frm is None:
+                blk = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(blk, "Conn Fail", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                display_frames.append(blk)
+            else:
+                display_frames.append(frm)
+                
+        mosaic = create_mosaic_image(display_frames)
+        cols = max(1, math.ceil(math.sqrt(len(display_frames))))
+        cw = SCREEN_WIDTH // cols
+        ch = SCREEN_HEIGHT // max(1, math.ceil(len(display_frames) / cols))
+        
+        for idx in range(len(display_frames)):
+            r, c = divmod(idx, cols)
+            cx, cy = c * cw, r * ch
+            cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
+            cv2.putText(mosaic, str(idx + 1), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
+            
+        cv2.namedWindow("Select Cameras", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Select Cameras", 1280, 720)
+        cv2.imshow("Select Cameras", mosaic)
+        cv2.waitKey(1)
+        
+        sel = input(">> 선택 (예: 1,3,5): ").strip()
+        selected_indices = []
+        if sel:
+            for n in [int(s.strip()) for s in sel.split(',') if s.strip().isdigit()]:
+                if 1 <= n <= len(batch_cams): selected_indices.append(i + (n - 1))
+        cv2.destroyWindow("Select Cameras")
+        
+        for idx in selected_indices:
+            cam = active_cameras[idx]
+            ip = cam.ip
+            url = cam.reader.url
+            frame = capture_snapshot_clean(cam)
+            
+            if frame is None: continue
+                
+            height, width = frame.shape[:2]
+            ratio = 960 / width
+            preview = cv2.resize(frame, (960, int(height * ratio)))
+            
+            win_name = "Camera Check"
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win_name, 960, int(height * ratio))
+            cv2.imshow(win_name, preview)
+            cv2.moveWindow(win_name, 100, 100)
+            cv2.waitKey(1)
+            
+            print(f"[{ip}]")
+            print(menu_str)
+            sel = input(">> 이벤트 선택 (예: 1,4,5): ")
+            cv2.destroyWindow(win_name)
+            
+            events = []
+            needs_poly = False
+            needs_line = False
+            for evt_idx, evt_class in enumerate(available_events):
+                if str(evt_idx + 1) in sel:
+                    events.append(evt_class.event_name)
+                    if evt_class.roi_type == "polygon": needs_poly = True
+                    if evt_class.roi_type == "line": needs_line = True
+            
+            roi_p = []
+            roi_l = []
+            if needs_poly: roi_p = get_roi_points_scaled(frame, "Polygon")
+            if needs_line:
+                while True:
+                    l = get_roi_points_scaled(frame, "Line", mode="line")
+                    if len(l) == 2: roi_l.extend(l)
+                    if input("    라인 추가? (y/n): ") != 'y': break
+            
+            config_manager.set_config(ip, {"url": url, "roi_poly_norm": roi_p, "roi_lines_norm": roi_l, "events": events})
+            
+            cam.events = events
+            cam.roi_poly_norm = roi_p
+            cam.roi_lines_norm = roi_l
+            cam.using_normalized_roi = bool(roi_p or roi_l)
+            cam.init_handlers()
+
+def prompt_runtime_options():
+    current_terminal_id = str(SYS_CFG.get("terminal_id", "99999"))
+    if current_terminal_id == "99999":
+        print("\n⚠️ [경고] 현재 단말기 ID(terminal_id)가 초기값(99999)으로 설정되어 있습니다.")
+        val_tid = input(">> 배정받은 실제 단말기 ID를 입력해주세요 (예: 3): ").strip()
+        if val_tid:
+            SYS_CFG["terminal_id"] = val_tid
+            save_json_file(CONFIG_COMMON_FILE, SYS_CFG)
+            print(f"✅ 단말기 ID가 '{val_tid}'(으)로 업데이트 되었습니다.")
+            
+    sensitivity = 5
+    try:
+        val = input("\n>> 움직임 감지 민감도 설정 (1-10, 엔터시 기본값 5): ")
+        if val.strip(): sensitivity = max(1, min(10, int(val)))
+    except Exception: pass
+        
+    val_disp = input(">> 모니터링 화면(GUI)을 출력하시겠습니까? (y/N, 기본값 y): ").strip().lower()
+    use_display = False if val_disp == 'n' else True
+    
+    use_drawing = True
+    if use_display:
+        val_draw = input(">> 화면에 박스 및 텍스트(시각화)를 그리시겠습니까? (y/N, 기본값 y): ").strip().lower()
+        use_drawing = False if val_draw == 'n' else True
+    else: use_drawing = False
+        
+    return sensitivity, use_display, use_drawing
+
+def prepare_config_manager(rtsp_list):
+    config_manager = ConfigManager(CONFIG_COMMON_FILE, CONFIG_CAMERAS_FILE)
+    
+    added_new = False
+    for url in rtsp_list:
+        ip = extract_ip(url)
+        if ip not in config_manager.camera_configs:
+            config_manager.camera_configs[ip] = {"url": url, "events": [], "roi_poly_norm": [], "roi_lines_norm": []}
+            added_new = True
+
+    for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
+        config_manager.camera_configs[ip]["cctv_id"] = idx
+        
+    if added_new:
+        config_manager.save()
+        config_manager.config = config_manager.build_runtime_config()
+
+    return config_manager
+
+def process_async_results(c, fid, raw_boxes, use_drawing):
+    buffered_frame = c.get_buffered_frame(fid)
+    if buffered_frame is None: return
+    
+    t_main, alarms = c.run_logic(buffered_frame, fid, raw_boxes)
+    
+    if use_drawing:
+        drawn = c.draw(buffered_frame, t_main, alarms, connected=True)
+        c.latest_display_frame = cv2.resize(drawn, (640, 360))
+    else:
+        c.latest_display_frame = cv2.resize(buffered_frame, (640, 360))
+
+def main():
+    setup_logging(SYS_CFG)
+    logger.info("="*60)
+    logger.info("🚀 [VMS 시스템] 모듈형 Async(원패스 통합모델) 프로덕션 부팅")
+    logger.info("="*60)
+    
+    rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
+    
+    if not rtsp_list:
+        logger.error(f"❌ 설정된 카메라가 없습니다. '{CAMERA_LIST_FILE}' 파일에 RTSP 주소가 입력되어 있는지 확인하십시오.")
+        sys.exit(1)
+
+    cams = [] 
+    
+    try:
+        sensitivity, use_display, use_drawing = prompt_runtime_options()
+        config_manager = prepare_config_manager(rtsp_list)
+
+        engine_main = VisionModelAsync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.dxnn"))
+        face_engine = VisionModelAsync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
+        
+        logger.info("카메라 백그라운드 리더 스레드를 초기화합니다...")
+        
+        for i, rtsp in enumerate(rtsp_list):
+            ip = extract_ip(rtsp)
+            conf = config_manager.get_config(ip)
+            if not conf:
+                conf = {"url": rtsp, "events": []}
+            cams.append(Camera(ip, conf, face_engine, len(cams) + 1, sensitivity))
+
+        val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
+        if val_setup == 'y':
+            print("카메라 스트림 안정화를 위해 3초 대기합니다...")
+            time.sleep(3)
+            run_wizard_batch_mode(config_manager, cams)
+            
+            for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
+                config_manager.camera_configs[ip]["cctv_id"] = idx
+            config_manager.save()
+            config_manager.config = config_manager.build_runtime_config()
+            
+        active_cams = [c for c in cams if len(c.events) > 0]
+        inactive_cams = [c for c in cams if len(c.events) == 0]
+        
+        for c in inactive_cams:
+            c.stop()
+            
+        cams = active_cams
+
+        if not cams: 
+            return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
+
+        target_fps = SYS_CFG.get("REC_FPS", 30)
+        dynamic_delay = 1.0 / target_fps
+        loop_count = 0 
+        
+        logger.info("모니터링 시작 (Async One-Pass Pipeline 가동 - 종료: Ctrl+C 또는 'q')")
+        
+        while True:
+            start_time = time.time()
+            cpu_usage, cpu_temp, chip_temp = get_system_metrics()
+            
+            if cpu_usage > 85:
+                target_fps = max(5, target_fps - 2)
+            elif cpu_usage < 60:
+                target_fps = min(SYS_CFG.get("REC_FPS", 30), target_fps + 1)
+                
+            dynamic_delay = 1.0 / target_fps
+
+            if loop_count % (target_fps * 10) == 0:
+                alive_cams = sum(1 for c in cams if c.reader.connected)
+                logger.info(f"💓 [STATUS] Active Cams: {alive_cams}/{len(cams)} | CPU: {cpu_usage}% ({cpu_temp}) | CHIP: {chip_temp}")
+                
+            loop_count += 1
+            if loop_count % 300 == 0: gc.collect()
+            
+            for c in cams:
+                frame, fid, connected = c.reader.read()
+                if not connected:
+                    if use_display and use_drawing:
+                        c.latest_display_frame = c.draw(None, [], {}, connected=False)
+                    continue
+                
+                if frame is not None and fid > c.last_submit_fid:
+                    if frame.size == 0 or len(frame.shape) != 3:
+                        logger.debug(f"[CAM {c.cam_id}] Shape error detected. Dropping frame {fid}.")
+                        continue
                         
-            if best_iou > 0.05 and best_raw is not None:
-                snapped_tracks.append([best_raw[0], best_raw[1], best_raw[2], best_raw[3], tid, best_raw[4], cls_id])
-            else:
-                snapped_tracks.append(t)
+                    std_val = np.std(frame)
+                    # 💡 방어 임계값을 10.0에서 2.0으로 대폭 하향 조정 (어두운 화면 등 오탐 방지)
+                    if std_val < 2.0:  
+                        logger.debug(f"[CAM {c.cam_id}] Corrupted/Blank frame detected (std={std_val:.1f}). Dropping frame {fid}.")
+                        continue
+
+                    if fid % SYS_CFG.get("SKIP_FRAMES", 1) == 0:
+                        c.buffer_frame(fid, frame)
+                        engine_main.infer_async(frame, context={'cam_id': c.cam_id, 'fid': fid})
+                    c.last_submit_fid = fid
+
+            while True:
+                res = engine_main.get_result()
+                if not res: break
                 
-        return snapped_tracks
-
-    def run_logic(self, frame, frame_id, raw_boxes=None):
-        with self.config_lock:
-            self._update_runtime_roi(frame.shape)
-            motion_mask = self.motion_det.apply(frame) 
-            
-            main_boxes = []
-            helmet_boxes = []
-            
-            if raw_boxes is not None:
-                for b in raw_boxes:
-                    cls_raw = int(b[5])
-                    if cls_raw in (ID_H_HELMET, ID_H_NO_HELMET):
-                        helmet_boxes.append(b)
-                    else:
-                        main_boxes.append(b)
-            
-            current_obj_count = len(main_boxes)
-            self.obj_history[frame_id] = current_obj_count
-            
-            for k in list(self.obj_history.keys()):
-                if frame_id - k > self.fps * 10:  
-                    del self.obj_history[k]
-                    
-            remaining_logs = []
-            for dlog in self.delayed_logs:
-                if frame_id >= dlog['target_fid_to_log']:
-                    before_fid = dlog['trigger_fid'] - int(self.pre_log_sec * self.fps)
-                    before_count = self.obj_history.get(before_fid, "Unknown")
-                    trigger_count = self.obj_history.get(dlog['trigger_fid'], "Unknown")
-                    after_count = current_obj_count
-                    
-                    logger.info(f"🚨 [EVENT] CAM:{self.cam_id} | Type:{dlog['event_name']} | "
-                                f"Triggered At:{dlog['time_str']} | "
-                                f"Obj Count -> -{self.pre_log_sec}s: {before_count} | 0s: {trigger_count} | +{self.post_log_sec}s: {after_count}")
-                else:
-                    remaining_logs.append(dlog)
-            self.delayed_logs = remaining_logs
-            
-            main_tracks = self.main_tracker.update(np.array(main_boxes)) if len(main_boxes) > 0 else self.main_tracker.predict_only()
-            main_tracks = self._snap_tracks_to_raw(main_tracks, main_boxes)
+                cam_id, fid = res['context']['cam_id'], res['context']['fid']
+                raw_boxes = res['boxes']
                 
-            helmet_tracks = []
-            if "no_helmet" in self.events:
-                helmet_tracks = self.helmet_tracker.update(np.array(helmet_boxes)) if len(helmet_boxes) > 0 else self.helmet_tracker.predict_only()
-                helmet_tracks = self._snap_tracks_to_raw(helmet_tracks, helmet_boxes)
+                c = next((cam for cam in cams if cam.cam_id == cam_id), None)
+                if c:
+                    process_async_results(c, fid, raw_boxes, use_drawing)
 
-            now = time.time()
-            current_alarms = {}
-            track_map = {int(t[4]): int(t[6]) for t in main_tracks}
-            
-            for handler in self.handlers:
-                for evt in handler.process(main_tracks, track_map, motion_mask, frame, frame_id, helmet_tracks=helmet_tracks, raw_helmet_boxes=helmet_boxes):
-                    draw_tid = evt['tid'] 
-                    self._trigger_event(frame, frame_id, draw_tid, handler.event_name, main_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
-                    current_alarms[draw_tid] = handler.event_name
-            
-            for tid, ename in current_alarms.items(): 
-                self.visual_alarms[tid] = {'evt': ename, 'expire': now + SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0)}
-                
-            for tid in list(self.visual_alarms.keys()):
-                if now > self.visual_alarms[tid]['expire']: 
-                    del self.visual_alarms[tid]
-                    
-            return main_tracks, {tid: info['evt'] for tid, info in self.visual_alarms.items()}
+            if use_display:
+                final_imgs = [c.latest_display_frame for c in cams if c.latest_display_frame is not None]
+                if final_imgs:
+                    mosaic = create_mosaic_image(final_imgs)
+                    if mosaic is not None: cv2.imshow("VMS Monitor", mosaic)
+                    if cv2.waitKey(1) == ord('q'): break
 
-    def _trigger_event(self, frame, frame_id, tid, event_name, tracks, now, event_frame=None, event_bbox=None, event_fid=None):
-        real_tid = tid
-        if event_name in self.alerted[tid] or now - self.last_evt_t.get(event_name, -999999) < self.event_config.get(event_name, {}).get('cooldown_sec', 600): 
-            return
-            
-        bbox = event_bbox if event_bbox is not None else next((t[:4] for t in tracks if int(t[4]) == real_tid), None)
-        if bbox is None: 
-            return
-            
-        source_fid = event_fid if event_fid is not None else frame_id
-        source_frame = event_frame if event_frame is not None else frame
-        
-        self.delayed_logs.append({
-            'event_name': event_name,
-            'trigger_fid': source_fid,
-            'target_fid_to_log': source_fid + int(self.post_log_sec * self.fps),
-            'time_str': datetime.datetime.now().strftime('%H:%M:%S')
-        })
-        
-        if event_frame is None:
-            if frame_id not in self.face_blur_cache:
-                self.face_blur_cache[frame_id] = self._apply_face_blur(source_frame.copy())
-                if len(self.face_blur_cache) > 5: 
-                    self.face_blur_cache.pop(next(iter(self.face_blur_cache)))
-            saved_img = self.face_blur_cache[frame_id]
-        else: 
-            saved_img = self._apply_face_blur(source_frame.copy())
-            
-        save_event_image_with_mark(saved_img, self.ip, event_name, bbox, real_tid, terminal_id=self.terminal_id, cctv_id=self.cctv_id)
-        
-        self.alerted[tid].add(event_name)
-        self.last_evt_t[event_name] = now
+            sleep_time = dynamic_delay - (time.time() - start_time)
+            if sleep_time > 0: time.sleep(sleep_time)
 
-    def draw(self, frame, tracks, alarms, connected=True):
-        if frame is None or not connected:
-            blank = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 1)
-            return blank
-            
-        h_frame, w_frame = frame.shape[:2]
-        
-        if len(alarms) > 0: 
-            cv2.rectangle(frame, (0, 0), (w_frame, h_frame), (0, 0, 255), 4)
-            
-        if self.roi_poly: 
-            cv2.polylines(frame, [np.array(self.roi_poly, np.int32)], True, (0,255,255), 1)
-            
-        if self.roi_lines:
-            for i in range(0, len(self.roi_lines) - 1, 2): 
-                cv2.line(frame, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0,0,255), 1)
-        
-        for t in tracks:
-            x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
-            tid, cls_id = int(tid), int(cls_id)
-            
-            if cls_id == ID_H_HELMET: color, label = (255, 0, 0), "Helmet"
-            elif cls_id == ID_H_NO_HELMET: color, label = (0, 0, 255), "No-Helmet"
-            elif cls_id == ID_G_PERSON: color, label = (0, 255, 0), "Person"
-            elif cls_id == ID_G_CAR: color, label = (255, 100, 0), "Car"
-            elif cls_id == ID_G_TRUCK: color, label = (255, 100, 0), "Truck"
-            elif cls_id == ID_PERSON_LOW: color, label = (0, 255, 100), "LowBody"
-            elif cls_id == ID_REFLECTIVE_VEST: color, label = (255, 255, 0), "Vest"
-            else: color, label = (255, 255, 255), "OBJ"
-            
-            if tid in alarms: color, label = (0, 0, 255), f"ALARM: {label}"
-                
-            thickness = 2 if tid in alarms else 1
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
-            cv2.putText(frame, f"{label} [{tid}]", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            
-        cv2.rectangle(frame, (0, 0), (60, 40), (0, 0, 0), -1)
-        cv2.putText(frame, f"C{self.cam_id}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
-        active_alarms = set(alarms.values())
-        for i, handler in enumerate(self.handlers):
-            if handler.event_name in active_alarms:
-                color, text = (0, 0, 255), f"[!] {handler.gui_name}"
-            else:
-                color, text = (0, 255, 0), f" -  {handler.gui_name}"
-            cv2.putText(frame, text, (10, h_frame - 15 - (len(self.handlers)-1-i)*20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            
-        return frame
+    except KeyboardInterrupt:
+        logger.info("모니터링 중단 (사용자 요청).")
+    except Exception as e:
+        logger.error(f"예외 발생: {e}")
+        traceback.print_exc()
+    finally:
+        logger.info("시스템 자원을 정리하고 안전하게 종료합니다...")
+        for c in cams: c.stop()
+        cv2.destroyAllWindows()
+        os._exit(0)
 
-    def stop(self):
-        self.reader.stop()
+if __name__ == "__main__":
+    main()
