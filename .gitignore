@@ -8,6 +8,8 @@ logs/*
 *.weights
 *.engine
 *.dxnn
+*.pt
+*.onnx
 CCTV_EVENT_ALERT/events
 config/system_config.json
 config/cameras.json
