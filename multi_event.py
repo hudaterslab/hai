@@ -1321,7 +1321,7 @@ class Camera:
             self.roi_poly = denormalize_roi_points(self.roi_poly_norm, width, height)
         if self.roi_lines_norm:
             self.roi_lines = denormalize_roi_points(self.roi_lines_norm, width, height)
-            
+
         # ROI가 스케일링 되었으므로, 이벤트 핸들러에도 새 좌표를 주입하여 갱신합니다.
         for ename in self.events:
             if ename in EVENT_REGISTRY:
@@ -1362,10 +1362,14 @@ class Camera:
             
         return blur_img
 
-    def run_logic(self, fr, fid, d_main_res, d_helmet_res):
+def run_logic(self, fr, fid, d_main_res, d_helmet_res):
+        # 💡 [핵심 방어] 프레임이 None인 경우(스트림 지연/유실) 즉시 빈 결과 반환하여 셧다운 방지
+        if fr is None:
+            return [], [], {}
+
         self._update_runtime_roi(fr.shape)
-        motion_mask = self.motion_det.apply(fr)
-        
+        motion_mask = self.motion_det.apply(fr) 
+
         # 메인 트래커 업데이트
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
