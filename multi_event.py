@@ -1363,6 +1363,7 @@ class Camera:
         return blur_img
 
     def run_logic(self, fr, fid, d_main_res, d_helmet_res):
+        
         if fr is None:
             return [], [], {}
         self._update_runtime_roi(fr.shape)
