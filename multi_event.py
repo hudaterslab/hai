@@ -1143,10 +1143,10 @@ def get_roi_points_scaled(frame, title, mode="poly"):
     cv2.destroyWindow(title)
     return normalize_roi_points(pts, orig_w, orig_h)
 
-def run_wizard_batch_mode(rtsp_list):
-    """설정 파일이 없을 때 GUI를 띄워 초기 설정을 진행합니다."""
+def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     logger.info("=== 설정 마법사 시작 ===")
-    configs = {}
+    # 기존 설정을 그대로 복사하여 기반으로 삼음
+    configs = existing_configs.copy() if existing_configs else {}
     
     for i in range(0, len(rtsp_list), BATCH_SIZE):
         batch = rtsp_list[i : i + BATCH_SIZE]
@@ -1301,22 +1301,34 @@ class Camera:
         self.last_evt_t = {}
         self.visual_alarms = {}
         
-        # 정규화 좌표가 있다면 화면 크기에 맞게 복원
-        if conf.get('roi_poly_norm'):
-            self.roi_poly = denormalize_roi_points(conf['roi_poly_norm'], SCREEN_WIDTH, SCREEN_HEIGHT)
-        else:
-            self.roi_poly = conf.get('roi_poly', [])
-            
-        if conf.get('roi_lines_norm'):
-            self.roi_lines = denormalize_roi_points(conf['roi_lines_norm'], SCREEN_WIDTH, SCREEN_HEIGHT)
-        else:
-            self.roi_lines = conf.get('roi_lines', [])
+        self.roi_poly_norm = conf.get('roi_poly_norm', [])
+        self.roi_lines_norm = conf.get('roi_lines_norm', [])
+        self.roi_poly = []
+        self.roi_lines = []
+        self.roi_frame_shape = None # 해상도 변경 감지용
         
         self.handlers = {}
         for ename in self.events:
             if ename in EVENT_REGISTRY:
+                self.handlers[ename] = EVENT_REGISTRY[ename](SYS_CFG.get("event_config", {}).get(ename, {}), self.roi_poly, self.roi_lines)
+
+    def _update_runtime_roi(self, frame_shape):
+        if self.roi_frame_shape == frame_shape[:2]:
+            return
+            
+        height, width = frame_shape[:2]
+        if self.roi_poly_norm:
+            self.roi_poly = denormalize_roi_points(self.roi_poly_norm, width, height)
+        if self.roi_lines_norm:
+            self.roi_lines = denormalize_roi_points(self.roi_lines_norm, width, height)
+            
+        # ROI가 스케일링 되었으므로, 이벤트 핸들러에도 새 좌표를 주입하여 갱신합니다.
+        for ename in self.events:
+            if ename in EVENT_REGISTRY:
                 event_cfg = SYS_CFG.get("event_config", {}).get(ename, {})
                 self.handlers[ename] = EVENT_REGISTRY[ename](event_cfg, self.roi_poly, self.roi_lines)
+                
+        self.roi_frame_shape = frame_shape[:2]
 
     def process_frame(self):
         fr, fid, connected = self.reader.read()
@@ -1351,7 +1363,8 @@ class Camera:
         return blur_img
 
     def run_logic(self, fr, fid, d_main_res, d_helmet_res):
-        motion_mask = self.motion_det.apply(fr) 
+        self._update_runtime_roi(fr.shape)
+        motion_mask = self.motion_det.apply(fr)
         
         # 메인 트래커 업데이트
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
@@ -1501,7 +1514,7 @@ def main():
         reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? (y/n): ").strip().lower()
         if reset_ans == 'y':
             logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
-            camera_configs = run_wizard_batch_mode(rtsp_list)
+            camera_configs = run_wizard_batch_mode(rtsp_list,camera_configs)
             try:
                 with open(config_file, 'w', encoding='utf-8') as f: 
                     json.dump(camera_configs, f, indent=4)
@@ -1509,7 +1522,7 @@ def main():
                 pass
     else:
         logger.warning("설정 파일(cameras.json)이 없어 터미널 마법사를 실행합니다.")
-        camera_configs = run_wizard_batch_mode(rtsp_list)
+        camera_configs = run_wizard_batch_mode(rtsp_list,{})
         try:
             with open(config_file, 'w', encoding='utf-8') as f: 
                 json.dump(camera_configs, f, indent=4)
