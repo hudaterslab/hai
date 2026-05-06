@@ -81,11 +81,11 @@ VISUAL_ALARM_DURATION = 5.0
 EVENT_COOLDOWN_SEC = 600
 
 MODEL_HELMET_PATH   = "helmet_3cls_v8.dxnn"
-MODEL_GENERAL_PATH = "YOLOV8M-1.dxnn"
+MODEL_GENERAL_PATH = "hanjin_cctv.dxnn"
 MODEL_FACE_PATH = "YOLOV7_Face-1.dxnn"
 
 ID_H_HELMET = 0; ID_H_NO_HELMET = 1; ID_H_PERSON = 2
-ID_G_PERSON = 0; ID_G_CAR = 2; ID_G_BUS = 5; ID_G_TRUCK = 7
+ID_G_PERSON = 2; ID_G_CAR = 3; ID_G_BUS = 5; ID_G_TRUCK = 6; ID_PERSON_LOW = 4
 TARGET_VEHICLES = [ID_G_CAR, ID_G_BUS, ID_G_TRUCK]
 
 IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -331,36 +331,41 @@ def _save_and_send_task(img, img_path, api_params):
     except Exception as e:
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
-def save_event_image_with_mark(frame, ip, event_type, bbox, tid):
-    if IMAGE_SAVER_POOL._work_queue.qsize() > MAX_SAVE_QUEUE: return
+def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="3", cctv_id=1):
+    # Python 3.9+ 에서는 _work_queue 접근보다 Bounded 큐를 사용하는 것이 권장되나, 
+    # 기존 코드의 호환성을 위해 안전하게 예외처리로 감쌌습니다.
+    try:
+        if IMAGE_SAVER_POOL._work_queue.qsize() > MAX_SAVE_QUEUE: 
+            return
+    except AttributeError:
+        pass
+        
     try:
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
         now = datetime.datetime.now()
-        msg = f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}"
-        cv2.putText(img, msg, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(img, f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         
-        dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
-        if not os.path.exists(dpath): 
-            os.makedirs(dpath)
+        if str(terminal_id) == "99999": 
+            cv2.putText(img, "[ TEST IMAGE ]", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             
-        fname = f"{now.strftime('%Y%m%d_%H%M%S')}_{ip}_{event_type}_{tid}.jpg"
-        img_path = os.path.join(dpath, fname)
-        h, w = frame.shape[:2]
+        dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
+        os.makedirs(dpath, exist_ok=True)
+        img_path = os.path.join(dpath, f"{now.strftime('%Y%m%d_%H%M%S')}_{ip}_{event_type}_{tid}.jpg")
         
-        ai_detected_bboxes = [{"id": tid, "box": [x1, y1, x2, y2], "label": event_type}]
-        api_params = {
-            'event_name': event_type,
-            'terminal_id': "3",
-            'cctv_id': 1,            
-            'bboxes': ai_detected_bboxes,
-            'img_width': w,
-            'img_height': h
+        params = {
+            'ip': ip, 
+            'event_name': event_type, 
+            'terminal_id': str(terminal_id),
+            'cctv_id': int(cctv_id), 
+            'bboxes': [{"id": tid, "box": [x1, y1, x2, y2], "label": event_type}],
+            'img_width': frame.shape[1], 
+            'img_height': frame.shape[0]
         }
-        IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, api_params)
+        IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, params)
     except Exception as e: 
-        logger.error(f"[EventLogic Error] {e}")
+        logger.error(f"⚠️ [이벤트 마킹 실패]: {e}")
 
 # ==========================================
 # 영상 녹화기
@@ -455,16 +460,27 @@ class SimpleTracker:
         return np.array(res_tracks)
 
 class ConfigManager:
-    def __init__(self, filepath): self.filepath = filepath; self.config = self.load()
+    def __init__(self, filepath): 
+        self.filepath = filepath
+        self.config = self.load()
+        
     def load(self):
         if not os.path.exists(self.filepath): return {}
         try:
-            data = json.load(open(self.filepath, 'r', encoding='utf-8'))
+            # FIX 2: Resource Leak 방지를 위한 with 구문 적용
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             for ip, info in data.items():
                 if 'url' in info: info['url'] = info['url'].strip()
             return data
-        except: return {}
-    def save(self): json.dump(self.config, open(self.filepath, 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
+        except Exception as e: 
+            logger.error(f"Config load error: {e}")
+            return {}
+            
+    def save(self): 
+        with open(self.filepath, 'w', encoding='utf-8') as f:
+            json.dump(self.config, f, indent=4, ensure_ascii=False)
+            
     def get_config(self, ip): return self.config.get(ip, None)
     def set_config(self, ip, data): self.config[ip] = data; self.save()
     def clear_all(self): self.config = {}; self.save()
@@ -475,7 +491,6 @@ class ConfigManager:
 class YoLoDeepX:
     def __init__(self, engine_path):
         self.engine_path = engine_path
-        # 💡 [핵심] 파일명에 'v7'이 포함되어 있으면 YOLOv7 후처리 로직(Objectness 분리)을 사용
         self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
         try:
             io = InferenceOption()
@@ -499,29 +514,24 @@ class YoLoDeepX:
         try:
             pred = np.array(output_tensor[0])
             
-            # YOLOv8의 경우 [batch, num_classes+4, num_boxes] 배열일 수 있으므로 동적 트랜스포즈
             if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
                 pred = pred.transpose((0, 2, 1))
             
             if pred.ndim == 3:
-                pred = pred[0] # batch 차원 제거 -> [N, C]
+                pred = pred[0] 
             
             C = pred.shape[1]
             
-            # 💡 [완벽한 해결책] YOLOv7과 YOLOv8의 Tensor 배열 구조를 구분하여 파싱
             if self.is_yolov7 or C == 6 or C == 85:
-                # YOLOv7 Format: 5번째 인덱스가 Objectness(객체 존재 여부)
                 obj_conf = pred[:, 4]
                 if C > 5:
                     cls_conf = pred[:, 5:]
                     scores = obj_conf * np.max(cls_conf, axis=1)
                     class_ids = np.argmax(cls_conf, axis=1)
                 else:
-                    # 완벽한 1-Class 전용 모델일 경우
                     scores = obj_conf
                     class_ids = np.zeros(len(scores), dtype=int)
             else:
-                # YOLOv8 Format: Objectness 없이 4번부터 바로 Class Confidence 시작
                 scores = np.max(pred[:, 4:], axis=1)
                 class_ids = np.argmax(pred[:, 4:], axis=1)
 
@@ -560,7 +570,6 @@ class YoLoDeepX:
         
         try:
             output_tensor = self.engine.run([npu_input_rgb])
-            # 💡 v7 얼굴 모델은 보수적 감지를 위해 임계값을 살짝 낮춥니다 (오탐 방지는 모자이크부에서 수행)
             raw_dets = self.postprocess(output_tensor, conf_thres=0.30 if self.is_yolov7 else 0.45)
             if not raw_dets: return np.empty((0,6))
             
@@ -637,7 +646,6 @@ class ParkingDetector:
             if tid not in curr_ids: del self.states[tid]
         return triggered
 
-
 class CrossingDetector:
     def __init__(self, roi_lines):
         self.lines = []
@@ -645,78 +653,157 @@ class CrossingDetector:
             if i + 1 < len(roi_lines): self.lines.append((roi_lines[i], roi_lines[i + 1]))
         self.prev = {}
         self.candidates = {}
-
-        # 💡 [핵심 수정] 무한 연장선이 아닌 '실제 그려진 유한 선분'만 통과했는지 검사하는 양방향 판정
+        
+        # FIX 1: 누락된 초기화 변수 추가
+        self.lb_offsets = {}
+        self.lb_last_height = {}
+        self.min_crossing_angle = 15.0
+        self.snapshot_mode = "crossing_moment"
+        self.distance_ratio = 0.5
+        self.ttl_fid_diff = 30
 
     def _is_intersect(self, p1, p2, p3, p4):
-        # p1, p2: 사용자가 그린 ROI 선분
-        # p3, p4: 사람의 발 이동 궤적 (과거 -> 현재)
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
         c2 = ccw(p3, p4, p1) * ccw(p3, p4, p2)
-        # 두 선분이 서로를 가로지를 때만 True 반환 (가상의 연장선 오탐 완벽 차단)
         return c1 < 0 and c2 < 0
 
-    def process(self, tracks, track_map, target_cls, motion_mask=None):
-        triggered = []
-        curr_ids = set()
-        now = time.time()
+    # FIX 1: 누락된 수학/기하학 연산 헬퍼 메서드 일괄 추가
+    def _get_intersection_over_lowbody_area(self, box1, box2):
+        x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
+        inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        return inter_area / float(area1) if area1 > 0 else 0.0
 
-        for t in tracks:
-            tid = int(t[4])
-            curr_ids.add(tid)
-            if track_map.get(tid) != target_cls: continue
+    def _get_line_intersection(self, p1, p2, p3, p4):
+        x1, y1 = p1; x2, y2 = p2
+        x3, y3 = p3; x4, y4 = p4
+        den = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+        if den == 0: return p3
+        px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / den
+        py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / den
+        return (int(px), int(py))
 
-            curr_pos = get_foot_point(*t[:4])
-            obj_width = t[2] - t[0]
+    def _get_crossing_angle(self, p1, p2, p3, p4):
+        v1 = (p2[0]-p1[0], p2[1]-p1[1])
+        v2 = (p4[0]-p3[0], p4[1]-p3[1])
+        dot = v1[0]*v2[0] + v1[1]*v2[1]
+        mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+        mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+        if mag1*mag2 == 0: return 0
+        cos_th = max(-1.0, min(1.0, dot / (mag1*mag2)))
+        angle = math.degrees(math.acos(cos_th))
+        return angle if angle <= 90 else 180 - angle
 
-            if tid in self.prev:
-                pp = self.prev[tid]
+    def _get_perpendicular_distance(self, p1, p2, pt):
+        num = abs((p2[0]-p1[0])*(p1[1]-pt[1]) - (p1[0]-pt[0])*(p2[1]-p1[1]))
+        den = math.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+        return num / den if den > 0 else 0
 
-                # 1. 교차 지점 후보 등록
-                if tid not in self.candidates:
-                    for p1, p2 in self.lines:
-                        # 💡q 기존의 절반짜리 판정식을 완벽한 유한 선분 판정식으로 교체
-                        if self._is_intersect(p1, p2, pp, curr_pos):
-                            self.candidates[tid] = {
-                                'crossing_pt': curr_pos,
-                                'width': obj_width,
-                                'timestamp': now,
-                                'line': (p1,p2),
-                                'entry_side': ccw(p1,p2,pp)
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
+        triggered, curr_ids = [], set()
+        
+        persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
+        low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
+        
+        for p in persons:
+            p_tid = int(p[4])
+            curr_ids.add(p_tid)
+            
+            px1, py1, px2, py2 = p[:4]
+            person_height = max(1, py2 - py1)
+            p_foot = (int((px1 + px2) / 2), int(py2))
+            
+            best_low_box = None
+            max_ioa = 0
+            for lb in low_bodies:
+                lx1, ly1, lx2, ly2 = lb[:4]
+                lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+                
+                if lcy < py1 + person_height * 0.4: continue
+                if lcx < px1 - 20 or lcx > px2 + 20: continue
+                
+                ioa = self._get_intersection_over_lowbody_area(lb[:4], p[:4])
+                if ioa > max_ioa:
+                    max_ioa = ioa
+                    best_low_box = lb[:4]
+                    
+            if max_ioa >= 0.4 and best_low_box is not None:
+                lx1, ly1, lx2, ly2 = best_low_box
+                low_height = max(1, ly2 - ly1)
+                curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
+                
+                self.lb_offsets[p_tid] = (curr_pos[0] - p_foot[0], curr_pos[1] - p_foot[1])
+                self.lb_last_height[p_tid] = low_height
+                event_bbox = tuple(best_low_box)
+            else:
+                if p_tid in self.lb_offsets:
+                    ox, oy = self.lb_offsets[p_tid]
+                    curr_pos = (p_foot[0] + ox, p_foot[1] + oy)
+                    low_height = self.lb_last_height.get(p_tid, person_height * 0.4)
+                    event_bbox = (px1, py2 - low_height, px2, py2)
+                else:
+                    continue
+                    
+            if p_tid in self.prev:
+                jump_dist = get_distance(self.prev[p_tid], curr_pos)
+                if jump_dist > person_height * 0.4:
+                    del self.prev[p_tid]
+                    if p_tid in self.candidates: del self.candidates[p_tid]
+                    if p_tid in self.lb_offsets: del self.lb_offsets[p_tid]
+                    self.prev[p_tid] = curr_pos
+                    continue
+                    
+            is_frame_out = (curr_pos[0] <= 15) or (curr_pos[0] >= SCREEN_WIDTH - 15) or (curr_pos[1] <= 15) or (curr_pos[1] >= SCREEN_HEIGHT - 15)
+            
+            if frame is not None:
+                cv2.circle(frame, curr_pos, 6, (255, 0, 255), -1) 
+            
+            if p_tid in self.prev and p_tid not in self.candidates:
+                for p1, p2 in self.lines:
+                    if self._is_intersect(p1, p2, self.prev[p_tid], curr_pos):
+                        cross_pt = self._get_line_intersection(p1, p2, self.prev[p_tid], curr_pos)
+                        cross_angle = self._get_crossing_angle(p1, p2, self.prev[p_tid], curr_pos)
+                        
+                        if cross_angle >= self.min_crossing_angle:
+                            self.candidates[p_tid] = {
+                                'crossing_pt': cross_pt, 
+                                'person_height': person_height, 
+                                'timestamp_fid': fid, 
+                                'line': (p1, p2),
+                                'entry_side': ccw(p1, p2, self.prev[p_tid]), 
+                                'frame': frame.copy() if frame is not None and self.snapshot_mode == "crossing_moment" else None,
+                                'bbox': event_bbox, 
+                                'fid': fid
                             }
-                            break
-
-            # 2. 바운딩 박스 떨림(Jittering) 방어 로직
-            if tid in self.candidates:
-                cand = self.candidates[tid]
+                        break
+                        
+            if p_tid in self.candidates:
+                cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
+                
                 curr_side = ccw(p1, p2, curr_pos)
-                moved_dist = get_distance(cand['crossing_pt'], curr_pos)
-
-                # 라인을 밟은 후, 객체 가로폭의 60% 이상 확실하게 넘어가야만 최종 알람 발생 (노이즈 방지)
-                # if moved_dist > (cand['width'] * 0.6):
-                direction_confirmed = (
-                        cand['entry_side'] != 0
-                        and curr_side != 0
-                        and cand['entry_side'] * curr_side < 0
-                )
-                dist_threshold = max(cand['width'] * 0.5, 15)
-                distance_confirmed = moved_dist > dist_threshold
-                if direction_confirmed and distance_confirmed:
-                    triggered.append(tid)
-                    del self.candidates[tid]
-                # 5초가 지나도록 완전히 넘어가지 않고 맴돌면 오탐으로 간주하고 후보에서 삭제
-                elif now - cand['timestamp'] > 5.0:
-                    del self.candidates[tid]
-
-            self.prev[tid] = curr_pos
-
-        # 프레임에서 사라진 객체들 메모리 정리
+                
+                if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
+                    perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
+                    dynamic_threshold = cand['person_height'] * self.distance_ratio
+                    
+                    if perp_dist >= dynamic_threshold or is_frame_out:
+                        triggered.append({'tid': p_tid, 'bbox': cand['bbox'], 'frame': cand['frame'], 'fid': cand['fid']})
+                        del self.candidates[p_tid]
+                        
+                elif fid - cand['timestamp_fid'] > self.ttl_fid_diff: 
+                    del self.candidates[p_tid]
+                    
+            self.prev[p_tid] = curr_pos
+            
         for tid in list(self.prev.keys()):
             if tid not in curr_ids:
                 del self.prev[tid]
                 if tid in self.candidates: del self.candidates[tid]
-
+                if tid in self.lb_offsets: del self.lb_offsets[tid]
+                if tid in self.lb_last_height: del self.lb_last_height[tid]
+                    
         return triggered
 
 class HelmetDetector:
@@ -936,8 +1023,10 @@ class Camera:
                         current_alarms[draw_tid] = ename
                 elif ename == "conveyor_crossing":
                     tm = {int(t[4]): int(t[6]) for t in t_g}
-                    ids = h.process(t_g, tm, target_cls=ID_G_PERSON)
-                    for i in ids: 
+                    # FIX 1: 교차 로직에서 딕셔너리를 반환하도록 구조가 변경되었으므로 파싱 로직 교정
+                    results = h.process(t_g, tm, fr, fid)
+                    for res in results: 
+                        i = res['tid']
                         draw_tid = i + 10000
                         self._trigger(fr, fid, draw_tid, ename, t_g, now)
                         current_alarms[draw_tid] = ename
@@ -1070,19 +1159,16 @@ class Camera:
         if bb is not None:
             logger.warning(f"🚨 [CAM {self.cam_id}] {ename} Detected! ID:{real_tid}")
             
-            # 💡 [보강] 단일/다중 클래스에 상관없이 모든 검출 객체(얼굴)만 정밀하게 모자이크
             if fid not in self.face_blur_cache:
                 blur_img = fr.copy()
                 if self.det_f is not None:
                     try:
                         f_dets = self.det_f.infer(blur_img)
                         for fx1, fy1, fx2, fy2, fscore, fcls in f_dets:
-                            # 얼굴 인식 전용 모델이므로, 신뢰도 0.3 이상이면 클래스 ID를 무시하고 렌더링
                             if fscore > 0.3:
                                 fx1, fy1, fx2, fy2 = max(0, int(fx1)), max(0, int(fy1)), int(fx2), int(fy2)
                                 fh, fw = fy2 - fy1, fx2 - fx1
                                 
-                                # 자동차나 벽 전체를 잡는 터무니없는 오탐(화면의 80% 이상)만 차단
                                 if fw > blur_img.shape[1] * 0.8 or fh > blur_img.shape[0] * 0.8:
                                     continue 
                                     
