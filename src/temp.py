@@ -60,12 +60,14 @@ def capture_snapshot_clean(camera_obj):
     valid_frame = None
     
     while time.time() - start_time < 20.0:
-        frame, _, connected = camera_obj.reader.read()
+        # 💡 수정 1: 직접 reader.read() 호출을 피하고 좀비 스레드 방어가 탑재된 get_frame() 사용
+        frame, _, connected = camera_obj.get_frame()
         
         if connected and frame is not None:
             mean_val = np.mean(frame)
             std_val = np.std(frame)
-            is_corrupted = (std_val < 15.0 and 100 < mean_val < 150) or (mean_val <= 1.0)
+            # 💡 수정 2: ROI 스냅샷 캡처 시에도 어두운 환경 오탐 방지를 위해 임계값을 2.0으로 완화
+            is_corrupted = (std_val < 2.0) or (mean_val <= 1.0)
             if not is_corrupted:
                 valid_frame = frame
                 break
@@ -348,7 +350,9 @@ def main():
             if loop_count % 300 == 0: gc.collect()
             
             for c in cams:
-                frame, fid, connected = c.reader.read()
+                # 💡 수정 3: 메인 큐에서 프레임 수신 시 get_frame() 사용 (스레드 좀비화 대응)
+                frame, fid, connected = c.get_frame()
+                
                 if not connected:
                     if use_display and use_drawing:
                         c.latest_display_frame = c.draw(None, [], {}, connected=False)
@@ -360,7 +364,6 @@ def main():
                         continue
                         
                     std_val = np.std(frame)
-                    # 💡 방어 임계값을 10.0에서 2.0으로 대폭 하향 조정 (어두운 화면 등 오탐 방지)
                     if std_val < 2.0:  
                         logger.debug(f"[CAM {c.cam_id}] Corrupted/Blank frame detected (std={std_val:.1f}). Dropping frame {fid}.")
                         continue
