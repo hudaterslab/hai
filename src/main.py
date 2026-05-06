@@ -18,7 +18,7 @@ from common import (SYS_CFG, CAMERA_LIST_FILE, CONFIG_COMMON_FILE, CONFIG_CAMERA
                     BATCH_SIZE, SCREEN_WIDTH, SCREEN_HEIGHT, setup_logging, load_rtsp_list_from_csv,
                     save_json_file)
 from event import EVENT_REGISTRY
-from ai_core import VisionModelAsync
+from ai_core import VisionModelSync
 from camera import Camera
 
 logger = logging.getLogger("VMS_SYSTEM")
@@ -60,17 +60,10 @@ def capture_snapshot_clean(camera_obj):
     valid_frame = None
     
     while time.time() - start_time < 20.0:
-        # 💡 수정 1: 직접 reader.read() 호출을 피하고 좀비 스레드 방어가 탑재된 get_frame() 사용
-        frame, _, connected = camera_obj.get_frame()
-        
+        frame, _, connected = camera_obj.process_frame()
         if connected and frame is not None:
-            mean_val = np.mean(frame)
-            std_val = np.std(frame)
-            # 💡 수정 2: ROI 스냅샷 캡처 시에도 어두운 환경 오탐 방지를 위해 임계값을 2.0으로 완화
-            is_corrupted = (std_val < 2.0) or (mean_val <= 1.0)
-            if not is_corrupted:
-                valid_frame = frame
-                break
+            valid_frame = frame
+            break
         time.sleep(0.5)
         
     return valid_frame
@@ -261,22 +254,10 @@ def prepare_config_manager(rtsp_list):
 
     return config_manager
 
-def process_async_results(c, fid, raw_boxes, use_drawing):
-    buffered_frame = c.get_buffered_frame(fid)
-    if buffered_frame is None: return
-    
-    t_main, alarms = c.run_logic(buffered_frame, fid, raw_boxes)
-    
-    if use_drawing:
-        drawn = c.draw(buffered_frame, t_main, alarms, connected=True)
-        c.latest_display_frame = cv2.resize(drawn, (640, 360))
-    else:
-        c.latest_display_frame = cv2.resize(buffered_frame, (640, 360))
-
 def main():
     setup_logging(SYS_CFG)
     logger.info("="*60)
-    logger.info("🚀 [VMS 시스템] 모듈형 Async(원패스 통합모델) 프로덕션 부팅")
+    logger.info("🚀 [VMS 시스템] 모듈형 동기식(Sync) 프로덕션 부팅")
     logger.info("="*60)
     
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
@@ -291,16 +272,15 @@ def main():
         sensitivity, use_display, use_drawing = prompt_runtime_options()
         config_manager = prepare_config_manager(rtsp_list)
 
-        engine_main = VisionModelAsync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.dxnn"))
-        face_engine = VisionModelAsync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
+        engine_main = VisionModelSync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.dxnn"))
+        face_engine = VisionModelSync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
         
         logger.info("카메라 백그라운드 리더 스레드를 초기화합니다...")
         
         for i, rtsp in enumerate(rtsp_list):
             ip = extract_ip(rtsp)
             conf = config_manager.get_config(ip)
-            if not conf:
-                conf = {"url": rtsp, "events": []}
+            if not conf: conf = {"url": rtsp, "events": []}
             cams.append(Camera(ip, conf, face_engine, len(cams) + 1, sensitivity))
 
         val_setup = input(">> 특정 카메라의 이벤트/ROI 설정 마법사를 실행하시겠습니까? (y/N, 기본값 N): ").strip().lower()
@@ -308,38 +288,29 @@ def main():
             print("카메라 스트림 안정화를 위해 3초 대기합니다...")
             time.sleep(3)
             run_wizard_batch_mode(config_manager, cams)
-            
             for idx, ip in enumerate(config_manager.camera_configs.keys(), start=1):
                 config_manager.camera_configs[ip]["cctv_id"] = idx
             config_manager.save()
             config_manager.config = config_manager.build_runtime_config()
             
         active_cams = [c for c in cams if len(c.events) > 0]
-        inactive_cams = [c for c in cams if len(c.events) == 0]
-        
-        for c in inactive_cams:
-            c.stop()
-            
+        for c in [c for c in cams if len(c.events) == 0]: c.stop()
         cams = active_cams
 
-        if not cams: 
-            return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
+        if not cams: return logger.warning("이벤트가 설정되어 활성화된 카메라가 없습니다.")
 
         target_fps = SYS_CFG.get("REC_FPS", 30)
         dynamic_delay = 1.0 / target_fps
         loop_count = 0 
         
-        logger.info("모니터링 시작 (Async One-Pass Pipeline 가동 - 종료: Ctrl+C 또는 'q')")
+        logger.info("모니터링 시작 (동기식 순차 루프 파이프라인 가동 - 종료: Ctrl+C 또는 'q')")
         
         while True:
             start_time = time.time()
             cpu_usage, cpu_temp, chip_temp = get_system_metrics()
             
-            if cpu_usage > 85:
-                target_fps = max(5, target_fps - 2)
-            elif cpu_usage < 60:
-                target_fps = min(SYS_CFG.get("REC_FPS", 30), target_fps + 1)
-                
+            if cpu_usage > 85: target_fps = max(5, target_fps - 2)
+            elif cpu_usage < 60: target_fps = min(SYS_CFG.get("REC_FPS", 30), target_fps + 1)
             dynamic_delay = 1.0 / target_fps
 
             if loop_count % (target_fps * 10) == 0:
@@ -349,47 +320,38 @@ def main():
             loop_count += 1
             if loop_count % 300 == 0: gc.collect()
             
-            for c in cams:
-                # 💡 수정 3: 메인 큐에서 프레임 수신 시 get_frame() 사용 (스레드 좀비화 대응)
-                frame, fid, connected = c.get_frame()
-                
-                if not connected:
+            # 💡 카메라 전체 순회하며 프레임 추출
+            raw_data = [c.process_frame() for c in cams]
+            final_imgs = []
+            
+            for idx, (fr, fid, connected) in enumerate(raw_data):
+                c = cams[idx]
+                if fr is None or not connected:
                     if use_display and use_drawing:
-                        c.latest_display_frame = c.draw(None, [], {}, connected=False)
+                        final_imgs.append(c.draw(None, [], {}, connected=False))
+                    elif use_display:
+                        final_imgs.append(np.zeros((360, 640, 3), dtype=np.uint8))
                     continue
                 
-                if frame is not None and fid > c.last_submit_fid:
-                    if frame.size == 0 or len(frame.shape) != 3:
-                        logger.debug(f"[CAM {c.cam_id}] Shape error detected. Dropping frame {fid}.")
-                        continue
-                        
-                    std_val = np.std(frame)
-                    if std_val < 2.0:  
-                        logger.debug(f"[CAM {c.cam_id}] Corrupted/Blank frame detected (std={std_val:.1f}). Dropping frame {fid}.")
-                        continue
-
-                    if fid % SYS_CFG.get("SKIP_FRAMES", 1) == 0:
-                        c.buffer_frame(fid, frame)
-                        engine_main.infer_async(frame, context={'cam_id': c.cam_id, 'fid': fid})
-                    c.last_submit_fid = fid
-
-            while True:
-                res = engine_main.get_result()
-                if not res: break
+                # 💡 동기식 추론 및 로직 실행
+                raw_boxes = []
+                if fid % SYS_CFG.get("SKIP_FRAMES", 1) == 0:
+                    raw_boxes = engine_main.infer(fr)
                 
-                cam_id, fid = res['context']['cam_id'], res['context']['fid']
-                raw_boxes = res['boxes']
+                t_main, alarms = c.run_logic(fr, fid, raw_boxes)
                 
-                c = next((cam for cam in cams if cam.cam_id == cam_id), None)
-                if c:
-                    process_async_results(c, fid, raw_boxes, use_drawing)
+                if use_display:
+                    if use_drawing:
+                        img = c.draw(fr, t_main, alarms, connected=True)
+                    else:
+                        img = fr.copy()
+                    final_imgs.append(cv2.resize(img, (640, 360)))
 
-            if use_display:
-                final_imgs = [c.latest_display_frame for c in cams if c.latest_display_frame is not None]
-                if final_imgs:
-                    mosaic = create_mosaic_image(final_imgs)
-                    if mosaic is not None: cv2.imshow("VMS Monitor", mosaic)
-                    if cv2.waitKey(1) == ord('q'): break
+            # 디스플레이 표출
+            if use_display and final_imgs:
+                mosaic = create_mosaic_image(final_imgs)
+                if mosaic is not None: cv2.imshow("VMS Monitor", mosaic)
+                if cv2.waitKey(1) == ord('q'): break
 
             sleep_time = dynamic_delay - (time.time() - start_time)
             if sleep_time > 0: time.sleep(sleep_time)
