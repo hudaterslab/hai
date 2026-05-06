@@ -1362,13 +1362,11 @@ class Camera:
             
         return blur_img
 
-def run_logic(self, fr, fid, d_main_res, d_helmet_res):
-        # 💡 [핵심 방어] 프레임이 None인 경우(스트림 지연/유실) 즉시 빈 결과 반환하여 셧다운 방지
+    def run_logic(self, fr, fid, d_main_res, d_helmet_res):
         if fr is None:
             return [], [], {}
-
         self._update_runtime_roi(fr.shape)
-        motion_mask = self.motion_det.apply(fr) 
+        motion_mask = self.motion_det.apply(fr)
 
         # 메인 트래커 업데이트
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
