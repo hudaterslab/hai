@@ -32,118 +32,56 @@ class FrameReader:
         
         self.out_w = 640
         self.out_h = 480
-        self.frame_bytes = self.out_w * self.out_h * 3
         
         self.target_fps = SYS_CFG.get("REC_FPS", 3)
-        self.process = None
-        
-        self.use_hw_engine = True
-        self.hw_fail_count = 0
         
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
+        # 💡 OpenCV FFmpeg 백엔드 최적화 환경변수 주입 (TCP 강제, 타임아웃 설정)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+        
         while self.running:
             self.connected = False
             
-            if self.use_hw_engine:
-                cmd = [
-                    'ffmpeg',
-                    '-hide_banner', '-loglevel', 'error',
-                    '-hwaccel', 'drm',
-                    '-rtsp_transport', 'tcp',              
-                    '-stimeout', '5000000',
-                    '-fflags', 'nobuffer+discardcorrupt',  
-                    '-flags', 'low_delay',                 
-                    '-i', self.url,
-                    '-vf', f'scale={self.out_w}:{self.out_h}', 
-                    '-r', str(self.target_fps),            
-                    '-f', 'image2pipe',
-                    '-pix_fmt', 'bgr24',
-                    '-vcodec', 'rawvideo',
-                    '-'
-                ]
+            # 💡 서브프로세스 제거 및 OpenCV VideoCapture 단일화 적용
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+            
+            if not cap.isOpened():
+                time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                continue
                 
-                try:
-                    self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-                except Exception:
-                    self.hw_fail_count += 1
-                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
-                    continue
-                    
-                read_success = False
-                while self.running:
-                    if psutil.cpu_percent(interval=None) > 95:
-                        time.sleep(0.05)
-                        
-                    raw = b''
-                    while len(raw) < self.frame_bytes:
-                        if not self.running: 
-                            break
-                        try:
-                            chunk = self.process.stdout.read(self.frame_bytes - len(raw))
-                            if not chunk: 
-                                break
-                            raw += chunk
-                        except Exception:
-                            break
-                            
-                    if len(raw) != self.frame_bytes: 
-                        break
-                        
-                    img = np.frombuffer(raw, dtype=np.uint8).reshape((self.out_h, self.out_w, 3)).copy()
-                    read_success = True
-                    self.connected = True
-                    self.hw_fail_count = 0 
-                    
-                    with self.lock:
-                        self.frame = img
-                        self.fid += 1
-                        self.last_frame_time = time.time()
-                        
-                self.connected = False
-                if self.process:
-                    try: 
-                        self.process.kill()
-                    except Exception: 
-                        pass
-                    self.process = None
+            self.connected = True
+            logger.info(f"[{self.ip}] 스트림 연결 성공 (OpenCV VideoCapture)")
+            
+            last_read_time = time.time()
+            
+            while self.running:
+                ret, frame = cap.read()
                 
-                if not read_success:
-                    self.hw_fail_count += 1
-                    
-                if self.hw_fail_count >= 2:
-                    self.use_hw_engine = False
-                    
-            else:
-                cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                if not ret:
+                    logger.warning(f"[{self.ip}] 프레임 수신 실패, 재연결을 시도합니다.")
+                    break
                 
-                if not cap.isOpened():
-                    time.sleep(STREAM_RECONNECT_DELAY_SEC)
-                    continue
-                    
-                self.connected = True
-                
-                last_read_time = time.time()
-                while self.running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    
-                    now = time.time()
-                    if now - last_read_time >= (1.0 / self.target_fps):
+                now = time.time()
+                # 💡 목표 FPS에 맞춘 프레임 솎아내기 (CPU 연산 낭비 방지)
+                if now - last_read_time >= (1.0 / self.target_fps):
+                    try:
                         frame = cv2.resize(frame, (self.out_w, self.out_h))
                         with self.lock:
                             self.frame = frame
                             self.fid += 1
                             self.last_frame_time = now
                         last_read_time = now
-                        
-                cap.release()
-                self.connected = False
-                
+                    except Exception as e:
+                        logger.debug(f"[{self.ip}] 프레임 리사이즈/할당 에러: {e}")
+                        break
+                    
+            cap.release()
+            self.connected = False
+            
             if self.running: 
                 time.sleep(STREAM_RECONNECT_DELAY_SEC)
 
@@ -153,11 +91,6 @@ class FrameReader:
             
     def stop(self, join_timeout=3.0):
         self.running = False
-        if self.process:
-            try: 
-                self.process.kill()
-            except Exception: 
-                pass
         if self.thread.is_alive(): 
             self.thread.join(timeout=join_timeout)
 
@@ -282,7 +215,6 @@ class Camera:
                 
         return snapped_tracks
 
-    # 💡 불필요한 클래스 맵핑 제거: 원본 박스를 곧바로 헬멧(0, 1)과 일반 객체로 다이렉트 분할 (속도 최적화)
     def run_logic(self, frame, frame_id, raw_boxes=None):
         with self.config_lock:
             self._update_runtime_roi(frame.shape)

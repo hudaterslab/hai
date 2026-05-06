@@ -1,330 +1,367 @@
-import os
 import cv2
 import numpy as np
 import time
-import queue
-import logging
+import datetime
 import threading
-import functools
-from common import clean_overlapping_detections, calculate_iou, SYS_CFG
+import os
+import logging
+import subprocess
+import psutil
+from collections import deque, defaultdict
+from common import (
+    SYS_CFG, EVENT_ROOT_DIR, WATCHDOG_TIMEOUT, STREAM_RECONNECT_DELAY_SEC, 
+    denormalize_roi_points, save_event_image_with_mark, ID_H_HELMET, ID_H_NO_HELMET, 
+    ID_G_PERSON, ID_G_CAR, ID_G_TRUCK, ID_PERSON_LOW, ID_REFLECTIVE_VEST,
+    calculate_iou
+)
+from event import MotionDetector, EVENT_REGISTRY
+from ai_core import SORTTracker
 
 logger = logging.getLogger("VMS_SYSTEM")
 
-DEBUG_MODE = SYS_CFG.get("debug_mode", False)
-
-def trace_execution(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if not DEBUG_MODE:
-            return func(*args, **kwargs)
-        start_time = time.time()
-        logger.debug(f"[START] {func.__name__} 실행 시작")
-        try:
-            result = func(*args, **kwargs)
-            return result
-        finally:
-            elapsed = time.time() - start_time
-            logger.debug(f"[END] {func.__name__} 실행 완료 (소요시간: {elapsed:.4f}초)")
-    return wrapper
-
-def get_model_confidence(engine_path, default_conf=0.45):
-    conf_map = SYS_CFG.get("model_confidences", {})
-    ep_lower = engine_path.lower()
-    
-    if "face" in ep_lower: 
-        return conf_map.get("FACE", 0.35)
-    elif "hanjin" in ep_lower or "main" in ep_lower: 
-        return conf_map.get("MAIN", 0.40)
-    else: 
-        return conf_map.get("GENERAL", 0.50)
-
-def resolve_model_path(engine_path, is_gpu=False):
-    base_path = os.path.splitext(engine_path)[0]
-    target_path = f"{base_path}.pt" if is_gpu else f"{base_path}.dxnn"
-
-    if os.path.exists(target_path):
-        return target_path
-    return os.path.join("models", os.path.basename(target_path))
-
-# 💡 요구사항 1 반영: 서브프로세스(CLI) 의존성 제거, Native Import 테스트로 엔진 체크 안정화
-def check_deepx_npu():
-    try: 
-        import dx_engine
-        # 라이브러리 로드가 정상적이면 NPU 구동 가능 환경으로 판별
-        return True
-    except ImportError as e:
-        logger.debug(f"[AI_CORE] dx_engine 임포트 실패 (NPU 미지원 환경): {e}")
-        return False
-    except Exception as e: 
-        logger.debug(f"[AI_CORE] NPU 초기화 중 알 수 없는 에러: {e}")
-        return False
-
-# 💡 요구사항 2 반영: 순수 Numpy 기반 초고속 Vectorized NMS 구현 (파이썬 리스트 변환 병목 제거)
-def fast_numpy_nms(boxes, scores, iou_threshold):
-    if len(boxes) == 0:
-        return []
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-    areas = (x2 - x1) * (y2 - y1)
-    
-    order = scores.argsort()[::-1]
-    keep = []
-    
-    while order.size > 0:
-        i = order[0]
-        keep.append(i)
+class FrameReader:
+    def __init__(self, url, ip):
+        self.url = url.replace(" ", "").replace("\n", "").replace("\r", "").strip()
+        self.ip = ip
+        self.lock = threading.Lock()
+        self.frame = None
+        self.fid = 0
+        self.running = True
+        self.connected = False
+        self.last_frame_time = time.time()
         
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
+        self.out_w = 640
+        self.out_h = 480
         
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
+        self.target_fps = SYS_CFG.get("REC_FPS", 3)
         
-        iou = inter / (areas[i] + areas[order[1:]] - inter)
-        inds = np.where(iou <= iou_threshold)[0]
-        order = order[inds + 1]
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        # 💡 OpenCV FFmpeg 백엔드 최적화 환경변수 주입 (TCP 강제, 타임아웃 설정)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
         
-    return keep
-
-USE_NPU = check_deepx_npu()
-
-if USE_NPU:
-    from dx_engine import InferenceEngine, InferenceOption
-    logger.info("🟢 DeepX NPU 활성화: dx_engine을 가동합니다.")
-
-    def onInferenceCallbackSync(outputs, user_arg):
-        event, result_list, is_yolov7, conf_thres, scale, offset = user_arg
-        boxes = []
-        try:
-            pred = np.array(outputs[0], copy=True)
-            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
-                pred = pred.transpose((0, 2, 1))
-            if pred.ndim == 3: 
-                pred = pred[0] 
+        while self.running:
+            self.connected = False
             
-            C = pred.shape[1]
-            if is_yolov7 or C == 6 or C == 85:
-                obj_conf = pred[:, 4]
-                if C > 5:
-                    scores = obj_conf * np.max(pred[:, 5:], axis=1)
-                    class_ids = np.argmax(pred[:, 5:], axis=1)
-                else:
-                    scores = obj_conf
-                    class_ids = np.zeros(len(obj_conf), dtype=int)
-            else:
-                scores = np.max(pred[:, 4:], axis=1)
-                class_ids = np.argmax(pred[:, 4:], axis=1)
-
-            mask = scores > conf_thres
-            pred = pred[mask]
-            scores = scores[mask]
-            class_ids = class_ids[mask]
+            # 💡 서브프로세스 제거 및 OpenCV VideoCapture 단일화 적용
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
             
-            if len(pred) > 0:
-                raw_boxes = pred[:, :4].copy()
-                raw_boxes[:, 0] = raw_boxes[:, 0] - raw_boxes[:, 2] / 2
-                raw_boxes[:, 1] = raw_boxes[:, 1] - raw_boxes[:, 3] / 2
-                raw_boxes[:, 2] = raw_boxes[:, 0] + raw_boxes[:, 2]
-                raw_boxes[:, 3] = raw_boxes[:, 1] + raw_boxes[:, 3]
+            if not cap.isOpened():
+                time.sleep(STREAM_RECONNECT_DELAY_SEC)
+                continue
                 
-                # Numpy 고속 NMS 적용 (CPU 과부하 방지)
-                indices = fast_numpy_nms(raw_boxes, scores, 0.45)
+            self.connected = True
+            logger.info(f"[{self.ip}] 스트림 연결 성공 (OpenCV VideoCapture)")
+            
+            last_read_time = time.time()
+            
+            while self.running:
+                ret, frame = cap.read()
                 
-                if len(indices) > 0:
-                    dw, dh = offset
-                    for i in indices:
-                        bx1, by1 = (raw_boxes[i][0] - dw) / scale, (raw_boxes[i][1] - dh) / scale
-                        bx2, by2 = (raw_boxes[i][2] - dw) / scale, (raw_boxes[i][3] - dh) / scale
-                        boxes.append([bx1, by1, bx2, by2, float(scores[i]), int(class_ids[i])])
-                        
-        except Exception as e: 
-            logger.error(f"⚠️ NPU Sync Error: {e}")
-        finally: 
-            result_list.append(boxes)
-            event.set()
-        return 0
-
-    class DeepXModelSync:
-        def __init__(self, engine_path):
-            self.engine_path = resolve_model_path(engine_path, is_gpu=False)
-            self.is_yolov7 = "v7" in os.path.basename(self.engine_path).lower()
-            self.conf_thres = get_model_confidence(self.engine_path)
-            
-            if not os.path.exists(self.engine_path): 
-                self.engine = None
-                if DEBUG_MODE: logger.debug(f"[AI_CORE] NPU 모델 로드 실패 (파일 없음): {self.engine_path}")
-            else:
-                self.engine = InferenceEngine(self.engine_path, InferenceOption())
-                self.engine.register_callback(onInferenceCallbackSync)
-                if DEBUG_MODE: logger.debug(f"[AI_CORE] NPU 동기 모델 초기화 완료 (Thres: {self.conf_thres}): {self.engine_path}")
+                if not ret:
+                    logger.warning(f"[{self.ip}] 프레임 수신 실패, 재연결을 시도합니다.")
+                    break
                 
-        def letter_box(self, img, new_shape=(640,640)):
-            h, w = img.shape[:2]
-            scale = min(new_shape[0]/h, new_shape[1]/w)
-            nw, nh = int(w*scale), int(h*scale)
-            resized = cv2.resize(img, (nw, nh))
-            canvas = np.full((new_shape[0], new_shape[1], 3), 114, dtype=np.uint8)
-            dw, dh = (new_shape[1] - nw) // 2, (new_shape[0] - nh) // 2
-            canvas[dh:dh+nh, dw:dw+nw] = resized
-            return canvas, scale, (dw, dh)
-            
-        @trace_execution
-        def infer(self, img):
-            if img is None or self.engine is None:
-                return []
-                
-            npu_input, scale, offset = self.letter_box(img)
-            input_tensor = np.ascontiguousarray(cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB))
-            
-            event = threading.Event()
-            result_list = []
-            user_arg = (event, result_list, self.is_yolov7, self.conf_thres, scale, offset)
-            
-            self.engine.run_async([input_tensor], user_arg=user_arg)
-            event.wait(timeout=2.0)
-            
-            if result_list:
-                return result_list[0]
-            return []
-
-    VisionModelSync = DeepXModelSync
-
-else:
-    class GPUModelSync:
-        def __init__(self, engine_path):
-            self.pt_path = resolve_model_path(engine_path, is_gpu=True)
-            self.conf_thres = get_model_confidence(self.pt_path)
-            self.model = None
-            try:
-                from ultralytics import YOLO
-                if os.path.exists(self.pt_path): 
-                    self.model = YOLO(self.pt_path)
-                    if DEBUG_MODE: logger.debug(f"[AI_CORE] GPU/CPU 폴백 모델 로드 완료: {self.pt_path}")
-            except Exception: 
-                pass
-                
-        @trace_execution
-        def infer(self, img):
-            if img is None or self.model is None: 
-                return []
-            try:
-                results = self.model(img, verbose=False, conf=self.conf_thres)
-                boxes = []
-                for r in results:
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        xyxy = r.boxes.xyxy.cpu().numpy()
-                        conf = r.boxes.conf.cpu().numpy()
-                        cls = r.boxes.cls.cpu().numpy()
-                        for i in range(len(xyxy)): 
-                            boxes.append([xyxy[i][0], xyxy[i][1], xyxy[i][2], xyxy[i][3], conf[i], int(cls[i])])
-                return np.array(boxes)
-            except Exception: 
-                return []
-
-    VisionModelSync = GPUModelSync
-
-class KalmanBoxTracker:
-    def __init__(self, bbox, cls_id, conf):
-        self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
-        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
-        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
-        
-        self.cls, self.conf, self.lost = cls_id, conf, 0
-        cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
-        self.w, self.h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        self.kf.statePost = np.array([[cx], [cy], [0.], [0.]], np.float32)
-        
-    def predict(self):
-        if self.lost > 0:
-            self.kf.statePost[2, 0] *= 0.5  
-            self.kf.statePost[3, 0] *= 0.5  
-            
-        pred = self.kf.predict()
-        cx, cy = pred[0, 0], pred[1, 0]
-        return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
-        
-    def correct(self, bbox, conf):
-        cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
-        self.w, self.h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        self.kf.correct(np.array([[cx], [cy]], np.float32))
-        self.conf, self.lost = conf, 0
-        
-    def get_state(self):
-        cx, cy = self.kf.statePost[0, 0], self.kf.statePost[1, 0]
-        return np.array([cx - self.w/2, cy - self.h/2, cx + self.w/2, cy + self.h/2])
-
-class SORTTracker:
-    def __init__(self, track_thresh=0.5, track_buffer=30, match_thresh=0.3, is_helmet=True):
-        self.track_thresh = track_thresh
-        self.track_buffer = track_buffer
-        self.match_thresh = match_thresh
-        self.is_helmet = is_helmet
-        self.next_id = 1
-        self.tracks = {}
-        
-    def _associate(self, detections, trackers_keys, iou_threshold):
-        if len(trackers_keys) == 0 or len(detections) == 0: 
-            return [], list(range(len(detections))), trackers_keys
-            
-        iou_matrix = np.zeros((len(detections), len(trackers_keys)), dtype=np.float32)
-        for d, det in enumerate(detections):
-            for t, tid in enumerate(trackers_keys):
-                iou_matrix[d, t] = calculate_iou(det[:4], self.tracks[tid].get_state())
-                
-        matched_indices, unmatched_dets, unmatched_trks = [], [], list(trackers_keys)
-        for d in range(len(detections)):
-            best_t_idx, best_iou = -1, iou_threshold
-            for t, tid in enumerate(trackers_keys):
-                if tid in unmatched_trks and iou_matrix[d, t] > best_iou:
-                    best_iou, best_t_idx = iou_matrix[d, t], t
+                now = time.time()
+                # 💡 목표 FPS에 맞춘 프레임 솎아내기 (CPU 연산 낭비 방지)
+                if now - last_read_time >= (1.0 / self.target_fps):
+                    try:
+                        frame = cv2.resize(frame, (self.out_w, self.out_h))
+                        with self.lock:
+                            self.frame = frame
+                            self.fid += 1
+                            self.last_frame_time = now
+                        last_read_time = now
+                    except Exception as e:
+                        logger.debug(f"[{self.ip}] 프레임 리사이즈/할당 에러: {e}")
+                        break
                     
-            if best_t_idx != -1:
-                matched_indices.append((d, trackers_keys[best_t_idx]))
-                unmatched_trks.remove(trackers_keys[best_t_idx])
-            else: 
-                unmatched_dets.append(d)
+            cap.release()
+            self.connected = False
+            
+            if self.running: 
+                time.sleep(STREAM_RECONNECT_DELAY_SEC)
+
+    def read(self):
+        with self.lock: 
+            return (None, self.fid, False) if time.time() - self.last_frame_time > WATCHDOG_TIMEOUT else (self.frame, self.fid, self.connected)
+            
+    def stop(self, join_timeout=3.0):
+        self.running = False
+        if self.thread.is_alive(): 
+            self.thread.join(timeout=join_timeout)
+
+class Camera:
+    def __init__(self, ip, conf, face_engine, cam_id, sensitivity):
+        self.ip = ip
+        self.conf = conf 
+        self.reader = FrameReader(conf['url'], ip)
+        self.terminal_id = str(conf.get('terminal_id', SYS_CFG.get("terminal_id", "99999")))
+        self.cctv_id = int(conf.get('cctv_id', 1))
+        self.event_config = conf.get('event_config', {})
+        self.roi_poly_norm = conf.get('roi_poly_norm', [])
+        self.roi_lines_norm = conf.get('roi_lines_norm', [])
+        self.using_normalized_roi = bool(self.roi_poly_norm or self.roi_lines_norm)
+        self.roi_poly = []
+        self.roi_lines = []
+        self.events = conf.get('events', [])
+        self.face_detector = face_engine
+        self.cam_id = cam_id 
+        self.last_submit_fid = -1
+        
+        main_conf = SYS_CFG.get("model_confidences", {}).get("MAIN", 0.40)
+        self.face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
+        self.helmet_conf = SYS_CFG.get("model_confidences", {}).get("HELMET", 0.45) 
+        
+        self.fps = SYS_CFG.get("REC_FPS", 3)
+        self.skip = SYS_CFG.get("SKIP_FRAMES", 1)
+        
+        track_buffer_sec = SYS_CFG.get("track_buffer_sec", 1.5)
+        target_buffer = max(1, int(track_buffer_sec * (self.fps / self.skip)))
+        
+        self.main_tracker = SORTTracker(track_thresh=main_conf, track_buffer=target_buffer, is_helmet=False)
+        self.helmet_tracker = SORTTracker(track_thresh=self.helmet_conf, track_buffer=target_buffer, is_helmet=True)
+        
+        self.alerted = defaultdict(set)
+        self.last_evt_t = {}
+        self.visual_alarms = {}
+        self.face_blur_cache = {}
+        self.roi_frame_shape = None
+        self.config_lock = threading.Lock() 
+        self.motion_det = MotionDetector(sensitivity)
+        
+        self.obj_history = {}
+        self.delayed_logs = []
+        
+        self.pre_log_sec = SYS_CFG.get("event_pre_log_sec", 2.0)
+        self.post_log_sec = SYS_CFG.get("event_post_log_sec", 2.0)
+        
+        self.frame_buffer = {}
+        self.latest_display_frame = None
+        
+        self.init_handlers()
+
+    def buffer_frame(self, fid, frame):
+        self.frame_buffer[fid] = frame.copy()
+        buffer_limit = self.fps * 5
+        keys = list(self.frame_buffer.keys())
+        for k in keys:
+            if fid - k > buffer_limit:
+                del self.frame_buffer[k]
                 
-        return matched_indices, unmatched_dets, unmatched_trks
-        
-    def update(self, detections):
-        if len(detections) > 0: 
-            detections = clean_overlapping_detections(detections, self.is_helmet)
+    def get_buffered_frame(self, fid):
+        return self.frame_buffer.get(fid, None)
+
+    def _update_runtime_roi(self, frame_shape):
+        if not self.using_normalized_roi or self.roi_frame_shape == frame_shape[:2]: 
+            return
+        h, w = frame_shape[:2]
+        self.roi_poly = denormalize_roi_points(self.roi_poly_norm, w, h)
+        self.roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h)
+        self.roi_frame_shape = frame_shape[:2]
+        self.init_handlers()
+
+    def init_handlers(self):
+        self.handlers = []
+        for evt in self.events:
+            if evt in EVENT_REGISTRY:
+                self.handlers.append(EVENT_REGISTRY[evt](self.event_config.get(evt, {}), self.roi_poly, self.roi_lines))
+
+    def _apply_face_blur(self, image):
+        if self.face_detector is None: 
+            return image
+        try:
+            for fx1, fy1, fx2, fy2, fscore, _ in self.face_detector.infer(image):
+                if fscore <= self.face_conf: 
+                    continue
+                fx1 = max(0, int(fx1))
+                fy1 = max(0, int(fy1))
+                fx2 = int(fx2)
+                fy2 = int(fy2)
+                fh = fy2 - fy1
+                fw = fx2 - fx1
+                if fw > image.shape[1] * 0.8 or fh > image.shape[0] * 0.8 or image[fy1:fy2, fx1:fx2].size == 0: 
+                    continue
+                small = cv2.resize(image[fy1:fy2, fx1:fx2], (fw // 15 + 1, fh // 15 + 1), interpolation=cv2.INTER_LINEAR)
+                image[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+        except Exception: 
+            pass
+        return image
+
+    def _snap_tracks_to_raw(self, tracks, raw_boxes):
+        if raw_boxes is None or len(raw_boxes) == 0 or len(tracks) == 0:
+            return tracks
             
-        for tid in list(self.tracks.keys()): 
-            self.tracks[tid].predict()
+        snapped_tracks = []
+        for t in tracks:
+            tx1, ty1, tx2, ty2, tid, conf, cls_id = t
+            best_iou = 0
+            best_raw = None
             
-        valid_dets = [d for d in detections if d[4] >= self.track_thresh]
-        
-        matched, unmatched_dets, unmatched_trks = self._associate(valid_dets, list(self.tracks.keys()), self.match_thresh)
-        
-        for d_idx, tid in matched: 
-            self.tracks[tid].correct(valid_dets[d_idx][:4], valid_dets[d_idx][4])
+            for rb in raw_boxes:
+                if int(rb[5]) == int(cls_id):
+                    iou = calculate_iou((tx1, ty1, tx2, ty2), rb[:4])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_raw = rb
+                        
+            if best_iou > 0.05 and best_raw is not None:
+                snapped_tracks.append([best_raw[0], best_raw[1], best_raw[2], best_raw[3], tid, best_raw[4], cls_id])
+            else:
+                snapped_tracks.append(t)
+                
+        return snapped_tracks
+
+    def run_logic(self, frame, frame_id, raw_boxes=None):
+        with self.config_lock:
+            self._update_runtime_roi(frame.shape)
+            motion_mask = self.motion_det.apply(frame) 
             
-        for tid in unmatched_trks: 
-            self.tracks[tid].lost += 1
+            main_boxes = []
+            helmet_boxes = []
             
-        for d_idx in unmatched_dets:
-            det = valid_dets[d_idx]
-            self.tracks[self.next_id] = KalmanBoxTracker(det[:4], int(det[5]), det[4])
-            self.next_id += 1
+            if raw_boxes is not None:
+                for b in raw_boxes:
+                    cls_raw = int(b[5])
+                    if cls_raw in (ID_H_HELMET, ID_H_NO_HELMET):
+                        helmet_boxes.append(b)
+                    else:
+                        main_boxes.append(b)
             
-        self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.track_buffer}
-        return self._get_results()
+            current_obj_count = len(main_boxes)
+            self.obj_history[frame_id] = current_obj_count
+            
+            for k in list(self.obj_history.keys()):
+                if frame_id - k > self.fps * 10:  
+                    del self.obj_history[k]
+                    
+            remaining_logs = []
+            for dlog in self.delayed_logs:
+                if frame_id >= dlog['target_fid_to_log']:
+                    before_fid = dlog['trigger_fid'] - int(self.pre_log_sec * self.fps)
+                    before_count = self.obj_history.get(before_fid, "Unknown")
+                    trigger_count = self.obj_history.get(dlog['trigger_fid'], "Unknown")
+                    after_count = current_obj_count
+                    
+                    logger.info(f"🚨 [EVENT] CAM:{self.cam_id} | Type:{dlog['event_name']} | "
+                                f"Triggered At:{dlog['time_str']} | "
+                                f"Obj Count -> -{self.pre_log_sec}s: {before_count} | 0s: {trigger_count} | +{self.post_log_sec}s: {after_count}")
+                else:
+                    remaining_logs.append(dlog)
+            self.delayed_logs = remaining_logs
+            
+            main_tracks = self.main_tracker.update(np.array(main_boxes)) if len(main_boxes) > 0 else self.main_tracker.predict_only()
+            main_tracks = self._snap_tracks_to_raw(main_tracks, main_boxes)
+                
+            helmet_tracks = []
+            if "no_helmet" in self.events:
+                helmet_tracks = self.helmet_tracker.update(np.array(helmet_boxes)) if len(helmet_boxes) > 0 else self.helmet_tracker.predict_only()
+                helmet_tracks = self._snap_tracks_to_raw(helmet_tracks, helmet_boxes)
+
+            now = time.time()
+            current_alarms = {}
+            track_map = {int(t[4]): int(t[6]) for t in main_tracks}
+            
+            for handler in self.handlers:
+                for evt in handler.process(main_tracks, track_map, motion_mask, frame, frame_id, helmet_tracks=helmet_tracks, raw_helmet_boxes=helmet_boxes):
+                    draw_tid = evt['tid'] 
+                    self._trigger_event(frame, frame_id, draw_tid, handler.event_name, main_tracks, now, event_frame=evt.get('frame'), event_bbox=evt.get('bbox'), event_fid=evt.get('fid'))
+                    current_alarms[draw_tid] = handler.event_name
+            
+            for tid, ename in current_alarms.items(): 
+                self.visual_alarms[tid] = {'evt': ename, 'expire': now + SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0)}
+                
+            for tid in list(self.visual_alarms.keys()):
+                if now > self.visual_alarms[tid]['expire']: 
+                    del self.visual_alarms[tid]
+                    
+            return main_tracks, {tid: info['evt'] for tid, info in self.visual_alarms.items()}
+
+    def _trigger_event(self, frame, frame_id, tid, event_name, tracks, now, event_frame=None, event_bbox=None, event_fid=None):
+        real_tid = tid
+        if event_name in self.alerted[tid] or now - self.last_evt_t.get(event_name, -999999) < self.event_config.get(event_name, {}).get('cooldown_sec', 600): 
+            return
+            
+        bbox = event_bbox if event_bbox is not None else next((t[:4] for t in tracks if int(t[4]) == real_tid), None)
+        if bbox is None: 
+            return
+            
+        source_fid = event_fid if event_fid is not None else frame_id
+        source_frame = event_frame if event_frame is not None else frame
         
-    def predict_only(self):
-        for tid, trk in self.tracks.items():
-            trk.predict()
-            trk.lost += 1
-        self.tracks = {tid: t for tid, t in self.tracks.items() if t.lost <= self.track_buffer}
-        return self._get_results()
+        self.delayed_logs.append({
+            'event_name': event_name,
+            'trigger_fid': source_fid,
+            'target_fid_to_log': source_fid + int(self.post_log_sec * self.fps),
+            'time_str': datetime.datetime.now().strftime('%H:%M:%S')
+        })
         
-    def _get_results(self):
-        return np.array([[*t.get_state(), tid, t.conf, t.cls] for tid, t in self.tracks.items() if t.lost <= 10])
+        if event_frame is None:
+            if frame_id not in self.face_blur_cache:
+                self.face_blur_cache[frame_id] = self._apply_face_blur(source_frame.copy())
+                if len(self.face_blur_cache) > 5: 
+                    self.face_blur_cache.pop(next(iter(self.face_blur_cache)))
+            saved_img = self.face_blur_cache[frame_id]
+        else: 
+            saved_img = self._apply_face_blur(source_frame.copy())
+            
+        save_event_image_with_mark(saved_img, self.ip, event_name, bbox, real_tid, terminal_id=self.terminal_id, cctv_id=self.cctv_id)
+        
+        self.alerted[tid].add(event_name)
+        self.last_evt_t[event_name] = now
+
+    def draw(self, frame, tracks, alarms, connected=True):
+        if frame is None or not connected:
+            blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 1)
+            return blank
+            
+        h_frame, w_frame = frame.shape[:2]
+        
+        if len(alarms) > 0: 
+            cv2.rectangle(frame, (0, 0), (w_frame, h_frame), (0, 0, 255), 4)
+            
+        if self.roi_poly: 
+            cv2.polylines(frame, [np.array(self.roi_poly, np.int32)], True, (0,255,255), 1)
+            
+        if self.roi_lines:
+            for i in range(0, len(self.roi_lines) - 1, 2): 
+                cv2.line(frame, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0,0,255), 1)
+        
+        for t in tracks:
+            x1, y1, x2, y2, tid, conf, cls_id = map(float, t)
+            tid, cls_id = int(tid), int(cls_id)
+            
+            if cls_id == ID_H_HELMET: color, label = (255, 0, 0), "Helmet"
+            elif cls_id == ID_H_NO_HELMET: color, label = (0, 0, 255), "No-Helmet"
+            elif cls_id == ID_G_PERSON: color, label = (0, 255, 0), "Person"
+            elif cls_id == ID_G_CAR: color, label = (255, 100, 0), "Car"
+            elif cls_id == ID_G_TRUCK: color, label = (255, 100, 0), "Truck"
+            elif cls_id == ID_PERSON_LOW: color, label = (0, 255, 100), "LowBody"
+            elif cls_id == ID_REFLECTIVE_VEST: color, label = (255, 255, 0), "Vest"
+            else: color, label = (255, 255, 255), "OBJ"
+            
+            if tid in alarms: color, label = (0, 0, 255), f"ALARM: {label}"
+                
+            thickness = 2 if tid in alarms else 1
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
+            cv2.putText(frame, f"{label} [{tid}]", (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            
+        cv2.rectangle(frame, (0, 0), (60, 40), (0, 0, 0), -1)
+        cv2.putText(frame, f"C{self.cam_id}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        active_alarms = set(alarms.values())
+        for i, handler in enumerate(self.handlers):
+            if handler.event_name in active_alarms:
+                color, text = (0, 0, 255), f"[!] {handler.gui_name}"
+            else:
+                color, text = (0, 255, 0), f" -  {handler.gui_name}"
+            cv2.putText(frame, text, (10, h_frame - 15 - (len(self.handlers)-1-i)*20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+        return frame
+
+    def stop(self):
+        self.reader.stop()

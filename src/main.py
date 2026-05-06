@@ -259,7 +259,6 @@ def prepare_config_manager(rtsp_list):
 
     return config_manager
 
-# 💡 raw_boxes 단일 처리 라우팅으로 함수 간소화
 def process_async_results(c, fid, raw_boxes, use_drawing):
     buffered_frame = c.get_buffered_frame(fid)
     if buffered_frame is None: return
@@ -290,8 +289,7 @@ def main():
         sensitivity, use_display, use_drawing = prompt_runtime_options()
         config_manager = prepare_config_manager(rtsp_list)
 
-        # 💡 통합 모델(GWKIM) 로드
-        engine_main = VisionModelAsync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv_gwkim.dxnn"))
+        engine_main = VisionModelAsync(SYS_CFG.get("models", {}).get("MAIN", "models/hanjin_cctv.dxnn"))
         face_engine = VisionModelAsync(SYS_CFG.get("models", {}).get("FACE", "models/yolov8m-face.pt")) 
         
         logger.info("카메라 백그라운드 리더 스레드를 초기화합니다...")
@@ -349,7 +347,6 @@ def main():
             loop_count += 1
             if loop_count % 300 == 0: gc.collect()
             
-            # 1. 큐에 프레임 입력
             for c in cams:
                 frame, fid, connected = c.reader.read()
                 if not connected:
@@ -358,12 +355,21 @@ def main():
                     continue
                 
                 if frame is not None and fid > c.last_submit_fid:
+                    # 💡 하드웨어 보호를 위한 NPU 인입 전 프레임 무결성 검증 (Hard Defense)
+                    if frame.size == 0 or len(frame.shape) != 3:
+                        logger.debug(f"[CAM {c.cam_id}] Shape error detected. Dropping frame {fid}.")
+                        continue
+                        
+                    std_val = np.std(frame)
+                    if std_val < 10.0:  # 극도로 단조로운 이미지(깨진 화면) 드롭
+                        logger.debug(f"[CAM {c.cam_id}] Corrupted/Blank frame detected (std={std_val:.1f}). Dropping frame {fid}.")
+                        continue
+
                     if fid % SYS_CFG.get("SKIP_FRAMES", 1) == 0:
                         c.buffer_frame(fid, frame)
                         engine_main.infer_async(frame, context={'cam_id': c.cam_id, 'fid': fid})
                     c.last_submit_fid = fid
 
-            # 2. 결과 폴링 및 즉시 처리 (2차 모델 대기 큐 제거)
             while True:
                 res = engine_main.get_result()
                 if not res: break
@@ -375,7 +381,6 @@ def main():
                 if c:
                     process_async_results(c, fid, raw_boxes, use_drawing)
 
-            # 3. 디스플레이 렌더링
             if use_display:
                 final_imgs = [c.latest_display_frame for c in cams if c.latest_display_frame is not None]
                 if final_imgs:
