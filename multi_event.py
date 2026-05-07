@@ -532,6 +532,8 @@ class YoLoDeepX:
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
 # ==========================================
+# [1] 시스템 기본 설정 및 상수 영역 하단에 추가
+DEBUG_MODE = False
 class SimpleTracker:
     def __init__(self, max_lost=30): 
         self.next_id = 1
@@ -557,25 +559,25 @@ class SimpleTracker:
                     best_idx = i
                     
             if best_iou > 0.2:
-                self.tracks[tid].update({'bbox': detections[best_idx][:4], 'lost': 0})
+                # 💡 [수정] bbox뿐만 아니라 conf(Confidence)도 업데이트
+                self.tracks[tid].update({'bbox': detections[best_idx][:4], 'lost': 0, 'conf': detections[best_idx][4]})
                 used_dets.add(best_idx)
             else: 
                 self.tracks[tid]['lost'] += 1
                 
-        # Lost 횟수가 초과된 트랙 삭제
         self.tracks = {tid: t for tid, t in self.tracks.items() if t['lost'] <= self.max_lost}
         
-        # 신규 객체 등록
         res_tracks = []
         for i, det in enumerate(detections):
             if i not in used_dets:
-                self.tracks[self.next_id] = {'bbox': det[:4], 'lost': 0, 'cls': int(det[5])}
+                # 💡 [수정] 신규 객체 등록 시 conf 추가
+                self.tracks[self.next_id] = {'bbox': det[:4], 'lost': 0, 'cls': int(det[5]), 'conf': det[4]}
                 self.next_id += 1
                 
-        # 유효한 트랙 결과 반환
         for tid, trk in self.tracks.items():
             if trk['lost'] == 0:
-                res_tracks.append([*trk['bbox'], tid, 1.0, trk['cls']])
+                # 💡 [수정] 1.0 하드코딩 대신 실제 conf 반환 (det 포맷 유지: x1, y1, x2, y2, tid, conf, cls)
+                res_tracks.append([*trk['bbox'], tid, trk.get('conf', 1.0), trk['cls']])
                 
         return np.array(res_tracks)
 
@@ -1285,19 +1287,24 @@ class FrameReader:
         while self.running:
             cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             if not cap.isOpened(): 
+                # 💡 [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
+                logger.error(f"🚨 [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
                 time.sleep(5)
                 continue
                 
             self.connected = True
+            logger.info(f"✅ [CAM:{self.ip}] 카메라 스트림 연결 성공.")
             self.last_t = time.time()
             
             while self.running and cap.isOpened():
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT: 
-                    logger.warning(f"[{self.ip}] 카메라 타임아웃. 재연결을 시도합니다.")
+                    # 💡 [수정] 타임아웃 로깅 레벨 격상
+                    logger.error(f"🚨 [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
                     break
                     
                 ret, fr = cap.read()
                 if not ret: 
+                    logger.error(f"🚨 [CAM:{self.ip}] 프레임 읽기 실패(EOF 또는 스트림 끊김).")
                     break
                     
                 if fr is not None:
@@ -1312,7 +1319,7 @@ class FrameReader:
                 
             self.connected = False
             try: cap.release()
-            except: pass
+            except Exception as e: logger.error(f"카메라 리소스 해제 중 예외: {e}")
 
     def read(self):
         with self.lock: 
@@ -1434,7 +1441,12 @@ class Camera:
 
         for ename, handler in self.handlers.items():
             kwargs = {'helmet_tracks': t_helmet} if ename == "no_helmet" else {}
-            triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
+            
+            try:
+                triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
+            except Exception as e:
+                logger.error(f"🚨 [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
+                continue
             
             for ev in triggered:
                 tid = ev['tid']
@@ -1443,14 +1455,28 @@ class Camera:
                 cooldown = SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 600)
                 
                 if ename not in self.alerted[tid] and (now - self.last_evt_t.get(ename, 0) >= cooldown):
-                    logger.warning(f"🚨 [CAM {self.cam_id}] {ename} 감지 - ID:{tid}")
+                    
+                    # 💡 [수정] 이벤트 상세 컨텍스트 수집 및 로깅
+                    conf_val = next((float(t[5]) for t in t_main if int(t[4]) == tid), 0.0)
+                    cls_id = track_map_main.get(tid, -1)
+                    terminal_id = SYS_CFG.get("terminal_id", "99999")
+                    
+                    # ROI 정보 압축 (좌표계가 너무 길어지는 것 방지)
+                    roi_str = f"Poly[{len(self.roi_poly)} pts]" if self.roi_poly else "None"
+                    
+                    log_msg = (
+                        f"🔥 [EVENT TRIGGERED] CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
+                        f"TermID:{terminal_id} | TID:{tid} | ClassID:{cls_id} | Conf:{conf_val:.2f} | "
+                        f"Trace(BBox):{tuple(map(int, bbox))} | FPS:{self.current_fps:.1f} | ROI:{roi_str}"
+                    )
+                    logger.warning(log_msg)
                     
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", False)
                     saved_img = self.apply_face_blur(ev_frame, bbox) if blur_face_option else ev_frame
                     
                     save_event_image_with_mark(
                         frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid, 
-                        terminal_id=SYS_CFG.get("terminal_id", "99999"), cctv_id=self.cam_id
+                        terminal_id=terminal_id, cctv_id=self.cam_id
                     )
                     
                     self.recorder.trigger(ename)
@@ -1550,6 +1576,7 @@ class Camera:
 # [11] 메인 프로세스 
 # ==========================================
 def main():
+    global DEBUG_MODE
     logger.info("[System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료")
     
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
@@ -1560,6 +1587,13 @@ def main():
     config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
     
+    # 💡 [수정] 디버그 모드 및 초기화 질문 (디폴트 'n')
+    debug_ans = input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
+    DEBUG_MODE = True if debug_ans == 'y' else False
+    if DEBUG_MODE:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("🛠️ 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
+    
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r', encoding='utf-8') as f: 
@@ -1567,24 +1601,23 @@ def main():
         except Exception as e: 
             logger.error(f"cameras.json 로드 실패: {e}")
             pass
-        # [수정] 설정 마법사 강제 호출 인터페이스 추가
-        reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? (y/n): ").strip().lower()
+            
+        # 💡 [수정] 아무것도 입력 안하면 기본적으로 'n'으로 처리되도록 방어 로직
+        reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
         if reset_ans == 'y':
             logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
-            camera_configs = run_wizard_batch_mode(rtsp_list,camera_configs)
+            camera_configs = run_wizard_batch_mode(rtsp_list, camera_configs)
             try:
                 with open(config_file, 'w', encoding='utf-8') as f: 
                     json.dump(camera_configs, f, indent=4)
-            except:
-                pass
+            except: pass
     else:
         logger.warning("설정 파일(cameras.json)이 없어 터미널 마법사를 실행합니다.")
-        camera_configs = run_wizard_batch_mode(rtsp_list,{})
+        camera_configs = run_wizard_batch_mode(rtsp_list, {})
         try:
             with open(config_file, 'w', encoding='utf-8') as f: 
                 json.dump(camera_configs, f, indent=4)
-        except:
-            pass
+        except: pass
 
     try:
         logger.info("DeepX 모델을 VPU 메모리로 할당 중...")
@@ -1629,6 +1662,15 @@ def main():
             loop_count += 1
             if loop_count % 300 == 0: 
                 gc.collect()
+                # 💡 [수정] 주기적 시스템 헬스체크 로깅 (메모리 릭, 스레드 포화 상태 감지용)
+                mem_usage = psutil.virtual_memory().percent
+                q_size = IMAGE_SAVER_POOL._work_queue.qsize()
+                
+                # 메모리가 80% 이상이거나 큐가 밀리기 시작하면 디버그 모드가 아니어도 강제 경고
+                if mem_usage > 80 or q_size > 20:
+                    logger.warning(f"⚠️ [System Health] CPU: {cpu_usage}% | Mem: {mem_usage}% | API Queue: {q_size} | 잦은 재시작 요인 주의")
+                elif DEBUG_MODE:
+                    logger.debug(f"ℹ️ [System Health] CPU: {cpu_usage}% | Mem: {mem_usage}% | API Queue: {q_size} | Target FPS: {target_fps}")
             
             raw_data = [c.process_frame() for c in cams]
             final_imgs = []
