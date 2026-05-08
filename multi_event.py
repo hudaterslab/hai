@@ -784,7 +784,6 @@ class ParkingDetector(BaseEventDetector):
         return triggered
 
 import math
-
 class CrossingDetector(BaseEventDetector):
     gui_name = "CROSSING"
     
@@ -803,7 +802,6 @@ class CrossingDetector(BaseEventDetector):
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
         
-        # [수정] 프레임 환산(ttl_fid_diff)을 제거하고 순수 초(sec) 단위로 관리
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
 
     def _is_intersect(self, p1, p2, p3, p4): 
@@ -902,6 +900,7 @@ class CrossingDetector(BaseEventDetector):
                     self.prev[p_tid] = curr_pos
                     continue
 
+            # 후보 등록 시점 (선분 교차 순간의 증거 스냅샷 보존)
             if p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 
@@ -921,6 +920,7 @@ class CrossingDetector(BaseEventDetector):
                             }
                         break
             
+            # 최종 판정 로직
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
@@ -937,16 +937,15 @@ class CrossingDetector(BaseEventDetector):
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
                     
                     if perp_dist >= dynamic_threshold:
-                        # [핵심 보완] 완전히 넘어선 순간의 최신 프레임과 BBox로 갱신하여 API 전송
+                        # [핵심 보완] 완전히 넘어갔음을 확정한 후, API에는 '교차 순간(cand)'의 이미지와 BBox를 발송
                         triggered.append({
                             'tid': p_tid, 
-                            'bbox': event_bbox, 
-                            'frame': frame.copy() if frame is not None else cand['frame'],
-                            'fid': fid
+                            'bbox': cand['bbox'], 
+                            'frame': cand['frame'],
+                            'fid': cand['fid']
                         })
                         del self.candidates[p_tid]
                         
-                # [가변 FPS 대응] 프레임 오차가 아닌 실제 대기 시간 초과 시 후보 삭제
                 elif (fid - cand['timestamp_fid']) / self.fps > self.candidate_ttl_sec: 
                     del self.candidates[p_tid]
                     
@@ -1206,7 +1205,12 @@ def get_roi_points_scaled(frame, title, mode="poly"):
             pts.append([int(x / scale), int(y / scale)])
             
     cv2.setMouseCallback(title, mouse_cb)
-    logger.info(f"'{title}' 설정 모드 - 화면을 클릭하여 점을 찍고 Enter(완료) 또는 ESC(취소)를 누르십시오.")
+    
+    # [UX 개선] 전체 화면 적용 방법(Skip)을 명시적으로 안내
+    if mode == "poly":
+        logger.info(f"'{title}' 설정 - 화면을 클릭하여 점을 찍으십시오. (전체 화면 적용 시 그냥 Enter 또는 ESC)")
+    else:
+        logger.info(f"'{title}' 설정 - 화면을 클릭하여 선분을 그리십시오. (Enter: 완료, ESC: 취소)")
     
     while True:
         temp = disp_frame.copy()
