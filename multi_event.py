@@ -152,17 +152,22 @@ atexit.register(graceful_shutdown)
 # ==========================================
 # [3] 딥엑스 NPU 엔진 및 환경변수 설정
 # ==========================================
+# ==========================================
+# [3] 딥엑스 NPU 엔진 및 환경변수 설정
+# ==========================================
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
 os.environ["OPENCV_FFMPEG_DEBUG"] = "0"
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;3000000|max_delay;500000"
 
+# [수정] sys.exit(1) 강제 종료를 제거하고 상태 플래그(HAS_DX_ENGINE) 도입
+HAS_DX_ENGINE = False
 try:
     from dx_engine import InferenceEngine, InferenceOption
+    HAS_DX_ENGINE = True
 except ImportError:
-    logger.error("dx_engine 모듈을 찾을 수 없습니다. DeepX SDK 설치 상태를 확인하십시오.")
-    sys.exit(1)
+    logger.warning("💡 [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
 
 # ==========================================
 # [4] 공통 유틸리티 함수
@@ -424,6 +429,10 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
 # ==========================================
 class YoLoDeepX:
     def __init__(self, engine_path):
+        # [수정] 객체 생성 시점에 NPU 환경인지 체크하여 안전하게 방어
+        if not HAS_DX_ENGINE:
+            raise RuntimeError("dx_engine이 설치되지 않은 서버/PC 환경에서는 YoLoDeepX(NPU) 객체를 생성할 수 없습니다.")
+            
         self.engine_path = engine_path
         try:
             io = InferenceOption()
@@ -469,12 +478,12 @@ class YoLoDeepX:
             if len(pred) == 0: 
                 return []
 
-            # 💡 [버그 픽스 1] NMSBoxes 포맷 맞춤 (x_min, y_min, width, height)
+            # NMSBoxes 포맷 맞춤 (x_min, y_min, width, height)
             boxes_xywh = pred[:, :4].copy()
             boxes_xywh[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2  # 중심 X -> 최소 X
             boxes_xywh[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2  # 중심 Y -> 최소 Y
             
-            # 💡 [버그 픽스 2] Class-Aware NMS (서로 다른 클래스 객체가 억제되는 현상 방지)
+            # Class-Aware NMS
             max_wh = 7680 
             class_offset = class_ids * max_wh
             boxes_shifted = boxes_xywh.copy()
@@ -487,7 +496,6 @@ class YoLoDeepX:
             if len(indices) > 0:
                 for i in indices.flatten():
                     x_min, y_min, w, h = boxes_xywh[i]
-                    # 반환 시 [x1, y1, x2, y2] 규격으로 원복
                     results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
                     
             return results
@@ -516,7 +524,6 @@ class YoLoDeepX:
             dw, dh = offset
             
             for box, score, cls_id in raw_dets:
-                # 레터박스 좌표를 원본 이미지 좌표로 변환
                 x1 = np.clip((box[0] - dw) / scale, 0, w_orig)
                 y1 = np.clip((box[1] - dh) / scale, 0, h_orig)
                 x2 = np.clip((box[2] - dw) / scale, 0, w_orig)
@@ -717,8 +724,7 @@ class ParkingDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.states = defaultdict(lambda: {'start_fid': 0, 'pos': None})
         
-        trigger_sec = config.get("trigger_sec", 5.0)
-        self.trigger_fid_diff = int(trigger_sec * self.fps)
+        self.trigger_sec = config.get("trigger_sec", 5.0)
         self.move_threshold_ratio = config.get("move_threshold_ratio", 0.1)
         
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
@@ -747,16 +753,28 @@ class ParkingDetector(BaseEventDetector):
                             'pos': c, 
                             'bbox': t[:4], 
                             'frame': frame.copy() if frame is not None else None,
+                            'fid': fid,
+                            'triggered': False # 중복 알람 방지용 플래그
+                        })
+                    else:
+                        # [핵심 보완] 정지 상태 유지 중에는 최신 스냅샷과 BBox로 지속 갱신 (API 이미지 이격 방지)
+                        self.states[tid].update({
+                            'bbox': t[:4],
+                            'frame': frame.copy() if frame is not None else None,
                             'fid': fid
                         })
-                    # 지정된 프레임 동안 정지 유지 시 이벤트 발생
-                    elif fid - self.states[tid]['start_fid'] >= self.trigger_fid_diff:
-                        triggered.append({
-                            'tid': tid, 
-                            'bbox': self.states[tid].get('bbox', t[:4]), 
-                            'frame': self.states[tid].get('frame'),
-                            'fid': self.states[tid].get('fid', fid)
-                        })
+                        
+                        # [가변 FPS 대응] 실제 정지 체류 시간(Duration) 계산
+                        duration_sec = (fid - self.states[tid]['start_fid']) / self.fps
+                        
+                        if not self.states[tid].get('triggered', False) and duration_sec >= self.trigger_sec:
+                            triggered.append({
+                                'tid': tid, 
+                                'bbox': self.states[tid]['bbox'], 
+                                'frame': self.states[tid]['frame'],
+                                'fid': self.states[tid]['fid']
+                            })
+                            self.states[tid]['triggered'] = True
                         
         # 프레임에서 사라진 객체 상태 정리
         for tid in list(self.states.keys()):
@@ -782,12 +800,11 @@ class CrossingDetector(BaseEventDetector):
         self.lb_offsets = {}
         self.lb_last_height = {}
         
-        # 선분과 궤적이 이루는 최소 교차 각도 (이 각도보다 얕게 들어오면 무시)
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
         
-        candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
-        self.ttl_fid_diff = int(candidate_ttl_sec * self.fps)
+        # [수정] 프레임 환산(ttl_fid_diff)을 제거하고 순수 초(sec) 단위로 관리
+        self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
 
     def _is_intersect(self, p1, p2, p3, p4): 
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
@@ -800,7 +817,6 @@ class CrossingDetector(BaseEventDetector):
         return abs((p2[0] - p1[0]) * (p1[1] - pt[1]) - (p1[0] - pt[0]) * (p2[1] - p1[1])) / den
 
     def _get_angle_between_lines(self, line1, line2):
-        """두 선분(ROI 선분과 객체의 이동 궤적) 사이의 예각을 계산합니다."""
         dx1 = line1[1][0] - line1[0][0]
         dy1 = line1[1][1] - line1[0][1]
         dx2 = line2[1][0] - line2[0][0]
@@ -816,13 +832,11 @@ class CrossingDetector(BaseEventDetector):
         cos_theta = max(-1.0, min(1.0, dot_product / (mag1 * mag2)))
         angle = math.degrees(math.acos(cos_theta))
         
-        # 항상 90도 이하의 예각을 반환
         if angle > 90:
             angle = 180 - angle
         return angle
 
     def _get_intersection_over_lowbody_area(self, box1, box2):
-        """IoA 계산: 하체 면적 대비 교차 면적 비율"""
         x1 = max(box1[0], box2[0])
         y1 = max(box1[1], box2[1])
         x2 = min(box1[2], box2[2])
@@ -851,12 +865,10 @@ class CrossingDetector(BaseEventDetector):
             best_low_box = None
             max_ioa = 0
             
-            # 하체 매칭
             for lb in low_bodies:
                 lx1, ly1, lx2, ly2 = lb[:4]
                 lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
                 
-                # 하체는 사람 높이의 상단 40% 아래에 있어야 함
                 if lcy < py1 + person_height * 0.4: 
                     continue
                     
@@ -869,7 +881,6 @@ class CrossingDetector(BaseEventDetector):
                 lx1, ly1, lx2, ly2 = best_low_box
                 low_height = max(1, ly2 - ly1)
                 
-                # 하체 박스 기준의 정밀 발 위치 산출 (10% 띄움)
                 curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
                 
                 self.lb_offsets[p_tid] = (curr_pos[0] - p_foot[0], curr_pos[1] - p_foot[1])
@@ -884,7 +895,6 @@ class CrossingDetector(BaseEventDetector):
                 else: 
                     continue
 
-            # 너무 큰 점프 오탐지 방어
             if p_tid in self.prev:
                 jump_dist = get_distance(self.prev[p_tid], curr_pos)
                 if jump_dist > person_height * 0.4:
@@ -892,13 +902,11 @@ class CrossingDetector(BaseEventDetector):
                     self.prev[p_tid] = curr_pos
                     continue
 
-            # 후보 등록 (선분을 교차한 순간)
             if p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
-                        # 교차 각도 검사: 선분과 너무 평행하게 걷는 경우(오탐) 필터링
                         cross_angle = self._get_angle_between_lines((p1, p2), trajectory)
                         
                         if cross_angle >= self.min_crossing_angle:
@@ -913,7 +921,6 @@ class CrossingDetector(BaseEventDetector):
                             }
                         break
             
-            # 최종 이벤트 트리거 (선분을 완전히 넘어선 후)
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
@@ -922,30 +929,29 @@ class CrossingDetector(BaseEventDetector):
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
                     
-                    # 선분의 절대 기울기 계산 (수평=0도, 수직=90도)
                     dx = abs(p2[0] - p1[0])
                     dy = abs(p2[1] - p1[1])
                     line_tilt_angle = math.degrees(math.atan2(dy, dx))
                     
-                    # 기울기가 클수록(수직에 가까울수록) 최대 1.5배까지 요구 거리를 늘림 (원근 왜곡 보상)
                     tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
                     
                     if perp_dist >= dynamic_threshold:
+                        # [핵심 보완] 완전히 넘어선 순간의 최신 프레임과 BBox로 갱신하여 API 전송
                         triggered.append({
                             'tid': p_tid, 
-                            'bbox': cand['bbox'], 
-                            'frame': cand['frame'],
-                            'fid': cand['fid']
+                            'bbox': event_bbox, 
+                            'frame': frame.copy() if frame is not None else cand['frame'],
+                            'fid': fid
                         })
                         del self.candidates[p_tid]
                         
-                elif fid - cand['timestamp_fid'] > self.ttl_fid_diff: 
+                # [가변 FPS 대응] 프레임 오차가 아닌 실제 대기 시간 초과 시 후보 삭제
+                elif (fid - cand['timestamp_fid']) / self.fps > self.candidate_ttl_sec: 
                     del self.candidates[p_tid]
                     
             self.prev[p_tid] = curr_pos
 
-        # 메모리 정리
         for tid in list(self.prev.keys()):
             if tid not in curr_ids:
                 del self.prev[tid]
@@ -960,14 +966,19 @@ class HelmetDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.states = {}
+        self.sessions = []
         
-        trigger_sec = config.get("trigger_sec", 3.0)
-        self.trigger_fid_diff = int(trigger_sec * self.fps)
-        self.grace_fid_diff = int(2.0 * self.fps)
+        self.trigger_sec = config.get("trigger_sec", 3.0)
+        self.window_sec = config.get("window_sec", 30.0)
+        
+        # FPS에 따라 window 길이를 fid 단위로 변환 (타임아웃용)
+        self.window_fids = int(self.window_sec * self.fps)
+        
+        # 가변 FPS 환경에서 단순 1~2프레임 튀는 오탐을 막기 위한 절대적인 '최소 감지 요구 프레임 수'
+        self.min_hit_count = config.get("min_hit_count", 3)
 
     def _get_intersection_over_head_area(self, head_box, person_box):
-        """머리 면적 대비 교차 면적 비율"""
+        """머리 면적 대비 교차 면적 비율 계산"""
         inter_w = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0]))
         inter_h = max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
         inter_area = inter_w * inter_h
@@ -980,13 +991,19 @@ class HelmetDetector(BaseEventDetector):
         helmet_tracks = kwargs.get('helmet_tracks', [])
         
         unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == ID_H_NO_HELMET]
-        current_nh_person_ids = set()
+        current_nh_persons = []
         
         for p in tracks:
             p_tid = int(p[4])
             if track_map.get(p_tid) != ID_G_PERSON: 
                 continue
                 
+            # ROI 설정 시, 사람의 발 위치가 ROI 내부에 있는지 검사
+            if self.roi_poly.size > 0:
+                foot_pt = get_foot_point(*p[:4])
+                if cv2.pointPolygonTest(self.roi_poly, foot_pt, False) < 0:
+                    continue
+                    
             px1, py1, px2, py2 = p[:4]
             person_height = max(1, py2 - py1)
             person_width = max(1, px2 - px1)
@@ -998,11 +1015,11 @@ class HelmetDetector(BaseEventDetector):
                 hx1, hy1, hx2, hy2 = head[:4]
                 hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
 
-                # [해부학적 필터 1] 머리는 전신의 상단 40% 이내에 위치해야 함
+                # [해부학적 필터 1] 머리는 전신의 상단 40% 이내
                 if hcy > py1 + person_height * 0.4:
                     continue
                     
-                # [수평 필터 2] 머리는 전신의 좌우 폭(15% 마진) 안에 있어야 함
+                # [수평 필터 2] 머리는 전신의 좌우 폭(15% 마진) 이내
                 margin = person_width * 0.15
                 if hcx < px1 - margin or hcx > px2 + margin:
                     continue
@@ -1012,32 +1029,66 @@ class HelmetDetector(BaseEventDetector):
                     max_ioa = ioa
                     nh_box_match = head[:4]
                     
+            # 헬멧 미착용으로 판별된 객체 수집
             if max_ioa >= 0.5 and nh_box_match is not None:
-                current_nh_person_ids.add(p_tid)
+                current_nh_persons.append({
+                    'tid': p_tid,
+                    'head_bbox': nh_box_match,
+                    'person_bbox': p[:4]
+                })
                 
-                # Snapshot Freezing 기법
-                if p_tid not in self.states: 
-                    self.states[p_tid] = {
-                        'start_fid': fid, 
-                        'last_seen': fid, 
-                        'bbox': nh_box_match,
-                        'frame': frame.copy() if frame is not None else None,
-                        'fid': fid
-                    }
-                else:
-                    self.states[p_tid]['last_seen'] = fid
+        # 수집된 객체들을 세션에 매칭 및 업데이트
+        for nh_p in current_nh_persons:
+            matched_session = None
+            
+            for session in self.sessions:
+                # Track ID 유지 또는 공간적 겹침(IoU) 기반 세션 매칭
+                if session['last_tid'] == nh_p['tid'] or calculate_iou(nh_p['person_bbox'], session['last_person_bbox']) > 0.3:
+                    matched_session = session
+                    break
                     
-                if fid - self.states[p_tid]['start_fid'] >= self.trigger_fid_diff:
-                    triggered.append({
-                        'tid': p_tid, 
-                        'bbox': self.states[p_tid]['bbox'], 
-                        'frame': self.states[p_tid]['frame'], 
-                        'fid': self.states[p_tid]['fid']
-                    })
-                    
-        for tid in list(self.states.keys()):
-            if fid - self.states[tid]['last_seen'] > self.grace_fid_diff:
-                del self.states[tid]
+            if matched_session:
+                matched_session['hit_fids'].add(fid)
+                matched_session['last_tid'] = nh_p['tid']
+                matched_session['last_person_bbox'] = nh_p['person_bbox']
+                matched_session['bbox'] = nh_p['head_bbox']
+                matched_session['frame'] = frame.copy() if frame is not None else None
+                matched_session['fid'] = fid
+            else:
+                self.sessions.append({
+                    'start_fid': fid,
+                    'hit_fids': {fid},
+                    'last_tid': nh_p['tid'],
+                    'last_person_bbox': nh_p['person_bbox'],
+                    'bbox': nh_p['head_bbox'],
+                    'frame': frame.copy() if frame is not None else None,
+                    'fid': fid,
+                    'triggered': False
+                })
+
+        # 세션 검사 (트리거 판별 및 정리)
+        active_sessions = []
+        for session in self.sessions:
+            # 30초 윈도우가 경과한 세션은 폐기
+            if fid - session['start_fid'] > self.window_fids:
+                continue
+                
+            # 현재 프레임과 첫 감지 프레임 간의 '비디오 기준 체류 시간' 계산
+            duration_sec = (fid - session['start_fid']) / self.fps
+            
+            # 가변 FPS 환경 트리거 조건: 3초 이상 경과 & 1프레임 노이즈가 아님(3회 이상 감지)
+            if not session['triggered'] and duration_sec >= self.trigger_sec and len(session['hit_fids']) >= self.min_hit_count:
+                triggered.append({
+                    'tid': session['last_tid'], 
+                    'bbox': session['bbox'], 
+                    'frame': session['frame'], 
+                    'fid': session['fid']
+                })
+                session['triggered'] = True 
+                
+            active_sessions.append(session)
+            
+        self.sessions = active_sessions
                 
         return triggered
 
