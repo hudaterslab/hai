@@ -1417,6 +1417,26 @@ class Camera:
             if ename in EVENT_REGISTRY:
                 self.handlers[ename] = EVENT_REGISTRY[ename](SYS_CFG.get("event_config", {}).get(ename, {}), self.roi_poly, self.roi_lines)
 
+    def update_config(self, new_conf):
+        """웹 UI 등 외부에서 cameras.json이 변경되었을 때, 무중단으로 설정을 핫 리로드합니다."""
+        old_events = self.events.copy()
+        self.events = new_conf.get('events', [])
+        self.roi_poly_norm = new_conf.get('roi_poly_norm', [])
+        self.roi_lines_norm = new_conf.get('roi_lines_norm', [])
+        
+        # 해상도 변경 감지 변수를 초기화하여 다음 프레임에서 ROI 역정규화를 강제 수행
+        self.roi_frame_shape = None 
+        
+        # 이벤트 핸들러 재구성
+        self.handlers = {}
+        for ename in self.events:
+            if ename in EVENT_REGISTRY:
+                # 새로운 설정과 텅 빈 ROI로 초기화 (이후 process_frame 타임에 runtime_roi가 자동 주입됨)
+                event_cfg = SYS_CFG.get("event_config", {}).get(ename, {})
+                self.handlers[ename] = EVENT_REGISTRY[ename](event_cfg, [], [])
+                
+        logger.info(f"🔄 [CAM:{self.ip}] 무중단 설정 리로드 완료: {old_events} -> {self.events}")
+
     def _update_runtime_roi(self, frame_shape):
         if self.roi_frame_shape == frame_shape[:2]:
             return
@@ -1526,7 +1546,7 @@ class Camera:
                     )
                     logger.warning(log_msg)
                     
-                    blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", False)
+                    blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
                     saved_img = self.apply_face_blur(ev_frame, bbox) if blur_face_option else ev_frame
                     
                     save_event_image_with_mark(
@@ -1626,9 +1646,90 @@ class Camera:
             y_pos += 40
             
         return fr
+# ==========================================
+# [11]  Platform 송수신 모듈
+# ==========================================
+def get_system_temperature():
+    """OS 환경(Linux, Edge Device 등)에 맞게 시스템 온도를 안전하게 수집합니다."""
+    try:
+        # 1차 시도: psutil을 통한 센서 온도 읽기
+        if hasattr(psutil, "sensors_temperatures"):
+            temps = psutil.sensors_temperatures()
+            if temps:
+                for name, entries in temps.items():
+                    for entry in entries:
+                        return float(entry.current)
+                        
+        # 2차 시도: 리눅스/엣지 단말(Jetson, Raspberry Pi 등)의 하드웨어 파일 직접 참조
+        temp_path = "/sys/class/thermal/thermal_zone0/temp"
+        if os.path.exists(temp_path):
+            with open(temp_path, "r") as f:
+                return float(f.read().strip()) / 1000.0
+    except Exception as e:
+        logger.debug(f"온도 센서 읽기 실패 (해당 OS 미지원): {e}")
+        
+    return 0.0 # 센서가 없는 PC 환경 등의 폴백(Fallback)
+
+class HealthCheckDaemon:
+    def __init__(self, terminal_id, version="v1.1.0", interval_sec=300):
+        self.terminal_id = terminal_id
+        self.version = version
+        self.interval = interval_sec
+        self.running = True
+        self.url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
+        
+        # 데몬 스레드로 실행하여 메인 프로세스 종료 시 강제 종료되도록 허용
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        logger.info(f"🩺 [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
+
+    def _run(self):
+        while self.running:
+            try:
+                # 자원 수집
+                cpu = psutil.cpu_percent(interval=1.0)
+                mem = psutil.virtual_memory().percent
+                temp = get_system_temperature()
+                
+                # ISO 8601 포맷
+                kst = pytz.timezone('Asia/Seoul')
+                reported_at = datetime.datetime.now(kst).strftime('%Y-%m-%dT%H:%M:%S')
+
+                data = {
+                    "terminalId": str(self.terminal_id),
+                    "reportedAt": reported_at,
+                    "cpuUsage": round(cpu, 1),
+                    "memoryUsage": round(mem, 1),
+                    "temperature": round(temp, 1),
+                    "softwareVersion": self.version
+                }
+
+                # requests 모듈은 딕셔너리를 data= 에 넘기면 자동으로 application/x-www-form-urlencoded 로 처리합니다.
+                headers = {"accept": "application/json"}
+                
+                response = requests.post(self.url, headers=headers, data=data, timeout=10, verify=False)
+                
+                if response.status_code == 200:
+                    logger.debug(f"🩺 [Health Check] 전송 성공 (CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%)")
+                else:
+                    logger.error(f"⚠️ [Health Check] API 응답 에러 (상태코드: {response.status_code}) - {response.text}")
+                    
+            except Exception as e:
+                logger.error(f"⚠️ [Health Check] 네트워크 연결 예외 발생: {e}")
+            
+            # interval(300초)을 통으로 sleep하지 않고, 1초마다 running 상태를 체크하여 빠른 셧다운을 지원
+            for _ in range(self.interval):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def stop(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
 
 # ==========================================
-# [11] 메인 프로세스 
+# [12] 메인 프로세스 
 # ==========================================
 def main():
     global DEBUG_MODE
@@ -1700,12 +1801,42 @@ def main():
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
     loop_count = 0
+    
+    # [추가] 5분(300초) 간격의 헬스 체크 데몬 실행
+    terminal_id = SYS_CFG.get("terminal_id", "99999")
+    software_version = "v1.1.0"  # 필요 시 SYS_CFG에서 로드 가능
+    health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=300)
+    
+    # [추가] 핫 리로드를 위한 설정 파일 타임스탬프 기록
+    last_config_mtime = 0
+    if os.path.exists(config_file):
+        last_config_mtime = os.path.getmtime(config_file)
+        
+    # [추가] 웹 UI 스냅샷 공유를 위한 RAM 디스크 폴더 준비 (리눅스 기준)
+    RAM_DISK_DIR = "/dev/shm/cctv_frames"
+    if not os.path.exists(RAM_DISK_DIR):
+        try: os.makedirs(RAM_DISK_DIR, exist_ok=True)
+        except: RAM_DISK_DIR = "./web_frames" # 윈도우나 지원하지 않는 환경용 폴백
 
     try:
         while True:
             start_time = time.time()
             
-            # [방어적 로직] CPU 부하에 따른 동적 FPS 스로틀링
+            # [추가] 3초(대략 45루프)마다 설정 파일의 변경 여부를 검사 (Watchdog)
+            if loop_count % 45 == 0 and os.path.exists(config_file):
+                current_mtime = os.path.getmtime(config_file)
+                if current_mtime > last_config_mtime:
+                    logger.info("🛠️ [System] cameras.json 변경 감지. 카메라 설정을 무중단 핫 리로드합니다.")
+                    try:
+                        with open(config_file, 'r', encoding='utf-8') as f:
+                            new_configs = json.load(f)
+                        for c in cams:
+                            if c.ip in new_configs:
+                                c.update_config(new_configs[c.ip])
+                        last_config_mtime = current_mtime
+                    except Exception as e:
+                        logger.error(f"핫 리로드 중 예외 발생 (JSON 문법 오류 등): {e}")
+
             cpu_usage = psutil.cpu_percent(interval=None)
             if cpu_usage > 85: 
                 target_fps = max(5, target_fps - 2)
@@ -1717,21 +1848,36 @@ def main():
             loop_count += 1
             if loop_count % 300 == 0: 
                 gc.collect()
-                # 💡 [수정] 주기적 시스템 헬스체크 로깅 (메모리 릭, 스레드 포화 상태 감지용)
                 mem_usage = psutil.virtual_memory().percent
                 q_size = IMAGE_SAVER_POOL._work_queue.qsize()
                 
-                # 메모리가 80% 이상이거나 큐가 밀리기 시작하면 디버그 모드가 아니어도 강제 경고
                 if mem_usage > 80 or q_size > 20:
-                    logger.warning(f"⚠️ [System Health] CPU: {cpu_usage}% | Mem: {mem_usage}% | API Queue: {q_size} | 잦은 재시작 요인 주의")
-                elif DEBUG_MODE:
-                    logger.debug(f"ℹ️ [System Health] CPU: {cpu_usage}% | Mem: {mem_usage}% | API Queue: {q_size} | Target FPS: {target_fps}")
+                    logger.warning(f"⚠️ [System Health] CPU: {cpu_usage}% | Mem: {mem_usage}% | API Queue: {q_size}")
             
             raw_data = [c.process_frame() for c in cams]
             final_imgs = []
             
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
+                
+                # [추가] 웹 UI 렌더링용 스냅샷 저장 (부하 최소화를 위해 100루프마다 1번씩만 RAM에 덮어쓰기)
+                if connected and fr is not None and loop_count % 100 == 0:
+                    try:
+                        # 통신 부하를 줄이기 위해 640x360으로 리사이즈 및 낮은 화질(JPEG 70) 압축
+                        small_fr = cv2.resize(fr, (640, 360))
+                        save_path = os.path.join(RAM_DISK_DIR, f"{cams[idx].ip}.jpg")
+                        cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    except Exception as e:
+                        pass
+                
+                # 이벤트가 설정되지 않은 카메라면 렌더링/추론 건너뛰기 (웹 UI 연동 시 CPU 최적화)
+                if not cams[idx].events:
+                    if connected and fr is not None:
+                        # 모니터링은 되게끔 원본 화면만 반환
+                        final_imgs.append(cams[idx].draw(fr, [], [], {}, True))
+                    else:
+                        final_imgs.append(cams[idx].draw(None, [], [], {}, False))
+                    continue
                 
                 if not connected:
                     final_imgs.append(cams[idx].draw(None, [], [], {}, False))
@@ -1763,6 +1909,11 @@ def main():
     except Exception as e:
         logger.error(f"[치명적 오류] {e}\n{traceback.format_exc()}")
     finally:
+        # [추가] 헬스 체크 데몬 안전 종료
+        if 'health_daemon' in locals():
+            logger.info("🩺 [Health Check] 데몬 스레드를 안전하게 종료합니다.")
+            health_daemon.stop()
+            
         for c in cams: 
             c.reader.running = False
             c.recorder.running = False
