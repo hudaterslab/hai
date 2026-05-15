@@ -311,6 +311,10 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
 # ==========================================
 def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, bboxes, img_width=None, img_height=None):
     """수신 서버(Receiver API)로 이벤트 이미지를 POST 전송합니다."""
+    if(terminal_id == "99999"):
+        logger.debug(f"[API 스킵] 기본 단말 ID(99999) 사용 중: {image_path}")
+        return
+    
     url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
     event_type_mapping = {
         "conveyor_crossing": 1, 
@@ -960,6 +964,14 @@ class CrossingDetector(BaseEventDetector):
                 
         return triggered
     
+import cv2
+import numpy as np
+from collections import deque
+
+# ---------------------------------------------------------
+# [Modified 코드 Part] - ROI 버퍼 기반 Median 검증 및 Track ID 블랙리스트 추가
+# ---------------------------------------------------------
+
 class HelmetDetector(BaseEventDetector):
     gui_name = "NO-HELMET"
     
@@ -970,14 +982,65 @@ class HelmetDetector(BaseEventDetector):
         self.trigger_sec = config.get("trigger_sec", 3.0)
         self.window_sec = config.get("window_sec", 30.0)
         
-        # FPS에 따라 window 길이를 fid 단위로 변환 (타임아웃용)
         self.window_fids = int(self.window_sec * self.fps)
-        
-        # 가변 FPS 환경에서 단순 1~2프레임 튀는 오탐을 막기 위한 절대적인 '최소 감지 요구 프레임 수'
         self.min_hit_count = config.get("min_hit_count", 3)
+        
+        # 빨간 헬멧(오인식)으로 확정된 Track ID를 영구 배제하기 위한 블랙리스트 Set
+        self.red_helmet_tids = set()
+
+    def _get_roi_crop(self, frame, box):
+        """메모리 절약을 위해 객체 상단 50% 영역만 잘라내어 반환합니다."""
+        if frame is None:
+            return None
+            
+        h_img, w_img = frame.shape[:2]
+        x1, y1, x2, y2 = map(int, box[:4])
+        
+        # 프레임 경계 방어 로직
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_img, x2), min(h_img, y2)
+        
+        h_box = y2 - y1
+        if h_box <= 0 or (x2 - x1) <= 0:
+            return None
+            
+        roi_y2 = y1 + int(h_box * 0.5)
+        roi = frame[y1:roi_y2, x1:x2]
+        
+        if roi.size == 0:
+            return None
+            
+        return roi.copy()  # 원본 프레임 참조를 끊기 위해 독립된 메모리로 복사
+
+    def _is_red_helmet_median(self, roi_buffer):
+        """버퍼에 쌓인 최근 3~5장 ROI들의 스칼라 중간값(Median)을 계산합니다."""
+        if not roi_buffer:
+            return False
+            
+        h_means, s_means, r_means = [], [], []
+        
+        for roi in roi_buffer:
+            if roi is None or roi.size == 0:
+                continue
+                
+            rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            
+            r_means.append(np.mean(rgb_roi[:, :, 0]))
+            h_means.append(np.mean(hsv_roi[:, :, 0]))
+            s_means.append(np.mean(hsv_roi[:, :, 1]))
+            
+        if not h_means:
+            return False
+            
+        # 프레임 단위의 스파이크 노이즈를 제거하기 위한 Median 연산
+        med_r = np.median(r_means)
+        med_h = np.median(h_means)
+        med_s = np.median(s_means)
+        
+        return (10 <= med_h <= 40) and (med_s >= 60) and (med_r >= 100)
 
     def _get_intersection_over_head_area(self, head_box, person_box):
-        """머리 면적 대비 교차 면적 비율 계산"""
         inter_w = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0]))
         inter_h = max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
         inter_area = inter_w * inter_h
@@ -994,11 +1057,15 @@ class HelmetDetector(BaseEventDetector):
         
         for p in tracks:
             p_tid = int(p[4])
+            
+            # [추가점] 이미 빨간 헬멧으로 확정된 ID는 처음부터 객체 매칭 연산에서 제외
+            if p_tid in self.red_helmet_tids:
+                continue
+                
             if track_map.get(p_tid) != ID_G_PERSON: 
                 continue
                 
-            # ROI 설정 시, 사람의 발 위치가 ROI 내부에 있는지 검사
-            if self.roi_poly.size > 0:
+            if self.roi_poly is not None and self.roi_poly.size > 0:
                 foot_pt = get_foot_point(*p[:4])
                 if cv2.pointPolygonTest(self.roi_poly, foot_pt, False) < 0:
                     continue
@@ -1014,11 +1081,9 @@ class HelmetDetector(BaseEventDetector):
                 hx1, hy1, hx2, hy2 = head[:4]
                 hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
 
-                # [해부학적 필터 1] 머리는 전신의 상단 40% 이내
                 if hcy > py1 + person_height * 0.4:
                     continue
                     
-                # [수평 필터 2] 머리는 전신의 좌우 폭(15% 마진) 이내
                 margin = person_width * 0.15
                 if hcx < px1 - margin or hcx > px2 + margin:
                     continue
@@ -1028,7 +1093,6 @@ class HelmetDetector(BaseEventDetector):
                     max_ioa = ioa
                     nh_box_match = head[:4]
                     
-            # 헬멧 미착용으로 판별된 객체 수집
             if max_ioa >= 0.5 and nh_box_match is not None:
                 current_nh_persons.append({
                     'tid': p_tid,
@@ -1036,15 +1100,16 @@ class HelmetDetector(BaseEventDetector):
                     'person_bbox': p[:4]
                 })
                 
-        # 수집된 객체들을 세션에 매칭 및 업데이트
         for nh_p in current_nh_persons:
             matched_session = None
             
             for session in self.sessions:
-                # Track ID 유지 또는 공간적 겹침(IoU) 기반 세션 매칭
                 if session['last_tid'] == nh_p['tid'] or calculate_iou(nh_p['person_bbox'], session['last_person_bbox']) > 0.3:
                     matched_session = session
                     break
+            
+            # 현재 프레임의 ROI 크롭 추출
+            roi_crop = self._get_roi_crop(frame, nh_p['head_bbox'])
                     
             if matched_session:
                 matched_session['hit_fids'].add(fid)
@@ -1053,7 +1118,15 @@ class HelmetDetector(BaseEventDetector):
                 matched_session['bbox'] = nh_p['head_bbox']
                 matched_session['frame'] = frame.copy() if frame is not None else None
                 matched_session['fid'] = fid
+                
+                if roi_crop is not None:
+                    matched_session['roi_buffer'].append(roi_crop)
             else:
+                # 신규 세션 생성 시 maxlen 5의 deque 할당
+                new_buffer = deque(maxlen=5)
+                if roi_crop is not None:
+                    new_buffer.append(roi_crop)
+                    
                 self.sessions.append({
                     'start_fid': fid,
                     'hit_fids': {fid},
@@ -1062,27 +1135,38 @@ class HelmetDetector(BaseEventDetector):
                     'bbox': nh_p['head_bbox'],
                     'frame': frame.copy() if frame is not None else None,
                     'fid': fid,
-                    'triggered': False
+                    'triggered': False,
+                    'roi_buffer': new_buffer
                 })
 
-        # 세션 검사 (트리거 판별 및 정리)
         active_sessions = []
         for session in self.sessions:
-            # 30초 윈도우가 경과한 세션은 폐기
+            # 루프 도중 블랙리스트에 등재된 ID가 있다면 즉시 폐기
+            if session['last_tid'] in self.red_helmet_tids:
+                continue
+                
             if fid - session['start_fid'] > self.window_fids:
                 continue
                 
-            # 현재 프레임과 첫 감지 프레임 간의 '비디오 기준 체류 시간' 계산
             duration_sec = (fid - session['start_fid']) / self.fps
             
-            # 가변 FPS 환경 트리거 조건: 3초 이상 경과 & 1프레임 노이즈가 아님(3회 이상 감지)
             if not session['triggered'] and duration_sec >= self.trigger_sec and len(session['hit_fids']) >= self.min_hit_count:
-                triggered.append({
-                    'tid': session['last_tid'], 
-                    'bbox': session['bbox'], 
-                    'frame': session['frame'], 
-                    'fid': session['fid']
-                })
+                
+                # 지연된 오인식 검증 (최대 최근 5장의 Median)
+                is_red_helmet = self._is_red_helmet_median(session['roi_buffer'])
+                
+                if is_red_helmet:
+                    # 오인식 판정 시: 해당 Track ID를 블랙리스트에 추가하여 향후 탐지에서 영구 배제
+                    self.red_helmet_tids.add(session['last_tid'])
+                else:
+                    # 실제 이벤트 발생
+                    triggered.append({
+                        'tid': session['last_tid'], 
+                        'bbox': session['bbox'], 
+                        'frame': session['frame'], 
+                        'fid': session['fid']
+                    })
+                    
                 session['triggered'] = True 
                 
             active_sessions.append(session)
@@ -1732,6 +1816,18 @@ class HealthCheckDaemon:
 # [12] 메인 프로세스 
 # ==========================================
 def main():
+    # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
+    parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
+    parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
+    args = parser.parse_args()
+    
+    is_gui_mode = args.gui
+
+    if not is_gui_mode:
+        logger.info("[시스템 모드] CLI (Headless) 모드로 동작합니다. (렌더링 생략으로 CPU 부하 최소화)")
+    else:
+        logger.info("[시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)")
+        
     global DEBUG_MODE
     logger.info("[System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료")
     
@@ -1801,11 +1897,13 @@ def main():
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
     loop_count = 0
+    fps_calc_interval = 30
+    last_fps_time = time.time()
     
-    # [추가] 5분(300초) 간격의 헬스 체크 데몬 실행
+    # [추가] 1분(60초) 간격의 헬스 체크 데몬 실행
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"  # 필요 시 SYS_CFG에서 로드 가능
-    health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=300)
+    health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=60)
     
     # [추가] 핫 리로드를 위한 설정 파일 타임스탬프 기록
     last_config_mtime = 0
@@ -1846,13 +1944,38 @@ def main():
             dynamic_delay = 1.0 / target_fps
             
             loop_count += 1
+            cpu_usage = psutil.cpu_percent(interval=None)
+            # CPU 부하에 따른 목표 FPS 동적 스로틀링
+            if cpu_usage > 85: 
+                target_fps = max(5, target_fps - 2)
+            elif cpu_usage < 60: 
+                target_fps = min(15, target_fps + 1)
+                
+            dynamic_delay = 1.0 / target_fps
+            
+            loop_count += 1
+            
+            # 지정된 주기(fps_calc_interval)마다 실제 FPS를 계산
+            if loop_count % fps_calc_interval == 0:
+                current_time = time.time()
+                elapsed_time = current_time - last_fps_time
+                actual_fps = fps_calc_interval / elapsed_time
+                
+                # [수정] 디버그 모드일 때만 CPU 점유율과 함께 FPS 지표를 출력
+                if DEBUG_MODE:
+                    logger.debug(f"⏱️ [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
+                
+                # 다음 측정을 위해 타이머 초기화
+                last_fps_time = current_time
+
+            # 300 루프마다 주기적인 가비지 컬렉션 및 헬스 체크 경고 (유지)
             if loop_count % 300 == 0: 
                 gc.collect()
                 mem_usage = psutil.virtual_memory().percent
-                q_size = IMAGE_SAVER_POOL._work_queue.qsize()
+                q_size = IMAGE_SAVER_POOL._work_queue.qsize() if hasattr(IMAGE_SAVER_POOL, '_work_queue') else 0
                 
                 if mem_usage > 80 or q_size > 20:
-                    logger.warning(f"⚠️ [System Health] CPU: {cpu_usage}% | Mem: {mem_usage}% | API Queue: {q_size}")
+                    logger.warning(f"⚠️ [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
             
             raw_data = [c.process_frame() for c in cams]
             final_imgs = []
@@ -1890,15 +2013,41 @@ def main():
                 if "no_helmet" in cams[idx].events:
                     d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
                 
-                # 로직 실행 및 렌더링
+                # 로직 실행
                 t_main, t_helmet, alarms = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res)
-                final_imgs.append(cams[idx].draw(fr, t_main, t_helmet, alarms, True))
-
-            if final_imgs:
-                cv2.imshow("Monitor", create_mosaic_image(final_imgs))
                 
-            if cv2.waitKey(1) == ord('q'): 
-                break
+                # [수정] GUI 모드일 때만 무거운 화면 그리기 수행
+                if is_gui_mode:
+                    final_imgs.append(cams[idx].draw(fr, t_main, t_helmet, alarms, True))
+                    
+                # [추가] 이벤트 발생 시 API 페이로드 구성 및 원본 저장
+                if alarms:
+                    # 렌더링 되지 않은 순수 원본 저장
+                    event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{idx}_{fid}.jpg")
+                    cv2.imwrite(event_img_path, fr)
+                    
+                    api_payload = []
+                    for alarm in alarms:
+                        # 알람 객체 구조에 맞춰 파싱 (딕셔너리로 가정)
+                        box = [int(x) for x in alarm.get('bbox', [0, 0, 0, 0])]
+                        # conf 값이 없다면 기본값 0.00 사용
+                        score = round(float(alarm.get('conf', 0.00)), 2)
+                        
+                        api_payload.append({
+                            "box": box,
+                            "label": "no_helmet",
+                            "score": score
+                        })
+                    
+                    logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 생성: {json.dumps(api_payload)}")
+                    # TODO: IMAGE_SAVER_POOL 이나 별도 워커를 통해 api_payload를 비동기 전송하십시오.
+
+            # GUI 렌더링 최종 처리
+            if is_gui_mode:
+                if final_imgs:
+                    cv2.imshow("Monitor", create_mosaic_image(final_imgs))
+                if cv2.waitKey(1) == ord('q'): 
+                    break
 
             sleep_time = dynamic_delay - (time.time() - start_time)
             if sleep_time > 0: 
@@ -1909,15 +2058,17 @@ def main():
     except Exception as e:
         logger.error(f"[치명적 오류] {e}\n{traceback.format_exc()}")
     finally:
-        # [추가] 헬스 체크 데몬 안전 종료
+        # 헬스 체크 데몬 안전 종료
         if 'health_daemon' in locals():
             logger.info("🩺 [Health Check] 데몬 스레드를 안전하게 종료합니다.")
             health_daemon.stop()
-            
+
         for c in cams: 
             c.reader.running = False
             c.recorder.running = False
-        cv2.destroyAllWindows()
+            
+        if is_gui_mode:
+            cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
