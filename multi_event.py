@@ -1900,6 +1900,8 @@ def main():
     loop_count = 0
     fps_calc_interval = 30
     last_fps_time = time.time()
+    cpu_usage = 0.0
+    dynamic_delay = 1.0 / target_fps
     
     # [추가] 1분(60초) 간격의 헬스 체크 데몬 실행
     terminal_id = SYS_CFG.get("terminal_id", "99999")
@@ -1918,11 +1920,12 @@ def main():
         except: RAM_DISK_DIR = "./web_frames" # 윈도우나 지원하지 않는 환경용 폴백
 
     try:
+        psutil.cpu_percent(interval=None)
+        
         while True:
             start_time = time.time()
             
-            # [추가] 3초(대략 45루프)마다 설정 파일의 변경 여부를 검사 (Watchdog)
-            if loop_count % 45 == 0 and os.path.exists(config_file):
+            if loop_count > 0 and loop_count % 45 == 0 and os.path.exists(config_file):
                 current_mtime = os.path.getmtime(config_file)
                 if current_mtime > last_config_mtime:
                     logger.info("🛠️ [System] cameras.json 변경 감지. 카메라 설정을 무중단 핫 리로드합니다.")
@@ -1934,42 +1937,34 @@ def main():
                                 c.update_config(new_configs[c.ip])
                         last_config_mtime = current_mtime
                     except Exception as e:
-                        logger.error(f"핫 리로드 중 예외 발생 (JSON 문법 오류 등): {e}")
+                        logger.error(f"핫 리로드 중 예외 발생: {e}")
 
-            cpu_usage = psutil.cpu_percent(interval=None)
-            if cpu_usage > 85: 
-                target_fps = max(5, target_fps - 2)
-            elif cpu_usage < 60: 
-                target_fps = min(15, target_fps + 1)
-                
-            dynamic_delay = 1.0 / target_fps
-            
-            loop_count += 1
-            cpu_usage = psutil.cpu_percent(interval=None)
-            # CPU 부하에 따른 목표 FPS 동적 스로틀링
-            if cpu_usage > 85: 
-                target_fps = max(5, target_fps - 2)
-            elif cpu_usage < 60: 
-                target_fps = min(15, target_fps + 1)
-                
-            dynamic_delay = 1.0 / target_fps
-            
             loop_count += 1
             
-            # 지정된 주기(fps_calc_interval)마다 실제 FPS를 계산
+            # [수정] 지정된 주기(fps_calc_interval)마다 CPU 사용량과 실제 FPS를 묶어서 계산
             if loop_count % fps_calc_interval == 0:
                 current_time = time.time()
                 elapsed_time = current_time - last_fps_time
                 actual_fps = fps_calc_interval / elapsed_time
                 
-                # [수정] 디버그 모드일 때만 CPU 점유율과 함께 FPS 지표를 출력
+                # 측정 주기를 넓혀서 호출하므로, 0이나 100으로 튀지 않고 정확한 누적 평균값이 반환됨
+                cpu_usage = psutil.cpu_percent(interval=None)
+                
+                # CPU 부하에 따른 목표 FPS 동적 스로틀링 (제어 주기를 늘려 Oscillation 방지)
+                if cpu_usage > 85: 
+                    target_fps = max(5, target_fps - 2)
+                elif cpu_usage < 60: 
+                    target_fps = min(15, target_fps + 1)
+                    
+                dynamic_delay = 1.0 / target_fps
+                
                 if DEBUG_MODE:
                     logger.debug(f"⏱️ [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
                 
                 # 다음 측정을 위해 타이머 초기화
                 last_fps_time = current_time
 
-            # 300 루프마다 주기적인 가비지 컬렉션 및 헬스 체크 경고 (유지)
+            # 300 루프마다 주기적인 가비지 컬렉션 및 헬스 체크 경고
             if loop_count % 300 == 0: 
                 gc.collect()
                 mem_usage = psutil.virtual_memory().percent
