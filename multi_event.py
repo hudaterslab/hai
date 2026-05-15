@@ -2023,15 +2023,45 @@ def main():
                     cv2.imwrite(event_img_path, fr)
                     
                     api_payload = []
-                    for alarm in alarms:
-                        # 알람 객체 구조에 맞춰 파싱 (딕셔너리로 가정)
-                        box = [int(x) for x in alarm.get('bbox', [0, 0, 0, 0])]
-                        # conf 값이 없다면 기본값 0.00 사용
-                        score = round(float(alarm.get('conf', 0.00)), 2)
+                    
+                    # alarms 데이터가 dict 구조인지, int(TID) list 구조인지 판별하여 정규화
+                    # ex: {'no_helmet': [152]} 또는 [152] 형태 모두 대응
+                    alarm_items = []
+                    if isinstance(alarms, dict):
+                        for evt_label, tids in alarms.items():
+                            tids = tids if isinstance(tids, list) else [tids]
+                            for tid in tids:
+                                alarm_items.append((evt_label, tid))
+                    elif isinstance(alarms, list):
+                        for item in alarms:
+                            alarm_items.append(("no_helmet", item)) # 기본 라벨 적용
+
+                    for label, alarm_data in alarm_items:
+                        box = [0, 0, 0, 0]
+                        score = 0.95
                         
+                        if isinstance(alarm_data, int):
+                            target_tid = alarm_data
+                            # TID만 넘어온 경우, 현재 프레임의 t_helmet 또는 t_main 트랙에서 BBox를 역추적하여 추출
+                            # track 포맷 가정: [x1, y1, x2, y2, tid, conf, cls]
+                            found = False
+                            for tracks in (t_helmet, t_main):
+                                for t in tracks:
+                                    if len(t) > 4 and int(t[4]) == target_tid:
+                                        box = [int(x) for x in t[:4]]
+                                        score = round(float(t[5]), 2) if len(t) > 5 else 0.95
+                                        found = True
+                                        break
+                                if found: break
+                                
+                        elif isinstance(alarm_data, dict):
+                            # 만약 dict 형태가 맞다면 기존 로직 수행
+                            box = [int(x) for x in alarm_data.get('bbox', [0, 0, 0, 0])]
+                            score = round(float(alarm_data.get('conf', 0.95)), 2)
+                            
                         api_payload.append({
                             "box": box,
-                            "label": "no_helmet",
+                            "label": label,
                             "score": score
                         })
                     
