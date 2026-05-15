@@ -21,6 +21,7 @@ import requests
 import pytz
 from urllib.parse import urlsplit, unquote
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
+import argparse
 
 warnings = requests.packages.urllib3.exceptions.InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(warnings)
@@ -80,14 +81,14 @@ def load_system_config():
             "HELMET": "helmet_3cls_v8.dxnn"
         },
         "model_confidences": {
-            "MAIN": 0.40,
+            "MAIN": 0.6,
             "FACE": 0.35,
-            "HELMET": 0.45
+            "HELMET": 0.55
         },
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
-        "REC_PRE_SEC": 3,
-        "REC_POST_SEC": 4,
+        "REC_PRE_SEC": 10,
+        "REC_POST_SEC": 10,
         "VISUAL_ALARM_DURATION": 5.0
     }
     
