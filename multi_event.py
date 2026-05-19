@@ -63,7 +63,7 @@ def deep_merge_dict(base, override):
 def load_system_config():
     """시스템 공통 설정(system_config.json)을 로드합니다."""
     default_config = {
-        "terminal_id": "99999",
+        "terminal_id": "2",
         "logging": {"dir": "./logs", "level": "INFO"},
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
@@ -384,7 +384,7 @@ def _save_and_send_task(img, img_path, api_params):
     except Exception as e:
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
-def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1):
+def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="2", cctv_id=1):
     """프레임에 BBox를 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
@@ -1619,7 +1619,7 @@ class Camera:
                     # 💡 [수정] 이벤트 상세 컨텍스트 수집 및 로깅
                     conf_val = next((float(t[5]) for t in t_main if int(t[4]) == tid), 0.0)
                     cls_id = track_map_main.get(tid, -1)
-                    terminal_id = SYS_CFG.get("terminal_id", "99999")
+                    terminal_id = SYS_CFG.get("terminal_id", "2")
                     
                     # ROI 정보 압축 (좌표계가 너무 길어지는 것 방지)
                     roi_str = f"Poly[{len(self.roi_poly)} pts]" if self.roi_poly else "None"
@@ -1904,7 +1904,7 @@ def main():
     dynamic_delay = 1.0 / target_fps
     
     # [추가] 1분(60초) 간격의 헬스 체크 데몬 실행
-    terminal_id = SYS_CFG.get("terminal_id", "99999")
+    terminal_id = SYS_CFG.get("terminal_id", "2")
     software_version = "v1.1.0"  # 필요 시 SYS_CFG에서 로드 가능
     health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=60)
     
