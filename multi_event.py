@@ -360,7 +360,7 @@ def trigger_tower_lamp(event_name):
                 green=LampState.BLINK,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=0,
+                sound_channel=1,
                 sound_group=5,
             )
         elif event_name == "illegal_parking":
@@ -370,7 +370,7 @@ def trigger_tower_lamp(event_name):
                 green=LampState.OFF,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=0,
+                sound_channel=2,
                 sound_group=5,
             )
         elif event_name == "conveyor_crossing":
@@ -380,7 +380,7 @@ def trigger_tower_lamp(event_name):
                 green=LampState.OFF,
                 blue=LampState.ON,
                 white=LampState.OFF,
-                sound_channel=0,
+                sound_channel=3,
                 sound_group=5,
             )
         elif event_name == "signal_vehicle":
@@ -390,7 +390,7 @@ def trigger_tower_lamp(event_name):
                 green=LampState.ON,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=0,
+                sound_channel=4,
                 sound_group=5,
             )
         else:
@@ -400,7 +400,7 @@ def trigger_tower_lamp(event_name):
                 green=LampState.OFF,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=0,
+                sound_channel=5,
                 sound_group=5,
             )
 
