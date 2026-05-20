@@ -49,6 +49,35 @@ ID_REFLECTIVE_VEST = 5
 ID_G_TRUCK = 6
 TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
 
+DEBUG_MODE = False
+
+# ------------------------------------------------------------
+# ROI 보정(Aligner) 튜닝 파라미터 
+# ------------------------------------------------------------
+ALIGN_INTERVAL_SEC = 300.0
+ORB_FEATURES = 1500
+MIN_GOOD_MATCHES = 20
+MIN_INLIERS = 12
+MIN_INLIER_RATIO = 0.25
+RANSAC_REPROJ_THRESH = 5.0
+TRACKING_UPDATE_MIN_INTERVAL_SEC = 2.0
+TRACKING_UPDATE_MIN_INLIERS = 25
+TRACKING_UPDATE_MIN_INLIER_RATIO = 0.35
+ANCHOR_DIRECT_CHECK_INTERVAL_SEC = 15.0
+ANCHOR_DIRECT_MIN_INLIERS = 30
+ANCHOR_DIRECT_MIN_INLIER_RATIO = 0.35
+MAX_CORNER_SHIFT_RATIO = 0.45      
+MAX_SCALE_CHANGE = 0.45            
+MAX_PERSPECTIVE_ABS = 0.003        
+HOMOGRAPHY_IDENTITY_ATOL = 1e-3
+
+MIN_APPLY_TRANSLATION_PX = 5.0     
+MIN_APPLY_ROTATION_DEG = 0.5       
+MIN_APPLY_SCALE_CHANGE = 0.02      
+MIN_APPLY_PERSPECTIVE = 0.0005     
+KEEP_LAST_GOOD_ROI_ON_FAILURE = True
+DEBUG_ALIGN = True
+
 def deep_merge_dict(base, override):
     """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
     import copy
@@ -63,7 +92,7 @@ def deep_merge_dict(base, override):
 def load_system_config():
     """시스템 공통 설정(system_config.json)을 로드합니다."""
     default_config = {
-        "terminal_id": "99999",
+        "terminal_id": "2",
         "logging": {"dir": "./logs", "level": "INFO"},
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
@@ -788,7 +817,6 @@ class ParkingDetector(BaseEventDetector):
                 
         return triggered
 
-import math
 class CrossingDetector(BaseEventDetector):
     gui_name = "CROSSING"
     
@@ -964,11 +992,6 @@ class CrossingDetector(BaseEventDetector):
                 if tid in self.lb_last_height: del self.lb_last_height[tid]
                 
         return triggered
-    
-import cv2
-import numpy as np
-from collections import deque
-
 # ---------------------------------------------------------
 # [Modified 코드 Part] - ROI 버퍼 기반 Median 검증 및 Track ID 블랙리스트 추가
 # ---------------------------------------------------------
@@ -1410,6 +1433,365 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
 # ==========================================
 # [10] 카메라 제어 (FrameReader / Camera)
 # ==========================================
+
+class AnchorTrackingROIAligner:
+    def __init__(self):
+        self.orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+        self.anchor_gray = None
+        self.anchor_kp = None
+        self.anchor_des = None
+        self.anchor_shape = None
+
+        self.tracking_gray = None
+        self.tracking_kp = None
+        self.tracking_des = None
+        self.tracking_shape = None
+
+        self.H_anchor_to_tracking = np.eye(3, dtype=np.float32)
+        self.H_last_good = np.eye(3, dtype=np.float32)
+
+        self.last_tracking_update_time = 0.0
+        self.last_anchor_direct_check_time = 0.0
+
+        self.fail_count = 0
+        self.success_count = 0
+
+        self.last_debug = {
+            "status": "not_initialized",
+            "method": "none",
+            "raw_matches": 0,
+            "good_matches": 0,
+            "inliers": 0,
+            "inlier_ratio": 0.0,
+            "dx": 0.0,
+            "dy": 0.0,
+            "angle_deg": 0.0,
+            "scale": 1.0,
+        }
+
+    def _gray(self, frame):
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def _features(self, gray):
+        kp, des = self.orb.detectAndCompute(gray, None)
+        return kp, des
+
+    def set_anchor(self, frame):
+        if frame is None:
+            self.last_debug["status"] = "set_anchor_failed_no_frame"
+            return False
+
+        gray = self._gray(frame)
+        kp, des = self._features(gray)
+
+        if des is None or kp is None or len(kp) < MIN_GOOD_MATCHES:
+            n = 0 if kp is None else len(kp)
+            self.last_debug = {
+                "status": f"set_anchor_failed_not_enough_features:{n}",
+                "method": "anchor_init",
+                "raw_matches": 0,
+                "good_matches": 0,
+                "inliers": 0,
+                "inlier_ratio": 0.0,
+                "dx": 0.0,
+                "dy": 0.0,
+                "angle_deg": 0.0,
+                "scale": 1.0,
+            }
+            if DEBUG_ALIGN:
+                print(f"[CCTV_Aligner] anchor 특징점 부족: {n}")
+            return False
+
+        self.anchor_gray = gray
+        self.anchor_kp = kp
+        self.anchor_des = des
+        self.anchor_shape = frame.shape[:2]
+
+        self.tracking_gray = gray
+        self.tracking_kp = kp
+        self.tracking_des = des
+        self.tracking_shape = frame.shape[:2]
+
+        self.H_anchor_to_tracking = np.eye(3, dtype=np.float32)
+        self.H_last_good = np.eye(3, dtype=np.float32)
+
+        now = time.time()
+        self.last_tracking_update_time = now
+        self.last_anchor_direct_check_time = now
+
+        self.fail_count = 0
+        self.success_count = 0
+
+        self.last_debug = {
+            "status": "anchor_set",
+            "method": "anchor_init",
+            "raw_matches": 0,
+            "good_matches": len(kp),
+            "inliers": 0,
+            "inlier_ratio": 0.0,
+            "dx": 0.0,
+            "dy": 0.0,
+            "angle_deg": 0.0,
+            "scale": 1.0,
+        }
+
+        if DEBUG_ALIGN:
+            print(f"[CCTV_Aligner] anchor 기준 프레임 등록 완료: features={len(kp)}")
+        return True
+
+    def _normalize_H(self, H):
+        if H is None:
+            return None
+        H = H.astype(np.float32)
+        if abs(float(H[2, 2])) < 1e-8:
+            return None
+        return H / H[2, 2]
+
+    def _decompose_homography_rough(self, H):
+        Hn = self._normalize_H(H)
+        if Hn is None:
+            return {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0, "perspective": 0.0}
+
+        dx = float(Hn[0, 2])
+        dy = float(Hn[1, 2])
+        a = float(Hn[0, 0])
+        b = float(Hn[1, 0])
+        c = float(Hn[0, 1])
+        d = float(Hn[1, 1])
+
+        scale_x = (a * a + b * b) ** 0.5
+        scale_y = (c * c + d * d) ** 0.5
+        scale = (scale_x + scale_y) / 2.0
+
+        angle_deg = float(np.degrees(np.arctan2(b, a)))
+        perspective = max(abs(float(Hn[2, 0])), abs(float(Hn[2, 1])))
+
+        return {"dx": dx, "dy": dy, "angle_deg": angle_deg, "scale": scale, "perspective": perspective}
+
+    def _is_small_jitter(self, H):
+        m = self._decompose_homography_rough(H)
+        return (
+            abs(m["dx"]) < MIN_APPLY_TRANSLATION_PX
+            and abs(m["dy"]) < MIN_APPLY_TRANSLATION_PX
+            and abs(m["angle_deg"]) < MIN_APPLY_ROTATION_DEG
+            and abs(m["scale"] - 1.0) < MIN_APPLY_SCALE_CHANGE
+            and abs(m["perspective"]) < MIN_APPLY_PERSPECTIVE
+        )
+
+    def _add_motion_debug(self, debug, H):
+        m = self._decompose_homography_rough(H)
+        debug["dx"] = float(m["dx"])
+        debug["dy"] = float(m["dy"])
+        debug["angle_deg"] = float(m["angle_deg"])
+        debug["scale"] = float(m["scale"])
+        debug["perspective"] = float(m["perspective"])
+        return debug
+
+    def _match_and_homography(self, src_kp, src_des, dst_kp, dst_des, dst_shape, method_name):
+        if src_des is None or dst_des is None:
+            return None, {"status": "descriptor_missing", "method": method_name, "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+
+        raw = self.matcher.knnMatch(src_des, dst_des, k=2)
+
+        good = []
+        for pair in raw:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+
+        debug = {"status": "matching", "method": method_name, "raw_matches": len(raw), "good_matches": len(good), "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+
+        if len(good) < MIN_GOOD_MATCHES:
+            debug["status"] = f"not_enough_good_matches:{len(good)}"
+            return None, debug
+
+        src_pts = np.float32([src_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([dst_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, RANSAC_REPROJ_THRESH)
+        if H is None or mask is None:
+            debug["status"] = "homography_failed"
+            return None, debug
+
+        inliers = int(mask.sum())
+        inlier_ratio = inliers / max(1, len(good))
+
+        debug["inliers"] = inliers
+        debug["inlier_ratio"] = float(inlier_ratio)
+        debug = self._add_motion_debug(debug, H)
+
+        if inliers < MIN_INLIERS:
+            debug["status"] = f"not_enough_inliers:{inliers}"
+            return None, debug
+
+        if inlier_ratio < MIN_INLIER_RATIO:
+            debug["status"] = f"low_inlier_ratio:{inlier_ratio:.2f}"
+            return None, debug
+
+        H = H.astype(np.float32)
+        ok, reason = self._is_homography_reasonable(H, dst_shape)
+        if not ok:
+            debug["status"] = reason
+            return None, debug
+
+        debug["status"] = "ok"
+        return H, debug
+
+    def _is_homography_reasonable(self, H, frame_shape):
+        if H is None: return False, "H_none"
+        if not np.isfinite(H).all(): return False, "H_not_finite"
+
+        h, w = frame_shape[:2]
+        corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+
+        try: warped = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+        except Exception: return False, "corner_transform_failed"
+
+        if not np.isfinite(warped).all(): return False, "warped_corner_not_finite"
+
+        orig = corners.reshape(-1, 2)
+        shift = np.linalg.norm(warped - orig, axis=1)
+        mean_shift = float(np.mean(shift))
+        max_allowed_shift = max(w, h) * MAX_CORNER_SHIFT_RATIO
+
+        if mean_shift > max_allowed_shift: return False, f"rejected_large_shift:{mean_shift:.1f}"
+
+        orig_top = np.linalg.norm(orig[1] - orig[0])
+        orig_bottom = np.linalg.norm(orig[2] - orig[3])
+        warped_top = np.linalg.norm(warped[1] - warped[0])
+        warped_bottom = np.linalg.norm(warped[2] - warped[3])
+
+        orig_avg = max(1.0, (orig_top + orig_bottom) / 2.0)
+        warped_avg = (warped_top + warped_bottom) / 2.0
+        scale = warped_avg / orig_avg
+
+        if scale < (1.0 - MAX_SCALE_CHANGE) or scale > (1.0 + MAX_SCALE_CHANGE):
+            return False, f"rejected_scale:{scale:.2f}"
+
+        if abs(float(H[2, 0])) > MAX_PERSPECTIVE_ABS or abs(float(H[2, 1])) > MAX_PERSPECTIVE_ABS:
+            return False, f"rejected_perspective:{H[2,0]:.5f},{H[2,1]:.5f}"
+
+        return True, "ok"
+
+    def _should_update_tracking(self, debug, now):
+        if debug.get("status") != "ok": return False
+        if now - self.last_tracking_update_time < TRACKING_UPDATE_MIN_INTERVAL_SEC: return False
+        if debug.get("inliers", 0) < TRACKING_UPDATE_MIN_INLIERS: return False
+        if debug.get("inlier_ratio", 0.0) < TRACKING_UPDATE_MIN_INLIER_RATIO: return False
+        return True
+
+    def _update_tracking_reference(self, frame, kp, des, H_anchor_to_current):
+        self.tracking_gray = self._gray(frame)
+        self.tracking_kp = kp
+        self.tracking_des = des
+        self.tracking_shape = frame.shape[:2]
+        self.H_anchor_to_tracking = H_anchor_to_current.astype(np.float32)
+        self.last_tracking_update_time = time.time()
+
+    def estimate_anchor_to_current(self, frame):
+        if self.anchor_des is None or self.tracking_des is None:
+            self.last_debug["status"] = "not_initialized"
+            return np.eye(3, dtype=np.float32), False
+
+        if frame is None:
+            self.last_debug["status"] = "no_current_frame"
+            return self.H_last_good.copy(), False
+
+        gray = self._gray(frame)
+        kp, des = self._features(gray)
+
+        if kp is None or des is None or len(kp) < MIN_GOOD_MATCHES:
+            self.fail_count += 1
+            self.last_debug = {"status": f"current_not_enough_features:{0 if kp is None else len(kp)}", "method": "current_features", "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+            return self.H_last_good.copy() if KEEP_LAST_GOOD_ROI_ON_FAILURE else np.eye(3, dtype=np.float32), False
+
+        now = time.time()
+
+        H_tracking_to_current, dbg_tracking = self._match_and_homography(self.tracking_kp, self.tracking_des, kp, des, frame.shape[:2], method_name="tracking_to_current")
+
+        if H_tracking_to_current is not None:
+            H_anchor_to_current = H_tracking_to_current @ self.H_anchor_to_tracking
+            H_anchor_to_current = H_anchor_to_current.astype(np.float32)
+
+            ok, reason = self._is_homography_reasonable(H_anchor_to_current, frame.shape[:2])
+            dbg_tracking = self._add_motion_debug(dbg_tracking, H_anchor_to_current)
+
+            if ok:
+                self.success_count += 1
+                self.fail_count = 0
+                self.last_debug = dbg_tracking
+
+                if self._is_small_jitter(H_anchor_to_current):
+                    self.last_debug["status"] = "skip_small_jitter_keep_identity"
+                    return np.eye(3, dtype=np.float32), True
+
+                self.H_last_good = H_anchor_to_current
+
+                if self._should_update_tracking(dbg_tracking, now):
+                    self._update_tracking_reference(frame, kp, des, H_anchor_to_current)
+                    self.last_debug["status"] = "ok_tracking_updated"
+
+                if now - self.last_anchor_direct_check_time > ANCHOR_DIRECT_CHECK_INTERVAL_SEC:
+                    self._try_anchor_direct_correction(frame, kp, des)
+                    self.last_anchor_direct_check_time = now
+
+                return self.H_last_good.copy(), True
+            else:
+                dbg_tracking["status"] = f"anchor_to_current_rejected:{reason}"
+
+        H_anchor_direct, dbg_anchor = self._match_and_homography(self.anchor_kp, self.anchor_des, kp, des, frame.shape[:2], method_name="anchor_to_current_fallback")
+
+        if H_anchor_direct is not None:
+            self.success_count += 1
+            self.fail_count = 0
+            self.last_debug = dbg_anchor
+            self.last_debug = self._add_motion_debug(self.last_debug, H_anchor_direct)
+
+            if self._is_small_jitter(H_anchor_direct):
+                self.last_debug["status"] = "skip_small_jitter_anchor_fallback"
+                return np.eye(3, dtype=np.float32), True
+
+            self.H_last_good = H_anchor_direct.astype(np.float32)
+            self.last_debug["status"] = "ok_anchor_fallback"
+
+            if self._should_update_tracking(dbg_anchor, now):
+                self._update_tracking_reference(frame, kp, des, self.H_last_good)
+                self.last_debug["status"] = "ok_anchor_fallback_tracking_updated"
+
+            return self.H_last_good.copy(), True
+
+        self.fail_count += 1
+        self.last_debug = dbg_tracking if dbg_tracking.get("good_matches", 0) >= dbg_anchor.get("good_matches", 0) else dbg_anchor
+        self.last_debug["status"] = "failed_keep_last_good:" + str(self.last_debug.get("status"))
+
+        if KEEP_LAST_GOOD_ROI_ON_FAILURE:
+            return self.H_last_good.copy(), False
+        return np.eye(3, dtype=np.float32), False
+
+    def _try_anchor_direct_correction(self, frame, kp, des):
+        H_direct, dbg = self._match_and_homography(self.anchor_kp, self.anchor_des, kp, des, frame.shape[:2], method_name="anchor_direct_drift_check")
+
+        if H_direct is None: return False
+        if dbg.get("inliers", 0) < ANCHOR_DIRECT_MIN_INLIERS: return False
+        if dbg.get("inlier_ratio", 0.0) < ANCHOR_DIRECT_MIN_INLIER_RATIO: return False
+
+        dbg = self._add_motion_debug(dbg, H_direct)
+
+        if self._is_small_jitter(H_direct):
+            self.last_debug = dbg
+            self.last_debug["status"] = "anchor_direct_small_jitter_skip"
+            return False
+
+        self.H_last_good = H_direct.astype(np.float32)
+        self._update_tracking_reference(frame, kp, des, self.H_last_good)
+        self.last_debug = dbg
+        self.last_debug["status"] = "anchor_direct_corrected_drift"
+        return True
+
 class FrameReader:
     def __init__(self, url, ip):
         self.url = sanitize_camera_url(url)
@@ -1487,7 +1869,6 @@ class Camera:
         self.last_evt_t = {}
         self.visual_alarms = {}
 
-        from collections import deque
         self.fps_queue = deque(maxlen=30)
         self.current_fps = 0.0
 
@@ -1496,49 +1877,185 @@ class Camera:
         self.roi_poly = []
         self.roi_lines = []
         self.roi_frame_shape = None # 해상도 변경 감지용
-        
+        self.status_history = deque(maxlen=10)
+        self._reset_alignment_state("ALIGN INIT")
+        self._rebuild_handlers()
+
+    def _reset_alignment_state(self, status_text="ALIGN RESET"):
+        """ROI 자동 보정 상태를 초기화한다."""
+        self.aligner = AnchorTrackingROIAligner()
+        self.anchor_set = False
+
+        self.base_roi_poly = []
+        self.base_roi_lines = []
+        self.aligned_roi_poly = []
+        self.aligned_roi_lines = []
+
+        self.last_align_time = 0.0
+        self.align_status_text = status_text
+        self.align_ok = False
+        self.align_shifted = False
+
+    def _rebuild_handlers(self):
+        """현재 self.events 기준으로 이벤트 핸들러를 다시 구성한다."""
         self.handlers = {}
+
         for ename in self.events:
             if ename in EVENT_REGISTRY:
-                self.handlers[ename] = EVENT_REGISTRY[ename](SYS_CFG.get("event_config", {}).get(ename, {}), self.roi_poly, self.roi_lines)
+                self.handlers[ename] = EVENT_REGISTRY[ename](
+                    SYS_CFG.get("event_config", {}).get(ename, {}),
+                    self.roi_poly,
+                    self.roi_lines
+                )
 
     def update_config(self, new_conf):
         """웹 UI 등 외부에서 cameras.json이 변경되었을 때, 무중단으로 설정을 핫 리로드합니다."""
         old_events = self.events.copy()
+
         self.events = new_conf.get('events', [])
         self.roi_poly_norm = new_conf.get('roi_poly_norm', [])
         self.roi_lines_norm = new_conf.get('roi_lines_norm', [])
-        
-        # 해상도 변경 감지 변수를 초기화하여 다음 프레임에서 ROI 역정규화를 강제 수행
-        self.roi_frame_shape = None 
-        
-        # 이벤트 핸들러 재구성
-        self.handlers = {}
-        for ename in self.events:
-            if ename in EVENT_REGISTRY:
-                # 새로운 설정과 텅 빈 ROI로 초기화 (이후 process_frame 타임에 runtime_roi가 자동 주입됨)
-                event_cfg = SYS_CFG.get("event_config", {}).get(ename, {})
-                self.handlers[ename] = EVENT_REGISTRY[ename](event_cfg, [], [])
-                
-        logger.info(f"🔄 [CAM:{self.ip}] 무중단 설정 리로드 완료: {old_events} -> {self.events}")
 
-    def _update_runtime_roi(self, frame_shape):
-        if self.roi_frame_shape == frame_shape[:2]:
+        self.roi_poly = []
+        self.roi_lines = []
+        self.roi_frame_shape = None
+
+        self._reset_alignment_state("ALIGN RESET")
+        self._rebuild_handlers()
+
+        try:
+            self.status_history.clear()
+        except Exception:
+            pass
+
+        logger.info(
+            f"🔄 [CAM:{self.ip}] 무중단 설정 리로드 완료: "
+            f"{old_events} -> {self.events} | ROI aligner reset"
+        )
+        print(f"[CCTV_Aligner] CAM {self.cam_id} 설정 변경으로 aligner reset 완료")
+        
+    def _initialize_base_roi_if_needed(self, frame):
+        if frame is None:
+            return False
+
+        h, w = frame.shape[:2]
+
+        need_init = False
+        if self.roi_frame_shape != frame.shape[:2]:
+            need_init = True
+        if self.roi_poly_norm and not self.base_roi_poly:
+            need_init = True
+        if self.roi_lines_norm and not self.base_roi_lines:
+            need_init = True
+
+        if not need_init:
+            return True
+
+        self.base_roi_poly = denormalize_roi_points(self.roi_poly_norm, w, h) if self.roi_poly_norm else []
+        self.base_roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h) if self.roi_lines_norm else []
+
+        self.aligned_roi_poly = list(self.base_roi_poly)
+        self.aligned_roi_lines = list(self.base_roi_lines)
+        self.roi_frame_shape = frame.shape[:2]
+
+        self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+        logger.info(f"[CAM:{self.cam_id}] base ROI init | poly={len(self.base_roi_poly)} lines={len(self.base_roi_lines)} shape={frame.shape[:2]}")
+        return True
+
+    def _inject_roi_to_handlers(self, roi_poly, roi_lines):
+        self.roi_poly = roi_poly or []
+        self.roi_lines = roi_lines or []
+
+        for ename in self.events:
+            if ename not in self.handlers: continue
+            handler = self.handlers[ename]
+
+            if self.roi_poly and len(self.roi_poly) >= 3:
+                handler.roi_poly = np.array(self.roi_poly, dtype=np.int32)
+            else:
+                handler.roi_poly = np.empty((0, 2), dtype=np.int32)
+
+            if hasattr(handler, "roi_lines"):
+                handler.roi_lines = self.roi_lines or []
+
+            if hasattr(handler, "lines"):
+                new_lines = []
+                lines = self.roi_lines or []
+                for i in range(0, len(lines), 2):
+                    if i + 1 < len(lines):
+                        new_lines.append((lines[i], lines[i + 1]))
+                handler.lines = new_lines
+
+    def _transform_points(self, pts, H):
+        if not pts: return []
+        pts_np = np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
+        try:
+            out = cv2.perspectiveTransform(pts_np, H)
+        except Exception as e:
+            logger.warning(f"[CAM:{self.cam_id}] ROI transform failed: {e}")
+            return pts
+        return out.reshape(-1, 2).astype(np.int32).tolist()
+
+    def _update_alignment(self, frame):
+        if frame is None: return
+
+        self._initialize_base_roi_if_needed(frame)
+
+        if not self.base_roi_poly and not self.base_roi_lines:
+            self.align_status_text = "NO ROI"
+            self._inject_roi_to_handlers([], [])
             return
-            
-        height, width = frame_shape[:2]
-        if self.roi_poly_norm:
-            self.roi_poly = denormalize_roi_points(self.roi_poly_norm, width, height)
-        if self.roi_lines_norm:
-            self.roi_lines = denormalize_roi_points(self.roi_lines_norm, width, height)
 
-        # ROI가 스케일링 되었으므로, 이벤트 핸들러에도 새 좌표를 주입하여 갱신합니다.
-        for ename in self.events:
-            if ename in EVENT_REGISTRY:
-                event_cfg = SYS_CFG.get("event_config", {}).get(ename, {})
-                self.handlers[ename] = EVENT_REGISTRY[ename](event_cfg, self.roi_poly, self.roi_lines)
-                
-        self.roi_frame_shape = frame_shape[:2]
+        if not self.anchor_set:
+            ok = self.aligner.set_anchor(frame)
+            if ok:
+                self.anchor_set = True
+                self.last_align_time = time.time()
+                self.align_status_text = "ANCHOR SET"
+                self.align_ok = True
+                self.align_shifted = False
+
+                logger.info(f"[CAM:{self.cam_id}] ROI anchor set | ip={self.ip}")
+                print(f"[CCTV_Aligner] CAM {self.cam_id} anchor set")
+            else:
+                self.align_status_text = "ANCHOR FAIL"
+                self.align_ok = False
+
+                logger.warning(f"[CAM:{self.cam_id}] ROI anchor failed | ip={self.ip}")
+                print(f"[CCTV_Aligner] CAM {self.cam_id} anchor failed")
+            return
+
+        now = time.time()
+        if now - self.last_align_time < ALIGN_INTERVAL_SEC: return
+
+        H, ok = self.aligner.estimate_anchor_to_current(frame)
+        dbg = self.aligner.last_debug
+
+        shifted = not np.allclose(H, np.eye(3, dtype=np.float32), atol=HOMOGRAPHY_IDENTITY_ATOL)
+
+        self.align_ok = ok
+        self.align_shifted = shifted
+
+        self.aligned_roi_poly = self._transform_points(self.base_roi_poly, H)
+        self.aligned_roi_lines = self._transform_points(self.base_roi_lines, H)
+        self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+
+        status = dbg.get("status", "unknown")
+        method = dbg.get("method", "none")
+        good = dbg.get("good_matches", 0)
+        inliers = dbg.get("inliers", 0)
+        ratio = dbg.get("inlier_ratio", 0.0)
+        
+        if ok:
+            self.align_status_text = f"ALIGN OK {method} g={good} i={inliers} r={ratio:.2f}"
+        else:
+            self.align_status_text = f"ALIGN HOLD {method} g={good} i={inliers} r={ratio:.2f}"
+
+        self.status_history.append(self.align_status_text)
+        self.last_align_time = now
+
+        logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
+        print(f"[CCTV_Aligner] CAM {self.cam_id} {self.align_status_text}")
 
     def process_frame(self):
         fr, fid, connected = self.reader.read()
@@ -1584,7 +2101,7 @@ class Camera:
             time_diff = self.fps_queue[-1] - self.fps_queue[0]
             self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
 
-        self._update_runtime_roi(fr.shape)
+        self._update_alignment(fr)
         motion_mask = self.motion_det.apply(fr)
 
         # 메인 트래커 업데이트
@@ -1619,7 +2136,7 @@ class Camera:
                     # 💡 [수정] 이벤트 상세 컨텍스트 수집 및 로깅
                     conf_val = next((float(t[5]) for t in t_main if int(t[4]) == tid), 0.0)
                     cls_id = track_map_main.get(tid, -1)
-                    terminal_id = SYS_CFG.get("terminal_id", "99999")
+                    terminal_id = SYS_CFG.get("terminal_id", "2")
                     
                     # ROI 정보 압축 (좌표계가 너무 길어지는 것 방지)
                     roi_str = f"Poly[{len(self.roi_poly)} pts]" if self.roi_poly else "None"
@@ -2028,10 +2545,17 @@ def main():
                     # ex: {'no_helmet': [152]} 또는 [152] 형태 모두 대응
                     alarm_items = []
                     if isinstance(alarms, dict):
-                        for evt_label, tids in alarms.items():
-                            tids = tids if isinstance(tids, list) else [tids]
-                            for tid in tids:
-                                alarm_items.append((evt_label, tid))
+                        for key, value in alarms.items():
+                            if isinstance(key, int):
+                                # 현재 run_logic() 반환 구조: {tid: event_name}
+                                alarm_items.append((value, key))
+                            else:
+                                # 혹시 구버전 구조: {event_name: tid_or_tid_list}
+                                evt_label = key
+                                tids = value if isinstance(value, list) else [value]
+                                for tid in tids:
+                                    alarm_items.append((evt_label, tid))
+
                     elif isinstance(alarms, list):
                         for item in alarms:
                             alarm_items.append(("no_helmet", item)) # 기본 라벨 적용
@@ -2066,7 +2590,6 @@ def main():
                         })
                     
                     logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 생성: {json.dumps(api_payload)}")
-                    # TODO: IMAGE_SAVER_POOL 이나 별도 워커를 통해 api_payload를 비동기 전송하십시오.
 
             # GUI 렌더링 최종 처리
             if is_gui_mode:
