@@ -22,6 +22,8 @@ import pytz
 from urllib.parse import urlsplit, unquote
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
 import argparse
+# 경광등 제어 임포트
+from qlight_etn import LampState, QLightETN
 
 warnings = requests.packages.urllib3.exceptions.InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(warnings)
@@ -34,6 +36,14 @@ CONFIG_COMMON_FILE = os.path.join(PROJECT_ROOT, "system_config.json")
 CONFIG_CAMERAS_FILE = os.path.join(PROJECT_ROOT, "cameras.json")
 CAMERA_LIST_FILE = os.path.join(PROJECT_ROOT, "cameras.csv")
 EVENT_ROOT_DIR = os.path.join(PROJECT_ROOT, "CCTV_EVENT_ALERT")
+#타워램프 영역 시작
+TOWER_LAMP_HOST = "192.168.1.114"
+TOWER_LAMP_PORT = 20000
+TOWER_LAMP_TIMEOUT = 2.0
+TOWER_LAMP_HOLD_SEC = 5.0
+TOWER_LAMP_ACTIVE_UNTIL = 0.0
+TOWER_LAMP = QLightETN(TOWER_LAMP_HOST, TOWER_LAMP_PORT, timeout=TOWER_LAMP_TIMEOUT)
+# 타워 램프 영역 끝
 
 SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
@@ -335,6 +345,97 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
         cv2.rectangle(mosaic, (x, y), (x+cell_w, y+cell_h), (100, 100, 100), 1)
         
     return mosaic
+
+# ==========================================
+# [TOWERLAMP] 타워램프동작
+# ==========================================
+def trigger_tower_lamp(event_name):
+    global TOWER_LAMP_ACTIVE_UNTIL
+
+    try:
+        if event_name == "no_helmet":
+            TOWER_LAMP.write_status(
+                red=LampState.OFF,
+                yellow=LampState.BLINK,
+                green=LampState.BLINK,
+                blue=LampState.OFF,
+                white=LampState.OFF,
+                sound_channel=3,
+                sound_group=0,
+            )
+        elif event_name == "illegal_parking":
+            TOWER_LAMP.write_status(
+                red=LampState.ON,
+                yellow=LampState.BLINK,
+                green=LampState.OFF,
+                blue=LampState.OFF,
+                white=LampState.OFF,
+                sound_channel=2,
+                sound_group=0,
+            )
+        elif event_name == "conveyor_crossing":
+            TOWER_LAMP.write_status(
+                red=LampState.BLINK,
+                yellow=LampState.OFF,
+                green=LampState.OFF,
+                blue=LampState.ON,
+                white=LampState.OFF,
+                sound_channel=4,
+                sound_group=0,
+            )
+        elif event_name == "signal_vehicle":
+            TOWER_LAMP.write_status(
+                red=LampState.ON,
+                yellow=LampState.ON,
+                green=LampState.ONF,
+                blue=LampState.OFF,
+                white=LampState.OFF,
+                sound_channel=5,
+                sound_group=0,
+            )
+        else:
+            TOWER_LAMP.write_status(
+                red=LampState.BLINK,
+                yellow=LampState.OFF,
+                green=LampState.OFF,
+                blue=LampState.OFF,
+                white=LampState.OFF,
+                sound_channel=1,
+                sound_group=0,
+            )
+
+        TOWER_LAMP_ACTIVE_UNTIL = max(TOWER_LAMP_ACTIVE_UNTIL, time.time() + TOWER_LAMP_HOLD_SEC)
+
+    except Exception as e:
+        logger.error(f"타워램프 제어 실패({event_name}): {e}")
+
+
+def update_tower_lamp():
+    global TOWER_LAMP_ACTIVE_UNTIL
+
+    if TOWER_LAMP_ACTIVE_UNTIL <= 0:
+        return
+
+    if time.time() < TOWER_LAMP_ACTIVE_UNTIL:
+        return
+
+    try:
+        TOWER_LAMP.all_off()
+    except Exception as e:
+        logger.error(f"타워램프 종료 실패: {e}")
+    finally:
+        TOWER_LAMP_ACTIVE_UNTIL = 0.0
+
+
+def shutdown_tower_lamp():
+    global TOWER_LAMP_ACTIVE_UNTIL
+
+    try:
+        TOWER_LAMP.all_off()
+    except Exception as e:
+        logger.error(f"타워램프 종료 실패: {e}")
+    finally:
+        TOWER_LAMP_ACTIVE_UNTIL = 0.0
 
 # ==========================================
 # [5] API 통신 및 이미지 저장 (NAS 연동 제외)
@@ -2155,7 +2256,9 @@ class Camera:
                         frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid, 
                         terminal_id=terminal_id, cctv_id=self.cam_id
                     )
-                    
+                    ##타워램프 동작
+                    trigger_tower_lamp(ename)
+                    ##타워램프 동작 함수 종료
                     self.recorder.trigger(ename)
                     self.alerted[tid].add(ename)
                     self.last_evt_t[ename] = now
