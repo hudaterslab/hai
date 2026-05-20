@@ -2014,9 +2014,15 @@ class Camera:
                 self.align_status_text = "ANCHOR SET"
                 self.align_ok = True
                 self.align_shifted = False
+
+                logger.info(f"[CAM:{self.cam_id}] ROI anchor set | ip={self.ip}")
+                print(f"[CCTV_Aligner] CAM {self.cam_id} anchor set")
             else:
                 self.align_status_text = "ANCHOR FAIL"
                 self.align_ok = False
+
+                logger.warning(f"[CAM:{self.cam_id}] ROI anchor failed | ip={self.ip}")
+                print(f"[CCTV_Aligner] CAM {self.cam_id} anchor failed")
             return
 
         now = time.time()
@@ -2047,6 +2053,9 @@ class Camera:
 
         self.status_history.append(self.align_status_text)
         self.last_align_time = now
+
+        logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
+        print(f"[CCTV_Aligner] CAM {self.cam_id} {self.align_status_text}")
 
     def process_frame(self):
         fr, fid, connected = self.reader.read()
