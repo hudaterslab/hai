@@ -70,6 +70,7 @@ MAX_CORNER_SHIFT_RATIO = 0.45
 MAX_SCALE_CHANGE = 0.45            
 MAX_PERSPECTIVE_ABS = 0.003        
 HOMOGRAPHY_IDENTITY_ATOL = 1e-3
+ROI_APPLY_MIN_SHIFT_PX = 5.0
 
 MIN_APPLY_TRANSLATION_PX = 5.0     
 MIN_APPLY_ROTATION_DEG = 0.5       
@@ -2095,10 +2096,9 @@ class Camera:
         perspective = float(dbg.get("perspective", 0.0) or 0.0)
 
         identity_H = np.eye(3, dtype=np.float32)
-        shifted = not np.allclose(H, identity_H, atol=HOMOGRAPHY_IDENTITY_ATOL)
+        h_shifted = not np.allclose(H, identity_H, atol=HOMOGRAPHY_IDENTITY_ATOL)
 
         self.align_ok = ok
-        self.align_shifted = shifted
 
         # H를 base ROI에 적용해서 이번 주기 ROI 후보 생성
         new_roi_poly = self._transform_points(self.base_roi_poly, H)
@@ -2121,10 +2121,19 @@ class Camera:
         poly_mean_shift, poly_max_shift = _mean_point_shift(old_roi_poly, new_roi_poly)
         line_mean_shift, line_max_shift = _mean_point_shift(old_roi_lines, new_roi_lines)
 
-        # 1) 매칭은 성공했지만 작은 jitter라서 ROI를 일부러 움직이지 않는 경우
+        roi_mean_shift = max(poly_mean_shift, line_mean_shift)
+        roi_max_shift = max(poly_max_shift, line_max_shift)
+
+        roi_shifted = roi_max_shift >= ROI_APPLY_MIN_SHIFT_PX
+        self.align_shifted = roi_shifted
+
+        # 1) aligner가 직접 작은 jitter라고 판단한 경우
         if status == "skip_small_jitter_keep_identity":
-            self.aligned_roi_poly = list(self.base_roi_poly)
-            self.aligned_roi_lines = list(self.base_roi_lines)
+            # 기존 aligned ROI 유지. 없으면 base ROI 주입.
+            if not self.aligned_roi_poly and not self.aligned_roi_lines:
+                self.aligned_roi_poly = list(self.base_roi_poly)
+                self.aligned_roi_lines = list(self.base_roi_lines)
+
             self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
 
             self.align_status_text = (
@@ -2132,11 +2141,12 @@ class Camera:
                 f"status={status} g={good} i={inliers} r={ratio:.2f} "
                 f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
                 f"scale={scale:.3f} persp={perspective:.5f} | "
-                f"ROI kept"
+                f"roi_shift max={roi_max_shift:.1f}px mean={roi_mean_shift:.1f}px | "
+                f"threshold={ROI_APPLY_MIN_SHIFT_PX:.1f}px | action=roi_kept"
             )
 
-        # 2) 매칭 성공 + 실제 변화로 판단되어 ROI 보정을 적용하는 경우
-        elif ok and shifted:
+        # 2) 매칭 성공 + 실제 ROI 좌표가 충분히 움직인 경우
+        elif ok and roi_shifted:
             self.aligned_roi_poly = new_roi_poly
             self.aligned_roi_lines = new_roi_lines
             self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
@@ -2146,29 +2156,34 @@ class Camera:
                 f"status={status} g={good} i={inliers} r={ratio:.2f} "
                 f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
                 f"scale={scale:.3f} persp={perspective:.5f} | "
+                f"h_shifted={h_shifted} | "
+                f"roi_shift max={roi_max_shift:.1f}px mean={roi_mean_shift:.1f}px | "
                 f"poly_shift mean={poly_mean_shift:.1f}px max={poly_max_shift:.1f}px | "
-                f"line_shift mean={line_mean_shift:.1f}px max={line_max_shift:.1f}px"
+                f"line_shift mean={line_mean_shift:.1f}px max={line_max_shift:.1f}px | "
+                f"threshold={ROI_APPLY_MIN_SHIFT_PX:.1f}px | action=roi_updated"
             )
 
-        # 3) 매칭 성공했지만 H가 사실상 identity인 경우
-        elif ok and not shifted:
-            self.aligned_roi_poly = list(self.base_roi_poly)
-            self.aligned_roi_lines = list(self.base_roi_lines)
+        # 3) 매칭은 성공했지만 실제 ROI 좌표 변화가 너무 작아서 유지
+        elif ok and not roi_shifted:
+            if not self.aligned_roi_poly and not self.aligned_roi_lines:
+                self.aligned_roi_poly = list(self.base_roi_poly)
+                self.aligned_roi_lines = list(self.base_roi_lines)
+
             self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
 
             self.align_status_text = (
-                f"ROI UNCHANGED {method} "
+                f"JITTER IGNORED {method} "
                 f"status={status} g={good} i={inliers} r={ratio:.2f} "
                 f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
                 f"scale={scale:.3f} persp={perspective:.5f} | "
-                f"reason=identity_transform"
+                f"h_shifted={h_shifted} but roi_shift max={roi_max_shift:.1f}px "
+                f"mean={roi_mean_shift:.1f}px < threshold={ROI_APPLY_MIN_SHIFT_PX:.1f}px | "
+                f"action=roi_kept"
             )
 
-        # 4) 매칭 실패 또는 homography가 위험하다고 판단되어 마지막 정상 ROI 유지
+        # 4) 매칭 실패 또는 homography가 위험하다고 판단된 경우
         else:
             if KEEP_LAST_GOOD_ROI_ON_FAILURE:
-                # 기존 aligned ROI를 유지한다.
-                # 비어 있으면 base ROI라도 주입한다.
                 if not self.aligned_roi_poly and not self.aligned_roi_lines:
                     self.aligned_roi_poly = list(self.base_roi_poly)
                     self.aligned_roi_lines = list(self.base_roi_lines)
@@ -2194,7 +2209,6 @@ class Camera:
 
         print(f"[CCTV_Aligner] CAM {self.cam_id} {self.align_status_text}")
         logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
-
     def process_frame(self):
         fr, fid, connected = self.reader.read()
         if fr is not None: 
