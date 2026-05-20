@@ -1997,17 +1997,39 @@ class Camera:
         return out.reshape(-1, 2).astype(np.int32).tolist()
 
     def _update_alignment(self, frame):
-        if frame is None: return
+        if frame is None:
+            return
 
+        # 현재 프레임 해상도 기준으로 base ROI 초기화 또는 갱신
         self._initialize_base_roi_if_needed(frame)
 
+        # ROI가 아예 없는 경우
         if not self.base_roi_poly and not self.base_roi_lines:
             self.align_status_text = "NO ROI"
             self._inject_roi_to_handlers([], [])
+
+            if not hasattr(self, "_no_roi_last_log_time"):
+                self._no_roi_last_log_time = 0.0
+
+            now_no_roi = time.time()
+            if now_no_roi - self._no_roi_last_log_time > 60.0:
+                msg = (
+                    f"[CCTV_Aligner] CAM {self.cam_id} NO ROI | "
+                    f"events={self.events} | ip={self.ip}"
+                )
+                print(msg)
+                logger.warning(
+                    f"[CAM:{self.cam_id}] ROI align skipped | reason=NO_ROI | "
+                    f"events={self.events} | ip={self.ip}"
+                )
+                self._no_roi_last_log_time = now_no_roi
+
             return
 
+        # 최초 anchor 등록
         if not self.anchor_set:
             ok = self.aligner.set_anchor(frame)
+
             if ok:
                 self.anchor_set = True
                 self.last_align_time = time.time()
@@ -2015,47 +2037,163 @@ class Camera:
                 self.align_ok = True
                 self.align_shifted = False
 
-                logger.info(f"[CAM:{self.cam_id}] ROI anchor set | ip={self.ip}")
-                print(f"[CCTV_Aligner] CAM {self.cam_id} anchor set")
+                msg = (
+                    f"[CCTV_Aligner] CAM {self.cam_id} ANCHOR SET | "
+                    f"ip={self.ip} | "
+                    f"base_poly={len(self.base_roi_poly)} pts | "
+                    f"base_lines={len(self.base_roi_lines)} pts"
+                )
+                print(msg)
+                logger.info(
+                    f"[CAM:{self.cam_id}] ROI anchor set | ip={self.ip} | "
+                    f"base_poly={len(self.base_roi_poly)} | "
+                    f"base_lines={len(self.base_roi_lines)}"
+                )
             else:
                 self.align_status_text = "ANCHOR FAIL"
                 self.align_ok = False
+                self.align_shifted = False
 
-                logger.warning(f"[CAM:{self.cam_id}] ROI anchor failed | ip={self.ip}")
-                print(f"[CCTV_Aligner] CAM {self.cam_id} anchor failed")
+                dbg = getattr(self.aligner, "last_debug", {}) or {}
+                status = dbg.get("status", "unknown")
+                good = dbg.get("good_matches", 0)
+
+                msg = (
+                    f"[CCTV_Aligner] CAM {self.cam_id} ANCHOR FAIL | "
+                    f"reason={status} | good={good} | ip={self.ip}"
+                )
+                print(msg)
+                logger.warning(
+                    f"[CAM:{self.cam_id}] ROI anchor failed | "
+                    f"reason={status} | good={good} | ip={self.ip}"
+                )
+
             return
 
         now = time.time()
-        if now - self.last_align_time < ALIGN_INTERVAL_SEC: return
+
+        # edge device 부하를 줄이기 위해 지정 간격 전에는 보정 계산을 하지 않음
+        if now - self.last_align_time < ALIGN_INTERVAL_SEC:
+            return
+
+        old_roi_poly = list(self.aligned_roi_poly or [])
+        old_roi_lines = list(self.aligned_roi_lines or [])
 
         H, ok = self.aligner.estimate_anchor_to_current(frame)
-        dbg = self.aligner.last_debug
+        dbg = getattr(self.aligner, "last_debug", {}) or {}
 
-        shifted = not np.allclose(H, np.eye(3, dtype=np.float32), atol=HOMOGRAPHY_IDENTITY_ATOL)
+        status = dbg.get("status", "unknown")
+        method = dbg.get("method", "none")
+        good = int(dbg.get("good_matches", 0) or 0)
+        inliers = int(dbg.get("inliers", 0) or 0)
+        ratio = float(dbg.get("inlier_ratio", 0.0) or 0.0)
+
+        dx = float(dbg.get("dx", 0.0) or 0.0)
+        dy = float(dbg.get("dy", 0.0) or 0.0)
+        angle = float(dbg.get("angle_deg", 0.0) or 0.0)
+        scale = float(dbg.get("scale", 1.0) or 1.0)
+        perspective = float(dbg.get("perspective", 0.0) or 0.0)
+
+        identity_H = np.eye(3, dtype=np.float32)
+        shifted = not np.allclose(H, identity_H, atol=HOMOGRAPHY_IDENTITY_ATOL)
 
         self.align_ok = ok
         self.align_shifted = shifted
 
-        self.aligned_roi_poly = self._transform_points(self.base_roi_poly, H)
-        self.aligned_roi_lines = self._transform_points(self.base_roi_lines, H)
-        self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+        # H를 base ROI에 적용해서 이번 주기 ROI 후보 생성
+        new_roi_poly = self._transform_points(self.base_roi_poly, H)
+        new_roi_lines = self._transform_points(self.base_roi_lines, H)
 
-        status = dbg.get("status", "unknown")
-        method = dbg.get("method", "none")
-        good = dbg.get("good_matches", 0)
-        inliers = dbg.get("inliers", 0)
-        ratio = dbg.get("inlier_ratio", 0.0)
-        
-        if ok:
-            self.align_status_text = f"ALIGN OK {method} g={good} i={inliers} r={ratio:.2f}"
+        # ROI 변화량 계산
+        def _mean_point_shift(before, after):
+            if not before or not after or len(before) != len(after):
+                return 0.0, 0.0
+
+            before_np = np.array(before, dtype=np.float32)
+            after_np = np.array(after, dtype=np.float32)
+
+            if before_np.shape != after_np.shape:
+                return 0.0, 0.0
+
+            dist = np.linalg.norm(after_np - before_np, axis=1)
+            return float(np.mean(dist)), float(np.max(dist))
+
+        poly_mean_shift, poly_max_shift = _mean_point_shift(old_roi_poly, new_roi_poly)
+        line_mean_shift, line_max_shift = _mean_point_shift(old_roi_lines, new_roi_lines)
+
+        # 1) 매칭은 성공했지만 작은 jitter라서 ROI를 일부러 움직이지 않는 경우
+        if status == "skip_small_jitter_keep_identity":
+            self.aligned_roi_poly = list(self.base_roi_poly)
+            self.aligned_roi_lines = list(self.base_roi_lines)
+            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+
+            self.align_status_text = (
+                f"JITTER IGNORED {method} "
+                f"status={status} g={good} i={inliers} r={ratio:.2f} "
+                f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
+                f"scale={scale:.3f} persp={perspective:.5f} | "
+                f"ROI kept"
+            )
+
+        # 2) 매칭 성공 + 실제 변화로 판단되어 ROI 보정을 적용하는 경우
+        elif ok and shifted:
+            self.aligned_roi_poly = new_roi_poly
+            self.aligned_roi_lines = new_roi_lines
+            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+
+            self.align_status_text = (
+                f"ALIGN APPLIED {method} "
+                f"status={status} g={good} i={inliers} r={ratio:.2f} "
+                f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
+                f"scale={scale:.3f} persp={perspective:.5f} | "
+                f"poly_shift mean={poly_mean_shift:.1f}px max={poly_max_shift:.1f}px | "
+                f"line_shift mean={line_mean_shift:.1f}px max={line_max_shift:.1f}px"
+            )
+
+        # 3) 매칭 성공했지만 H가 사실상 identity인 경우
+        elif ok and not shifted:
+            self.aligned_roi_poly = list(self.base_roi_poly)
+            self.aligned_roi_lines = list(self.base_roi_lines)
+            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+
+            self.align_status_text = (
+                f"ROI UNCHANGED {method} "
+                f"status={status} g={good} i={inliers} r={ratio:.2f} "
+                f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
+                f"scale={scale:.3f} persp={perspective:.5f} | "
+                f"reason=identity_transform"
+            )
+
+        # 4) 매칭 실패 또는 homography가 위험하다고 판단되어 마지막 정상 ROI 유지
         else:
-            self.align_status_text = f"ALIGN HOLD {method} g={good} i={inliers} r={ratio:.2f}"
+            if KEEP_LAST_GOOD_ROI_ON_FAILURE:
+                # 기존 aligned ROI를 유지한다.
+                # 비어 있으면 base ROI라도 주입한다.
+                if not self.aligned_roi_poly and not self.aligned_roi_lines:
+                    self.aligned_roi_poly = list(self.base_roi_poly)
+                    self.aligned_roi_lines = list(self.base_roi_lines)
+
+                self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+                hold_action = "last_good_roi_kept"
+            else:
+                self.aligned_roi_poly = list(self.base_roi_poly)
+                self.aligned_roi_lines = list(self.base_roi_lines)
+                self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+                hold_action = "base_roi_restored"
+
+            self.align_status_text = (
+                f"ALIGN HOLD {method} "
+                f"status={status} g={good} i={inliers} r={ratio:.2f} "
+                f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
+                f"scale={scale:.3f} persp={perspective:.5f} | "
+                f"reason={status} | action={hold_action}"
+            )
 
         self.status_history.append(self.align_status_text)
         self.last_align_time = now
 
-        logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
         print(f"[CCTV_Aligner] CAM {self.cam_id} {self.align_status_text}")
+        logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
 
     def process_frame(self):
         fr, fid, connected = self.reader.read()
