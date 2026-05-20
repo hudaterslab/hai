@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 import socket
 from typing import Dict
+import urllib.request
 
 
 DEFAULT_PORT = 20000
@@ -40,7 +41,10 @@ class DeviceStatus:
 
 class QLightETN:
     """
-    TCP client for QLight ETN Ethernet tower lamps.
+    Client for QLight ETN Ethernet tower lamps.
+
+    This device exposes TCP status reads on port 20000, but lamp/sound writes
+    are sent through the same HTTP endpoints used by the built-in web UI.
     """
 
     def __init__(self, host: str, port: int = DEFAULT_PORT, timeout: float = 2.0) -> None:
@@ -67,25 +71,23 @@ class QLightETN:
         keep_previous: int = 100,
     ) -> None:
         self._validate_sound_group(sound_group)
-        frame = bytearray([ord("W"), sound_group, keep_previous, keep_previous, keep_previous, keep_previous, keep_previous, 0, 0, 0])
 
-        if red is not None:
-            frame[2] = int(red)
-        if yellow is not None:
-            frame[3] = int(yellow)
-        if green is not None:
-            frame[4] = int(green)
-        if blue is not None:
-            frame[5] = int(blue)
-        if white is not None:
-            frame[6] = int(white)
+        self._send_http_command(f"L?T={sound_group}")
+
+        lamp_commands = (
+            (1, red),
+            (2, yellow),
+            (3, green),
+            (4, blue),
+            (5, white),
+        )
+        for lamp_number, state in lamp_commands:
+            if state is not None:
+                self._send_http_command(f"L?{lamp_number}={self._to_http_lamp_state(state)}")
+
         if sound_channel is not None:
             self._validate_sound_channel(sound_channel)
-            frame[7] = sound_channel
-        else:
-            frame[7] = keep_previous
-
-        self._send_frame(frame, expect_response=False)
+            self._send_http_command(f"L?S={sound_channel}")
 
     def all_off(self) -> None:
         self.write_status(
@@ -112,6 +114,26 @@ class QLightETN:
             if response[0] != ord("A"):
                 raise RuntimeError(f"unexpected response header: {response[0]!r}")
             return response
+
+    def _send_http_command(self, command: str) -> str:
+        base_url = self.host
+        if not base_url.startswith(("http://", "https://")):
+            base_url = f"http://{base_url}"
+        url = f"{base_url.rstrip('/')}/{command}"
+
+        with urllib.request.urlopen(url, timeout=self.timeout) as response:
+            body = response.read().decode("utf-8", errors="replace").strip()
+
+        if body and body != "OK":
+            raise RuntimeError(f"unexpected HTTP response for {command}: {body!r}")
+        return body
+
+    @staticmethod
+    def _to_http_lamp_state(state: LampState | int) -> int:
+        state = LampState(state)
+        if state == LampState.OFF:
+            return 3
+        return int(state)
 
     @staticmethod
     def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -140,8 +162,8 @@ class QLightETN:
 
     @staticmethod
     def _validate_sound_group(sound_group: int) -> None:
-        if not 0 <= sound_group <= 4:
-            raise ValueError("sound_group must be between 0 and 4")
+        if not 0 <= sound_group <= 5:
+            raise ValueError("sound_group must be between 0 and 5")
 
     @staticmethod
     def _validate_sound_channel(sound_channel: int) -> None:

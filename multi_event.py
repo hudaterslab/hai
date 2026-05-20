@@ -360,8 +360,8 @@ def trigger_tower_lamp(event_name):
                 green=LampState.BLINK,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=3,
-                sound_group=0,
+                sound_channel=0,
+                sound_group=5,
             )
         elif event_name == "illegal_parking":
             TOWER_LAMP.write_status(
@@ -370,8 +370,8 @@ def trigger_tower_lamp(event_name):
                 green=LampState.OFF,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=2,
-                sound_group=0,
+                sound_channel=0,
+                sound_group=5,
             )
         elif event_name == "conveyor_crossing":
             TOWER_LAMP.write_status(
@@ -380,18 +380,18 @@ def trigger_tower_lamp(event_name):
                 green=LampState.OFF,
                 blue=LampState.ON,
                 white=LampState.OFF,
-                sound_channel=4,
-                sound_group=0,
+                sound_channel=0,
+                sound_group=5,
             )
         elif event_name == "signal_vehicle":
             TOWER_LAMP.write_status(
                 red=LampState.ON,
                 yellow=LampState.ON,
-                green=LampState.ONF,
+                green=LampState.ON,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=5,
-                sound_group=0,
+                sound_channel=0,
+                sound_group=5,
             )
         else:
             TOWER_LAMP.write_status(
@@ -400,8 +400,8 @@ def trigger_tower_lamp(event_name):
                 green=LampState.OFF,
                 blue=LampState.OFF,
                 white=LampState.OFF,
-                sound_channel=1,
-                sound_group=0,
+                sound_channel=0,
+                sound_group=5,
             )
 
         TOWER_LAMP_ACTIVE_UNTIL = max(TOWER_LAMP_ACTIVE_UNTIL, time.time() + TOWER_LAMP_HOLD_SEC)
