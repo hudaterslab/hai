@@ -2092,7 +2092,7 @@ class Camera:
             time_diff = self.fps_queue[-1] - self.fps_queue[0]
             self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
 
-        self._update_runtime_roi(fr.shape)
+        self._update_alignment(fr)
         motion_mask = self.motion_det.apply(fr)
 
         # 메인 트래커 업데이트
