@@ -49,8 +49,36 @@ ID_REFLECTIVE_VEST = 5
 ID_G_TRUCK = 6
 TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
 
+DEBUG_MODE = False
+
+# ------------------------------------------------------------
+# ROI 보정(Aligner) 튜닝 파라미터 
+# ------------------------------------------------------------
+ALIGN_INTERVAL_SEC = 300.0
+ORB_FEATURES = 1500
+MIN_GOOD_MATCHES = 20
+MIN_INLIERS = 12
+MIN_INLIER_RATIO = 0.25
+RANSAC_REPROJ_THRESH = 5.0
+TRACKING_UPDATE_MIN_INTERVAL_SEC = 2.0
+TRACKING_UPDATE_MIN_INLIERS = 25
+TRACKING_UPDATE_MIN_INLIER_RATIO = 0.35
+ANCHOR_DIRECT_CHECK_INTERVAL_SEC = 15.0
+ANCHOR_DIRECT_MIN_INLIERS = 30
+ANCHOR_DIRECT_MIN_INLIER_RATIO = 0.35
+MAX_CORNER_SHIFT_RATIO = 0.45      
+MAX_SCALE_CHANGE = 0.45            
+MAX_PERSPECTIVE_ABS = 0.003        
+HOMOGRAPHY_IDENTITY_ATOL = 1e-3
+
+MIN_APPLY_TRANSLATION_PX = 5.0     
+MIN_APPLY_ROTATION_DEG = 0.5       
+MIN_APPLY_SCALE_CHANGE = 0.02      
+MIN_APPLY_PERSPECTIVE = 0.0005     
+KEEP_LAST_GOOD_ROI_ON_FAILURE = True
+DEBUG_ALIGN = True
+
 def deep_merge_dict(base, override):
-    """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
     import copy
     result = copy.deepcopy(base)
     for k, v in (override or {}).items():
@@ -61,7 +89,6 @@ def deep_merge_dict(base, override):
     return result
 
 def load_system_config():
-    """시스템 공통 설정(system_config.json)을 로드합니다."""
     default_config = {
         "terminal_id": "2",
         "logging": {"dir": "./logs", "level": "INFO"},
@@ -127,7 +154,6 @@ file_handler.setFormatter(formatter)
 stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setFormatter(formatter)
 
-# 비동기 로깅을 위한 큐(Queue) 설정
 log_queue = queue.Queue(-1)
 queue_handler = QueueHandler(log_queue)
 logger.addHandler(queue_handler)
@@ -136,7 +162,6 @@ LOG_LISTENER = QueueListener(log_queue, file_handler, stream_handler, respect_ha
 LOG_LISTENER.start()
 
 def graceful_shutdown():
-    """시스템 종료 시 스레드 풀과 로거를 안전하게 정리합니다."""
     if LOG_LISTENER is not None:
         try:
             LOG_LISTENER.stop()
@@ -153,16 +178,12 @@ atexit.register(graceful_shutdown)
 # ==========================================
 # [3] 딥엑스 NPU 엔진 및 환경변수 설정
 # ==========================================
-# ==========================================
-# [3] 딥엑스 NPU 엔진 및 환경변수 설정
-# ==========================================
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
 os.environ["OPENCV_FFMPEG_DEBUG"] = "0"
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;3000000|max_delay;500000"
 
-# [수정] sys.exit(1) 강제 종료를 제거하고 상태 플래그(HAS_DX_ENGINE) 도입
 HAS_DX_ENGINE = False
 try:
     from dx_engine import InferenceEngine, InferenceOption
@@ -174,7 +195,6 @@ except ImportError:
 # [4] 공통 유틸리티 함수
 # ==========================================
 def sanitize_camera_url(url: str) -> str:
-    """RTSP URL에서 공백 및 불순물을 제거합니다."""
     if not url: return ""
     try:
         clean_url = url.encode('ascii', 'ignore').decode('ascii')
@@ -183,7 +203,6 @@ def sanitize_camera_url(url: str) -> str:
         return re.sub(r'\s+', '', str(url).strip())
 
 def extract_ip(rtsp_url: str) -> str:
-    """RTSP URL에서 식별용 고유 ID(IP+Channel)를 추출합니다."""
     try:
         clean_url = sanitize_camera_url(rtsp_url)
         if "://" not in clean_url:
@@ -192,7 +211,6 @@ def extract_ip(rtsp_url: str) -> str:
         parsed = urlsplit(clean_url)
         host = parsed.netloc.rsplit("@", 1)[-1].strip("[]").split(":")[0].split(".")[-1]
         
-        # Path와 Query(채널 정보 등)를 포함하여 고유한 키 생성
         path = re.sub(r'[^a-zA-Z0-9]', '_', parsed.path)
         query = re.sub(r'[^a-zA-Z0-9]', '_', parsed.query)
         
@@ -203,7 +221,6 @@ def extract_ip(rtsp_url: str) -> str:
         return "unknown_cam"
 
 def load_rtsp_list_from_csv(csv_path):
-    """CSV 파일에서 카메라 RTSP URL 목록을 로드합니다."""
     if not os.path.exists(csv_path):
         logger.error(f"카메라 목록 CSV를 찾을 수 없습니다: {csv_path}")
         return []
@@ -234,7 +251,6 @@ def load_rtsp_list_from_csv(csv_path):
     return unique_list
 
 def calculate_iou(box1, box2):
-    """두 BBox 간의 IoU(Intersection over Union)를 계산합니다."""
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
@@ -262,7 +278,6 @@ def get_distance(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
 def ccw(p1, p2, p3):
-    """세 점의 방향성을 판별합니다. (선분 교차 알고리즘용)"""
     val = (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
     if val > 0: return 1
     elif val < 0: return -1
@@ -279,7 +294,6 @@ def denormalize_roi_points(points, width, height):
     return [[int(round(float(x) * width)), int(round(float(y) * height))] for x, y in points]
 
 def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
-    """여러 카메라의 영상을 하나의 모자이크 화면으로 합성합니다."""
     if not images: 
         return None
         
@@ -308,10 +322,9 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
     return mosaic
 
 # ==========================================
-# [5] API 통신 및 이미지 저장 (NAS 연동 제외)
+# [5] API 통신 및 이미지 저장
 # ==========================================
 def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, bboxes, img_width=None, img_height=None):
-    """수신 서버(Receiver API)로 이벤트 이미지를 POST 전송합니다."""
     if(terminal_id == "99999"):
         logger.debug(f"[API 스킵] 기본 단말 ID(99999) 사용 중: {image_path}")
         return
@@ -364,7 +377,6 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.error(f"⚠️ [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
 def _save_and_send_task(img, img_path, api_params):
-    """비동기 스레드에서 파일 쓰기 및 API 전송을 처리합니다."""
     try:
         cv2.imwrite(img_path, img)
     except Exception as e:
@@ -385,7 +397,6 @@ def _save_and_send_task(img, img_path, api_params):
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
 def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="2", cctv_id=1):
-    """프레임에 BBox를 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
         return
@@ -394,13 +405,11 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="2"
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
         
-        # Bounding Box 렌더링
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
         
         now = datetime.datetime.now()
         msg = f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}"
         
-        # 텍스트가 화면 위로 벗어나지 않도록 처리
         text_y = max(20, y1 - 10)
         cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
@@ -430,11 +439,10 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="2"
         logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
 
 # ==========================================
-# [6] DeepX NPU 모델 추론 (YOLOv8 버그 픽스 반영)
+# [6] DeepX NPU 모델 추론
 # ==========================================
 class YoLoDeepX:
     def __init__(self, engine_path):
-        # [수정] 객체 생성 시점에 NPU 환경인지 체크하여 안전하게 방어
         if not HAS_DX_ENGINE:
             raise RuntimeError("dx_engine이 설치되지 않은 서버/PC 환경에서는 YoLoDeepX(NPU) 객체를 생성할 수 없습니다.")
             
@@ -464,17 +472,14 @@ class YoLoDeepX:
         try:
             pred = np.array(output_tensor[0])
             
-            # YOLOv8 배열 형태 보정
             if pred.ndim == 3 and pred.shape[1] < pred.shape[2]: 
                 pred = pred.transpose((0, 2, 1))
             if pred.ndim == 3: 
                 pred = pred[0]
             
-            # Class-Id 및 Score 추출
             scores = np.max(pred[:, 4:], axis=1)
             class_ids = np.argmax(pred[:, 4:], axis=1)
 
-            # Confidence 필터링
             mask = scores > conf_thres
             pred = pred[mask]
             scores = scores[mask]
@@ -483,12 +488,10 @@ class YoLoDeepX:
             if len(pred) == 0: 
                 return []
 
-            # NMSBoxes 포맷 맞춤 (x_min, y_min, width, height)
             boxes_xywh = pred[:, :4].copy()
-            boxes_xywh[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2  # 중심 X -> 최소 X
-            boxes_xywh[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2  # 중심 Y -> 최소 Y
+            boxes_xywh[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2  
+            boxes_xywh[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2  
             
-            # Class-Aware NMS
             max_wh = 7680 
             class_offset = class_ids * max_wh
             boxes_shifted = boxes_xywh.copy()
@@ -544,8 +547,6 @@ class YoLoDeepX:
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
 # ==========================================
-# [1] 시스템 기본 설정 및 상수 영역 하단에 추가
-DEBUG_MODE = False
 class SimpleTracker:
     def __init__(self, max_lost=30): 
         self.next_id = 1
@@ -571,7 +572,6 @@ class SimpleTracker:
                     best_idx = i
                     
             if best_iou > 0.2:
-                # 💡 [수정] bbox뿐만 아니라 conf(Confidence)도 업데이트
                 self.tracks[tid].update({'bbox': detections[best_idx][:4], 'lost': 0, 'conf': detections[best_idx][4]})
                 used_dets.add(best_idx)
             else: 
@@ -582,13 +582,11 @@ class SimpleTracker:
         res_tracks = []
         for i, det in enumerate(detections):
             if i not in used_dets:
-                # 💡 [수정] 신규 객체 등록 시 conf 추가
                 self.tracks[self.next_id] = {'bbox': det[:4], 'lost': 0, 'cls': int(det[5]), 'conf': det[4]}
                 self.next_id += 1
                 
         for tid, trk in self.tracks.items():
             if trk['lost'] == 0:
-                # 💡 [수정] 1.0 하드코딩 대신 실제 conf 반환 (det 포맷 유지: x1, y1, x2, y2, tid, conf, cls)
                 res_tracks.append([*trk['bbox'], tid, trk.get('conf', 1.0), trk['cls']])
                 
         return np.array(res_tracks)
@@ -634,7 +632,6 @@ class VideoRecorder:
             self.record_end_time = now + post_sec
             self.current_event = event_name
             
-            # 프리버퍼의 모든 프레임을 기록 큐에 일괄 삽입
             temp_buffer = list(self.buffer)
             for f in temp_buffer: 
                 self.write_queue.put(f)
@@ -688,7 +685,7 @@ class MotionDetector:
         return fg_mask
 
 # ==========================================
-# [8] 정밀 이벤트 감지 로직 (OOP 구조)
+# [8] 정밀 이벤트 감지 로직
 # ==========================================
 class BaseEventDetector:
     gui_name = "BASE"
@@ -751,7 +748,6 @@ class ParkingDetector(BaseEventDetector):
                     
                     dynamic_move_threshold = vehicle_size * self.move_threshold_ratio
                     
-                    # 신규 진입 또는 동적 임계값 이상 이동 시 초기화
                     if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > dynamic_move_threshold:
                         self.states[tid].update({
                             'start_fid': fid, 
@@ -759,17 +755,15 @@ class ParkingDetector(BaseEventDetector):
                             'bbox': t[:4], 
                             'frame': frame.copy() if frame is not None else None,
                             'fid': fid,
-                            'triggered': False # 중복 알람 방지용 플래그
+                            'triggered': False
                         })
                     else:
-                        # [핵심 보완] 정지 상태 유지 중에는 최신 스냅샷과 BBox로 지속 갱신 (API 이미지 이격 방지)
                         self.states[tid].update({
                             'bbox': t[:4],
                             'frame': frame.copy() if frame is not None else None,
                             'fid': fid
                         })
                         
-                        # [가변 FPS 대응] 실제 정지 체류 시간(Duration) 계산
                         duration_sec = (fid - self.states[tid]['start_fid']) / self.fps
                         
                         if not self.states[tid].get('triggered', False) and duration_sec >= self.trigger_sec:
@@ -781,14 +775,12 @@ class ParkingDetector(BaseEventDetector):
                             })
                             self.states[tid]['triggered'] = True
                         
-        # 프레임에서 사라진 객체 상태 정리
         for tid in list(self.states.keys()):
             if tid not in curr_ids: 
                 del self.states[tid]
                 
         return triggered
 
-import math
 class CrossingDetector(BaseEventDetector):
     gui_name = "CROSSING"
     
@@ -806,7 +798,6 @@ class CrossingDetector(BaseEventDetector):
         
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
-        
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
 
     def _is_intersect(self, p1, p2, p3, p4): 
@@ -905,7 +896,6 @@ class CrossingDetector(BaseEventDetector):
                     self.prev[p_tid] = curr_pos
                     continue
 
-            # 후보 등록 시점 (선분 교차 순간의 증거 스냅샷 보존)
             if p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 
@@ -925,7 +915,6 @@ class CrossingDetector(BaseEventDetector):
                             }
                         break
             
-            # 최종 판정 로직
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
@@ -942,7 +931,6 @@ class CrossingDetector(BaseEventDetector):
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
                     
                     if perp_dist >= dynamic_threshold:
-                        # [핵심 보완] 완전히 넘어갔음을 확정한 후, API에는 '교차 순간(cand)'의 이미지와 BBox를 발송
                         triggered.append({
                             'tid': p_tid, 
                             'bbox': cand['bbox'], 
@@ -964,14 +952,6 @@ class CrossingDetector(BaseEventDetector):
                 if tid in self.lb_last_height: del self.lb_last_height[tid]
                 
         return triggered
-    
-import cv2
-import numpy as np
-from collections import deque
-
-# ---------------------------------------------------------
-# [Modified 코드 Part] - ROI 버퍼 기반 Median 검증 및 Track ID 블랙리스트 추가
-# ---------------------------------------------------------
 
 class HelmetDetector(BaseEventDetector):
     gui_name = "NO-HELMET"
@@ -985,19 +965,15 @@ class HelmetDetector(BaseEventDetector):
         
         self.window_fids = int(self.window_sec * self.fps)
         self.min_hit_count = config.get("min_hit_count", 3)
-        
-        # 빨간 헬멧(오인식)으로 확정된 Track ID를 영구 배제하기 위한 블랙리스트 Set
         self.red_helmet_tids = set()
 
     def _get_roi_crop(self, frame, box):
-        """메모리 절약을 위해 객체 상단 50% 영역만 잘라내어 반환합니다."""
         if frame is None:
             return None
             
         h_img, w_img = frame.shape[:2]
         x1, y1, x2, y2 = map(int, box[:4])
         
-        # 프레임 경계 방어 로직
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_img, x2), min(h_img, y2)
         
@@ -1011,10 +987,9 @@ class HelmetDetector(BaseEventDetector):
         if roi.size == 0:
             return None
             
-        return roi.copy()  # 원본 프레임 참조를 끊기 위해 독립된 메모리로 복사
+        return roi.copy() 
 
     def _is_red_helmet_median(self, roi_buffer):
-        """버퍼에 쌓인 최근 3~5장 ROI들의 스칼라 중간값(Median)을 계산합니다."""
         if not roi_buffer:
             return False
             
@@ -1034,7 +1009,6 @@ class HelmetDetector(BaseEventDetector):
         if not h_means:
             return False
             
-        # 프레임 단위의 스파이크 노이즈를 제거하기 위한 Median 연산
         med_r = np.median(r_means)
         med_h = np.median(h_means)
         med_s = np.median(s_means)
@@ -1059,7 +1033,6 @@ class HelmetDetector(BaseEventDetector):
         for p in tracks:
             p_tid = int(p[4])
             
-            # [추가점] 이미 빨간 헬멧으로 확정된 ID는 처음부터 객체 매칭 연산에서 제외
             if p_tid in self.red_helmet_tids:
                 continue
                 
@@ -1109,7 +1082,6 @@ class HelmetDetector(BaseEventDetector):
                     matched_session = session
                     break
             
-            # 현재 프레임의 ROI 크롭 추출
             roi_crop = self._get_roi_crop(frame, nh_p['head_bbox'])
                     
             if matched_session:
@@ -1123,7 +1095,6 @@ class HelmetDetector(BaseEventDetector):
                 if roi_crop is not None:
                     matched_session['roi_buffer'].append(roi_crop)
             else:
-                # 신규 세션 생성 시 maxlen 5의 deque 할당
                 new_buffer = deque(maxlen=5)
                 if roi_crop is not None:
                     new_buffer.append(roi_crop)
@@ -1142,7 +1113,6 @@ class HelmetDetector(BaseEventDetector):
 
         active_sessions = []
         for session in self.sessions:
-            # 루프 도중 블랙리스트에 등재된 ID가 있다면 즉시 폐기
             if session['last_tid'] in self.red_helmet_tids:
                 continue
                 
@@ -1152,15 +1122,11 @@ class HelmetDetector(BaseEventDetector):
             duration_sec = (fid - session['start_fid']) / self.fps
             
             if not session['triggered'] and duration_sec >= self.trigger_sec and len(session['hit_fids']) >= self.min_hit_count:
-                
-                # 지연된 오인식 검증 (최대 최근 5장의 Median)
                 is_red_helmet = self._is_red_helmet_median(session['roi_buffer'])
                 
                 if is_red_helmet:
-                    # 오인식 판정 시: 해당 Track ID를 블랙리스트에 추가하여 향후 탐지에서 영구 배제
                     self.red_helmet_tids.add(session['last_tid'])
                 else:
-                    # 실제 이벤트 발생
                     triggered.append({
                         'tid': session['last_tid'], 
                         'bbox': session['bbox'], 
@@ -1261,7 +1227,6 @@ EVENT_REGISTRY = {
 # [9] 터미널 마법사 및 설정 UI
 # ==========================================
 def capture_snapshot(url):
-    """설정 마법사용 스냅샷 캡처"""
     try:
         cap = cv2.VideoCapture(sanitize_camera_url(url), cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -1275,7 +1240,6 @@ def capture_snapshot(url):
         return None
 
 def get_roi_points_scaled(frame, title, mode="poly"):
-    """마우스 클릭을 통해 ROI(관심 영역)를 획득합니다."""
     pts = []
     orig_h, orig_w = frame.shape[:2]
     scale = 960 / orig_w
@@ -1291,7 +1255,6 @@ def get_roi_points_scaled(frame, title, mode="poly"):
             
     cv2.setMouseCallback(title, mouse_cb)
     
-    # [UX 개선] 전체 화면 적용 방법(Skip)을 명시적으로 안내
     if mode == "poly":
         logger.info(f"'{title}' 설정 - 화면을 클릭하여 점을 찍으십시오. (전체 화면 적용 시 그냥 Enter 또는 ESC)")
     else:
@@ -1312,9 +1275,9 @@ def get_roi_points_scaled(frame, title, mode="poly"):
                 
         cv2.imshow(title, temp)
         k = cv2.waitKey(1)
-        if k == 13: # Enter
+        if k == 13: 
             break 
-        if k == 27: # ESC
+        if k == 27: 
             pts = []
             break 
         if mode == "line" and len(pts) == 2: 
@@ -1326,7 +1289,6 @@ def get_roi_points_scaled(frame, title, mode="poly"):
 
 def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     logger.info("=== 설정 마법사 시작 ===")
-    # 기존 설정을 그대로 복사하여 기반으로 삼음
     configs = existing_configs.copy() if existing_configs else {}
     
     for i in range(0, len(rtsp_list), BATCH_SIZE):
@@ -1408,8 +1370,367 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     return configs
 
 # ==========================================
-# [10] 카메라 제어 (FrameReader / Camera)
+# [10] 카메라 제어 및 ROI Aligner
 # ==========================================
+
+class AnchorTrackingROIAligner:
+    def __init__(self):
+        self.orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+        self.anchor_gray = None
+        self.anchor_kp = None
+        self.anchor_des = None
+        self.anchor_shape = None
+
+        self.tracking_gray = None
+        self.tracking_kp = None
+        self.tracking_des = None
+        self.tracking_shape = None
+
+        self.H_anchor_to_tracking = np.eye(3, dtype=np.float32)
+        self.H_last_good = np.eye(3, dtype=np.float32)
+
+        self.last_tracking_update_time = 0.0
+        self.last_anchor_direct_check_time = 0.0
+
+        self.fail_count = 0
+        self.success_count = 0
+
+        self.last_debug = {
+            "status": "not_initialized",
+            "method": "none",
+            "raw_matches": 0,
+            "good_matches": 0,
+            "inliers": 0,
+            "inlier_ratio": 0.0,
+            "dx": 0.0,
+            "dy": 0.0,
+            "angle_deg": 0.0,
+            "scale": 1.0,
+        }
+
+    def _gray(self, frame):
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def _features(self, gray):
+        kp, des = self.orb.detectAndCompute(gray, None)
+        return kp, des
+
+    def set_anchor(self, frame):
+        if frame is None:
+            self.last_debug["status"] = "set_anchor_failed_no_frame"
+            return False
+
+        gray = self._gray(frame)
+        kp, des = self._features(gray)
+
+        if des is None or kp is None or len(kp) < MIN_GOOD_MATCHES:
+            n = 0 if kp is None else len(kp)
+            self.last_debug = {
+                "status": f"set_anchor_failed_not_enough_features:{n}",
+                "method": "anchor_init",
+                "raw_matches": 0,
+                "good_matches": 0,
+                "inliers": 0,
+                "inlier_ratio": 0.0,
+                "dx": 0.0,
+                "dy": 0.0,
+                "angle_deg": 0.0,
+                "scale": 1.0,
+            }
+            if DEBUG_ALIGN:
+                print(f"[CCTV_Aligner] anchor 특징점 부족: {n}")
+            return False
+
+        self.anchor_gray = gray
+        self.anchor_kp = kp
+        self.anchor_des = des
+        self.anchor_shape = frame.shape[:2]
+
+        self.tracking_gray = gray
+        self.tracking_kp = kp
+        self.tracking_des = des
+        self.tracking_shape = frame.shape[:2]
+
+        self.H_anchor_to_tracking = np.eye(3, dtype=np.float32)
+        self.H_last_good = np.eye(3, dtype=np.float32)
+
+        now = time.time()
+        self.last_tracking_update_time = now
+        self.last_anchor_direct_check_time = now
+
+        self.fail_count = 0
+        self.success_count = 0
+
+        self.last_debug = {
+            "status": "anchor_set",
+            "method": "anchor_init",
+            "raw_matches": 0,
+            "good_matches": len(kp),
+            "inliers": 0,
+            "inlier_ratio": 0.0,
+            "dx": 0.0,
+            "dy": 0.0,
+            "angle_deg": 0.0,
+            "scale": 1.0,
+        }
+
+        if DEBUG_ALIGN:
+            print(f"[CCTV_Aligner] anchor 기준 프레임 등록 완료: features={len(kp)}")
+        return True
+
+    def _normalize_H(self, H):
+        if H is None:
+            return None
+        H = H.astype(np.float32)
+        if abs(float(H[2, 2])) < 1e-8:
+            return None
+        return H / H[2, 2]
+
+    def _decompose_homography_rough(self, H):
+        Hn = self._normalize_H(H)
+        if Hn is None:
+            return {"dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0, "perspective": 0.0}
+
+        dx = float(Hn[0, 2])
+        dy = float(Hn[1, 2])
+        a = float(Hn[0, 0])
+        b = float(Hn[1, 0])
+        c = float(Hn[0, 1])
+        d = float(Hn[1, 1])
+
+        scale_x = (a * a + b * b) ** 0.5
+        scale_y = (c * c + d * d) ** 0.5
+        scale = (scale_x + scale_y) / 2.0
+
+        angle_deg = float(np.degrees(np.arctan2(b, a)))
+        perspective = max(abs(float(Hn[2, 0])), abs(float(Hn[2, 1])))
+
+        return {"dx": dx, "dy": dy, "angle_deg": angle_deg, "scale": scale, "perspective": perspective}
+
+    def _is_small_jitter(self, H):
+        m = self._decompose_homography_rough(H)
+        return (
+            abs(m["dx"]) < MIN_APPLY_TRANSLATION_PX
+            and abs(m["dy"]) < MIN_APPLY_TRANSLATION_PX
+            and abs(m["angle_deg"]) < MIN_APPLY_ROTATION_DEG
+            and abs(m["scale"] - 1.0) < MIN_APPLY_SCALE_CHANGE
+            and abs(m["perspective"]) < MIN_APPLY_PERSPECTIVE
+        )
+
+    def _add_motion_debug(self, debug, H):
+        m = self._decompose_homography_rough(H)
+        debug["dx"] = float(m["dx"])
+        debug["dy"] = float(m["dy"])
+        debug["angle_deg"] = float(m["angle_deg"])
+        debug["scale"] = float(m["scale"])
+        debug["perspective"] = float(m["perspective"])
+        return debug
+
+    def _match_and_homography(self, src_kp, src_des, dst_kp, dst_des, dst_shape, method_name):
+        if src_des is None or dst_des is None:
+            return None, {"status": "descriptor_missing", "method": method_name, "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+
+        raw = self.matcher.knnMatch(src_des, dst_des, k=2)
+
+        good = []
+        for pair in raw:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+
+        debug = {"status": "matching", "method": method_name, "raw_matches": len(raw), "good_matches": len(good), "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+
+        if len(good) < MIN_GOOD_MATCHES:
+            debug["status"] = f"not_enough_good_matches:{len(good)}"
+            return None, debug
+
+        src_pts = np.float32([src_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([dst_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, RANSAC_REPROJ_THRESH)
+        if H is None or mask is None:
+            debug["status"] = "homography_failed"
+            return None, debug
+
+        inliers = int(mask.sum())
+        inlier_ratio = inliers / max(1, len(good))
+
+        debug["inliers"] = inliers
+        debug["inlier_ratio"] = float(inlier_ratio)
+        debug = self._add_motion_debug(debug, H)
+
+        if inliers < MIN_INLIERS:
+            debug["status"] = f"not_enough_inliers:{inliers}"
+            return None, debug
+
+        if inlier_ratio < MIN_INLIER_RATIO:
+            debug["status"] = f"low_inlier_ratio:{inlier_ratio:.2f}"
+            return None, debug
+
+        H = H.astype(np.float32)
+        ok, reason = self._is_homography_reasonable(H, dst_shape)
+        if not ok:
+            debug["status"] = reason
+            return None, debug
+
+        debug["status"] = "ok"
+        return H, debug
+
+    def _is_homography_reasonable(self, H, frame_shape):
+        if H is None: return False, "H_none"
+        if not np.isfinite(H).all(): return False, "H_not_finite"
+
+        h, w = frame_shape[:2]
+        corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+
+        try: warped = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+        except Exception: return False, "corner_transform_failed"
+
+        if not np.isfinite(warped).all(): return False, "warped_corner_not_finite"
+
+        orig = corners.reshape(-1, 2)
+        shift = np.linalg.norm(warped - orig, axis=1)
+        mean_shift = float(np.mean(shift))
+        max_allowed_shift = max(w, h) * MAX_CORNER_SHIFT_RATIO
+
+        if mean_shift > max_allowed_shift: return False, f"rejected_large_shift:{mean_shift:.1f}"
+
+        orig_top = np.linalg.norm(orig[1] - orig[0])
+        orig_bottom = np.linalg.norm(orig[2] - orig[3])
+        warped_top = np.linalg.norm(warped[1] - warped[0])
+        warped_bottom = np.linalg.norm(warped[2] - warped[3])
+
+        orig_avg = max(1.0, (orig_top + orig_bottom) / 2.0)
+        warped_avg = (warped_top + warped_bottom) / 2.0
+        scale = warped_avg / orig_avg
+
+        if scale < (1.0 - MAX_SCALE_CHANGE) or scale > (1.0 + MAX_SCALE_CHANGE):
+            return False, f"rejected_scale:{scale:.2f}"
+
+        if abs(float(H[2, 0])) > MAX_PERSPECTIVE_ABS or abs(float(H[2, 1])) > MAX_PERSPECTIVE_ABS:
+            return False, f"rejected_perspective:{H[2,0]:.5f},{H[2,1]:.5f}"
+
+        return True, "ok"
+
+    def _should_update_tracking(self, debug, now):
+        if debug.get("status") != "ok": return False
+        if now - self.last_tracking_update_time < TRACKING_UPDATE_MIN_INTERVAL_SEC: return False
+        if debug.get("inliers", 0) < TRACKING_UPDATE_MIN_INLIERS: return False
+        if debug.get("inlier_ratio", 0.0) < TRACKING_UPDATE_MIN_INLIER_RATIO: return False
+        return True
+
+    def _update_tracking_reference(self, frame, kp, des, H_anchor_to_current):
+        self.tracking_gray = self._gray(frame)
+        self.tracking_kp = kp
+        self.tracking_des = des
+        self.tracking_shape = frame.shape[:2]
+        self.H_anchor_to_tracking = H_anchor_to_current.astype(np.float32)
+        self.last_tracking_update_time = time.time()
+
+    def estimate_anchor_to_current(self, frame):
+        if self.anchor_des is None or self.tracking_des is None:
+            self.last_debug["status"] = "not_initialized"
+            return np.eye(3, dtype=np.float32), False
+
+        if frame is None:
+            self.last_debug["status"] = "no_current_frame"
+            return self.H_last_good.copy(), False
+
+        gray = self._gray(frame)
+        kp, des = self._features(gray)
+
+        if kp is None or des is None or len(kp) < MIN_GOOD_MATCHES:
+            self.fail_count += 1
+            self.last_debug = {"status": f"current_not_enough_features:{0 if kp is None else len(kp)}", "method": "current_features", "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+            return self.H_last_good.copy() if KEEP_LAST_GOOD_ROI_ON_FAILURE else np.eye(3, dtype=np.float32), False
+
+        now = time.time()
+
+        H_tracking_to_current, dbg_tracking = self._match_and_homography(self.tracking_kp, self.tracking_des, kp, des, frame.shape[:2], method_name="tracking_to_current")
+
+        if H_tracking_to_current is not None:
+            H_anchor_to_current = H_tracking_to_current @ self.H_anchor_to_tracking
+            H_anchor_to_current = H_anchor_to_current.astype(np.float32)
+
+            ok, reason = self._is_homography_reasonable(H_anchor_to_current, frame.shape[:2])
+            dbg_tracking = self._add_motion_debug(dbg_tracking, H_anchor_to_current)
+
+            if ok:
+                self.success_count += 1
+                self.fail_count = 0
+                self.last_debug = dbg_tracking
+
+                if self._is_small_jitter(H_anchor_to_current):
+                    self.last_debug["status"] = "skip_small_jitter_keep_identity"
+                    return np.eye(3, dtype=np.float32), True
+
+                self.H_last_good = H_anchor_to_current
+
+                if self._should_update_tracking(dbg_tracking, now):
+                    self._update_tracking_reference(frame, kp, des, H_anchor_to_current)
+                    self.last_debug["status"] = "ok_tracking_updated"
+
+                if now - self.last_anchor_direct_check_time > ANCHOR_DIRECT_CHECK_INTERVAL_SEC:
+                    self._try_anchor_direct_correction(frame, kp, des)
+                    self.last_anchor_direct_check_time = now
+
+                return self.H_last_good.copy(), True
+            else:
+                dbg_tracking["status"] = f"anchor_to_current_rejected:{reason}"
+
+        H_anchor_direct, dbg_anchor = self._match_and_homography(self.anchor_kp, self.anchor_des, kp, des, frame.shape[:2], method_name="anchor_to_current_fallback")
+
+        if H_anchor_direct is not None:
+            self.success_count += 1
+            self.fail_count = 0
+            self.last_debug = dbg_anchor
+            self.last_debug = self._add_motion_debug(self.last_debug, H_anchor_direct)
+
+            if self._is_small_jitter(H_anchor_direct):
+                self.last_debug["status"] = "skip_small_jitter_anchor_fallback"
+                return np.eye(3, dtype=np.float32), True
+
+            self.H_last_good = H_anchor_direct.astype(np.float32)
+            self.last_debug["status"] = "ok_anchor_fallback"
+
+            if self._should_update_tracking(dbg_anchor, now):
+                self._update_tracking_reference(frame, kp, des, self.H_last_good)
+                self.last_debug["status"] = "ok_anchor_fallback_tracking_updated"
+
+            return self.H_last_good.copy(), True
+
+        self.fail_count += 1
+        self.last_debug = dbg_tracking if dbg_tracking.get("good_matches", 0) >= dbg_anchor.get("good_matches", 0) else dbg_anchor
+        self.last_debug["status"] = "failed_keep_last_good:" + str(self.last_debug.get("status"))
+
+        if KEEP_LAST_GOOD_ROI_ON_FAILURE:
+            return self.H_last_good.copy(), False
+        return np.eye(3, dtype=np.float32), False
+
+    def _try_anchor_direct_correction(self, frame, kp, des):
+        H_direct, dbg = self._match_and_homography(self.anchor_kp, self.anchor_des, kp, des, frame.shape[:2], method_name="anchor_direct_drift_check")
+
+        if H_direct is None: return False
+        if dbg.get("inliers", 0) < ANCHOR_DIRECT_MIN_INLIERS: return False
+        if dbg.get("inlier_ratio", 0.0) < ANCHOR_DIRECT_MIN_INLIER_RATIO: return False
+
+        dbg = self._add_motion_debug(dbg, H_direct)
+
+        if self._is_small_jitter(H_direct):
+            self.last_debug = dbg
+            self.last_debug["status"] = "anchor_direct_small_jitter_skip"
+            return False
+
+        self.H_last_good = H_direct.astype(np.float32)
+        self._update_tracking_reference(frame, kp, des, self.H_last_good)
+        self.last_debug = dbg
+        self.last_debug["status"] = "anchor_direct_corrected_drift"
+        return True
+
 class FrameReader:
     def __init__(self, url, ip):
         self.url = sanitize_camera_url(url)
@@ -1427,7 +1748,6 @@ class FrameReader:
         while self.running:
             cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             if not cap.isOpened(): 
-                # 💡 [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
                 logger.error(f"🚨 [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
                 time.sleep(5)
                 continue
@@ -1438,7 +1758,6 @@ class FrameReader:
             
             while self.running and cap.isOpened():
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT: 
-                    # 💡 [수정] 타임아웃 로깅 레벨 격상
                     logger.error(f"🚨 [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
                     break
                     
@@ -1487,7 +1806,6 @@ class Camera:
         self.last_evt_t = {}
         self.visual_alarms = {}
 
-        from collections import deque
         self.fps_queue = deque(maxlen=30)
         self.current_fps = 0.0
 
@@ -1495,50 +1813,165 @@ class Camera:
         self.roi_lines_norm = conf.get('roi_lines_norm', [])
         self.roi_poly = []
         self.roi_lines = []
-        self.roi_frame_shape = None # 해상도 변경 감지용
+        self.roi_frame_shape = None 
         
+        self.aligner = AnchorTrackingROIAligner()
+        self.anchor_set = False
+        self.base_roi_poly = []
+        self.base_roi_lines = []
+        self.aligned_roi_poly = []
+        self.aligned_roi_lines = []
+        self.last_align_time = 0.0
+        self.align_status_text = "ALIGN INIT"
+        self.align_ok = False
+        self.align_shifted = False
+        self.status_history = deque(maxlen=10)
+
         self.handlers = {}
         for ename in self.events:
             if ename in EVENT_REGISTRY:
                 self.handlers[ename] = EVENT_REGISTRY[ename](SYS_CFG.get("event_config", {}).get(ename, {}), self.roi_poly, self.roi_lines)
 
     def update_config(self, new_conf):
-        """웹 UI 등 외부에서 cameras.json이 변경되었을 때, 무중단으로 설정을 핫 리로드합니다."""
         old_events = self.events.copy()
         self.events = new_conf.get('events', [])
         self.roi_poly_norm = new_conf.get('roi_poly_norm', [])
         self.roi_lines_norm = new_conf.get('roi_lines_norm', [])
-        
-        # 해상도 변경 감지 변수를 초기화하여 다음 프레임에서 ROI 역정규화를 강제 수행
         self.roi_frame_shape = None 
         
-        # 이벤트 핸들러 재구성
+        self.aligner = AnchorTrackingROIAligner()
+        self.anchor_set = False
+        self.base_roi_poly = []
+        self.base_roi_lines = []
+        self.aligned_roi_poly = []
+        self.aligned_roi_lines = []
+        self.last_align_time = 0.0
+        self.align_status_text = "ALIGN RESET"
+        self.align_ok = False
+        self.align_shifted = False
+        logger.info(f"[CAM:{self.cam_id}] ROI aligner reset after config update")
+        
         self.handlers = {}
         for ename in self.events:
             if ename in EVENT_REGISTRY:
-                # 새로운 설정과 텅 빈 ROI로 초기화 (이후 process_frame 타임에 runtime_roi가 자동 주입됨)
                 event_cfg = SYS_CFG.get("event_config", {}).get(ename, {})
                 self.handlers[ename] = EVENT_REGISTRY[ename](event_cfg, [], [])
                 
         logger.info(f"🔄 [CAM:{self.ip}] 무중단 설정 리로드 완료: {old_events} -> {self.events}")
 
-    def _update_runtime_roi(self, frame_shape):
-        if self.roi_frame_shape == frame_shape[:2]:
-            return
-            
-        height, width = frame_shape[:2]
-        if self.roi_poly_norm:
-            self.roi_poly = denormalize_roi_points(self.roi_poly_norm, width, height)
-        if self.roi_lines_norm:
-            self.roi_lines = denormalize_roi_points(self.roi_lines_norm, width, height)
+    def _initialize_base_roi_if_needed(self, frame):
+        if frame is None:
+            return False
 
-        # ROI가 스케일링 되었으므로, 이벤트 핸들러에도 새 좌표를 주입하여 갱신합니다.
+        h, w = frame.shape[:2]
+
+        need_init = False
+        if self.roi_frame_shape != frame.shape[:2]:
+            need_init = True
+        if self.roi_poly_norm and not self.base_roi_poly:
+            need_init = True
+        if self.roi_lines_norm and not self.base_roi_lines:
+            need_init = True
+
+        if not need_init:
+            return True
+
+        self.base_roi_poly = denormalize_roi_points(self.roi_poly_norm, w, h) if self.roi_poly_norm else []
+        self.base_roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h) if self.roi_lines_norm else []
+
+        self.aligned_roi_poly = list(self.base_roi_poly)
+        self.aligned_roi_lines = list(self.base_roi_lines)
+        self.roi_frame_shape = frame.shape[:2]
+
+        self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+        logger.info(f"[CAM:{self.cam_id}] base ROI init | poly={len(self.base_roi_poly)} lines={len(self.base_roi_lines)} shape={frame.shape[:2]}")
+        return True
+
+    def _inject_roi_to_handlers(self, roi_poly, roi_lines):
+        self.roi_poly = roi_poly or []
+        self.roi_lines = roi_lines or []
+
         for ename in self.events:
-            if ename in EVENT_REGISTRY:
-                event_cfg = SYS_CFG.get("event_config", {}).get(ename, {})
-                self.handlers[ename] = EVENT_REGISTRY[ename](event_cfg, self.roi_poly, self.roi_lines)
-                
-        self.roi_frame_shape = frame_shape[:2]
+            if ename not in self.handlers: continue
+            handler = self.handlers[ename]
+
+            if self.roi_poly and len(self.roi_poly) >= 3:
+                handler.roi_poly = np.array(self.roi_poly, dtype=np.int32)
+            else:
+                handler.roi_poly = np.empty((0, 2), dtype=np.int32)
+
+            if hasattr(handler, "roi_lines"):
+                handler.roi_lines = self.roi_lines or []
+
+            if hasattr(handler, "lines"):
+                new_lines = []
+                lines = self.roi_lines or []
+                for i in range(0, len(lines), 2):
+                    if i + 1 < len(lines):
+                        new_lines.append((lines[i], lines[i + 1]))
+                handler.lines = new_lines
+
+    def _transform_points(self, pts, H):
+        if not pts: return []
+        pts_np = np.array(pts, dtype=np.float32).reshape(-1, 1, 2)
+        try:
+            out = cv2.perspectiveTransform(pts_np, H)
+        except Exception as e:
+            logger.warning(f"[CAM:{self.cam_id}] ROI transform failed: {e}")
+            return pts
+        return out.reshape(-1, 2).astype(np.int32).tolist()
+
+    def _update_alignment(self, frame):
+        if frame is None: return
+
+        self._initialize_base_roi_if_needed(frame)
+
+        if not self.base_roi_poly and not self.base_roi_lines:
+            self.align_status_text = "NO ROI"
+            self._inject_roi_to_handlers([], [])
+            return
+
+        if not self.anchor_set:
+            ok = self.aligner.set_anchor(frame)
+            if ok:
+                self.anchor_set = True
+                self.last_align_time = time.time()
+                self.align_status_text = "ANCHOR SET"
+                self.align_ok = True
+                self.align_shifted = False
+            else:
+                self.align_status_text = "ANCHOR FAIL"
+                self.align_ok = False
+            return
+
+        now = time.time()
+        if now - self.last_align_time < ALIGN_INTERVAL_SEC: return
+
+        H, ok = self.aligner.estimate_anchor_to_current(frame)
+        dbg = self.aligner.last_debug
+
+        shifted = not np.allclose(H, np.eye(3, dtype=np.float32), atol=HOMOGRAPHY_IDENTITY_ATOL)
+
+        self.align_ok = ok
+        self.align_shifted = shifted
+
+        self.aligned_roi_poly = self._transform_points(self.base_roi_poly, H)
+        self.aligned_roi_lines = self._transform_points(self.base_roi_lines, H)
+        self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+
+        status = dbg.get("status", "unknown")
+        method = dbg.get("method", "none")
+        good = dbg.get("good_matches", 0)
+        inliers = dbg.get("inliers", 0)
+        ratio = dbg.get("inlier_ratio", 0.0)
+        
+        if ok:
+            self.align_status_text = f"ALIGN OK {method} g={good} i={inliers} r={ratio:.2f}"
+        else:
+            self.align_status_text = f"ALIGN HOLD {method} g={good} i={inliers} r={ratio:.2f}"
+
+        self.status_history.append(self.align_status_text)
+        self.last_align_time = now
 
     def process_frame(self):
         fr, fid, connected = self.reader.read()
@@ -1559,7 +1992,6 @@ class Camera:
                 fx1, fy1, fx2, fy2 = map(int, f[:4])
                 fh, fw = fy2 - fy1, fx2 - fx1
                 
-                # 터무니없는 크기의 오탐 얼굴 방어 (화면의 80% 이상)
                 if fw > blur_img.shape[1] * 0.8: 
                     continue 
                     
@@ -1573,25 +2005,22 @@ class Camera:
         return blur_img
 
     def run_logic(self, fr, fid, d_main_res, d_helmet_res):
-
         if fr is None:
             return [], [], {}
 
-        # [추가] 이동 평균 FPS 계산 로직
         now_t = time.time()
         self.fps_queue.append(now_t)
         if len(self.fps_queue) > 1:
             time_diff = self.fps_queue[-1] - self.fps_queue[0]
             self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
 
-        self._update_runtime_roi(fr.shape)
+        # ROI 보정 적용
+        self._update_alignment(fr)
         motion_mask = self.motion_det.apply(fr)
 
-        # 메인 트래커 업데이트
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
         
-        # 헬멧 트래커 업데이트
         d_helmet_filtered = [d for d in d_helmet_res if int(d[5]) == ID_H_NO_HELMET]
         t_helmet = self.trk_helmet.update(d_helmet_filtered)
 
@@ -1616,12 +2045,10 @@ class Camera:
                 
                 if ename not in self.alerted[tid] and (now - self.last_evt_t.get(ename, 0) >= cooldown):
                     
-                    # 💡 [수정] 이벤트 상세 컨텍스트 수집 및 로깅
                     conf_val = next((float(t[5]) for t in t_main if int(t[4]) == tid), 0.0)
                     cls_id = track_map_main.get(tid, -1)
                     terminal_id = SYS_CFG.get("terminal_id", "2")
                     
-                    # ROI 정보 압축 (좌표계가 너무 길어지는 것 방지)
                     roi_str = f"Poly[{len(self.roi_poly)} pts]" if self.roi_poly else "None"
                     
                     log_msg = (
@@ -1645,7 +2072,6 @@ class Camera:
                     
                 current_alarms[tid] = ename
         
-        # 화면 시각적 알람 처리
         alarm_duration = SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0)
         for tid, ename in current_alarms.items(): 
             self.visual_alarms[tid] = {'evt': ename, 'expire': now + alarm_duration}
@@ -1665,11 +2091,9 @@ class Camera:
 
         h_frame, w_frame = fr.shape[:2]
         
-        # 화면 테두리 알람 마킹
         if len(alarms) > 0: 
             cv2.rectangle(fr, (0, 0), (w_frame, h_frame), (0, 0, 255), 20)
             
-        # ROI 다각형 및 라인 렌더링
         if len(self.roi_poly) > 2: 
             cv2.polylines(fr, [np.array(self.roi_poly, np.int32)], True, (0, 255, 255), 2)
         if self.roi_lines:
@@ -1677,7 +2101,6 @@ class Camera:
                 if i + 1 < len(self.roi_lines): 
                     cv2.line(fr, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0, 0, 255), 2)
 
-        # Main Tracker BBox 렌더링
         for t in t_main:
             tid = int(t[4])
             cls_id = int(t[6])
@@ -1697,7 +2120,6 @@ class Camera:
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # Helmet Tracker BBox 렌더링
         for t in t_helmet:
             tid = int(t[4])
             color = (0, 0, 255)
@@ -1710,7 +2132,6 @@ class Camera:
         cv2.rectangle(fr, (0, 0), (220, 100), (0, 0, 0), -1) 
         cv2.putText(fr, f"CAM {self.cam_id}", (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
         
-        # FPS 수치에 따라 색상 변경 (10 미만이면 붉은색 경고)
         fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
         cv2.putText(fr, f"FPS: {self.current_fps:.1f}", (15, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.0, fps_color, 2)
         
@@ -1731,13 +2152,12 @@ class Camera:
             y_pos += 40
             
         return fr
+
 # ==========================================
-# [11]  Platform 송수신 모듈
+# [11] Platform 송수신 모듈
 # ==========================================
 def get_system_temperature():
-    """OS 환경(Linux, Edge Device 등)에 맞게 시스템 온도를 안전하게 수집합니다."""
     try:
-        # 1차 시도: psutil을 통한 센서 온도 읽기
         if hasattr(psutil, "sensors_temperatures"):
             temps = psutil.sensors_temperatures()
             if temps:
@@ -1745,7 +2165,6 @@ def get_system_temperature():
                     for entry in entries:
                         return float(entry.current)
                         
-        # 2차 시도: 리눅스/엣지 단말(Jetson, Raspberry Pi 등)의 하드웨어 파일 직접 참조
         temp_path = "/sys/class/thermal/thermal_zone0/temp"
         if os.path.exists(temp_path):
             with open(temp_path, "r") as f:
@@ -1753,7 +2172,7 @@ def get_system_temperature():
     except Exception as e:
         logger.debug(f"온도 센서 읽기 실패 (해당 OS 미지원): {e}")
         
-    return 0.0 # 센서가 없는 PC 환경 등의 폴백(Fallback)
+    return 0.0 
 
 class HealthCheckDaemon:
     def __init__(self, terminal_id, version="v1.1.0", interval_sec=300):
@@ -1763,7 +2182,6 @@ class HealthCheckDaemon:
         self.running = True
         self.url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
         
-        # 데몬 스레드로 실행하여 메인 프로세스 종료 시 강제 종료되도록 허용
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         logger.info(f"🩺 [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
@@ -1771,12 +2189,10 @@ class HealthCheckDaemon:
     def _run(self):
         while self.running:
             try:
-                # 자원 수집
                 cpu = psutil.cpu_percent(interval=1.0)
                 mem = psutil.virtual_memory().percent
                 temp = get_system_temperature()
                 
-                # ISO 8601 포맷
                 kst = pytz.timezone('Asia/Seoul')
                 reported_at = datetime.datetime.now(kst).strftime('%Y-%m-%dT%H:%M:%S')
 
@@ -1789,9 +2205,7 @@ class HealthCheckDaemon:
                     "softwareVersion": self.version
                 }
 
-                # requests 모듈은 딕셔너리를 data= 에 넘기면 자동으로 application/x-www-form-urlencoded 로 처리합니다.
                 headers = {"accept": "application/json"}
-                
                 response = requests.post(self.url, headers=headers, data=data, timeout=10, verify=False)
                 
                 if response.status_code == 200:
@@ -1802,7 +2216,6 @@ class HealthCheckDaemon:
             except Exception as e:
                 logger.error(f"⚠️ [Health Check] 네트워크 연결 예외 발생: {e}")
             
-            # interval(300초)을 통으로 sleep하지 않고, 1초마다 running 상태를 체크하여 빠른 셧다운을 지원
             for _ in range(self.interval):
                 if not self.running:
                     break
@@ -1817,7 +2230,6 @@ class HealthCheckDaemon:
 # [12] 메인 프로세스 
 # ==========================================
 def main():
-    # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
     parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
     args = parser.parse_args()
@@ -1840,7 +2252,6 @@ def main():
     config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
     
-    # 💡 [수정] 디버그 모드 및 초기화 질문 (디폴트 'n')
     debug_ans = input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
     DEBUG_MODE = True if debug_ans == 'y' else False
     if DEBUG_MODE:
@@ -1855,7 +2266,6 @@ def main():
             logger.error(f"cameras.json 로드 실패: {e}")
             pass
             
-        # 💡 [수정] 아무것도 입력 안하면 기본적으로 'n'으로 처리되도록 방어 로직
         reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
         if reset_ans == 'y':
             logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
@@ -1893,7 +2303,6 @@ def main():
         cams.append(Camera(ip, conf, d_main, d_helmet, d_face, cam_id=i+1))
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
-    # 환경 변수 스로틀링 기준
     target_fps = SYS_CFG.get("REC_FPS", 15)
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
@@ -1903,21 +2312,18 @@ def main():
     cpu_usage = 0.0
     dynamic_delay = 1.0 / target_fps
     
-    # [추가] 1분(60초) 간격의 헬스 체크 데몬 실행
     terminal_id = SYS_CFG.get("terminal_id", "2")
-    software_version = "v1.1.0"  # 필요 시 SYS_CFG에서 로드 가능
+    software_version = "v1.1.0"  
     health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=60)
     
-    # [추가] 핫 리로드를 위한 설정 파일 타임스탬프 기록
     last_config_mtime = 0
     if os.path.exists(config_file):
         last_config_mtime = os.path.getmtime(config_file)
         
-    # [추가] 웹 UI 스냅샷 공유를 위한 RAM 디스크 폴더 준비 (리눅스 기준)
     RAM_DISK_DIR = "/dev/shm/cctv_frames"
     if not os.path.exists(RAM_DISK_DIR):
         try: os.makedirs(RAM_DISK_DIR, exist_ok=True)
-        except: RAM_DISK_DIR = "./web_frames" # 윈도우나 지원하지 않는 환경용 폴백
+        except: RAM_DISK_DIR = "./web_frames" 
 
     try:
         psutil.cpu_percent(interval=None)
@@ -1941,16 +2347,13 @@ def main():
 
             loop_count += 1
             
-            # [수정] 지정된 주기(fps_calc_interval)마다 CPU 사용량과 실제 FPS를 묶어서 계산
             if loop_count % fps_calc_interval == 0:
                 current_time = time.time()
                 elapsed_time = current_time - last_fps_time
                 actual_fps = fps_calc_interval / elapsed_time
                 
-                # 측정 주기를 넓혀서 호출하므로, 0이나 100으로 튀지 않고 정확한 누적 평균값이 반환됨
                 cpu_usage = psutil.cpu_percent(interval=None)
                 
-                # CPU 부하에 따른 목표 FPS 동적 스로틀링 (제어 주기를 늘려 Oscillation 방지)
                 if cpu_usage > 85: 
                     target_fps = max(5, target_fps - 2)
                 elif cpu_usage < 60: 
@@ -1961,10 +2364,8 @@ def main():
                 if DEBUG_MODE:
                     logger.debug(f"⏱️ [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
                 
-                # 다음 측정을 위해 타이머 초기화
                 last_fps_time = current_time
 
-            # 300 루프마다 주기적인 가비지 컬렉션 및 헬스 체크 경고
             if loop_count % 300 == 0: 
                 gc.collect()
                 mem_usage = psutil.virtual_memory().percent
@@ -1979,20 +2380,16 @@ def main():
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
                 
-                # [추가] 웹 UI 렌더링용 스냅샷 저장 (부하 최소화를 위해 100루프마다 1번씩만 RAM에 덮어쓰기)
                 if connected and fr is not None and loop_count % 100 == 0:
                     try:
-                        # 통신 부하를 줄이기 위해 640x360으로 리사이즈 및 낮은 화질(JPEG 70) 압축
                         small_fr = cv2.resize(fr, (640, 360))
                         save_path = os.path.join(RAM_DISK_DIR, f"{cams[idx].ip}.jpg")
                         cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
                     except Exception as e:
                         pass
                 
-                # 이벤트가 설정되지 않은 카메라면 렌더링/추론 건너뛰기 (웹 UI 연동 시 CPU 최적화)
                 if not cams[idx].events:
                     if connected and fr is not None:
-                        # 모니터링은 되게끔 원본 화면만 반환
                         final_imgs.append(cams[idx].draw(fr, [], [], {}, True))
                     else:
                         final_imgs.append(cams[idx].draw(None, [], [], {}, False))
@@ -2002,39 +2399,39 @@ def main():
                     final_imgs.append(cams[idx].draw(None, [], [], {}, False))
                     continue
                 
-                # NPU 추론
                 d_main_res = cams[idx].det_main.infer(fr, conf_override=main_conf)
                 
                 d_helmet_res = []
                 if "no_helmet" in cams[idx].events:
                     d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
                 
-                # 로직 실행
                 t_main, t_helmet, alarms = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res)
                 
-                # [수정] GUI 모드일 때만 무거운 화면 그리기 수행
                 if is_gui_mode:
                     final_imgs.append(cams[idx].draw(fr, t_main, t_helmet, alarms, True))
                     
-                # [추가] 이벤트 발생 시 API 페이로드 구성 및 원본 저장
                 if alarms:
-                    # 렌더링 되지 않은 순수 원본 저장
                     event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{idx}_{fid}.jpg")
                     cv2.imwrite(event_img_path, fr)
                     
                     api_payload = []
                     
-                    # alarms 데이터가 dict 구조인지, int(TID) list 구조인지 판별하여 정규화
-                    # ex: {'no_helmet': [152]} 또는 [152] 형태 모두 대응
                     alarm_items = []
                     if isinstance(alarms, dict):
-                        for evt_label, tids in alarms.items():
-                            tids = tids if isinstance(tids, list) else [tids]
-                            for tid in tids:
-                                alarm_items.append((evt_label, tid))
+                        for key, value in alarms.items():
+                            if isinstance(key, int):
+                                # 현재 run_logic() 반환 구조: {tid: event_name}
+                                alarm_items.append((value, key))
+                            else:
+                                # 혹시 구버전 구조: {event_name: tid_or_tid_list}
+                                evt_label = key
+                                tids = value if isinstance(value, list) else [value]
+                                for tid in tids:
+                                    alarm_items.append((evt_label, tid))
+
                     elif isinstance(alarms, list):
                         for item in alarms:
-                            alarm_items.append(("no_helmet", item)) # 기본 라벨 적용
+                            alarm_items.append(("no_helmet", item))
 
                     for label, alarm_data in alarm_items:
                         box = [0, 0, 0, 0]
@@ -2042,8 +2439,6 @@ def main():
                         
                         if isinstance(alarm_data, int):
                             target_tid = alarm_data
-                            # TID만 넘어온 경우, 현재 프레임의 t_helmet 또는 t_main 트랙에서 BBox를 역추적하여 추출
-                            # track 포맷 가정: [x1, y1, x2, y2, tid, conf, cls]
                             found = False
                             for tracks in (t_helmet, t_main):
                                 for t in tracks:
@@ -2055,7 +2450,6 @@ def main():
                                 if found: break
                                 
                         elif isinstance(alarm_data, dict):
-                            # 만약 dict 형태가 맞다면 기존 로직 수행
                             box = [int(x) for x in alarm_data.get('bbox', [0, 0, 0, 0])]
                             score = round(float(alarm_data.get('conf', 0.95)), 2)
                             
@@ -2066,9 +2460,7 @@ def main():
                         })
                     
                     logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 생성: {json.dumps(api_payload)}")
-                    # TODO: IMAGE_SAVER_POOL 이나 별도 워커를 통해 api_payload를 비동기 전송하십시오.
 
-            # GUI 렌더링 최종 처리
             if is_gui_mode:
                 if final_imgs:
                     cv2.imshow("Monitor", create_mosaic_image(final_imgs))
@@ -2084,7 +2476,6 @@ def main():
     except Exception as e:
         logger.error(f"[치명적 오류] {e}\n{traceback.format_exc()}")
     finally:
-        # 헬스 체크 데몬 안전 종료
         if 'health_daemon' in locals():
             logger.info("🩺 [Health Check] 데몬 스레드를 안전하게 종료합니다.")
             health_daemon.stop()
