@@ -2213,7 +2213,7 @@ class Camera:
                     # 💡 [수정] 이벤트 상세 컨텍스트 수집 및 로깅
                     conf_val = next((float(t[5]) for t in t_main if int(t[4]) == tid), 0.0)
                     cls_id = track_map_main.get(tid, -1)
-                    terminal_id = SYS_CFG.get("terminal_id", "2")
+                    terminal_id = SYS_CFG.get("terminal_id", "99999")
                     
                     # ROI 정보 압축 (좌표계가 너무 길어지는 것 방지)
                     roi_str = f"Poly[{len(self.roi_poly)} pts]" if self.roi_poly else "None"
