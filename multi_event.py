@@ -78,6 +78,12 @@ MIN_APPLY_PERSPECTIVE = 0.0005
 KEEP_LAST_GOOD_ROI_ON_FAILURE = True
 DEBUG_ALIGN = True
 
+"""
+기존방식 -> opencv 사용(ffmpeg)
+신규방식 -> gstreamer 사용(dx-stream)
+"""
+STREAM_BACKEND = "gstreamer"#"opencv"  # or "gstreamer"
+
 def deep_merge_dict(base, override):
     """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
     import copy
@@ -1791,8 +1797,74 @@ class AnchorTrackingROIAligner:
         self.last_debug = dbg
         self.last_debug["status"] = "anchor_direct_corrected_drift"
         return True
+class GstFrameReader:
+    def __init__(self, url, ip):
+        self.url = sanitize_camera_url(url)
+        self.ip = ip
+        self.frame = None
+        self.fid = 0
+        self.running = True
+        self.connected = False
+        self.last_t = time.time()
+        self.lock = threading.Lock()
 
-class FrameReader:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _build_pipeline(self):
+        return (
+            f'rtspsrc location="{self.url}" protocols=tcp latency=100 timeout=3000000 ! '
+            'rtph264depay ! h264parse ! avdec_h264 ! '
+            'videoconvert ! video/x-raw,format=BGR ! '
+            'appsink drop=true max-buffers=1 sync=false'
+        )
+
+    def _run(self):
+        while self.running:
+            pipeline = self._build_pipeline()
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+
+            if not cap.isOpened():
+                logger.error(f"[CAM:{self.ip}] GStreamer RTSP 연결 실패. 5초 후 재시도합니다.")
+                self.connected = False
+                time.sleep(5)
+                continue
+
+            self.connected = True
+            self.last_t = time.time()
+            logger.info(f"[CAM:{self.ip}] GStreamer 스트림 연결 성공.")
+
+            while self.running and cap.isOpened():
+                if time.time() - self.last_t > WATCHDOG_TIMEOUT:
+                    logger.error(f"[CAM:{self.ip}] GStreamer 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결합니다.")
+                    break
+
+                ret, fr = cap.read()
+                if not ret or fr is None:
+                    logger.error(f"[CAM:{self.ip}] GStreamer 프레임 읽기 실패.")
+                    break
+
+                if fr.shape[1] > 720:
+                    ratio = 720 / fr.shape[1]
+                    fr = cv2.resize(fr, (720, int(fr.shape[0] * ratio)), interpolation=cv2.INTER_NEAREST)
+
+                with self.lock:
+                    self.frame = fr
+                    self.fid += 1
+                    self.last_t = time.time()
+
+                time.sleep(0.005)
+
+            self.connected = False
+            try:
+                cap.release()
+            except Exception as e:
+                logger.error(f"[CAM:{self.ip}] GStreamer 리소스 해제 실패: {e}")
+
+    def read(self):
+        with self.lock:
+            return self.frame, self.fid, self.connected
+
+class OpenCVFrameReader:
     def __init__(self, url, ip):
         self.url = sanitize_camera_url(url)
         self.ip = ip
@@ -1860,8 +1932,13 @@ class Camera:
         
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
-        
-        self.reader = FrameReader(conf.get('url', ''), ip)
+
+        if STREAM_BACKEND == "gstreamer":
+            self.reader = GstFrameReader(conf.get("url", ""), ip)
+        else:
+            self.reader = OpenCVFrameReader(conf.get("url", ""), ip)
+        #기존 코드 OpenCVFrameReader로 변경
+        # self.reader = FrameReader(conf.get('url', ''), ip)
         self.recorder = VideoRecorder(ip)
         self.motion_det = MotionDetector()
         
