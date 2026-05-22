@@ -82,7 +82,7 @@ DEBUG_ALIGN = True
 기존방식 -> opencv 사용(ffmpeg)
 신규방식 -> gstreamer 사용(dx-stream)
 """
-STREAM_BACKEND = "gstreamer"#"opencv"  # or "gstreamer"
+STREAM_BACKEND = os.environ.get("HAI_STREAM_BACKEND", "auto").strip().lower() or "auto"
 
 def deep_merge_dict(base, override):
     """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
@@ -1811,9 +1811,10 @@ class GstFrameReader:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _build_pipeline(self):
+        uri = self.url.replace('"', "%22")
         return (
-            f'rtspsrc location="{self.url}" protocols=tcp latency=100 timeout=3000000 ! '
-            'rtph264depay ! h264parse ! avdec_h264 ! '
+            f'uridecodebin uri="{uri}" ! '
+            'queue max-size-buffers=2 leaky=downstream ! '
             'videoconvert ! video/x-raw,format=BGR ! '
             'appsink drop=true max-buffers=1 sync=false'
         )
@@ -1919,6 +1920,43 @@ class OpenCVFrameReader:
         with self.lock: 
             return self.frame, self.fid, self.connected
 
+_OPENCV_GSTREAMER_SUPPORTED = None
+
+def opencv_supports_gstreamer():
+    global _OPENCV_GSTREAMER_SUPPORTED
+    if _OPENCV_GSTREAMER_SUPPORTED is not None:
+        return _OPENCV_GSTREAMER_SUPPORTED
+
+    try:
+        build_info = cv2.getBuildInformation()
+    except Exception:
+        _OPENCV_GSTREAMER_SUPPORTED = False
+        return _OPENCV_GSTREAMER_SUPPORTED
+
+    _OPENCV_GSTREAMER_SUPPORTED = False
+    for line in build_info.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("GStreamer:"):
+            _OPENCV_GSTREAMER_SUPPORTED = "YES" in stripped.upper()
+            break
+    return _OPENCV_GSTREAMER_SUPPORTED
+
+def create_frame_reader(url, ip):
+    backend = STREAM_BACKEND
+    if backend == "auto":
+        backend = "gstreamer" if opencv_supports_gstreamer() else "opencv"
+    elif backend == "gstreamer" and not opencv_supports_gstreamer():
+        logger.warning(f"[CAM:{ip}] OpenCV was built without GStreamer; falling back to FFMPEG.")
+        backend = "opencv"
+    elif backend != "opencv":
+        logger.warning(f"[CAM:{ip}] Unknown stream backend '{STREAM_BACKEND}', falling back to FFMPEG.")
+        backend = "opencv"
+
+    logger.info(f"[CAM:{ip}] stream backend selected: {backend}")
+    if backend == "gstreamer":
+        return GstFrameReader(url, ip)
+    return OpenCVFrameReader(url, ip)
+
 class Camera:
     def __init__(self, ip, conf, det_main, det_helmet, det_face, cam_id):
         self.ip = ip
@@ -1933,10 +1971,7 @@ class Camera:
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
 
-        if STREAM_BACKEND == "gstreamer":
-            self.reader = GstFrameReader(conf.get("url", ""), ip)
-        else:
-            self.reader = OpenCVFrameReader(conf.get("url", ""), ip)
+        self.reader = create_frame_reader(conf.get("url", ""), ip)
         #기존 코드 OpenCVFrameReader로 변경
         # self.reader = FrameReader(conf.get('url', ''), ip)
         self.recorder = VideoRecorder(ip)
