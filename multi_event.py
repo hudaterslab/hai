@@ -98,7 +98,7 @@ def deep_merge_dict(base, override):
 def load_system_config():
     """시스템 공통 설정(system_config.json)을 로드합니다."""
     default_config = {
-        "terminal_id": "2",
+        "terminal_id": "99999",
         "logging": {"dir": "./logs", "level": "INFO"},
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
@@ -1811,9 +1811,12 @@ class GstFrameReader:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _build_pipeline(self):
+        uri = self.url.replace('"', "%22")
         return (
-            f'rtspsrc location="{self.url}" protocols=tcp latency=100 timeout=3000000 ! '
-            'rtph264depay ! h264parse ! avdec_h264 ! '
+            f'urisourcebin uri="{uri}" ! '
+            'queue max-size-buffers=2 leaky=downstream ! '
+            'decodebin ! '
+            'queue max-size-buffers=2 leaky=downstream ! '
             'videoconvert ! video/x-raw,format=BGR ! '
             'appsink drop=true max-buffers=1 sync=false'
         )
