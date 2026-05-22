@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import socket
+import time
 from typing import Dict
 import urllib.request
 
@@ -47,10 +48,19 @@ class QLightETN:
     are sent through the same HTTP endpoints used by the built-in web UI.
     """
 
-    def __init__(self, host: str, port: int = DEFAULT_PORT, timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int = DEFAULT_PORT,
+        timeout: float = 2.0,
+        command_delay: float = 0.15,
+        retries: int = 2,
+    ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.command_delay = command_delay
+        self.retries = retries
 
     def read_status(self) -> DeviceStatus:
         frame = bytearray(FRAME_SIZE)
@@ -121,12 +131,27 @@ class QLightETN:
             base_url = f"http://{base_url}"
         url = f"{base_url.rstrip('/')}/{command}"
 
-        with urllib.request.urlopen(url, timeout=self.timeout) as response:
-            body = response.read().decode("utf-8", errors="replace").strip()
+        last_error = None
+        for attempt in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=self.timeout) as response:
+                    body = response.read().decode("utf-8", errors="replace").strip()
 
-        if body and body != "OK":
-            raise RuntimeError(f"unexpected HTTP response for {command}: {body!r}")
-        return body
+                if body and body != "OK":
+                    raise RuntimeError(f"unexpected HTTP response: {body!r}")
+
+                if self.command_delay > 0:
+                    time.sleep(self.command_delay)
+                return body
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.retries:
+                    break
+                time.sleep(max(self.command_delay, 0.1) * (attempt + 1))
+
+        raise RuntimeError(
+            f"HTTP command failed after {self.retries + 1} attempts ({command} -> {url}): {last_error}"
+        ) from last_error
 
     @staticmethod
     def _to_http_lamp_state(state: LampState | int) -> int:
