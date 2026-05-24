@@ -22,6 +22,12 @@ import pytz
 from urllib.parse import urlsplit, unquote
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
 import argparse
+import gi
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
+
+Gst.init(None)
 
 warnings = requests.packages.urllib3.exceptions.InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(warnings)
@@ -216,25 +222,69 @@ def sanitize_camera_url(url: str) -> str:
         return re.sub(r'\s+', '', clean_url.strip())
     except Exception:
         return re.sub(r'\s+', '', str(url).strip())
+def parse_camera_endpoint(rtsp_url: str):
+    """
+    RTSP URL에서 clean_url, host, port를 추출한다.
+    예:
+      rtsp://192.168.1.171:8554/h264_1
+      -> clean_url, 192.168.1.171, 8554
+    """
+    clean_url = sanitize_camera_url(rtsp_url)
+    parsed = urlsplit(clean_url)
 
+    host = parsed.hostname or ""
+    port = str(parsed.port) if parsed.port else ""
+
+    return clean_url, host, port
+def infer_stream_codec(url: str, default="h264") -> str:
+    """
+    URL/path 이름으로 코덱을 추정.
+    현재 MediaMTX 경로가 h264_1, h265_1 형태라 이 방식이면 충분함.
+    """
+    u = (url or "").lower()
+
+    if "h265" in u or "hevc" in u:
+        return "h265"
+
+    if "h264" in u or "avc" in u:
+        return "h264"
+
+    return default
 def extract_ip(rtsp_url: str) -> str:
-    """RTSP URL에서 식별용 고유 ID(IP+Channel)를 추출합니다."""
+    """
+    카메라 식별 키 생성.
+
+    기존 방식:
+        rtsp://192.168.1.171:8554/h264_1
+        rtsp://192.168.1.171:8554/h264_2
+        둘 다 171_8554 로 겹침.
+
+    변경 후:
+        171_8554_h264_1
+        171_8554_h264_2
+    """
     try:
-        clean_url = sanitize_camera_url(rtsp_url)
-        if "://" not in clean_url:
-            clean_url = f"rtsp://{clean_url}"
-            
+        clean_url, host, port = parse_camera_endpoint(rtsp_url)
         parsed = urlsplit(clean_url)
-        host = parsed.netloc.rsplit("@", 1)[-1].strip("[]").split(":")[0].split(".")[-1]
-        
-        # Path와 Query(채널 정보 등)를 포함하여 고유한 키 생성
-        path = re.sub(r'[^a-zA-Z0-9]', '_', parsed.path)
-        query = re.sub(r'[^a-zA-Z0-9]', '_', parsed.query)
-        
-        uid = f"{host}{path}_{query}".strip('_')
-        return uid if uid else "unknown_cam"
+
+        host_tail = host.split(".")[-1]
+
+        path = parsed.path.strip("/")
+        path_key = re.sub(r"[^A-Za-z0-9_-]+", "_", path)
+        path_key = path_key.strip("_")
+
+        parts = [host_tail]
+
+        if port:
+            parts.append(port)
+
+        if path_key:
+            parts.append(path_key)
+
+        return "_".join(parts)
+
     except Exception as e:
-        logger.warning(f"고유 식별자 추출 실패: {e}")
+        logger.warning(f"IP 추출 실패: {e} | input={rtsp_url!r}")
         return "unknown_cam"
 
 def load_rtsp_list_from_csv(csv_path):
@@ -1290,18 +1340,95 @@ EVENT_REGISTRY = {
 # [9] 터미널 마법사 및 설정 UI
 # ==========================================
 def capture_snapshot(url):
-    """설정 마법사용 스냅샷 캡처"""
+    """설정 마법사용 GStreamer 스냅샷 캡처"""
+    clean_url = sanitize_camera_url(url)
+    codec = infer_stream_codec(clean_url)
+
+    if codec in ("h265", "hevc"):
+        encoding = "H265"
+        depay = "rtph265depay"
+        parser = "h265parse"
+        decoder = "avdec_h265"
+    else:
+        encoding = "H264"
+        depay = "rtph264depay"
+        parser = "h264parse"
+        decoder = "avdec_h264"
+
+    pipeline_str = (
+        f'rtspsrc location="{clean_url}" protocols=tcp latency=100 name=src '
+        f'src. ! application/x-rtp,media=video,encoding-name={encoding} ! '
+        f'{depay} ! {parser} ! {decoder} ! '
+        f'videoconvert ! video/x-raw,format=BGR ! '
+        f'appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true'
+    )
+
+    pipeline = None
+
     try:
-        cap = cv2.VideoCapture(sanitize_camera_url(url), cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not cap.isOpened(): 
+        pipeline = Gst.parse_launch(pipeline_str)
+        appsink = pipeline.get_by_name("sink")
+
+        ret = pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            logger.error(f"[snapshot] GStreamer PLAYING 실패: {clean_url}")
             return None
-        ret, frame = cap.read()
-        cap.release()
-        return frame if ret else None
+
+        sample = appsink.emit("try-pull-sample", 5 * Gst.SECOND)
+
+        if sample is None:
+            logger.warning(f"[snapshot] sample 없음: {clean_url}")
+            return None
+
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
+
+        width = int(structure.get_value("width"))
+        height = int(structure.get_value("height"))
+
+        ok, map_info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            logger.warning(f"[snapshot] buffer map 실패: {clean_url}")
+            return None
+
+        try:
+            data = map_info.data
+            expected = width * height * 3
+            actual = len(data)
+
+            if actual == expected:
+                frame = np.frombuffer(data, dtype=np.uint8).reshape(
+                    (height, width, 3)
+                ).copy()
+
+            elif actual > expected:
+                row_stride = actual // height
+                frame = np.ndarray(
+                    shape=(height, width, 3),
+                    dtype=np.uint8,
+                    buffer=data,
+                    strides=(row_stride, 3, 1),
+                ).copy()
+
+            else:
+                logger.warning(
+                    f"[snapshot] invalid buffer size. actual={actual}, expected={expected}"
+                )
+                return None
+
+            return frame
+
+        finally:
+            buf.unmap(map_info)
+
     except Exception as e:
-        logger.error(f"스냅샷 캡처 실패: {e}")
+        logger.error(f"[snapshot] GStreamer 캡처 실패: {e}")
         return None
+
+    finally:
+        if pipeline is not None:
+            pipeline.set_state(Gst.State.NULL)
 
 def get_roi_points_scaled(frame, title, mode="poly"):
     """마우스 클릭을 통해 ROI(관심 영역)를 획득합니다."""
@@ -1422,11 +1549,12 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                                 roi_l.extend(l)
                             if input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y': 
                                 break
-                                
+
                     configs[ip] = {
-                        "url": url, 
-                        "events": events, 
-                        "roi_poly_norm": roi_p, 
+                        "url": url,
+                        "codec": infer_stream_codec(url),
+                        "events": events,
+                        "roi_poly_norm": roi_p,
                         "roi_lines_norm": roi_l
                     }
         except Exception as e: 
@@ -1798,73 +1926,175 @@ class AnchorTrackingROIAligner:
         self.last_debug["status"] = "anchor_direct_corrected_drift"
         return True
 class GstFrameReader:
-    def __init__(self, url, ip):
-        self.url = sanitize_camera_url(url)
+    def __init__(self, url, ip, codec="h264"):
+        self.url = url.replace(" ", "").strip()
         self.ip = ip
+        self.codec = (codec or infer_stream_codec(self.url)).lower()
+
+        self.lock = threading.Lock()
         self.frame = None
         self.fid = 0
         self.running = True
         self.connected = False
-        self.last_t = time.time()
-        self.lock = threading.Lock()
+        self.last_frame_time = time.time()
+        self.is_stuck = False
+        self.resolution_checked = False
 
-        threading.Thread(target=self._run, daemon=True).start()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
 
-    def _build_pipeline(self):
-        uri = self.url.replace('"', "%22")
+    def _make_pipeline(self):
+        if self.codec in ("h265", "hevc"):
+            encoding = "H265"
+            depay = "rtph265depay"
+            parser = "h265parse"
+            decoder = "avdec_h265"
+        else:
+            encoding = "H264"
+            depay = "rtph264depay"
+            parser = "h264parse"
+            decoder = "avdec_h264"
+
         return (
-            f'urisourcebin uri="{uri}" ! '
-            'queue max-size-buffers=2 leaky=downstream ! '
-            'decodebin ! '
-            'queue max-size-buffers=2 leaky=downstream ! '
-            'videoconvert ! video/x-raw,format=BGR ! '
-            'appsink drop=true max-buffers=1 sync=false'
+            f'rtspsrc location="{self.url}" protocols=tcp latency=100 name=src '
+            f'src. ! application/x-rtp,media=video,encoding-name={encoding} ! '
+            f'{depay} ! {parser} ! {decoder} ! '
+            f'videoconvert ! video/x-raw,format=BGR ! '
+            f'appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true'
         )
+
+    def _sample_to_bgr(self, sample):
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
+
+        width = int(structure.get_value("width"))
+        height = int(structure.get_value("height"))
+
+        ok, map_info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return None, width, height
+
+        try:
+            data = map_info.data
+            expected = width * height * 3
+            actual = len(data)
+
+            if actual == expected:
+                frame = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3)).copy()
+            elif actual > expected:
+                # 일부 raw video buffer는 row padding이 있을 수 있음
+                row_stride = actual // height
+                frame = np.ndarray(
+                    shape=(height, width, 3),
+                    dtype=np.uint8,
+                    buffer=data,
+                    strides=(row_stride, 3, 1),
+                ).copy()
+            else:
+                logger.warning(
+                    f"[{self.ip}] Invalid buffer size. actual={actual}, expected={expected}"
+                )
+                return None, width, height
+
+            return frame, width, height
+
+        finally:
+            buf.unmap(map_info)
 
     def _run(self):
         while self.running:
-            pipeline = self._build_pipeline()
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            pipeline = None
 
-            if not cap.isOpened():
-                logger.error(f"[CAM:{self.ip}] GStreamer RTSP 연결 실패. 5초 후 재시도합니다.")
-                self.connected = False
-                time.sleep(5)
-                continue
-
-            self.connected = True
-            self.last_t = time.time()
-            logger.info(f"[CAM:{self.ip}] GStreamer 스트림 연결 성공.")
-
-            while self.running and cap.isOpened():
-                if time.time() - self.last_t > WATCHDOG_TIMEOUT:
-                    logger.error(f"[CAM:{self.ip}] GStreamer 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결합니다.")
-                    break
-
-                ret, fr = cap.read()
-                if not ret or fr is None:
-                    logger.error(f"[CAM:{self.ip}] GStreamer 프레임 읽기 실패.")
-                    break
-
-                if fr.shape[1] > 720:
-                    ratio = 720 / fr.shape[1]
-                    fr = cv2.resize(fr, (720, int(fr.shape[0] * ratio)), interpolation=cv2.INTER_NEAREST)
-
-                with self.lock:
-                    self.frame = fr
-                    self.fid += 1
-                    self.last_t = time.time()
-
-                time.sleep(0.005)
-
-            self.connected = False
             try:
-                cap.release()
+                pipeline_str = self._make_pipeline()
+                logger.info(f"[{self.ip}] GStreamer connecting... codec={self.codec}, url={self.url}")
+
+                pipeline = Gst.parse_launch(pipeline_str)
+                appsink = pipeline.get_by_name("sink")
+                bus = pipeline.get_bus()
+
+                ret = pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    logger.error(f"[{self.ip}] GStreamer pipeline PLAYING failed.")
+                    time.sleep(2)
+                    continue
+
+                self.connected = True
+                self.is_stuck = False
+                self.last_frame_time = time.time()
+
+                while self.running:
+                    msg = bus.timed_pop_filtered(
+                        0,
+                        Gst.MessageType.ERROR | Gst.MessageType.EOS
+                    )
+
+                    if msg:
+                        if msg.type == Gst.MessageType.ERROR:
+                            err, debug = msg.parse_error()
+                            logger.error(f"[{self.ip}] GStreamer error: {err}, debug={debug}")
+                        elif msg.type == Gst.MessageType.EOS:
+                            logger.warning(f"[{self.ip}] GStreamer EOS.")
+                        break
+
+                    if time.time() - self.last_frame_time > WATCHDOG_TIMEOUT:
+                        logger.warning(f"[{self.ip}] GStreamer timeout. Reconnecting...")
+                        self.is_stuck = True
+                        break
+
+                    sample = appsink.emit("try-pull-sample", Gst.SECOND)
+
+                    if sample is None:
+                        time.sleep(0.05)
+                        continue
+
+                    frame, width, height = self._sample_to_bgr(sample)
+
+                    if frame is None:
+                        continue
+
+                    if not self.resolution_checked:
+                        logger.info(f"[{self.ip}] GStreamer resolution: {width} x {height}")
+                        self.resolution_checked = True
+
+                    if frame.shape[1] > 720:
+                        scale = 720 / frame.shape[1]
+                        frame = cv2.resize(
+                            frame,
+                            (720, int(frame.shape[0] * scale)),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+
+                    with self.lock:
+                        self.frame = frame
+                        self.fid += 1
+                        self.last_frame_time = time.time()
+                        self.connected = True
+                        self.is_stuck = False
+
+                    time.sleep(0.005)
+
             except Exception as e:
-                logger.error(f"[CAM:{self.ip}] GStreamer 리소스 해제 실패: {e}")
+                logger.exception(f"[{self.ip}] GStreamer reader error: {e}")
+
+            finally:
+                self.connected = False
+
+                if pipeline is not None:
+                    try:
+                        pipeline.set_state(Gst.State.NULL)
+                    except Exception:
+                        pass
+
+                if self.running:
+                    time.sleep(2)
 
     def read(self):
         with self.lock:
+            if self.is_stuck or (time.time() - self.last_frame_time > WATCHDOG_TIMEOUT):
+                return None, self.fid, False
+
             return self.frame, self.fid, self.connected
 
 class OpenCVFrameReader:
@@ -1936,12 +2166,7 @@ class Camera:
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
 
-        if STREAM_BACKEND == "gstreamer":
-            self.reader = GstFrameReader(conf.get("url", ""), ip)
-        else:
-            self.reader = OpenCVFrameReader(conf.get("url", ""), ip)
-        #기존 코드 OpenCVFrameReader로 변경
-        # self.reader = FrameReader(conf.get('url', ''), ip)
+        self.reader = self._create_reader()
         self.recorder = VideoRecorder(ip)
         self.motion_det = MotionDetector()
         
@@ -1961,6 +2186,17 @@ class Camera:
         self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
 
+    def _create_reader(self):
+        codec = self.conf.get("codec") or infer_stream_codec(self.conf.get("url", ""))
+
+        if STREAM_BACKEND.lower() == "opencv":
+            return OpenCVFrameReader(self.conf["url"], self.ip)
+
+        return GstFrameReader(
+            self.conf["url"],
+            self.ip,
+            codec=codec,
+        )
     def _reset_alignment_state(self, status_text="ALIGN RESET"):
         """ROI 자동 보정 상태를 초기화한다."""
         self.aligner = AnchorTrackingROIAligner()
@@ -1991,11 +2227,27 @@ class Camera:
     def update_config(self, new_conf):
         """웹 UI 등 외부에서 cameras.json이 변경되었을 때, 무중단으로 설정을 핫 리로드합니다."""
         old_events = self.events.copy()
+        old_url = self.conf.get("url")
+        old_codec = self.conf.get("codec")
 
-        self.events = new_conf.get('events', [])
-        self.roi_poly_norm = new_conf.get('roi_poly_norm', [])
-        self.roi_lines_norm = new_conf.get('roi_lines_norm', [])
+        self.conf = deep_merge_dict(self.conf, new_conf)
 
+        self.events = self.conf.get('events', [])
+        self.roi_poly_norm = self.conf.get('roi_poly_norm', [])
+        self.roi_lines_norm = self.conf.get('roi_lines_norm', [])
+        new_url = self.conf.get("url")
+        new_codec = self.conf.get("codec") or infer_stream_codec(new_url)
+
+        if old_url != new_url or old_codec != new_codec:
+            logger.info(f"🔄 [CAM:{self.ip}] 스트림 설정 변경 감지. Reader 재생성: {old_url} -> {new_url}")
+
+            try:
+                self.reader.running = False
+            except Exception:
+                pass
+
+            self.conf["codec"] = new_codec
+            self.reader = self._create_reader()
         self.roi_poly = []
         self.roi_lines = []
         self.roi_frame_shape = None
@@ -2485,9 +2737,11 @@ def main():
         
         if not conf or not conf.get('events'): 
             continue
-            
+
         conf['url'] = rtsp
-        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, cam_id=i+1))
+        conf['codec'] = conf.get("codec") or infer_stream_codec(rtsp)
+
+        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, cam_id=i + 1))
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
     # 환경 변수 스로틀링 기준
