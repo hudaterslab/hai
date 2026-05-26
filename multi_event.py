@@ -22,6 +22,7 @@ import pytz
 from urllib.parse import urlsplit, unquote
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
 import argparse
+import select
 
 warnings = requests.packages.urllib3.exceptions.InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(warnings)
@@ -230,6 +231,22 @@ def extract_ip(rtsp_url: str) -> str:
     except Exception as e:
         logger.warning(f"고유 식별자 추출 실패: {e}")
         return "unknown_cam"
+
+def input_with_timeout(prompt, timeout=10, default=""):
+    """
+    timeout 초 동안 입력이 없으면 default 값을 반환.
+    Linux 터미널 기준.
+    """
+    print(prompt, end="", flush=True)
+
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+
+    if ready:
+        return sys.stdin.readline().strip()
+
+    print()  # timeout 후 줄바꿈
+    return default
+
 
 def load_rtsp_list_from_csv(csv_path):
     """CSV 파일에서 카메라 RTSP URL 목록을 로드합니다."""
@@ -2365,8 +2382,13 @@ def main():
         
     config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
-    
-    debug_ans = input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
+
+    #DebugMode Input Time Out 추가
+    debug_ans = input_with_timeout(
+        ">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ",
+        timeout=10,
+        default="n"
+    ).strip().lower()
     DEBUG_MODE = True if debug_ans == 'y' else False
     if DEBUG_MODE:
         logger.setLevel(logging.DEBUG)
@@ -2379,8 +2401,12 @@ def main():
         except Exception as e: 
             logger.error(f"cameras.json 로드 실패: {e}")
             pass
-            
-        reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
+        # 카메라 설정 마법사 Input Time Out 추가
+        reset_ans = input_with_timeout(
+            ">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ",
+            timeout=10,
+            default="n"
+        ).strip().lower()
         if reset_ans == 'y':
             logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
             camera_configs = run_wizard_batch_mode(rtsp_list, camera_configs)
