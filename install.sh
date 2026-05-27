@@ -43,27 +43,26 @@ fi
 echo "✅ 1단계 검증 통과 (파일 확인 완료)"
 echo "-----------------------------------------------------"
 
-# 4. [핵심 추가] 가상환경 모의 실행 및 dx_engine 로드 테스트
-echo "-> [2단계] 가상환경을 활성화하여 실제 구동 테스트를 진행합니다..."
-echo "          (dx_engine 로드 및 파이썬 환경 이상 여부 확인)"
+# 4. [수정됨] Timeout을 활용한 가상환경 모의 실행
+echo "-> [2단계] 15초간 가상환경 구동 테스트를 진행합니다..."
+echo "          (NPU 모델 로드 대기 중... 에러가 없으면 자동으로 다음 단계로 넘어갑니다)"
 
-# 가상환경을 켜고 파이썬을 실행하되, 실제 메인 루프에 진입하기 전 컴파일 및 초기 임포트 에러가 나는지 확인
-# (실행 직후 바로 종료되도록 파이프라인 우회 처리 환경 구성)
-/bin/bash -c "source $VENV_ACTIVATE && echo -e 'n\nn' | python3 $TARGET_SCRIPT" > /dev/null 2>&1
+# timeout 15 명령어를 사용해 15초간만 실행하고 프로세스를 닫습니다.
+timeout 15 /bin/bash -c "source $VENV_ACTIVATE && echo -e 'n\nn' | python3 $TARGET_SCRIPT" > /dev/null 2>&1
 
-# 파이썬 실행 결과(Exit Code) 확인
+# timeout으로 종료된 경우 반환 코드(Exit Code)는 124입니다.
+# 즉, 124(15초 생존 성공) 또는 0(그 전에 정상 종료)이면 성공으로 간주합니다.
 TEST_RESULT=$?
 
-if [ $TEST_RESULT -ne 0 ]; then
+if [ $TEST_RESULT -ne 124 ] && [ $TEST_RESULT -ne 0 ]; then
     echo "====================================================="
-    echo "❌ [설치 실패] 가상환경에서 파이썬 실행 중 오류가 발생했습니다!"
-    echo "   -> 'dx_engine'을 읽어오지 못했거나 의존성 에러가 있을 수 있습니다."
-    echo "   -> 수동 명령어 'source $VENV_ACTIVATE && python3 multi_event.py' 로 에러를 먼저 확인하세요."
+    echo "❌ [설치 실패] 파이썬 실행 중 초기 오류(코드: $TEST_RESULT)가 발생했습니다!"
+    echo "   -> 'dx_engine'을 읽어오지 못했거나 모델 로드 중 실패했을 수 있습니다."
+    echo "   -> 터미널에서 'source $VENV_ACTIVATE && python3 multi_event.py' 로 에러를 먼저 확인하세요."
     echo "====================================================="
     
-    # 만약 기존에 서비스가 등록되어 작동 중이었다면 안전하게 끄고 비활성화
     if [ -f "$SERVICE_PATH" ]; then
-        echo "-> 기존에 등록되어 있던 서비스를 중지 및 비활성화(disable) 처리합니다."
+        echo "-> 기존 등록된 서비스를 중지 및 비활성화(disable) 처리합니다."
         sudo systemctl stop $SERVICE_NAME > /dev/null 2>&1
         sudo systemctl disable $SERVICE_NAME > /dev/null 2>&1
     fi
@@ -72,7 +71,7 @@ if [ $TEST_RESULT -ne 0 ]; then
     exit 1
 fi
 
-echo "✅ 2단계 검증 통과 (가상환경 정상 작동 확인)"
+echo "✅ 2단계 검증 통과 (15초 생존 완료. NPU 및 환경 정상 작동 확인)"
 echo "====================================================="
 
 # 5. Systemd 서비스 파일 생성
@@ -88,10 +87,7 @@ ConditionPathExists=$CONFIG_FILE
 Type=simple
 User=$ACTUAL_USER
 WorkingDirectory=$PROJECT_DIR
-
-# 가상환경을 적용하여 백그라운드 구동
 ExecStart=/bin/bash -c 'source $VENV_ACTIVATE && yes n | python3 -u multi_event.py'
-
 Restart=always
 RestartSec=10
 StandardOutput=journal
