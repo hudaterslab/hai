@@ -1012,7 +1012,6 @@ class CrossingDetector(BaseEventDetector):
 # ---------------------------------------------------------
 # [Modified 코드 Part] - ROI 버퍼 기반 Median 검증 및 Track ID 블랙리스트 추가
 # ---------------------------------------------------------
-
 class HelmetDetector(BaseEventDetector):
     gui_name = "NO-HELMET"
     
@@ -1025,6 +1024,9 @@ class HelmetDetector(BaseEventDetector):
         
         self.window_fids = int(self.window_sec * self.fps)
         self.min_hit_count = config.get("min_hit_count", 3)
+        
+        # [추가] 상단 경계 무시 비율 (기본값 0.2 = 상단 20%)
+        self.ignore_top_ratio = config.get("ignore_top_ratio", 0.2)
         
         # 빨간 헬멧(오인식)으로 확정된 Track ID를 영구 배제하기 위한 블랙리스트 Set
         self.red_helmet_tids = set()
@@ -1096,6 +1098,11 @@ class HelmetDetector(BaseEventDetector):
         unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == ID_H_NO_HELMET]
         current_nh_persons = []
         
+        # [추가] 프레임 해상도 기반 상단 무시 경계선(Y 좌표) 산출
+        ignore_y_thresh = 0
+        if frame is not None:
+            ignore_y_thresh = frame.shape[0] * self.ignore_top_ratio
+        
         for p in tracks:
             p_tid = int(p[4])
             
@@ -1104,12 +1111,17 @@ class HelmetDetector(BaseEventDetector):
             if track_map.get(p_tid) != ID_G_PERSON: 
                 continue
                 
+            px1, py1, px2, py2 = p[:4]
+            
+            # [추가] 사람 객체의 최상단(머리끝)이 카메라 상단 마진 내에 있으면 판정 보류 (Truncation 방어)
+            if py1 <= ignore_y_thresh:
+                continue
+                
             if self.roi_poly is not None and self.roi_poly.size > 0:
                 foot_pt = get_foot_point(*p[:4])
                 if cv2.pointPolygonTest(self.roi_poly, foot_pt, False) < 0:
                     continue
                     
-            px1, py1, px2, py2 = p[:4]
             person_height = max(1, py2 - py1)
             person_width = max(1, px2 - px1)
 
@@ -1129,7 +1141,7 @@ class HelmetDetector(BaseEventDetector):
                     max_ioa = ioa
                     nh_track_match = head
                     
-            # [수정] 사람과 머리 메타데이터 동시 추출
+            # 사람과 머리 메타데이터 동시 추출
             if max_ioa >= 0.5 and nh_track_match is not None:
                 current_nh_persons.append({
                     'tid': p_tid,
@@ -1212,16 +1224,43 @@ class SignalVehicleDetector(BaseEventDetector):
         self.history = defaultdict(lambda: deque(maxlen=30))
         self.motion_ratio = config.get("motion_threshold_ratio", 0.10)
         
+        # 2분(120초) 유예 기간 및 인증을 위한 신호수 3초 지속 유지 시간
+        self.auth_grace_sec = config.get("auth_grace_sec", 120.0) 
+        self.presence_threshold_sec = config.get("presence_threshold_sec", 3.0) 
+        
+        # [추가] 차량이 ROI 내에 체류해야 하는 최소 시간 (3초)
+        self.vehicle_roi_dwell_sec = config.get("vehicle_roi_dwell_sec", 3.0)
+        
+        # [추가] 해상도 기반의 신호수 근거리(Proximity) 판정 비율 (기본값 0.8 적용, 실환경 0.3 권장)
+        self.prox_ratio_x = config.get("prox_ratio_x", 0.8)
+        self.prox_ratio_y = config.get("prox_ratio_y", 0.8)
+        
+        self.presence_start_fid = {}     # 차량 반경 내 신호수 출현 추적 시작 FID
+        self.last_auth_fid = {}          # 120초 유예가 갱신된 시점의 FID
+        self.vehicle_roi_start_fid = {}  # 차량이 ROI에 진입한 시점의 FID
+        
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         curr_ids = set()
         
-        if self.roi_poly.size == 0 or motion_mask is None: 
+        if self.roi_poly.size == 0 or motion_mask is None or frame is None: 
             return triggered
             
-        ppts = [get_foot_point(*t[:4]) for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
-        scale_x = 640 / SCREEN_WIDTH
-        scale_y = 360 / SCREEN_HEIGHT
+        h_frame, w_frame = frame.shape[:2]
+        h_mask, w_mask = motion_mask.shape[:2]
+        scale_x = w_mask / float(w_frame)
+        scale_y = h_mask / float(h_frame)
+        
+        # 동적 근거리 픽셀 임계값 산출
+        prox_x_thresh = w_frame * self.prox_ratio_x
+        prox_y_thresh = h_frame * self.prox_ratio_y
+        
+        # 클래스 매핑: 2(사람), 5(신호수)
+        ID_SIGNALMAN = 5
+        signalmen_pts = [
+            get_foot_point(*t[:4]) for t in tracks 
+            if track_map.get(int(t[4])) in [ID_G_PERSON, ID_SIGNALMAN]
+        ]
         
         for t in tracks:
             tid = int(t[4])
@@ -1231,8 +1270,19 @@ class SignalVehicleDetector(BaseEventDetector):
             curr_ids.add(tid)
             x1, y1, x2, y2 = t[:4]
             fc = get_foot_point(*t[:4])
+            c_pt = get_center_point(*t[:4])
             v_size = max(x2 - x1, y2 - y1)
             
+            # 1. 차량의 ROI 체류 시간 관리 로직
+            is_in_roi = cv2.pointPolygonTest(self.roi_poly, c_pt, False) >= 0
+            if is_in_roi:
+                if tid not in self.vehicle_roi_start_fid:
+                    self.vehicle_roi_start_fid[tid] = fid
+            else:
+                if tid in self.vehicle_roi_start_fid:
+                    del self.vehicle_roi_start_fid[tid]
+            
+            # 튀는 BBox(Jittering) 방어
             if len(self.history[tid]) > 0 and get_distance(self.history[tid][-1], fc) > v_size * 0.6: 
                 self.history[tid].clear()
                 continue
@@ -1240,16 +1290,43 @@ class SignalVehicleDetector(BaseEventDetector):
             self.history[tid].append(fc)
             h_list = list(self.history[tid])
             
+            # 2. 신호수 근거리(해상도 비율) 체류 시간 인증 로직
+            has_signalman = False
+            for pt in signalmen_pts:
+                # 차의 발 위치와 사람의 발 위치가 동적 X, Y 임계값 이내인지 검사
+                if abs(fc[0] - pt[0]) <= prox_x_thresh and abs(fc[1] - pt[1]) <= prox_y_thresh:
+                    has_signalman = True
+                    break
+            
+            if has_signalman:
+                if tid not in self.presence_start_fid:
+                    self.presence_start_fid[tid] = fid
+                    
+                presence_sec = (fid - self.presence_start_fid[tid]) / self.fps
+                if presence_sec >= self.presence_threshold_sec:
+                    # 3초 이상 체류 시 2분 유예 토큰 발급/갱신
+                    self.last_auth_fid[tid] = fid
+            else:
+                if tid in self.presence_start_fid:
+                    del self.presence_start_fid[tid]
+            
+            # 3. 차량 이동 및 임의출발 이벤트 판별
             if len(h_list) > 5:
                 start_p = (sum(p[0] for p in h_list[:3])/3, sum(p[1] for p in h_list[:3])/3)
                 end_p = (sum(p[0] for p in h_list[-3:])/3, sum(p[1] for p in h_list[-3:])/3)
                 dist = get_distance(start_p, end_p)
                 
-                if dist >= v_size * 0.15 and cv2.pointPolygonTest(self.roi_poly, get_center_point(*t[:4]), False) >= 0:
+                # 차량 ROI 체류 시간 산출
+                vehicle_dwell_sec = 0.0
+                if tid in self.vehicle_roi_start_fid:
+                    vehicle_dwell_sec = (fid - self.vehicle_roi_start_fid[tid]) / self.fps
+                
+                # 이동 거리, ROI 내부 여부, 그리고 차량 ROI 체류 3초 이상 조건 충족 시
+                if dist >= v_size * 0.15 and is_in_roi and vehicle_dwell_sec >= self.vehicle_roi_dwell_sec:
                     mx1 = max(0, int(x1 * scale_x))
                     my1 = max(0, int(y1 * scale_y))
-                    mx2 = min(640, int(x2 * scale_x))
-                    my2 = min(360, int(y2 * scale_y))
+                    mx2 = min(w_mask, int(x2 * scale_x))
+                    my2 = min(h_mask, int(y2 * scale_y))
                     
                     if mx2 > mx1 and my2 > my1:
                         car_roi = motion_mask[my1:my2, mx1:mx2]
@@ -1257,23 +1334,34 @@ class SignalVehicleDetector(BaseEventDetector):
                         
                         total_px = (mx2 - mx1) * (my2 - my1)
                         if total_px > 0 and (cv2.countNonZero(m_only) / total_px) > self.motion_ratio:
-                            has_signalman = any(
-                                math.sqrt(max(t[0]-pt[0], 0, pt[0]-t[2])**2 + max(t[1]-pt[1], 0, pt[1]-t[3])**2) < v_size * 1.5 
-                                for pt in ppts
-                            )
                             
-                            if not has_signalman:
+                            last_auth = self.last_auth_fid.get(tid, 0)
+                            time_since_auth = (fid - last_auth) / self.fps
+                            
+                            if last_auth == 0 or time_since_auth > self.auth_grace_sec:
                                 triggered.append({
                                     'tid': tid, 
                                     'bbox': t[:4], 
-                                    'frame': frame.copy() if frame is not None else None,
+                                    'frame': frame.copy(),
                                     'fid': fid
                                 })
                                 self.history[tid].clear()
-                                
+                                if tid in self.last_auth_fid:
+                                    del self.last_auth_fid[tid]
+                                    
+        # 메모리 정리
         for tid in list(self.history.keys()):
             if tid not in curr_ids: 
                 del self.history[tid]
+        for tid in list(self.last_auth_fid.keys()):
+            if tid not in curr_ids:
+                del self.last_auth_fid[tid]
+        for tid in list(self.presence_start_fid.keys()):
+            if tid not in curr_ids:
+                del self.presence_start_fid[tid]
+        for tid in list(self.vehicle_roi_start_fid.keys()):
+            if tid not in curr_ids:
+                del self.vehicle_roi_start_fid[tid]
                 
         return triggered
 
