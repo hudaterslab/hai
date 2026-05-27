@@ -4,39 +4,47 @@
 SERVICE_NAME="cctv_ai.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 
-# 현재 디렉토리 및 사용자 정보 가져오기
+# sudo로 실행하더라도 원래 계정 이름과 홈 디렉토리 경로를 정확히 가져옴
+ACTUAL_USER=${SUDO_USER:-$USER}
+USER_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
 PROJECT_DIR=$(pwd)
-CURRENT_USER=$USER
-PYTHON_EXEC=$(which python3)
 
-# 카메라 설정 파일 경로
+# 카메라 설정 파일 및 가상환경 경로
 CONFIG_FILE="$PROJECT_DIR/cameras.json"
+VENV_ACTIVATE="$USER_HOME/dx-runtime/venv-dx-runtime/bin/activate"
 
 echo "====================================================="
-echo " Raspberry Pi Edge AI CCTV 서비스 설치를 시작합니다."
+echo " Raspberry Pi Edge AI CCTV 서비스 설치 (가상환경 버전)"
 echo "====================================================="
 echo "프로젝트 경로: $PROJECT_DIR"
-echo "실행 계정: $CURRENT_USER"
-echo "설정 파일 검사 경로: $CONFIG_FILE"
+echo "실행 계정: $ACTUAL_USER ($USER_HOME)"
+echo "가상환경 경로: $VENV_ACTIVATE"
 echo "====================================================="
+
+# 가상환경 파일 존재 여부 1차 검증
+if [ ! -f "$VENV_ACTIVATE" ]; then
+    echo "[경고] 가상환경 활성화 파일을 찾을 수 없습니다: $VENV_ACTIVATE"
+    echo "경로가 정확한지 확인 후 다시 실행해주세요."
+    exit 1
+fi
 
 # 1. Systemd 서비스 파일 생성
 echo "-> Systemd 서비스 파일을 생성 중입니다..."
 
 sudo bash -c "cat > $SERVICE_PATH" << EOL
 [Unit]
-Description=Raspberry Pi Edge AI CCTV Event Detection Background Service
+Description=Raspberry Pi Edge AI CCTV Event Detection (Venv)
 After=network.target
-# 이 조건 덕분에 cameras.json 파일이 없으면 서비스 자체가 시작되지 않습니다.
 ConditionPathExists=$CONFIG_FILE
 
 [Service]
 Type=simple
-User=$CURRENT_USER
+User=$ACTUAL_USER
 WorkingDirectory=$PROJECT_DIR
-# 파이썬 코드의 input()을 우회하기 위해 'n' 두 개를 연속으로 입력합니다.
-# (디버그 모드 N -> 기존 설정 무시 N)
-ExecStart=/bin/bash -c 'echo -e "n\nn" | $PYTHON_EXEC multi_event.py'
+
+# 1) source 명령어로 가상환경을 켜고
+# 2) 파이프라인으로 input()을 자동 통과시키며 python을 실행합니다.
+ExecStart=/bin/bash -c 'source $VENV_ACTIVATE && echo -e "n\nn" | python3 multi_event.py'
 
 Restart=always
 RestartSec=10
@@ -52,22 +60,14 @@ echo "-> Systemd 데몬을 리로드하고 서비스를 등록합니다..."
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
 
-# 3. 서비스 시작 시도 (cameras.json 존재 여부에 따라 다르게 동작)
+# 3. 서비스 시작 시도
 if [ -f "$CONFIG_FILE" ]; then
     echo "-> cameras.json 파일이 확인되어 서비스를 즉시 시작합니다."
     sudo systemctl start $SERVICE_NAME
 else
-    echo "-> [알림] cameras.json 파일이 존재하지 않아 서비스가 대기 상태로 유지됩니다."
-    echo "-> 나중에 'python3 multi_event.py'를 직접 실행하여 설정을 완료한 후,"
-    echo "-> 'sudo systemctl start $SERVICE_NAME' 명령어로 서비스를 수동 시작해주세요."
+    echo "-> [알림] cameras.json 파일이 없어 서비스가 대기 상태로 유지됩니다."
 fi
 
 echo "====================================================="
 echo " 설치가 완료되었습니다!"
-echo "====================================================="
-echo " [유용한 명령어 모음]"
-echo " - 상태 확인: sudo systemctl status $SERVICE_NAME"
-echo " - 로그 보기: journalctl -u $SERVICE_NAME -f"
-echo " - 서비스 시작: sudo systemctl start $SERVICE_NAME"
-echo " - 서비스 중지: sudo systemctl stop $SERVICE_NAME"
 echo "====================================================="
