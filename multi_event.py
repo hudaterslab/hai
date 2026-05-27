@@ -1019,27 +1019,24 @@ class HelmetDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.sessions = []
         
-        self.trigger_sec = config.get("trigger_sec", 3.0)
+        # [수정] 이중 조건 달성을 위한 시간 설정
+        self.min_streak_sec = config.get("min_streak_sec", 2.0)     # 단일 구간 최소 지속 시간 (2초)
+        self.trigger_total_sec = config.get("trigger_total_sec", 4.0) # 유효 구간 총합 (4초)
+        self.max_gap_sec = config.get("max_gap_sec", 1.5)           # 프레임 끊김 허용 오차 (1.5초)
+        
         self.window_sec = config.get("window_sec", 30.0)
-        
         self.window_fids = int(self.window_sec * self.fps)
-        self.min_hit_count = config.get("min_hit_count", 3)
         
-        # [추가] 상단 경계 무시 비율 (기본값 0.2 = 상단 20%)
         self.ignore_top_ratio = config.get("ignore_top_ratio", 0.2)
-        
-        # 빨간 헬멧(오인식)으로 확정된 Track ID를 영구 배제하기 위한 블랙리스트 Set
         self.red_helmet_tids = set()
 
     def _get_roi_crop(self, frame, box):
-        """메모리 절약을 위해 객체 상단 50% 영역만 잘라내어 반환합니다."""
         if frame is None:
             return None
             
         h_img, w_img = frame.shape[:2]
         x1, y1, x2, y2 = map(int, box[:4])
         
-        # 프레임 경계 방어 로직
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_img, x2), min(h_img, y2)
         
@@ -1053,10 +1050,9 @@ class HelmetDetector(BaseEventDetector):
         if roi.size == 0:
             return None
             
-        return roi.copy()  # 원본 프레임 참조를 끊기 위해 독립된 메모리로 복사
+        return roi.copy()
 
     def _is_red_helmet_median(self, roi_buffer):
-        """버퍼에 쌓인 최근 3~5장 ROI들의 스칼라 중간값(Median)을 계산합니다."""
         if not roi_buffer:
             return False
             
@@ -1076,7 +1072,6 @@ class HelmetDetector(BaseEventDetector):
         if not h_means:
             return False
             
-        # 프레임 단위의 스파이크 노이즈를 제거하기 위한 Median 연산
         med_r = np.median(r_means)
         med_h = np.median(h_means)
         med_s = np.median(s_means)
@@ -1098,7 +1093,6 @@ class HelmetDetector(BaseEventDetector):
         unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == ID_H_NO_HELMET]
         current_nh_persons = []
         
-        # [추가] 프레임 해상도 기반 상단 무시 경계선(Y 좌표) 산출
         ignore_y_thresh = 0
         if frame is not None:
             ignore_y_thresh = frame.shape[0] * self.ignore_top_ratio
@@ -1113,7 +1107,6 @@ class HelmetDetector(BaseEventDetector):
                 
             px1, py1, px2, py2 = p[:4]
             
-            # [추가] 사람 객체의 최상단(머리끝)이 카메라 상단 마진 내에 있으면 판정 보류 (Truncation 방어)
             if py1 <= ignore_y_thresh:
                 continue
                 
@@ -1141,7 +1134,6 @@ class HelmetDetector(BaseEventDetector):
                     max_ioa = ioa
                     nh_track_match = head
                     
-            # 사람과 머리 메타데이터 동시 추출
             if max_ioa >= 0.5 and nh_track_match is not None:
                 current_nh_persons.append({
                     'tid': p_tid,
@@ -1163,13 +1155,21 @@ class HelmetDetector(BaseEventDetector):
             roi_crop = self._get_roi_crop(frame, nh_p['head_bbox'])
                     
             if matched_session:
-                matched_session['hit_fids'].add(fid)
+                # [수정] 프레임 끊김(Gap) 검사를 통한 연속 구간(Streak) 연장 또는 신규 구간 생성
+                gap_sec = (fid - matched_session['last_seen_fid']) / self.fps
+                if gap_sec <= self.max_gap_sec:
+                    matched_session['streaks'][-1]['end_fid'] = fid
+                else:
+                    matched_session['streaks'].append({'start_fid': fid, 'end_fid': fid})
+                
+                matched_session['last_seen_fid'] = fid
                 matched_session['last_tid'] = nh_p['tid']
                 matched_session['last_person_bbox'] = nh_p['person_bbox']
                 matched_session['bbox'] = nh_p['head_bbox']
                 matched_session['frame'] = frame.copy() if frame is not None else None
                 matched_session['fid'] = fid
-                matched_session['objects'] = nh_p['objects'] # 객체 메타 갱신
+                matched_session['objects'] = nh_p['objects']
+                
                 if roi_crop is not None:
                     matched_session['roi_buffer'].append(roi_crop)
             else:
@@ -1179,7 +1179,8 @@ class HelmetDetector(BaseEventDetector):
                     
                 self.sessions.append({
                     'start_fid': fid,
-                    'hit_fids': {fid},
+                    'last_seen_fid': fid,
+                    'streaks': [{'start_fid': fid, 'end_fid': fid}], # [수정] 연속 구간 관리 배열 도입
                     'last_tid': nh_p['tid'],
                     'last_person_bbox': nh_p['person_bbox'],
                     'bbox': nh_p['head_bbox'],
@@ -1187,7 +1188,7 @@ class HelmetDetector(BaseEventDetector):
                     'fid': fid,
                     'triggered': False,
                     'roi_buffer': new_buffer,
-                    'objects': nh_p['objects'] # 객체 메타 저장
+                    'objects': nh_p['objects']
                 })
 
         active_sessions = []
@@ -1195,9 +1196,15 @@ class HelmetDetector(BaseEventDetector):
             if session['last_tid'] in self.red_helmet_tids: continue
             if fid - session['start_fid'] > self.window_fids: continue
                 
-            duration_sec = (fid - session['start_fid']) / self.fps
+            # [수정] 2초 이상 유지된 구간들만 필터링하여 총 유효 시간(total_valid_sec) 합산
+            total_valid_sec = 0.0
+            for streak in session['streaks']:
+                streak_duration = (streak['end_fid'] - streak['start_fid']) / self.fps
+                if streak_duration >= self.min_streak_sec:
+                    total_valid_sec += streak_duration
             
-            if not session['triggered'] and duration_sec >= self.trigger_sec and len(session['hit_fids']) >= self.min_hit_count:
+            # 유효 시간 총합이 4초를 넘었을 때 트리거
+            if not session['triggered'] and total_valid_sec >= self.trigger_total_sec:
                 is_red_helmet = self._is_red_helmet_median(session['roi_buffer'])
                 if is_red_helmet:
                     self.red_helmet_tids.add(session['last_tid'])
@@ -1207,7 +1214,7 @@ class HelmetDetector(BaseEventDetector):
                         'bbox': session['bbox'], 
                         'frame': session['frame'], 
                         'fid': session['fid'],
-                        'objects': session['objects'] # 최종 반환
+                        'objects': session['objects']
                     })
                 session['triggered'] = True 
                 
