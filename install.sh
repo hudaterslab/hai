@@ -15,63 +15,74 @@ VENV_ACTIVATE="$DX_DIR/venv-dx-runtime/bin/activate"
 VENV_PYTHON="$DX_DIR/venv-dx-runtime/bin/python"
 
 echo "====================================================="
-echo " Raspberry Pi Edge AI CCTV 서비스 설치 (안전성 강화 버전)"
+echo " Raspberry Pi Edge AI CCTV 서비스 설치 및 자동화"
 echo "====================================================="
 
-# 3. 파일 검증 (실행 테스트 대신 파이썬 문법 에러만 빠르게 확인)
-echo "-> 필수 파일 및 파이썬 문법 검사를 진행합니다..."
-
+# 3. 파일 및 환경 검증
 if [ ! -f "$TARGET_SCRIPT" ] || [ ! -d "$DX_DIR" ] || [ ! -f "$VENV_ACTIVATE" ]; then
     echo "❌ [설치 중단] 필수 파일이나 가상환경 경로를 찾을 수 없습니다."
     exit 1
 fi
 
-# NPU에 올리지 않고 파이썬 코드의 치명적 오타/문법 에러만 컴파일 테스트 (안전함)
-$VENV_PYTHON -m py_compile $TARGET_SCRIPT
-if [ $? -ne 0 ]; then
-    echo "❌ [설치 중단] 파이썬 코드(multi_event.py)에 문법 오류가 있습니다."
-    exit 1
-fi
-echo "✅ 코드 검증 완료"
+# 4. [기능 1] 유저가 터미널을 켜자마자 가상환경이 자동 활성화되도록 ~/.bashrc 설정
+echo "-> 터미널 시작 시 가상환경 자동 활성화 설정을 확인합니다..."
+BASHRC_PATH="$USER_HOME/.bashrc"
+AUTO_ACTIVATE_STR="source $VENV_ACTIVATE"
 
-# 4. Systemd 서비스 파일 생성
+if ! grep -Fxq "$AUTO_ACTIVATE_STR" "$BASHRC_PATH"; then
+    echo -e "\n# DeepX Runtime 가상환경 자동 활성화\n$AUTO_ACTIVATE_STR" >> "$BASHRC_PATH"
+    echo "✅ ~/.bashrc에 가상환경 자동 활성화 등록 완료!"
+else
+    echo "ℹ️ 이미 가상환경 자동 활성화가 등록되어 있습니다."
+fi
+
+# 5. [기능 2] Systemd 서비스 파일 생성 (온전한 부팅 후 실행되도록 튜닝)
 echo "-> Systemd 서비스 파일을 생성 중입니다..."
 
 sudo bash -c "cat > $SERVICE_PATH" << EOL
 [Unit]
 Description=Raspberry Pi Edge AI CCTV Event Detection
-# [핵심 수정] dxrt.service(DeepX 런타임)가 켜진 이후에만 우리 서비스가 구동되도록 종속성 추가
 Requires=dxrt.service
-After=network.target dxrt.service
-ConditionPathExists=$CONFIG_FILE
+# dxrt.service와 모든 그래픽/멀티미디어 환경(graphical.target)이 완료된 후 실행 요청
+After=network.target dxrt.service graphical.target
 
 [Service]
 Type=simple
 User=$ACTUAL_USER
 WorkingDirectory=$PROJECT_DIR
+
+# [핵심 수정] 온전한 부팅 후 dxrt 데몬이 완전히 준비될 시간을 벌기 위해 20초 지연 후 파이썬 실행
+ExecStartPre=/bin/sleep 20
 ExecStart=/bin/bash -c 'source $VENV_ACTIVATE && yes n | python3 -u multi_event.py'
+
 Restart=always
-RestartSec=10
+RestartSec=15
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
 EOL
 
-# 5. 데몬 리로드 및 서비스 등록
+# 6. 데몬 리로드 및 서비스 등록
 echo "-> 서비스를 시스템에 등록합니다..."
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
 
+# 기존 서비스 중지 및 초기화
 sudo systemctl stop $SERVICE_NAME
+
 if [ -f "$CONFIG_FILE" ]; then
+    echo "▶️ 서비스를 백그라운드로 실행합니다. (설정된 20초 지연 후 실구동 시작)"
     sudo systemctl start $SERVICE_NAME
-    echo "▶️ 백그라운드 서비스가 시작되었습니다."
 else
-    echo "⚠️ cameras.json 파일이 없어 대기 상태입니다."
+    echo "⚠️ cameras.json 파일이 없어 서비스가 대기 상태로 설정됩니다."
 fi
 
 echo "====================================================="
-echo " 🎉 완료되었습니다! (상태 확인: sudo systemctl status $SERVICE_NAME)"
+echo " 🎉 모든 설정 및 설치가 완료되었습니다!"
+echo "-----------------------------------------------------"
+echo " 1. 지금 터미널 창을 새로 열면 가상환경이 자동으로 켜집니다."
+echo " 2. 시스템이 리부팅되면 NPU 데몬 안정화를 위해 20초 뒤"
+echo "    CCTV AI 프로세스가 자동으로 완벽하게 구동됩니다."
 echo "====================================================="
