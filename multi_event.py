@@ -1271,7 +1271,7 @@ class SignalVehicleDetector(BaseEventDetector):
         
         for t in tracks:
             tid = int(t[4])
-            if track_map.get(tid) not in TARGET_VEHICLES: 
+            if track_map.get(tid) != ID_G_TRUCK:
                 continue
                 
             curr_ids.add(tid)
@@ -2211,7 +2211,8 @@ class Camera:
         now = time.time()
         current_alarms = {} 
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
-        
+        # tid를 key로, score를 value로 하는 딕셔너리 생성
+        score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
         # [수정] main 스레드로 반환할 신규 이벤트 객체 리스트
         newly_triggered_events = []
 
@@ -2234,7 +2235,9 @@ class Camera:
                     
                     # [수정] 복합 객체 메타데이터(objects) 추출 및 로깅용 텍스트 빌드
                     # 구버전 이벤트 대응을 위한 Fallback 포함
-                    objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': 0.95, 'tid': tid}])
+                    #실제 스코어적용
+                    actual_score = score_map_main.get(tid, 0.95)
+                    objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
                     objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
                     
                     cls_id = track_map_main.get(tid, -1)
