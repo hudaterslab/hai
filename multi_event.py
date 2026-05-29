@@ -772,7 +772,7 @@ class ParkingDetector(BaseEventDetector):
     
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.states = defaultdict(lambda: {'start_fid': 0, 'pos': None})
+        self.states = defaultdict(lambda: {'start_time': 0.0, 'pos': None})
         
         self.trigger_sec = config.get("trigger_sec", 5.0)
         self.move_threshold_ratio = config.get("move_threshold_ratio", 0.1)
@@ -780,6 +780,7 @@ class ParkingDetector(BaseEventDetector):
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         curr_ids = set()
+        current_time = time.time()
         
         if self.roi_poly.size == 0: 
             return triggered
@@ -796,26 +797,23 @@ class ParkingDetector(BaseEventDetector):
                     
                     dynamic_move_threshold = vehicle_size * self.move_threshold_ratio
                     
-                    # 신규 진입 또는 동적 임계값 이상 이동 시 초기화
-                    if self.states[tid]['start_fid'] == 0 or get_distance(c, self.states[tid]['pos']) > dynamic_move_threshold:
+                    if self.states[tid]['start_time'] == 0.0 or get_distance(c, self.states[tid]['pos']) > dynamic_move_threshold:
                         self.states[tid].update({
-                            'start_fid': fid, 
+                            'start_time': current_time, 
                             'pos': c, 
                             'bbox': t[:4], 
                             'frame': frame.copy() if frame is not None else None,
                             'fid': fid,
-                            'triggered': False # 중복 알람 방지용 플래그
+                            'triggered': False
                         })
                     else:
-                        # [핵심 보완] 정지 상태 유지 중에는 최신 스냅샷과 BBox로 지속 갱신 (API 이미지 이격 방지)
                         self.states[tid].update({
                             'bbox': t[:4],
                             'frame': frame.copy() if frame is not None else None,
                             'fid': fid
                         })
                         
-                        # [가변 FPS 대응] 실제 정지 체류 시간(Duration) 계산
-                        duration_sec = (fid - self.states[tid]['start_fid']) / self.fps
+                        duration_sec = current_time - self.states[tid]['start_time']
                         
                         if not self.states[tid].get('triggered', False) and duration_sec >= self.trigger_sec:
                             triggered.append({
@@ -826,7 +824,6 @@ class ParkingDetector(BaseEventDetector):
                             })
                             self.states[tid]['triggered'] = True
                         
-        # 프레임에서 사라진 객체 상태 정리
         for tid in list(self.states.keys()):
             if tid not in curr_ids: 
                 del self.states[tid]
@@ -897,6 +894,7 @@ class CrossingDetector(BaseEventDetector):
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         curr_ids = set()
+        current_time = time.time()
         
         persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
@@ -924,7 +922,6 @@ class CrossingDetector(BaseEventDetector):
                     max_ioa = ioa
                     best_low_track = lb
                     
-            # [수정] 후보 진입 순간의 현재 다중 객체 메타데이터(objects) 구성
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid}]
             
             if max_ioa >= 0.4 and best_low_track is not None:
@@ -936,7 +933,6 @@ class CrossingDetector(BaseEventDetector):
                 self.lb_last_height[p_tid] = low_height
                 event_bbox = tuple(best_low_track[:4])
                 
-                # 하반신 메타데이터 추가
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
             else:
                 if p_tid in self.lb_offsets:
@@ -962,13 +958,13 @@ class CrossingDetector(BaseEventDetector):
                         if cross_angle >= self.min_crossing_angle:
                             self.candidates[p_tid] = {
                                 'person_height': person_height, 
-                                'timestamp_fid': fid, 
+                                'timestamp_time': current_time,
                                 'line': (p1, p2), 
                                 'entry_side': ccw(p1, p2, trajectory[0]), 
                                 'bbox': event_bbox, 
                                 'frame': frame.copy() if frame is not None else None,
                                 'fid': fid,
-                                'objects': curr_objects # 다중 객체 메타데이터 저장
+                                'objects': curr_objects
                             }
                         break
             
@@ -992,11 +988,11 @@ class CrossingDetector(BaseEventDetector):
                             'bbox': cand['bbox'], 
                             'frame': cand['frame'],
                             'fid': cand['fid'],
-                            'objects': cand['objects'] # 최종 반환
+                            'objects': cand['objects']
                         })
                         del self.candidates[p_tid]
                         
-                elif (fid - cand['timestamp_fid']) / self.fps > self.candidate_ttl_sec: 
+                elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec: 
                     del self.candidates[p_tid]
                     
             self.prev[p_tid] = curr_pos
@@ -1009,9 +1005,7 @@ class CrossingDetector(BaseEventDetector):
                 if tid in self.lb_last_height: del self.lb_last_height[tid]
                 
         return triggered
-# ---------------------------------------------------------
-# [Modified 코드 Part] - ROI 버퍼 기반 Median 검증 및 Track ID 블랙리스트 추가
-# ---------------------------------------------------------
+
 class HelmetDetector(BaseEventDetector):
     gui_name = "NO-HELMET"
     
@@ -1019,13 +1013,11 @@ class HelmetDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.sessions = []
         
-        # [수정] 이중 조건 달성을 위한 시간 설정
-        self.min_streak_sec = config.get("min_streak_sec", 2.0)     # 단일 구간 최소 지속 시간 (2초)
-        self.trigger_total_sec = config.get("trigger_total_sec", 4.0) # 유효 구간 총합 (4초)
-        self.max_gap_sec = config.get("max_gap_sec", 1.5)           # 프레임 끊김 허용 오차 (1.5초)
+        self.min_streak_sec = config.get("min_streak_sec", 2.0)
+        self.trigger_total_sec = config.get("trigger_total_sec", 4.0)
+        self.max_gap_sec = config.get("max_gap_sec", 1.5)
         
         self.window_sec = config.get("window_sec", 30.0)
-        self.window_fids = int(self.window_sec * self.fps)
         
         self.ignore_top_ratio = config.get("ignore_top_ratio", 0.2)
         self.red_helmet_tids = set()
@@ -1089,6 +1081,7 @@ class HelmetDetector(BaseEventDetector):
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         helmet_tracks = kwargs.get('helmet_tracks', [])
+        current_time = time.time()
         
         unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == ID_H_NO_HELMET]
         current_nh_persons = []
@@ -1155,14 +1148,13 @@ class HelmetDetector(BaseEventDetector):
             roi_crop = self._get_roi_crop(frame, nh_p['head_bbox'])
                     
             if matched_session:
-                # [수정] 프레임 끊김(Gap) 검사를 통한 연속 구간(Streak) 연장 또는 신규 구간 생성
-                gap_sec = (fid - matched_session['last_seen_fid']) / self.fps
+                gap_sec = current_time - matched_session['last_seen_time']
                 if gap_sec <= self.max_gap_sec:
-                    matched_session['streaks'][-1]['end_fid'] = fid
+                    matched_session['streaks'][-1]['end_time'] = current_time
                 else:
-                    matched_session['streaks'].append({'start_fid': fid, 'end_fid': fid})
+                    matched_session['streaks'].append({'start_time': current_time, 'end_time': current_time})
                 
-                matched_session['last_seen_fid'] = fid
+                matched_session['last_seen_time'] = current_time
                 matched_session['last_tid'] = nh_p['tid']
                 matched_session['last_person_bbox'] = nh_p['person_bbox']
                 matched_session['bbox'] = nh_p['head_bbox']
@@ -1178,9 +1170,9 @@ class HelmetDetector(BaseEventDetector):
                     new_buffer.append(roi_crop)
                     
                 self.sessions.append({
-                    'start_fid': fid,
-                    'last_seen_fid': fid,
-                    'streaks': [{'start_fid': fid, 'end_fid': fid}], # [수정] 연속 구간 관리 배열 도입
+                    'start_time': current_time,
+                    'last_seen_time': current_time,
+                    'streaks': [{'start_time': current_time, 'end_time': current_time}],
                     'last_tid': nh_p['tid'],
                     'last_person_bbox': nh_p['person_bbox'],
                     'bbox': nh_p['head_bbox'],
@@ -1194,16 +1186,14 @@ class HelmetDetector(BaseEventDetector):
         active_sessions = []
         for session in self.sessions:
             if session['last_tid'] in self.red_helmet_tids: continue
-            if fid - session['start_fid'] > self.window_fids: continue
+            if current_time - session['start_time'] > self.window_sec: continue
                 
-            # [수정] 2초 이상 유지된 구간들만 필터링하여 총 유효 시간(total_valid_sec) 합산
             total_valid_sec = 0.0
             for streak in session['streaks']:
-                streak_duration = (streak['end_fid'] - streak['start_fid']) / self.fps
+                streak_duration = streak['end_time'] - streak['start_time']
                 if streak_duration >= self.min_streak_sec:
                     total_valid_sec += streak_duration
             
-            # 유효 시간 총합이 4초를 넘었을 때 트리거
             if not session['triggered'] and total_valid_sec >= self.trigger_total_sec:
                 is_red_helmet = self._is_red_helmet_median(session['roi_buffer'])
                 if is_red_helmet:
@@ -1231,24 +1221,21 @@ class SignalVehicleDetector(BaseEventDetector):
         self.history = defaultdict(lambda: deque(maxlen=30))
         self.motion_ratio = config.get("motion_threshold_ratio", 0.10)
         
-        # 2분(120초) 유예 기간 및 인증을 위한 신호수 3초 지속 유지 시간
         self.auth_grace_sec = config.get("auth_grace_sec", 120.0) 
         self.presence_threshold_sec = config.get("presence_threshold_sec", 3.0) 
-        
-        # [추가] 차량이 ROI 내에 체류해야 하는 최소 시간 (3초)
         self.vehicle_roi_dwell_sec = config.get("vehicle_roi_dwell_sec", 3.0)
         
-        # [추가] 해상도 기반의 신호수 근거리(Proximity) 판정 비율 (기본값 0.8 적용, 실환경 0.3 권장)
         self.prox_ratio_x = config.get("prox_ratio_x", 0.8)
         self.prox_ratio_y = config.get("prox_ratio_y", 0.8)
         
-        self.presence_start_fid = {}     # 차량 반경 내 신호수 출현 추적 시작 FID
-        self.last_auth_fid = {}          # 120초 유예가 갱신된 시점의 FID
-        self.vehicle_roi_start_fid = {}  # 차량이 ROI에 진입한 시점의 FID
+        self.presence_start_time = {}     
+        self.last_auth_time = {}          
+        self.vehicle_roi_start_time = {}  
         
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         curr_ids = set()
+        current_time = time.time()
         
         if self.roi_poly.size == 0 or motion_mask is None or frame is None: 
             return triggered
@@ -1258,11 +1245,9 @@ class SignalVehicleDetector(BaseEventDetector):
         scale_x = w_mask / float(w_frame)
         scale_y = h_mask / float(h_frame)
         
-        # 동적 근거리 픽셀 임계값 산출
         prox_x_thresh = w_frame * self.prox_ratio_x
         prox_y_thresh = h_frame * self.prox_ratio_y
         
-        # 클래스 매핑: 2(사람), 5(신호수)
         ID_SIGNALMAN = 5
         signalmen_pts = [
             get_foot_point(*t[:4]) for t in tracks 
@@ -1280,16 +1265,14 @@ class SignalVehicleDetector(BaseEventDetector):
             c_pt = get_center_point(*t[:4])
             v_size = max(x2 - x1, y2 - y1)
             
-            # 1. 차량의 ROI 체류 시간 관리 로직
             is_in_roi = cv2.pointPolygonTest(self.roi_poly, c_pt, False) >= 0
             if is_in_roi:
-                if tid not in self.vehicle_roi_start_fid:
-                    self.vehicle_roi_start_fid[tid] = fid
+                if tid not in self.vehicle_roi_start_time:
+                    self.vehicle_roi_start_time[tid] = current_time
             else:
-                if tid in self.vehicle_roi_start_fid:
-                    del self.vehicle_roi_start_fid[tid]
+                if tid in self.vehicle_roi_start_time:
+                    del self.vehicle_roi_start_time[tid]
             
-            # 튀는 BBox(Jittering) 방어
             if len(self.history[tid]) > 0 and get_distance(self.history[tid][-1], fc) > v_size * 0.6: 
                 self.history[tid].clear()
                 continue
@@ -1297,38 +1280,32 @@ class SignalVehicleDetector(BaseEventDetector):
             self.history[tid].append(fc)
             h_list = list(self.history[tid])
             
-            # 2. 신호수 근거리(해상도 비율) 체류 시간 인증 로직
             has_signalman = False
             for pt in signalmen_pts:
-                # 차의 발 위치와 사람의 발 위치가 동적 X, Y 임계값 이내인지 검사
                 if abs(fc[0] - pt[0]) <= prox_x_thresh and abs(fc[1] - pt[1]) <= prox_y_thresh:
                     has_signalman = True
                     break
             
             if has_signalman:
-                if tid not in self.presence_start_fid:
-                    self.presence_start_fid[tid] = fid
+                if tid not in self.presence_start_time:
+                    self.presence_start_time[tid] = current_time
                     
-                presence_sec = (fid - self.presence_start_fid[tid]) / self.fps
+                presence_sec = current_time - self.presence_start_time[tid]
                 if presence_sec >= self.presence_threshold_sec:
-                    # 3초 이상 체류 시 2분 유예 토큰 발급/갱신
-                    self.last_auth_fid[tid] = fid
+                    self.last_auth_time[tid] = current_time
             else:
-                if tid in self.presence_start_fid:
-                    del self.presence_start_fid[tid]
+                if tid in self.presence_start_time:
+                    del self.presence_start_time[tid]
             
-            # 3. 차량 이동 및 임의출발 이벤트 판별
             if len(h_list) > 5:
                 start_p = (sum(p[0] for p in h_list[:3])/3, sum(p[1] for p in h_list[:3])/3)
                 end_p = (sum(p[0] for p in h_list[-3:])/3, sum(p[1] for p in h_list[-3:])/3)
                 dist = get_distance(start_p, end_p)
                 
-                # 차량 ROI 체류 시간 산출
                 vehicle_dwell_sec = 0.0
-                if tid in self.vehicle_roi_start_fid:
-                    vehicle_dwell_sec = (fid - self.vehicle_roi_start_fid[tid]) / self.fps
+                if tid in self.vehicle_roi_start_time:
+                    vehicle_dwell_sec = current_time - self.vehicle_roi_start_time[tid]
                 
-                # 이동 거리, ROI 내부 여부, 그리고 차량 ROI 체류 3초 이상 조건 충족 시
                 if dist >= v_size * 0.15 and is_in_roi and vehicle_dwell_sec >= self.vehicle_roi_dwell_sec:
                     mx1 = max(0, int(x1 * scale_x))
                     my1 = max(0, int(y1 * scale_y))
@@ -1342,10 +1319,10 @@ class SignalVehicleDetector(BaseEventDetector):
                         total_px = (mx2 - mx1) * (my2 - my1)
                         if total_px > 0 and (cv2.countNonZero(m_only) / total_px) > self.motion_ratio:
                             
-                            last_auth = self.last_auth_fid.get(tid, 0)
-                            time_since_auth = (fid - last_auth) / self.fps
+                            last_auth = self.last_auth_time.get(tid, 0.0)
+                            time_since_auth = current_time - last_auth
                             
-                            if last_auth == 0 or time_since_auth > self.auth_grace_sec:
+                            if last_auth == 0.0 or time_since_auth > self.auth_grace_sec:
                                 triggered.append({
                                     'tid': tid, 
                                     'bbox': t[:4], 
@@ -1353,22 +1330,21 @@ class SignalVehicleDetector(BaseEventDetector):
                                     'fid': fid
                                 })
                                 self.history[tid].clear()
-                                if tid in self.last_auth_fid:
-                                    del self.last_auth_fid[tid]
+                                if tid in self.last_auth_time:
+                                    del self.last_auth_time[tid]
                                     
-        # 메모리 정리
         for tid in list(self.history.keys()):
             if tid not in curr_ids: 
                 del self.history[tid]
-        for tid in list(self.last_auth_fid.keys()):
+        for tid in list(self.last_auth_time.keys()):
             if tid not in curr_ids:
-                del self.last_auth_fid[tid]
-        for tid in list(self.presence_start_fid.keys()):
+                del self.last_auth_time[tid]
+        for tid in list(self.presence_start_time.keys()):
             if tid not in curr_ids:
-                del self.presence_start_fid[tid]
-        for tid in list(self.vehicle_roi_start_fid.keys()):
+                del self.presence_start_time[tid]
+        for tid in list(self.vehicle_roi_start_time.keys()):
             if tid not in curr_ids:
-                del self.vehicle_roi_start_fid[tid]
+                del self.vehicle_roi_start_time[tid]
                 
         return triggered
 
