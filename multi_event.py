@@ -91,7 +91,6 @@ def deep_merge_dict(base, override):
     return result
 
 def load_system_config():
-    """시스템 공통 설정(system_config.json)을 로드합니다."""
     default_config = {
         "terminal_id": "99999",
         "logging": {"dir": "./logs", "level": "INFO"},
@@ -113,10 +112,12 @@ def load_system_config():
         "model_confidences": {
             "MAIN": 0.6,
             "FACE": 0.35,
-            "HELMET": 0.55
+            "HELMET": 0.55,
+            "PERSON": 0.35  # [추가] 사람 및 신호수 전용 기본 임계값 설정
         },
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
+        "LOOP_FPS": 15,
         "REC_PRE_SEC": 10,
         "REC_POST_SEC": 10,
         "VISUAL_ALARM_DURATION": 5.0
@@ -416,8 +417,8 @@ def _save_and_send_task(img, img_path, api_params):
     except Exception as e:
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
-def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None):
-    """프레임에 BBox를 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
+def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None):
+    """프레임에 BBox와 다중 궤적을 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
         return
@@ -426,6 +427,16 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
         
+        # [추가] 전달받은 다중 객체 궤적(Trajectory) 렌더링
+        if trajectories:
+            for obj_tid, hist_pts in trajectories.items():
+                if len(hist_pts) > 1:
+                    # 궤적을 보라색 계열로 렌더링 (안티앨리어싱 적용)
+                    cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 3, cv2.LINE_AA)
+                    # 시작점(노란색)과 현재 앵커점(빨간색) 마킹
+                    cv2.circle(img, hist_pts[0], 5, (0, 255, 255), -1)
+                    cv2.circle(img, hist_pts[-1], 6, (0, 0, 255), -1)
+                    
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
         now = datetime.datetime.now()
         msg = f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}"
@@ -593,10 +604,11 @@ class YoLoDeepX:
 # [1] 시스템 기본 설정 및 상수 영역 하단에 추가
 DEBUG_MODE = False
 class SimpleTracker:
-    def __init__(self, max_lost=30): 
+    def __init__(self, max_lost=30, history_len=60): # 15FPS 기준 약 4초 분량의 궤적 저장
         self.next_id = 1
         self.tracks = {}
         self.max_lost = max_lost
+        self.history_len = history_len
 
     def update(self, detections):
         used_dets = set()
@@ -617,8 +629,16 @@ class SimpleTracker:
                     best_idx = i
                     
             if best_iou > 0.2:
-                # 💡 [수정] bbox뿐만 아니라 conf(Confidence)도 업데이트
-                self.tracks[tid].update({'bbox': detections[best_idx][:4], 'lost': 0, 'conf': detections[best_idx][4]})
+                # 중심점 좌표 계산 및 히스토리에 누적
+                cx = int((detections[best_idx][0] + detections[best_idx][2]) / 2)
+                cy = int((detections[best_idx][1] + detections[best_idx][3]) / 2)
+                
+                self.tracks[tid].update({
+                    'bbox': detections[best_idx][:4], 
+                    'lost': 0, 
+                    'conf': detections[best_idx][4]
+                })
+                self.tracks[tid]['history'].append((cx, cy))
                 used_dets.add(best_idx)
             else: 
                 self.tracks[tid]['lost'] += 1
@@ -628,13 +648,16 @@ class SimpleTracker:
         res_tracks = []
         for i, det in enumerate(detections):
             if i not in used_dets:
-                # 💡 [수정] 신규 객체 등록 시 conf 추가
-                self.tracks[self.next_id] = {'bbox': det[:4], 'lost': 0, 'cls': int(det[5]), 'conf': det[4]}
+                cx = int((det[0] + det[2]) / 2)
+                cy = int((det[1] + det[3]) / 2)
+                self.tracks[self.next_id] = {
+                    'bbox': det[:4], 'lost': 0, 'cls': int(det[5]), 'conf': det[4],
+                    'history': deque([(cx, cy)], maxlen=self.history_len) # 신규 객체 궤적 초기화
+                }
                 self.next_id += 1
                 
         for tid, trk in self.tracks.items():
             if trk['lost'] == 0:
-                # 💡 [수정] 1.0 하드코딩 대신 실제 conf 반환 (det 포맷 유지: x1, y1, x2, y2, tid, conf, cls)
                 res_tracks.append([*trk['bbox'], tid, trk.get('conf', 1.0), trk['cls']])
                 
         return np.array(res_tracks)
@@ -643,7 +666,7 @@ class VideoRecorder:
     def __init__(self, ip):
         self.ip = ip
         self.fps = SYS_CFG.get("REC_FPS", 3)
-        self.buffer = deque(maxlen=self.fps * SYS_CFG.get("REC_PRE_SEC", 3))
+        self.buffer = deque(maxlen=self.fps * SYS_CFG.get("REC_PRE_SEC", 10))
         self.write_queue = queue.Queue()
         
         self.recording = False
@@ -670,7 +693,7 @@ class VideoRecorder:
 
     def trigger(self, event_name):
         now = time.time()
-        post_sec = SYS_CFG.get("REC_POST_SEC", 4)
+        post_sec = SYS_CFG.get("REC_POST_SEC", 10)
         
         if self.recording:
             self.record_end_time = now + post_sec
@@ -1220,14 +1243,14 @@ class SignalVehicleDetector(BaseEventDetector):
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
         self.history = defaultdict(lambda: deque(maxlen=30))
-        self.motion_ratio = config.get("motion_threshold_ratio", 0.10)
+        self.motion_ratio = config.get("motion_threshold_ratio", 0.20)
         
         self.auth_grace_sec = config.get("auth_grace_sec", 120.0) 
         self.presence_threshold_sec = config.get("presence_threshold_sec", 3.0) 
         self.vehicle_roi_dwell_sec = config.get("vehicle_roi_dwell_sec", 3.0)
         
-        self.prox_ratio_x = config.get("prox_ratio_x", 0.8)
-        self.prox_ratio_y = config.get("prox_ratio_y", 0.8)
+        self.prox_ratio_x = config.get("prox_ratio_x", 1.0)
+        self.prox_ratio_y = config.get("prox_ratio_y", 1.0)
         
         self.presence_start_time = {}     
         self.last_auth_time = {}          
@@ -1302,12 +1325,13 @@ class SignalVehicleDetector(BaseEventDetector):
                 start_p = (sum(p[0] for p in h_list[:3])/3, sum(p[1] for p in h_list[:3])/3)
                 end_p = (sum(p[0] for p in h_list[-3:])/3, sum(p[1] for p in h_list[-3:])/3)
                 dist = get_distance(start_p, end_p)
+                min_movement = max(v_size * 0.15, 10.0)
                 
                 vehicle_dwell_sec = 0.0
                 if tid in self.vehicle_roi_start_time:
                     vehicle_dwell_sec = current_time - self.vehicle_roi_start_time[tid]
                 
-                if dist >= v_size * 0.15 and is_in_roi and vehicle_dwell_sec >= self.vehicle_roi_dwell_sec:
+                if dist >= min_movement and is_in_roi and vehicle_dwell_sec >= self.vehicle_roi_dwell_sec:
                     mx1 = max(0, int(x1 * scale_x))
                     my1 = max(0, int(y1 * scale_y))
                     mx2 = min(w_mask, int(x2 * scale_x))
@@ -2287,8 +2311,7 @@ class Camera:
         logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
     def process_frame(self):
         fr, fid, connected = self.reader.read()
-        if fr is not None: 
-            self.recorder.update(fr)
+        # [수정] 원본 영상을 바로 Recorder에 밀어넣지 않습니다. (run_logic에서 렌더링 후 삽입)
         return fr, fid, connected
 
     def apply_face_blur(self, frame, bbox):
@@ -2339,10 +2362,11 @@ class Camera:
         now = time.time()
         current_alarms = {} 
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
-        # tid를 key로, score를 value로 하는 딕셔너리 생성
         score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
-        # [수정] main 스레드로 반환할 신규 이벤트 객체 리스트
         newly_triggered_events = []
+
+        # [추가] 녹화용 프레임 복사 (원본 프레임을 보존하면서 궤적만 그리기 위함)
+        record_fr = fr.copy()
 
         for ename, handler in self.handlers.items():
             kwargs = {'helmet_tracks': t_helmet} if ename == "no_helmet" else {}
@@ -2359,34 +2383,36 @@ class Camera:
                 ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
                 cooldown = SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 600)
                 
+                # 현재 처리된 이벤트에 관여된 객체의 궤적 수집 (다중 궤적 지원)
+                actual_score = score_map_main.get(tid, 0.95)
+                objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
+                
                 if ename not in self.alerted[tid] and (now - self.last_evt_t.get(ename, 0) >= cooldown):
-                    
-                    # [수정] 복합 객체 메타데이터(objects) 추출 및 로깅용 텍스트 빌드
-                    # 구버전 이벤트 대응을 위한 Fallback 포함
-                    #실제 스코어적용
-                    actual_score = score_map_main.get(tid, 0.95)
-                    objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
                     objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
                     
-                    cls_id = track_map_main.get(tid, -1)
-                    terminal_id = SYS_CFG.get("terminal_id", "99999")
-                    roi_str = f"Poly[{len(self.roi_poly)} pts]" if self.roi_poly else "None"
-                    
-                    # 로깅에 다중 객체의 Confidence와 BBox를 모두 남기도록 개선
                     log_msg = (
                         f"🔥 [EVENT TRIGGERED] CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
-                        f"TermID:{terminal_id} | TID:{tid} | FPS:{self.current_fps:.1f} | "
-                        f"Objects -> {objs_log_str} | ROI:{roi_str}"
+                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FPS:{self.current_fps:.1f} | "
+                        f"Objects -> {objs_log_str}"
                     )
                     logger.warning(log_msg)
                     
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
                     saved_img = self.apply_face_blur(ev_frame, bbox) if blur_face_option else ev_frame
                     
-                    # 다중 객체 메타데이터를 API 큐에도 함께 전달
+                    # [추가] 궤적 데이터 딕셔너리 구성 및 API/이미지 저장 함수로 전달
+                    event_trajectories = {}
+                    for obj in objects_meta:
+                        obj_tid = obj.get('tid')
+                        if obj_tid in self.trk_main.tracks:
+                            event_trajectories[obj_tid] = list(self.trk_main.tracks[obj_tid]['history'])
+                        elif obj_tid in self.trk_helmet.tracks:
+                            event_trajectories[obj_tid] = list(self.trk_helmet.tracks[obj_tid]['history'])
+                    
                     save_event_image_with_mark(
                         frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid, 
-                        terminal_id=terminal_id, cctv_id=self.cam_id, objects_meta=objects_meta
+                        terminal_id=SYS_CFG.get("terminal_id", "99999"), cctv_id=self.cam_id, 
+                        objects_meta=objects_meta, trajectories=event_trajectories # 궤적 전달
                     )
                     
                     self.recorder.trigger(ename)
@@ -2408,7 +2434,27 @@ class Camera:
             if now > self.visual_alarms[tid]['expire']: 
                 del self.visual_alarms[tid]
                 
-        # [수정] newly_triggered_events 리스트 추가 반환
+        # [추가] 녹화 비디오용 프레임(record_fr)에 추적된 궤적 및 BBox를 렌더링
+        # 알람이 발생하지 않은 평상시(Pre-buffer 영상)에도 녹색 궤적이 남고, 알람 시 붉은색으로 강조됩니다.
+        if record_fr is not None:
+            for t in t_main:
+                t_id = int(t[4])
+                is_alarmed = t_id in current_alarms
+                
+                color = (0, 0, 255) if is_alarmed else (0, 255, 0)
+                thickness = 3 if is_alarmed else 1
+                bx1, by1, bx2, by2 = map(int, t[:4])
+                
+                cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), color, thickness)
+                
+                if t_id in self.trk_main.tracks:
+                    hist = list(self.trk_main.tracks[t_id]['history'])
+                    if len(hist) > 1:
+                        cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, thickness, cv2.LINE_AA)
+                        
+            # 렌더링이 완료된 프레임을 VideoRecorder 버퍼로 전송
+            self.recorder.update(record_fr)
+                
         return t_main, t_helmet, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
     def draw(self, fr, t_main, t_helmet, alarms, connected=True):
@@ -2595,7 +2641,8 @@ def main():
     debug_ans = input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
     DEBUG_MODE = True if debug_ans == 'y' else False
     if DEBUG_MODE:
-        logger.setLevel(logging.DEBUG)
+        _log_level_str = SYS_CFG.get("logging", {}).get("level", "INFO").upper()
+        logger.setLevel(getattr(logging, _log_level_str, logging.INFO))
         logger.debug("🛠️ 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
     
     if os.path.exists(config_file):
@@ -2647,6 +2694,7 @@ def main():
     target_fps = SYS_CFG.get("REC_FPS", 15)
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
+    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35)  # [추가] 설정값 로드
     loop_count = 0
     fps_calc_interval = 30
     last_fps_time = time.time()
@@ -2687,6 +2735,9 @@ def main():
                             if c.ip in new_configs:
                                 c.update_config(new_configs[c.ip])
                         last_config_mtime = current_mtime
+                        
+                        # [추가] 만약 system_config.json 도 함께 체크하거나 리로드 구조가 있다면 
+                        # 여기에서 person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35) 를 갱신할 수 있습니다.
                     except Exception as e:
                         logger.error(f"핫 리로드 중 예외 발생: {e}")
 
@@ -2744,13 +2795,35 @@ def main():
                     final_imgs.append(cams[idx].draw(None, [], [], {}, False))
                     continue
                 
-                d_main_res = cams[idx].det_main.infer(fr, conf_override=main_conf)
+                # ---------------------------------------------------------
+                # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
+                # ---------------------------------------------------------
+                # 기존 하드코딩 대신 변수(person_conf)를 적용합니다.
+                base_conf = min(main_conf, person_conf)
+                d_main_res = cams[idx].det_main.infer(fr, conf_override=base_conf)
+                
+                d_main_res_list = []
+                for d in d_main_res:
+                    cls_id = int(d[5])
+                    conf = float(d[4])
+                    
+                    # ID_G_PERSON(2) 또는 ID_REFLECTIVE_VEST(5)인 경우 JSON에서 로드한 person_conf 적용
+                    if cls_id in [ID_G_PERSON, ID_REFLECTIVE_VEST]:
+                        if conf >= person_conf:
+                            d_main_res_list.append(d)
+                    else:
+                        # 차량 등 나머지 객체는 JSON에서 로드한 main_conf 유지
+                        if conf >= main_conf:
+                            d_main_res_list.append(d)
+                            
+                t_main_input = np.array(d_main_res_list) if len(d_main_res_list) > 0 else np.empty((0, 6))
                 
                 d_helmet_res = []
                 if "no_helmet" in cams[idx].events:
                     d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
                 
-                t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res)
+                # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
+                t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res)
                 
                 if is_gui_mode:
                     final_imgs.append(cams[idx].draw(fr, t_main, t_helmet, alarms, True))

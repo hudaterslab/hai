@@ -40,7 +40,7 @@ class VideoMockReader:
             
         self.orig_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if self.orig_fps <= 0 or math.isnan(self.orig_fps):
-            self.orig_fps = 30.0
+            self.orig_fps = 15.0
             
         self.frame_skip = max(1, int(round(self.orig_fps / target_fps)))
         self.fid = 0

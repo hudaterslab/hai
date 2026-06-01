@@ -17,6 +17,10 @@ debug_logs
 test_videos
 test_results
 test.py
+cameras.json
+system_config.json
+streaming.py
+temp.py
 # Local runtime/config files
 cameras.csv
 config
