@@ -100,7 +100,7 @@ def load_system_config():
             "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True, "trigger_sec": 3.0},
             "conveyor_crossing": {
                 "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", 
-                "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
+                "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
             },
             "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.10}
         },
@@ -711,7 +711,7 @@ class VideoRecorder:
             else:
                 self.write_queue.put(frame)
 
-    def trigger(self, event_name):
+    def trigger(self, event_name, objects_meta=None): # [수정] objects_meta 매개변수 추가
         now = time.time()
         post_sec = SYS_CFG.get("REC_POST_SEC", 10)
         
@@ -722,8 +722,8 @@ class VideoRecorder:
             self.recording = True
             self.record_end_time = now + post_sec
             self.current_event = event_name
+            self.current_meta = objects_meta # [추가] 이벤트 발생 시점의 BBox 메타데이터 기억
             
-            # 프리버퍼의 모든 프레임을 기록 큐에 일괄 삽입
             temp_buffer = list(self.buffer)
             for f in temp_buffer: 
                 self.write_queue.put(f)
@@ -747,8 +747,24 @@ class VideoRecorder:
                 if not os.path.exists(dpath): 
                     os.makedirs(dpath, exist_ok=True)
                     
-                fname = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.ip}_{self.current_event}.mp4"
+                # 파일명 동기화를 위해 변수 처리
+                time_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                fname = f"{time_str}_{self.ip}_{self.current_event}.mp4"
                 fpath = os.path.join(dpath, fname)
+                
+                # -----------------------------------------------------------
+                # [추가] 영상 생성 시점에 BBox 상세 수치 데이터(JSON)를 동시 저장
+                # -----------------------------------------------------------
+                if hasattr(self, 'current_meta') and self.current_meta:
+                    meta_fname = f"{time_str}_{self.ip}_{self.current_event}.json"
+                    meta_path = os.path.join(dpath, meta_fname)
+                    try:
+                        with open(meta_path, 'w', encoding='utf-8') as f_meta:
+                            json.dump(self.current_meta, f_meta, indent=4, ensure_ascii=False)
+                        logger.info(f"📝 [BBox 데이터 저장 완료] 경로: {meta_path}")
+                    except Exception as e:
+                        logger.error(f"⚠️ BBox JSON 메타데이터 저장 실패: {e}")
+                # -----------------------------------------------------------
                 
                 h, w = frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -943,6 +959,7 @@ class CrossingDetector(BaseEventDetector):
         persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
         
+        #하반신 매칭 및 발 위치 정밀 계산
         for p in persons:
             p_tid = int(p[4])
             curr_ids.add(p_tid)
@@ -953,7 +970,7 @@ class CrossingDetector(BaseEventDetector):
             
             best_low_track = None
             max_ioa = 0
-            
+            #해당 사람과 짝지어질 하반신을 찾습니다.
             for lb in low_bodies:
                 lx1, ly1, lx2, ly2 = lb[:4]
                 lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
@@ -968,6 +985,8 @@ class CrossingDetector(BaseEventDetector):
                     
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid}]
             
+            #하반신이 정상적으로 찾아진 경우:
+            #사람 전체 박스 기준 발 위치(p_foot)와 진짜 발 위치(curr_pos)의 차이값을 lb_offsets에 저장해 둡니다. (나중에 하반신을 놓쳤을 때 쓰기 위함)
             if max_ioa >= 0.4 and best_low_track is not None:
                 lx1, ly1, lx2, ly2 = best_low_track[:4]
                 low_height = max(1, ly2 - ly1)
@@ -978,6 +997,9 @@ class CrossingDetector(BaseEventDetector):
                 event_bbox = tuple(best_low_track[:4])
                 
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
+            
+            #컨베이어 벨트에 가려지는 등 하반신을 찾지 못한 경우:
+            #과거에 저장해 두었던 오프셋(ox, oy)을 꺼내와, 대략적인 발 위치(p_foot)에 더해서 진짜 발 위치(curr_pos)를 역산해 냅니다.
             else:
                 if p_tid in self.lb_offsets:
                     ox, oy = self.lb_offsets[p_tid]
@@ -986,14 +1008,16 @@ class CrossingDetector(BaseEventDetector):
                     event_bbox = (px1, py2 - low_height, px2, py2)
                 else: 
                     continue
-
+            #점프 방어
             if p_tid in self.prev:
                 jump_dist = get_distance(self.prev[p_tid], curr_pos)
-                if jump_dist > person_height * 0.4:
+                if jump_dist > person_height * 0.2:
                     del self.prev[p_tid]
                     self.prev[p_tid] = curr_pos
                     continue
-
+                
+            #횡단 판별: 아직 횡단 후보자가 아닌 경우, 과거 위치와 현재 위치를 이어 선분(trajectory)을 만듭니다.
+            #이 선분이 횡단선(p1, p2)과 교차(Intersect)했고, 그 진입 각도가 너무 평행하지 않다면(>= min_crossing_angle), 이 사람을 '선을 넘은 후보(candidates)'로 등록
             if p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 for p1, p2 in self.lines:
@@ -1011,12 +1035,14 @@ class CrossingDetector(BaseEventDetector):
                                 'objects': curr_objects
                             }
                         break
-            
+                    
+            #수직 거리 기반 최종 알람 트리거
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
                 curr_side = ccw(p1, p2, curr_pos)
                 
+                #선 밖으로 진입했던 방향과 현재 방향이 반대라면
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
                     dx = abs(p2[0] - p1[0])
@@ -1035,6 +1061,11 @@ class CrossingDetector(BaseEventDetector):
                             'objects': cand['objects']
                         })
                         del self.candidates[p_tid]
+                    else:
+                        # 알람은 안 울렸지만 현재 스코어가 어디까지 가고 있는지 상시 출력
+                        if p_tid in self.candidates:
+                            print(f"[프레임 {fid}] ID {p_tid} 수직거리: {perp_dist:.2f} / 요구거리: {dynamic_threshold:.2f} (진행률: {(perp_dist/dynamic_threshold)*100:.1f}%)")
+                        
                         
                 elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec: 
                     del self.candidates[p_tid]
@@ -2345,27 +2376,53 @@ class Camera:
         # [수정] 원본 영상을 바로 Recorder에 밀어넣지 않습니다. (run_logic에서 렌더링 후 삽입)
         return fr, fid, connected
 
-    def apply_face_blur(self, frame, bbox):
+    def apply_face_blur(self, frame, person_boxes):
         if frame is None or self.det_face is None: 
             return frame
             
         blur_img = frame.copy()
+        
         try:
             face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
+            
+            # 1. 원본 전체 프레임을 대상으로 1회만 얼굴 탐지 수행 (NPU 오버헤드 최소화 및 모델 정확도 유지)
             f_dets = self.det_face.infer(blur_img, conf_override=face_conf)
             
             for f in f_dets:
                 fx1, fy1, fx2, fy2 = map(int, f[:4])
-                fh, fw = fy2 - fy1, fx2 - fx1
+                fw, fh = fx2 - fx1, fy2 - fy1
                 
-                # 터무니없는 크기의 오탐 얼굴 방어 (화면의 80% 이상)
-                if fw > blur_img.shape[1] * 0.8: 
+                # 터무니없는 크기의 오탐 얼굴 방어 (화면의 40% 이상)
+                if fw > blur_img.shape[1] * 0.4: 
                     continue 
                     
-                roi = blur_img[fy1:fy2, fx1:fx2]
-                if roi.size > 0:
-                    small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
-                    blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                # 2. 얼굴 BBox의 중심점 좌표 계산
+                fcx = fx1 + (fw / 2.0)
+                fcy = fy1 + (fh / 2.0)
+                is_valid_face = False
+                
+                # 3. 해당 얼굴이 '사람 객체' 내부에 속하는지 검증
+                for p in person_boxes:
+                    px1, py1, px2, py2 = map(int, p[:4])
+                    pw, ph = px2 - px1, py2 - py1
+                    
+                    # 얼굴이 사람 BBox 경계선이나 약간 위쪽에 걸치는 경우를 허용하기 위해 동적 여유 공간(패딩) 부여
+                    pad_x = pw * 0.15          # 좌우 15% 여유
+                    pad_y_top = ph * 0.25      # 머리 위쪽 25% 여유
+                    pad_y_bottom = ph * 0.05   # 하단 5% 여유
+                    
+                    # 얼굴 중심점이 확장된 사람 ROI 내부에 포함되는지 확인
+                    if (px1 - pad_x) <= fcx <= (px2 + pad_x) and (py1 - pad_y_top) <= fcy <= (py2 + pad_y_bottom):
+                        is_valid_face = True
+                        break
+                        
+                # 4. 검증을 통과한 유효 얼굴(사람 내부)에만 모자이크 렌더링
+                if is_valid_face:
+                    roi = blur_img[fy1:fy2, fx1:fx2]
+                    if roi.size > 0:
+                        small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
+                        blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                        
         except Exception as e: 
             logger.error(f"모자이크 처리 실패: {e}")
             
@@ -2428,10 +2485,14 @@ class Camera:
                     )
                     logger.warning(log_msg)
                     
+                    # [수정] 이미 낮은 Confidence(person_conf)로 필터링되어 추적 중인 객체 중
+                    # 사람과 관련된 클래스(일반 사람, 신호수, 하반신)만 발라내어 블러 함수로 전달
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
-                    saved_img = self.apply_face_blur(ev_frame, bbox) if blur_face_option else ev_frame
                     
-                    # [추가] 궤적 데이터 딕셔너리 구성 및 API/이미지 저장 함수로 전달
+                    person_boxes = [t for t in t_main if int(t[6]) in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]]
+                    saved_img = self.apply_face_blur(ev_frame, person_boxes) if blur_face_option else ev_frame
+                    
+                    # 궤적 데이터 딕셔너리 구성
                     event_trajectories = {}
                     for obj in objects_meta:
                         obj_tid = obj.get('tid')
@@ -2450,7 +2511,7 @@ class Camera:
                         auth_tokens=auth_tokens # 파라미터 주입
                     )
                     
-                    self.recorder.trigger(ename)
+                    self.recorder.trigger(ename, objects_meta=objects_meta) 
                     self.alerted[tid].add(ename)
                     self.last_evt_t[ename] = now
                     
@@ -2487,9 +2548,6 @@ class Camera:
                     if len(hist) > 1:
                         cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, thickness, cv2.LINE_AA)
                         
-            # 렌더링이 완료된 프레임을 VideoRecorder 버퍼로 전송
-            self.recorder.update(record_fr)
-                
         return t_main, t_helmet, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
     def draw(self, fr, t_main, t_helmet, alarms, connected=True):
@@ -2858,10 +2916,25 @@ def main():
                     d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
                 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
-                t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res)
+                t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res)
                 
-                if is_gui_mode:
-                    final_imgs.append(cams[idx].draw(fr, t_main, t_helmet, alarms, True))
+                # -----------------------------------------------------------
+                # [수정] BBox와 알람이 그려진 프레임을 생성하여 녹화기에 주입
+                # -----------------------------------------------------------
+                if connected and fr is not None:
+                    # 원본 프레임 복사본에 BBox를 그립니다.
+                    recorded_fr = fr.copy()
+                    recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, alarms, True)
+                    
+                    # BBox가 그려진 프레임을 버퍼 및 녹화 큐에 업데이트합니다.
+                    cams[idx].recorder.update(recorded_fr)
+                    
+                    if is_gui_mode:
+                        final_imgs.append(recorded_fr)
+                else:
+                    if is_gui_mode:
+                        final_imgs.append(cams[idx].draw(None, [], [], {}, False))
+                # -----------------------------------------------------------
                     
                 if new_events:
                     # [수정] 디스크에 바로 쓰지 않고, 큐에 스택(Stacking)하며 이벤트 시간 갱신
