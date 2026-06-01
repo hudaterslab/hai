@@ -102,7 +102,7 @@ def load_system_config():
                 "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", 
                 "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
             },
-            "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.10}
+            "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30}
         },
         "models": {
             "MAIN": "hanjin_cctv.dxnn",
@@ -417,8 +417,8 @@ def _save_and_send_task(img, img_path, api_params):
     except Exception as e:
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
-def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None):
-    """프레임에 BBox와 다중 궤적을 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
+def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None, auth_tokens=None):
+    """프레임에 BBox, 다중 궤적, 신호수 유예 토큰을 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
         return
@@ -427,21 +427,24 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
         
-        # (이전 질문에서 추가한 궤적 렌더링 로직 유지)
+        # 1. 다중 객체 궤적(Trajectory) 렌더링
         if trajectories:
             for obj_tid, hist_pts in trajectories.items():
                 if len(hist_pts) > 1:
+                    # 궤적을 보라색 계열로 렌더링
                     cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 3, cv2.LINE_AA)
+                    # 시작점(노란색)과 현재 앵커점(빨간색) 마킹
                     cv2.circle(img, hist_pts[0], 5, (0, 255, 255), -1)
                     cv2.circle(img, hist_pts[-1], 6, (0, 0, 255), -1)
                     
+        # 2. 메인 BBox 및 이벤트 정보 텍스트 렌더링
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
         now = datetime.datetime.now()
         msg = f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}"
         text_y = max(20, y1 - 10)
         cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
-        # [추가] 신호수 유예 토큰 상태 렌더링 (1시 방향)
+        # 3. 신호수 유예 토큰 상태 렌더링 (1시 방향)
         if auth_tokens:
             h_img, w_img = img.shape[:2]
             overlay = img.copy()
@@ -463,6 +466,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
                 text = f"Truck [{token['tid']}] | Grace: {token['remain']:.1f}s"
                 cv2.putText(img, text, (x_start + 10, y_start + 55 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+        # 4. 저장 경로 생성 및 비동기 API 전송 태스크 큐 등록
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
         if not os.path.exists(dpath):
             os.makedirs(dpath, exist_ok=True)
@@ -472,7 +476,6 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         
         h, w = frame.shape[:2]
         
-        # [수정] 수신 API 스펙(box, label, score)에 정확히 일치하도록 불필요한 키 제거 및 타입 강제
         if objects_meta:
             ai_detected_bboxes = [
                 {
@@ -1294,7 +1297,7 @@ class SignalVehicleDetector(BaseEventDetector):
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
         self.history = defaultdict(lambda: deque(maxlen=30))
-        self.motion_ratio = config.get("motion_threshold_ratio", 0.20)
+        self.motion_ratio = config.get("motion_threshold_ratio", 0.30)
         
         self.auth_grace_sec = config.get("auth_grace_sec", 120.0) 
         self.presence_threshold_sec = config.get("presence_threshold_sec", 3.0) 
