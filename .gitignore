@@ -20,6 +20,10 @@ test.py
 cameras.json
 system_config.json
 streaming.py
+streaming_multi.py
+mediamtx
+mediamtx.yml
+LICENSE
 temp.py
 # Local runtime/config files
 cameras.csv

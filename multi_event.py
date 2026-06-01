@@ -427,13 +427,11 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
         
-        # [추가] 전달받은 다중 객체 궤적(Trajectory) 렌더링
+        # (이전 질문에서 추가한 궤적 렌더링 로직 유지)
         if trajectories:
             for obj_tid, hist_pts in trajectories.items():
                 if len(hist_pts) > 1:
-                    # 궤적을 보라색 계열로 렌더링 (안티앨리어싱 적용)
                     cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 3, cv2.LINE_AA)
-                    # 시작점(노란색)과 현재 앵커점(빨간색) 마킹
                     cv2.circle(img, hist_pts[0], 5, (0, 255, 255), -1)
                     cv2.circle(img, hist_pts[-1], 6, (0, 0, 255), -1)
                     
@@ -443,6 +441,28 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         text_y = max(20, y1 - 10)
         cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
+        # [추가] 신호수 유예 토큰 상태 렌더링 (1시 방향)
+        if auth_tokens:
+            h_img, w_img = img.shape[:2]
+            overlay = img.copy()
+            
+            box_w = 260
+            box_h = 35 + len(auth_tokens) * 25
+            x_start = w_img - box_w - 20
+            y_start = 20
+
+            # 반투명 배경 박스
+            cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+
+            # 타이틀
+            cv2.putText(img, "Recent Auth Tokens", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # 토큰 리스트 표출
+            for i, token in enumerate(auth_tokens):
+                text = f"Truck [{token['tid']}] | Grace: {token['remain']:.1f}s"
+                cv2.putText(img, text, (x_start + 10, y_start + 55 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
         if not os.path.exists(dpath):
             os.makedirs(dpath, exist_ok=True)
@@ -1348,11 +1368,22 @@ class SignalVehicleDetector(BaseEventDetector):
                             time_since_auth = current_time - last_auth
                             
                             if last_auth == 0.0 or time_since_auth > self.auth_grace_sec:
+                                # [추가] 가장 최근 인가된 유예 토큰 5개 수집 및 잔여 시간 계산
+                                recent_auths = []
+                                for a_tid, auth_t in self.last_auth_time.items():
+                                    remain = max(0, self.auth_grace_sec - (current_time - auth_t))
+                                    recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t})
+                                
+                                # 최신순(auth_t 내림차순) 정렬 후 5개 컷
+                                recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
+                                top_5_auths = recent_auths[:5]
+
                                 triggered.append({
                                     'tid': tid, 
                                     'bbox': t[:4], 
                                     'frame': frame.copy(),
-                                    'fid': fid
+                                    'fid': fid,
+                                    'auth_tokens': top_5_auths  # 토큰 배열 추가
                                 })
                                 self.history[tid].clear()
                                 if tid in self.last_auth_time:
@@ -2409,10 +2440,14 @@ class Camera:
                         elif obj_tid in self.trk_helmet.tracks:
                             event_trajectories[obj_tid] = list(self.trk_helmet.tracks[obj_tid]['history'])
                     
+                    # [추가] 이벤트 딕셔너리에서 auth_tokens 추출
+                    auth_tokens = ev.get('auth_tokens', None)
+
                     save_event_image_with_mark(
                         frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid, 
                         terminal_id=SYS_CFG.get("terminal_id", "99999"), cctv_id=self.cam_id, 
-                        objects_meta=objects_meta, trajectories=event_trajectories # 궤적 전달
+                        objects_meta=objects_meta, trajectories=event_trajectories,
+                        auth_tokens=auth_tokens # 파라미터 주입
                     )
                     
                     self.recorder.trigger(ename)
