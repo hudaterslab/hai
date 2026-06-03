@@ -418,7 +418,7 @@ def _save_and_send_task(img, img_path, api_params):
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
 def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None, auth_tokens=None):
-    """프레임에 BBox, 다중 궤적, 신호수 유예 토큰을 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
+    """프레임에 BBox, 다중 궤적, 신호수 토큰 적용 절대 시간을 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
         return
@@ -431,11 +431,10 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         if trajectories:
             for obj_tid, hist_pts in trajectories.items():
                 if len(hist_pts) > 1:
-                    # 궤적을 보라색 계열로 렌더링
-                    cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 3, cv2.LINE_AA)
-                    # 시작점(노란색)과 현재 앵커점(빨간색) 마킹
-                    cv2.circle(img, hist_pts[0], 5, (0, 255, 255), -1)
-                    cv2.circle(img, hist_pts[-1], 6, (0, 0, 255), -1)
+                    # [수정] 궤적 굵기를 3에서 1로 얇게 수정
+                    cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 1, cv2.LINE_AA)
+                    cv2.circle(img, hist_pts[0], 3, (0, 255, 255), -1)
+                    cv2.circle(img, hist_pts[-1], 4, (0, 0, 255), -1)
                     
         # 2. 메인 BBox 및 이벤트 정보 텍스트 렌더링
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -444,27 +443,31 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         text_y = max(20, y1 - 10)
         cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
-        # 3. 신호수 유예 토큰 상태 렌더링 (1시 방향)
-        if auth_tokens:
+        # 3. 신호수 유예 토큰 상태 렌더링 (화면 우측 하단 배치)
+        if event_type == "signal_vehicle":
+            safe_tokens = auth_tokens[:1] if auth_tokens else [] # 최대 1개 제한
             h_img, w_img = img.shape[:2]
             overlay = img.copy()
             
             box_w = 260
-            box_h = 35 + len(auth_tokens) * 25
+            box_h = 35 + max(1, len(safe_tokens) * 2) * 20 # 1개당 2줄 차지하므로 높이 조정
             x_start = w_img - box_w - 20
-            y_start = 20
+            y_start = h_img - box_h - 20
 
-            # 반투명 배경 박스
             cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
             cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
 
-            # 타이틀
-            cv2.putText(img, "Recent Auth Tokens", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(img, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-            # 토큰 리스트 표출
-            for i, token in enumerate(auth_tokens):
-                text = f"Truck [{token['tid']}] | Grace: {token['remain']:.1f}s"
-                cv2.putText(img, text, (x_start + 10, y_start + 55 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            if not safe_tokens:
+                cv2.putText(img, "No active tokens", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+            else:
+                for i, token in enumerate(safe_tokens):
+                    auth_time_str = datetime.datetime.fromtimestamp(token['auth_t']).strftime('%H:%M:%S')
+                    # 1번째 줄: 트럭 정보
+                    cv2.putText(img, f"Truck [{token['tid']}] | Auth: {auth_time_str}", (x_start + 10, y_start + 45 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    # 2번째 줄: 신호수 정보
+                    cv2.putText(img, f"Authorized by: Signalman [{token['sig_tid']}]", (x_start + 10, y_start + 65 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
         # 4. 저장 경로 생성 및 비동기 API 전송 태스크 큐 등록
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
@@ -1308,6 +1311,8 @@ class SignalVehicleDetector(BaseEventDetector):
         
         self.presence_start_time = {}     
         self.last_auth_time = {}          
+        self.last_auth_pos = {}           
+        self.last_auth_signalman = {}     # [추가] 인가를 부여한 신호수 ID 기억
         self.vehicle_roi_start_time = {}  
         
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
@@ -1326,10 +1331,10 @@ class SignalVehicleDetector(BaseEventDetector):
         prox_x_thresh = w_frame * self.prox_ratio_x
         prox_y_thresh = h_frame * self.prox_ratio_y
         
-        ID_SIGNALMAN = 5
-        signalmen_pts = [
-            get_foot_point(*t[:4]) for t in tracks 
-            if track_map.get(int(t[4])) in [ID_G_PERSON, ID_SIGNALMAN]
+        # [수정] 신호수 좌표뿐만 아니라 ID도 함께 수집
+        signalmen_info = [
+            {'tid': int(t[4]), 'pt': get_foot_point(*t[:4])}
+            for t in tracks if track_map.get(int(t[4])) in [ID_G_PERSON, 5]
         ]
         
         for t in tracks:
@@ -1359,9 +1364,11 @@ class SignalVehicleDetector(BaseEventDetector):
             h_list = list(self.history[tid])
             
             has_signalman = False
-            for pt in signalmen_pts:
-                if abs(fc[0] - pt[0]) <= prox_x_thresh and abs(fc[1] - pt[1]) <= prox_y_thresh:
+            matched_sig_tid = -1
+            for s_info in signalmen_info:
+                if abs(fc[0] - s_info['pt'][0]) <= prox_x_thresh and abs(fc[1] - s_info['pt'][1]) <= prox_y_thresh:
                     has_signalman = True
+                    matched_sig_tid = s_info['tid'] # 매칭된 신호수 ID 저장
                     break
             
             if has_signalman:
@@ -1371,6 +1378,8 @@ class SignalVehicleDetector(BaseEventDetector):
                 presence_sec = current_time - self.presence_start_time[tid]
                 if presence_sec >= self.presence_threshold_sec:
                     self.last_auth_time[tid] = current_time
+                    self.last_auth_pos[tid] = fc
+                    self.last_auth_signalman[tid] = matched_sig_tid # 신호수 기록
             else:
                 if tid in self.presence_start_time:
                     del self.presence_start_time[tid]
@@ -1402,39 +1411,66 @@ class SignalVehicleDetector(BaseEventDetector):
                             time_since_auth = current_time - last_auth
                             
                             if last_auth == 0.0 or time_since_auth > self.auth_grace_sec:
-                                # [추가] 가장 최근 인가된 유예 토큰 5개 수집 및 잔여 시간 계산
                                 recent_auths = []
                                 for a_tid, auth_t in self.last_auth_time.items():
                                     remain = max(0, self.auth_grace_sec - (current_time - auth_t))
-                                    recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t})
+                                    sig_tid = self.last_auth_signalman.get(a_tid, "Unknown")
+                                    recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t, 'sig_tid': sig_tid})
                                 
-                                # 최신순(auth_t 내림차순) 정렬 후 5개 컷
                                 recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
-                                top_5_auths = recent_auths[:5]
+                                top_1_auth = recent_auths[:1] # [수정] 1개만 API 페이로드용으로 추출
 
                                 triggered.append({
                                     'tid': tid, 
                                     'bbox': t[:4], 
                                     'frame': frame.copy(),
                                     'fid': fid,
-                                    'auth_tokens': top_5_auths  # 토큰 배열 추가
+                                    'auth_tokens': top_1_auth
                                 })
                                 self.history[tid].clear()
-                                if tid in self.last_auth_time:
-                                    del self.last_auth_time[tid]
-                                    
+                                if tid in self.last_auth_time: del self.last_auth_time[tid]
+                                if tid in self.last_auth_pos: del self.last_auth_pos[tid]
+                                if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
+
+        # 상속(Inheritance) 로직에도 신호수 ID 전달
+        for t in tracks:
+            tid = int(t[4])
+            if track_map.get(tid) != ID_G_TRUCK: continue
+            if tid in self.last_auth_time: continue 
+            
+            fc = get_foot_point(*t[:4])
+            v_size = max(t[2]-t[0], t[3]-t[1])
+            
+            for auth_tid, auth_t in list(self.last_auth_time.items()):
+                if auth_tid in curr_ids: continue 
+                if auth_tid not in self.last_auth_pos: continue
+                
+                remain = self.auth_grace_sec - (current_time - auth_t)
+                if remain > 0:
+                    dist = get_distance(fc, self.last_auth_pos[auth_tid])
+                    if dist < v_size * 1.5:
+                        self.last_auth_time[tid] = auth_t
+                        self.last_auth_pos[tid] = fc
+                        self.last_auth_signalman[tid] = self.last_auth_signalman.get(auth_tid, "Unknown")
+                        
+                        del self.last_auth_time[auth_tid]
+                        del self.last_auth_pos[auth_tid]
+                        if auth_tid in self.last_auth_signalman: del self.last_auth_signalman[auth_tid]
+                        break
+
         for tid in list(self.history.keys()):
-            if tid not in curr_ids: 
-                del self.history[tid]
+            if tid not in curr_ids: del self.history[tid]
+            
         for tid in list(self.last_auth_time.keys()):
-            if tid not in curr_ids:
+            if current_time - self.last_auth_time[tid] > self.auth_grace_sec:
                 del self.last_auth_time[tid]
+                if tid in self.last_auth_pos: del self.last_auth_pos[tid]
+                if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
+                    
         for tid in list(self.presence_start_time.keys()):
-            if tid not in curr_ids:
-                del self.presence_start_time[tid]
+            if tid not in curr_ids: del self.presence_start_time[tid]
         for tid in list(self.vehicle_roi_start_time.keys()):
-            if tid not in curr_ids:
-                del self.vehicle_roi_start_time[tid]
+            if tid not in curr_ids: del self.vehicle_roi_start_time[tid]
                 
         return triggered
 
@@ -2604,29 +2640,98 @@ class Camera:
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        cv2.rectangle(fr, (0, 0), (220, 100), (0, 0, 0), -1) 
-        cv2.putText(fr, f"CAM {self.cam_id}", (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+        # [수정] 좌측 상단 카메라 ID 및 FPS 크기 1/3 축소 (배경 박스 및 글꼴 크기 대폭 감소)
+        cv2.rectangle(fr, (0, 0), (100, 40), (0, 0, 0), -1) 
+        cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         
-        # FPS 수치에 따라 색상 변경 (10 미만이면 붉은색 경고)
         fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
-        cv2.putText(fr, f"FPS: {self.current_fps:.1f}", (15, 85), cv2.FONT_HERSHEY_SIMPLEX, 1.0, fps_color, 2)
+        cv2.putText(fr, f"FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
         
         active_alarms = set(alarms.values())
-        menu_height = len(self.events) * 40 + 10
         
+        # [수정] 우측 상단 이벤트 메뉴 1/3 축소
+        menu_height = len(self.events) * 20 + 10
         overlay = fr.copy()
-        cv2.rectangle(overlay, (w_frame - 250, 0), (w_frame, menu_height), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (w_frame - 150, 0), (w_frame, menu_height), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.5, fr, 0.5, 0, fr)
         
-        y_pos = 35
+        y_pos = 15
         for evt in self.events:
             display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
             color = (0, 0, 255) if evt in active_alarms else (0, 255, 0)
             prefix = "[!] " if evt in active_alarms else " -  "
             
-            cv2.putText(fr, f"{prefix}{display_name}", (w_frame - 240, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            y_pos += 40
+            cv2.putText(fr, f"{prefix}{display_name}", (w_frame - 145, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+            y_pos += 20
             
+        # -----------------------------------------------------------
+        # [수정] Signalman Auth (최대 1개 / 2줄 표출)
+        # -----------------------------------------------------------
+        if "signal_vehicle" in self.events and "signal_vehicle" in self.handlers:
+            sv_handler = self.handlers["signal_vehicle"]
+            current_time = time.time()
+            display_items = []
+
+            for a_tid, auth_t in list(sv_handler.last_auth_time.items()):
+                remain = sv_handler.auth_grace_sec - (current_time - auth_t)
+                if remain > 0:
+                    auth_time_str = datetime.datetime.fromtimestamp(auth_t).strftime('%H:%M:%S')
+                    is_visible = any(int(t[4]) == a_tid for t in t_main if int(t[6]) == ID_G_TRUCK)
+                    status_text = "Tracking" if is_visible else "Hidden"
+                    color = (0, 255, 0) if is_visible else (0, 180, 0) 
+                    sig_id = sv_handler.last_auth_signalman.get(a_tid, "Unknown")
+                    
+                    display_items.append({
+                        'tid': a_tid, 'sort_val': auth_t,
+                        'line1': f"Truck [{a_tid}] | Auth: {auth_time_str} ({status_text})",
+                        'line2': f"Auth by: Signalman [{sig_id}]",
+                        'color': color
+                    })
+
+            display_items.sort(key=lambda x: x['sort_val'], reverse=True)
+
+            current_trucks = [int(t[4]) for t in t_main if int(t[6]) == ID_G_TRUCK]
+            auth_tids = [item['tid'] for item in display_items]
+
+            for t_tid in current_trucks:
+                if t_tid not in auth_tids:
+                    if t_tid in sv_handler.presence_start_time:
+                        wait_sec = current_time - sv_handler.presence_start_time[t_tid]
+                        display_items.append({
+                            'tid': t_tid, 'sort_val': 0,
+                            'line1': f"Truck [{t_tid}] | Wait: {wait_sec:.1f}s / {sv_handler.presence_threshold_sec}s",
+                            'line2': "Waiting for Signalman...",
+                            'color': (0, 165, 255)
+                        })
+                    else:
+                        display_items.append({
+                            'tid': t_tid, 'sort_val': 0,
+                            'line1': f"Truck [{t_tid}] | UNAUTH",
+                            'line2': "No Signalman Token",
+                            'color': (0, 0, 255)
+                        })
+
+            # [핵심] 최대 1개의 상태(2줄)만 표시
+            display_items = display_items[:1]
+
+            box_w = 320 
+            box_h = 35 + max(1, len(display_items)) * 40 # 1개당 2줄
+            x_start = w_frame - box_w - 20
+            y_start = h_frame - box_h - 20
+
+            overlay2 = fr.copy()
+            cv2.rectangle(overlay2, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay2, 0.6, fr, 0.4, 0, fr)
+
+            cv2.putText(fr, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            if not display_items:
+                cv2.putText(fr, "No active/tracked trucks", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+            else:
+                for i, item in enumerate(display_items):
+                    cv2.putText(fr, item['line1'], (x_start + 10, y_start + 45 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, item['color'], 1)
+                    cv2.putText(fr, item['line2'], (x_start + 10, y_start + 65 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, item['color'], 1)
+                    
         return fr
 # ==========================================
 # [11]  Platform 송수신 모듈
