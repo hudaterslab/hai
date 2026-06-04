@@ -2044,7 +2044,7 @@ class Camera:
         self.roi_lines = []
         self.roi_frame_shape = None # 해상도 변경 감지용
         self.status_history = deque(maxlen=10)
-        self._reset_alignment_state("ALIGN INIT")
+        #self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
 
     def _reset_alignment_state(self, status_text="ALIGN RESET"):
@@ -2086,7 +2086,7 @@ class Camera:
         self.roi_lines = []
         self.roi_frame_shape = None
 
-        self._reset_alignment_state("ALIGN RESET")
+        #self._reset_alignment_state("ALIGN RESET")
         self._rebuild_handlers()
 
         try:
