@@ -14,7 +14,7 @@ CAM_CONFIG_FILE="$PROJECT_DIR/cameras.json"
 SYS_CONFIG_FILE="$PROJECT_DIR/system_config.json"
 TARGET_SCRIPT="$PROJECT_DIR/multi_event.py"
 
-# 가상환경 경로 정의
+# 가상환경 경로 정의 (dx-runtime 클론 디렉토리)
 DX_DIR="$USER_HOME/dx-runtime"
 VENV_ACTIVATE="$DX_DIR/venv-dx-runtime/bin/activate"
 
@@ -103,7 +103,7 @@ else
 fi
 
 echo "-----------------------------------------------------"
-# 4. 환경 검증 및 자동 복구
+# 4. 환경 검증 및 자동 복구 (GitHub Clone 및 스크립트 기반 설치로 수정됨)
 echo "-> dx_engine 라이브러리가 정상 작동하는 최적의 환경을 탐색합니다..."
 DETECTED_MODE=""
 
@@ -116,24 +116,34 @@ elif sudo -u "$ACTUAL_USER" -i bash -c "python3 -c 'import dx_engine'" > /dev/nu
 else
     echo "====================================================="
     echo "⚠️ [자동 복구] 시스템에서 'dx_engine'을 찾을 수 없습니다."
-    echo "   -> DeepX Runtime(DXRT) 및 NPU 드라이버 자동 설치를 시작합니다..."
+    echo "   -> DeepX 공식 저장소를 클론하여 Firmware(fw) 및 Runtime(rt) 설치를 시작합니다..."
     
-    DOWNLOAD_DIR="$USER_HOME/Downloads"
-    sudo -u "$ACTUAL_USER" mkdir -p "$DOWNLOAD_DIR"
+    if [ ! -d "$DX_DIR" ]; then
+        echo "   [1/2] dx-runtime 패키지 클론 중..."
+        sudo -u "$ACTUAL_USER" git clone --recurse-submodules https://github.com/DEEPX-AI/dx-runtime.git "$DX_DIR"
+    else
+        echo "   [1/2] 기존 dx-runtime 저장소가 확인되어 최신 버전으로 갱신합니다..."
+        sudo -u "$ACTUAL_USER" bash -c "cd $DX_DIR && git pull --recurse-submodules"
+    fi
 
-    echo "   [1/2] 패키지 다운로드 중..."
-    sudo -u "$ACTUAL_USER" wget -q --show-progress -P "$DOWNLOAD_DIR" https://github.com/DEEPX-AI/dx_rt_npu_linux_driver/raw/refs/heads/main/release/2.4.0/dxrt-driver-dkms_2.4.0-2_all.deb
-    sudo -u "$ACTUAL_USER" wget -q --show-progress -P "$DOWNLOAD_DIR" https://github.com/DEEPX-AI/dx_rt/raw/refs/heads/main/release/3.3.2/libdxrt_3.3.2_all.deb
-
-    echo "   [2/2] 패키지 설치 중 (시간이 소요될 수 있습니다)..."
-    sudo apt install -y "$DOWNLOAD_DIR/dxrt-driver-dkms_2.4.0-2_all.deb"
-    sudo apt install -y "$DOWNLOAD_DIR/libdxrt_3.3.2_all.deb"
+    echo "   [2/2] DeepX 모듈 설치 중 (시간이 소요될 수 있습니다)..."
+    pushd "$DX_DIR" > /dev/null
     
-    if sudo -u "$ACTUAL_USER" -i bash -c "python3 -c 'import dx_engine'" > /dev/null 2>&1; then
+    # 펌웨어(fw) 및 런타임(rt) 구동을 위해 드라이버가 선행 설치되어야 하므로 타겟 순차 실행
+    ./install.sh --target=dx_rt_npu_linux_driver
+    ./install.sh --target=dx_fw
+    ./install.sh --target=dx_rt
+    
+    popd > /dev/null
+    
+    if [ -f "$VENV_ACTIVATE" ] && sudo -u "$ACTUAL_USER" -i bash -c "source $VENV_ACTIVATE && python3 -c 'import dx_engine'" > /dev/null 2>&1; then
+        echo "✅ [복구 성공] 런타임 설치 후 가상환경(VENV)에서 'dx_engine' 구동이 확인되었습니다."
+        DETECTED_MODE="VENV"
+    elif sudo -u "$ACTUAL_USER" -i bash -c "python3 -c 'import dx_engine'" > /dev/null 2>&1; then
         echo "✅ [복구 성공] 런타임 설치 후 로컬(Global) 환경에서 'dx_engine' 구동이 확인되었습니다."
         DETECTED_MODE="GLOBAL"
     else
-        echo "❌ [설치 중단] 드라이버 설치 후에도 모듈 로드 실패. 재부팅이 필요합니다."
+        echo "❌ [설치 중단] 설치 스크립트 실행 후에도 모듈 로드에 실패했습니다. 재부팅 또는 하드웨어 연결 상태를 확인하세요."
         exit 1
     fi
 fi
@@ -145,7 +155,6 @@ sudo bash -c "cat > $SERVICE_PATH" << EOL
 Description=Raspberry Pi Edge AI CCTV Event Detection
 Requires=dxrt.service
 After=network.target dxrt.service graphical.target
-# system_config.json 이 존재해야 서비스가 실행되도록 조건 변경
 ConditionPathExists=$SYS_CONFIG_FILE
 ConditionPathExists=$CAM_CSV_FILE
 
