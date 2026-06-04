@@ -1,9 +1,12 @@
 #!/bin/bash
 
 echo "=========================================="
-echo " 1. Tailscale 설치 시작 (설치까지만)"
+echo " 1. 필수 패키지 설치 (Tailscale & RDP)"
 echo "=========================================="
-sudo apt update && sudo apt install -y curl gpg
+# 원격 데스크톱 구동에 필요한 패키지(gnome-remote-desktop) 추가
+sudo apt update && sudo apt install -y curl gpg gnome-remote-desktop
+
+# Tailscale 설치
 curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale.gpg > /dev/null
 echo "deb [signed-by=/usr/share/keyrings/tailscale.gpg] https://pkgs.tailscale.com/stable/ubuntu $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/tailscale.list
 sudo apt update && sudo apt install -y tailscale
@@ -11,25 +14,26 @@ sudo apt update && sudo apt install -y tailscale
 echo "=========================================="
 echo " 2. Ubuntu 원격 데스크톱 (RDP) 기본 설정"
 echo "=========================================="
-CERT_DIR="/home/asus"
+# 하드코딩된 경로 대신 현재 실행 중인 사용자의 홈 디렉토리($HOME) 사용
+CERT_DIR="$HOME"
 CRT_FILE="$CERT_DIR/rdp.crt"
 KEY_FILE="$CERT_DIR/rdp.key"
 
 # 혹시 모를 기존 인증서 파일 덮어쓰기 방지를 위해 삭제
-rm -f $CRT_FILE $KEY_FILE
+rm -f "$CRT_FILE" "$KEY_FILE"
 
 # 10년짜리 새 보안 인증서 및 키 생성 (2048비트)
-openssl req -x509 -newkey rsa:2048 -nodes -keyout $KEY_FILE -out $CRT_FILE -days 3650 -subj "/C=KR/O=Home/CN=ubuntu-rdp"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY_FILE" -out "$CRT_FILE" -days 3650 -subj "/C=KR/O=Home/CN=ubuntu-rdp"
 
 # 인증서 및 키 권한 설정 (보안 유지)
-chmod 600 $KEY_FILE
-chmod 644 $CRT_FILE
+chmod 600 "$KEY_FILE"
+chmod 644 "$CRT_FILE"
 
-# RDP 설정에 인증서 등록 (순서 중요: crt 먼저, key 나중에)
-grdctl rdp set-tls-cert $CRT_FILE
-grdctl rdp set-tls-key $KEY_FILE
+# RDP 설정에 인증서 등록
+grdctl rdp set-tls-cert "$CRT_FILE"
+grdctl rdp set-tls-key "$KEY_FILE"
 
-# 계정 및 비밀번호 설정 (asus / 1234 통일)
+# 계정 및 비밀번호 설정 (요청하신 asus / 1234 통일)
 grdctl rdp set-credentials asus 1234
 
 # 보기 전용 모드 해제 (마우스/키보드 입력 허용)
