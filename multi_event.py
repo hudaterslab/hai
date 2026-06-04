@@ -2078,9 +2078,15 @@ class Camera:
         self.roi_lines_norm = conf.get('roi_lines_norm', [])
         self.roi_poly = []
         self.roi_lines = []
+
+        self.base_roi_poly = []
+        self.base_roi_lines = []
+        self.aligned_roi_poly = []
+        self.aligned_roi_lines = []
+
         self.roi_frame_shape = None # 해상도 변경 감지용
         self.status_history = deque(maxlen=10)
-        self._reset_alignment_state("ALIGN INIT")
+        #self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
 
     def _reset_alignment_state(self, status_text="ALIGN RESET"):
@@ -2122,7 +2128,7 @@ class Camera:
         self.roi_lines = []
         self.roi_frame_shape = None
 
-        self._reset_alignment_state("ALIGN RESET")
+        #self._reset_alignment_state("ALIGN RESET")
         self._rebuild_handlers()
 
         try:
@@ -2477,7 +2483,8 @@ class Camera:
             time_diff = self.fps_queue[-1] - self.fps_queue[0]
             self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
 
-        self._update_alignment(fr)
+        self._initialize_base_roi_if_needed(fr)
+        #self._update_alignment(fr)
         motion_mask = self.motion_det.apply(fr)
 
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
