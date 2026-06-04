@@ -428,13 +428,13 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         x1, y1, x2, y2 = map(int, bbox)
         
         # 1. 다중 객체 궤적(Trajectory) 렌더링
-        if trajectories:
-            for obj_tid, hist_pts in trajectories.items():
-                if len(hist_pts) > 1:
+        #if trajectories:
+        #    for obj_tid, hist_pts in trajectories.items():
+        #        if len(hist_pts) > 1:
                     # [수정] 궤적 굵기를 3에서 1로 얇게 수정
-                    cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 1, cv2.LINE_AA)
-                    cv2.circle(img, hist_pts[0], 3, (0, 255, 255), -1)
-                    cv2.circle(img, hist_pts[-1], 4, (0, 0, 255), -1)
+        #            cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 1, cv2.LINE_AA)
+        #            cv2.circle(img, hist_pts[0], 3, (0, 255, 255), -1)
+        #            cv2.circle(img, hist_pts[-1], 4, (0, 0, 255), -1)
                     
         # 2. 메인 BBox 및 이벤트 정보 텍스트 렌더링
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
