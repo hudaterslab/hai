@@ -1159,6 +1159,11 @@ class HelmetDetector(BaseEventDetector):
         head_area = max(1, (head_box[2] - head_box[0]) * (head_box[3] - head_box[1]))
         return inter_area / head_area
 
+    def _is_no_helmet_in_roi(self, head_box):
+        if self.roi_poly is None or self.roi_poly.size == 0:
+            return True
+        return cv2.pointPolygonTest(self.roi_poly, get_center_point(*head_box), False) >= 0
+
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         helmet_tracks = kwargs.get('helmet_tracks', [])
@@ -1209,6 +1214,9 @@ class HelmetDetector(BaseEventDetector):
                     nh_track_match = head
                     
             if max_ioa >= 0.5 and nh_track_match is not None:
+                if not self._is_no_helmet_in_roi(nh_track_match[:4]):
+                    continue
+
                 current_nh_persons.append({
                     'tid': p_tid,
                     'head_bbox': nh_track_match[:4],
@@ -1608,7 +1616,7 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     roi_p = []
                     roi_l = []
                     
-                    if any(e in events for e in ["intrusion", "illegal_parking", "signal_vehicle"]): 
+                    if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle"]):
                         roi_p = get_roi_points_scaled(frames[n-1], f"Polygon - CAM: {ip}")
                         
                     if "conveyor_crossing" in events:
