@@ -2105,7 +2105,8 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_main, det_helmet, det_face, cam_id):
+    # [수정] 파라미터에 det_signalman 추가
+    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, cam_id):
         self.ip = ip
         self.conf = conf
         self.cam_id = cam_id
@@ -2114,9 +2115,11 @@ class Camera:
         self.det_main = det_main
         self.det_helmet = det_helmet
         self.det_face = det_face
+        self.det_signalman = det_signalman # [추가] 신호수 모델 내부 변수 할당
         
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
+        self.trk_signalman = SimpleTracker() # [추가] 신호수 전용 트래커 할당
         
         self.reader = FrameReader(conf.get('url', ''), ip)
         self.recorder = VideoRecorder(ip)
@@ -2133,7 +2136,7 @@ class Camera:
         self.roi_lines_norm = conf.get('roi_lines_norm', [])
         self.roi_poly = []
         self.roi_lines = []
-        self.roi_frame_shape = None # 해상도 변경 감지용
+        self.roi_frame_shape = None
         self.status_history = deque(maxlen=10)
         self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
@@ -2948,6 +2951,7 @@ def main():
         d_main = YoLoDeepX(SYS_CFG["models"]["MAIN"])
         d_face = YoLoDeepX(SYS_CFG["models"]["FACE"])
         d_helmet = YoLoDeepX(SYS_CFG["models"]["HELMET"])
+        d_signalman = YoLoDeepX(os.path.join(PROJECT_ROOT, "signalman.dxnn"))
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
@@ -2961,7 +2965,7 @@ def main():
             continue
             
         conf['url'] = rtsp
-        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, cam_id=i+1))
+        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, d_signalman, cam_id=i+1))
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
     # 환경 변수 스로틀링 기준
