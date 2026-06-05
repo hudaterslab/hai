@@ -2525,9 +2525,9 @@ class Camera:
             
         return blur_img
 
-    def run_logic(self, fr, fid, d_main_res, d_helmet_res):
+    def run_logic(self, fr, fid, d_main_res, d_helmet_res, t_signalman):
         if fr is None:
-            return [], [], {}, []
+            return [], [], [], {}, []
 
         now_t = time.time()
         self.fps_queue.append(now_t)
@@ -2550,11 +2550,13 @@ class Camera:
         score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
         newly_triggered_events = []
 
-        # [추가] 녹화용 프레임 복사 (원본 프레임을 보존하면서 궤적만 그리기 위함)
         record_fr = fr.copy()
 
         for ename, handler in self.handlers.items():
-            kwargs = {'helmet_tracks': t_helmet} if ename == "no_helmet" else {}
+            # [수정] 신호수 트랙 데이터를 kwargs로 묶어 핸들러로 전달
+            kwargs = {}
+            if ename == "no_helmet": kwargs['helmet_tracks'] = t_helmet
+            if ename == "signal_vehicle": kwargs['signalman_tracks'] = t_signalman
             
             try:
                 triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
@@ -2568,7 +2570,6 @@ class Camera:
                 ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
                 cooldown = SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 600)
                 
-                # 현재 처리된 이벤트에 관여된 객체의 궤적 수집 (다중 궤적 지원)
                 actual_score = score_map_main.get(tid, 0.95)
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
                 
@@ -2582,14 +2583,10 @@ class Camera:
                     )
                     logger.warning(log_msg)
                     
-                    # [수정] 이미 낮은 Confidence(person_conf)로 필터링되어 추적 중인 객체 중
-                    # 사람과 관련된 클래스(일반 사람, 신호수, 하반신)만 발라내어 블러 함수로 전달
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
-                    
                     person_boxes = [t for t in t_main if int(t[6]) in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]]
                     saved_img = self.apply_face_blur(ev_frame, person_boxes) if blur_face_option else ev_frame
                     
-                    # 궤적 데이터 딕셔너리 구성
                     event_trajectories = {}
                     for obj in objects_meta:
                         obj_tid = obj.get('tid')
@@ -2598,24 +2595,20 @@ class Camera:
                         elif obj_tid in self.trk_helmet.tracks:
                             event_trajectories[obj_tid] = list(self.trk_helmet.tracks[obj_tid]['history'])
                     
-                    # [추가] 이벤트 딕셔너리에서 auth_tokens 추출
                     auth_tokens = ev.get('auth_tokens', None)
 
                     save_event_image_with_mark(
                         frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid, 
                         terminal_id=SYS_CFG.get("terminal_id", "99999"), cctv_id=self.cam_id, 
                         objects_meta=objects_meta, trajectories=event_trajectories,
-                        auth_tokens=auth_tokens # 파라미터 주입
+                        auth_tokens=auth_tokens 
                     )
                     
                     self.recorder.trigger(ename, objects_meta=objects_meta) 
                     self.alerted[tid].add(ename)
                     self.last_evt_t[ename] = now
                     
-                    newly_triggered_events.append({
-                        'event_name': ename,
-                        'objects': objects_meta
-                    })
+                    newly_triggered_events.append({'event_name': ename, 'objects': objects_meta})
                     
                 current_alarms[tid] = ename
         
@@ -2627,8 +2620,6 @@ class Camera:
             if now > self.visual_alarms[tid]['expire']: 
                 del self.visual_alarms[tid]
                 
-        # [추가] 녹화 비디오용 프레임(record_fr)에 추적된 궤적 및 BBox를 렌더링
-        # 알람이 발생하지 않은 평상시(Pre-buffer 영상)에도 녹색 궤적이 남고, 알람 시 붉은색으로 강조됩니다.
         if record_fr is not None:
             for t in t_main:
                 t_id = int(t[4])
@@ -2645,7 +2636,8 @@ class Camera:
                     if len(hist) > 1:
                         cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, thickness, cv2.LINE_AA)
                         
-        return t_main, t_helmet, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
+        # [수정] draw 메서드에서 렌더링할 수 있도록 t_signalman을 리턴에 포함
+        return t_main, t_helmet, t_signalman, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
     def draw(self, fr, t_main, t_helmet, t_signalman, alarms, connected=True):
         if fr is None or not connected:
@@ -3110,10 +3102,12 @@ def main():
                 
                 # [수정] main에서의 중복된 트래커 update() 호출 삭제
                 # 필터링이 완료된 d_signal_res를 바로 run_logic으로 전달합니다.
+                # 필터링된 진짜 신호수 객체만 전용 트래커로 넘겨 ID 핑퐁 방지
+                t_signalman = cams[idx].trk_signalman.update(d_signal_res)
                 
-                # [수정] d_main_res 원본 대신 필터링이 적용된 t_main_input 전달
+                # [수정] 정확히 5개의 파라미터 전달: fr, fid, t_main_input, d_helmet_res, t_signalman
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(
-                    fr, fid, t_main_input, d_helmet_res, d_signal_res
+                    fr, fid, t_main_input, d_helmet_res, t_signalman
                 )
                 
                 # -----------------------------------------------------------
@@ -3121,7 +3115,6 @@ def main():
                 # -----------------------------------------------------------
                 if connected and fr is not None:
                     recorded_fr = fr.copy()
-                    # [수정] t_signalman 파라미터 누락 복구
                     recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, t_signalman, alarms, True)
                     
                     cams[idx].recorder.update(recorded_fr)
