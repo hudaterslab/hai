@@ -2541,8 +2541,9 @@ class Camera:
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
         
-        d_helmet_filtered = [d for d in d_helmet_res if int(d[5]) == ID_H_NO_HELMET]
-        t_helmet = self.trk_helmet.update(d_helmet_filtered)
+        # d_helmet_filtered = [d for d in d_helmet_res if int(d[5]) == ID_H_NO_HELMET]
+        # t_helmet = self.trk_helmet.update(d_helmet_filtered)
+        t_helmet = self.trk_helmet.update(d_helmet_res)
 
         now = time.time()
         current_alarms = {} 
@@ -2663,11 +2664,11 @@ class Camera:
         # -----------------------------------------------------------
         allowed_classes = set()
         if "signal_vehicle" in self.events:
-            allowed_classes.add(ID_G_TRUCK) # 신호수 차량 감시: 트럭만 허용
+            allowed_classes.add(ID_G_TRUCK) 
         if "no_helmet" in self.events or "conveyor_crossing" in self.events or "intrusion" in self.events:
-            allowed_classes.update([ID_G_PERSON, ID_PERSON_LOW]) # 안전모, 횡단, 침입 감시: 사람 및 하반신 허용
+            allowed_classes.update([ID_G_PERSON, ID_PERSON_LOW]) 
         if "illegal_parking" in self.events or "intrusion" in self.events:
-            allowed_classes.update(TARGET_VEHICLES) # 주정차, 침입 감시: 모든 차량 허용
+            allowed_classes.update(TARGET_VEHICLES) 
 
         # 1. Main Tracker BBox 렌더링
         for t in t_main:
@@ -2675,7 +2676,7 @@ class Camera:
             cls_id = int(t[6])
             is_alarmed = tid in alarms
             
-            # [수정] 알람이 울린 객체가 아니고, 해당 카메라의 감시 대상 클래스가 아니면 화면에서 깔끔하게 숨김
+            # 알람이 울린 객체가 아니고, 해당 카메라의 감시 대상 클래스가 아니면 화면에서 깔끔하게 숨김
             if not is_alarmed and cls_id not in allowed_classes: 
                 continue 
 
@@ -2699,7 +2700,7 @@ class Camera:
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # 2. Signalman 커스텀 모델 전용 Tracker BBox 렌더링 (신호수 이벤트가 있을 때만)
+        # 2. Signalman 커스텀 모델 전용 Tracker BBox 렌더링
         if "signal_vehicle" in self.events:
             for t in t_signalman:
                 tid = int(t[4])
@@ -2707,18 +2708,26 @@ class Camera:
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
                 cv2.putText(fr, f"Signalman [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
-        # 3. Helmet Tracker BBox 렌더링 (안전모 이벤트가 있을 때만)
+        # 3. Helmet Tracker BBox 렌더링 (정상 헬멧과 미착용 분리)
         if "no_helmet" in self.events:
             for t in t_helmet:
                 tid = int(t[4])
-                color = (0, 0, 255)
-                label = f"Head [{tid}]"
+                cls_id = int(t[6]) # 0: Helmet, 1: No-Helmet
                 
-                thickness = 3 if tid in alarms else 2
+                # [수정] 헬멧 착용 여부에 따라 라벨과 색상을 명확히 분리
+                if cls_id == ID_H_HELMET:
+                    color = (0, 255, 0) # 초록색
+                    label = f"Helmet [{tid}]"
+                    thickness = 2
+                else:
+                    color = (0, 0, 255) # 빨간색
+                    label = f"Head [{tid}]"
+                    thickness = 3 if tid in alarms else 2
+                    
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
                 cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # [수정] 좌측 상단 카메라 ID 및 FPS 크기 1/3 축소 
+        # 좌측 상단 카메라 ID 및 FPS
         cv2.rectangle(fr, (0, 0), (100, 40), (0, 0, 0), -1) 
         cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         
@@ -2727,7 +2736,7 @@ class Camera:
         
         active_alarms = set(alarms.values())
         
-        # [수정] 우측 상단 이벤트 메뉴 1/3 축소
+        # 우측 상단 이벤트 메뉴
         menu_height = len(self.events) * 20 + 10
         overlay = fr.copy()
         cv2.rectangle(overlay, (w_frame - 150, 0), (w_frame, menu_height), (0, 0, 0), -1)
@@ -2743,7 +2752,7 @@ class Camera:
             y_pos += 20
             
         # -----------------------------------------------------------
-        # [수정] Signalman Auth (최대 1개 / 2줄 표출)
+        # Signalman Auth 상태창 렌더링
         # -----------------------------------------------------------
         if "signal_vehicle" in self.events and "signal_vehicle" in self.handlers:
             sv_handler = self.handlers["signal_vehicle"]
@@ -2761,7 +2770,6 @@ class Camera:
                     sort_score = auth_t
                     if a_tid in alarms: sort_score = float('inf')
                     
-                    # [복구] Truck ID 지우고 남은 시간(Remain) 표출
                     display_items.append({
                         'tid': a_tid, 'sort_val': sort_score,
                         'line1': f"Auth: {auth_time_str} | Remain: {remain:.1f}s ({status_text})",
@@ -2777,7 +2785,6 @@ class Camera:
                     is_alarming = t_tid in alarms
                     base_sort = float('inf') if is_alarming else 0
                     
-                    # [수정] 1순위: 무단 출발로 알람이 터졌을 때만 강력한 빨간색 UNAUTH 표출
                     if is_alarming:
                         display_items.append({
                             'tid': t_tid, 'sort_val': base_sort + 3,
@@ -2785,7 +2792,6 @@ class Camera:
                             'line2': "Reason: Moving without Signalman",
                             'color': (0, 0, 255)
                         })
-                    # 2순위: 신호수가 옆에 있어서 인증이 진행 중인 경우
                     elif t_tid in sv_handler.presence_start_time:
                         wait_sec = current_time - sv_handler.presence_start_time[t_tid]
                         display_items.append({
@@ -2794,15 +2800,13 @@ class Camera:
                             'line2': "Authenticating Signalman...",
                             'color': (0, 165, 255) 
                         })
-                    # 3순위: 60초가 지나 주차 상태이지만 알람은 없는 얌전한 상태
                     elif t_tid in sv_handler.is_parked:
                         display_items.append({
                             'tid': t_tid, 'sort_val': base_sort + 1,
                             'line1': "Status: PARKED (Monitoring)",
                             'line2': "Awaiting Signalman",
-                            'color': (255, 150, 0) # 시야를 방해하지 않는 주황색 표출
+                            'color': (255, 150, 0) 
                         })
-                    # 4순위: 이제 막 진입해서 주차 중인 트럭
                     else:
                         dwell_sec = current_time - sv_handler.stationary_start_time.get(t_tid, current_time)
                         display_items.append({
