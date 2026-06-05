@@ -93,7 +93,7 @@ def deep_merge_dict(base, override):
 def load_system_config():
     default_config = {
         "terminal_id": "99999",
-        "logging": {"dir": "./logs", "level": "INFO"},
+        "logging": {"dir": "./logs", "level": "INFO", "retention_days": 14},
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
             "illegal_parking": {"enabled": False, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1},
@@ -122,6 +122,8 @@ def load_system_config():
         "REC_POST_SEC": 10,
         "EVENT_FRAME_SAVE_DELAY_SEC": 10.0,
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
+        "OUTPUT_RETENTION_DAYS": 14,
+        "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
         "VISUAL_ALARM_DURATION": 5.0
     }
     
@@ -154,7 +156,8 @@ formatter = logging.Formatter('%(asctime)s | %(levelname)-7s | [%(funcName)s] %(
 log_filename = datetime.datetime.now().strftime("cctv_%Y%m%d.log")
 log_filepath = os.path.join(LOG_DIR, log_filename)
 
-file_handler = TimedRotatingFileHandler(log_filepath, when="H", interval=1, backupCount=24, encoding='utf-8')
+log_retention_days = max(1, int(SYS_CFG.get("logging", {}).get("retention_days", 14)))
+file_handler = TimedRotatingFileHandler(log_filepath, when="H", interval=1, backupCount=24 * log_retention_days, encoding='utf-8')
 file_handler.setFormatter(formatter)
 
 stream_handler = logging.StreamHandler(sys.stdout)
@@ -182,6 +185,58 @@ def graceful_shutdown():
         pass
 
 atexit.register(graceful_shutdown)
+
+def cleanup_old_files(root_dir, retention_days, label):
+    """지정된 폴더에서 보관 기간이 지난 파일을 삭제하고 빈 폴더를 정리합니다."""
+    # 산출물은 계속 쌓이면 디스크를 채우기 때문에 14일 같은 보관 기간을 둡니다.
+    # 삭제 기준은 파일의 마지막 수정 시간입니다. 즉, retention_days보다 오래된 파일만 지웁니다.
+    # root_dir 바깥은 건드리지 않고, os.walk로 root_dir 내부만 순회합니다.
+    if retention_days <= 0:
+        logger.info(f"[Retention] {label} 보관 정리가 비활성화되어 있습니다.")
+        return
+
+    root_dir = os.path.abspath(root_dir)
+    if not os.path.isdir(root_dir):
+        logger.debug(f"[Retention] {label} 폴더가 아직 없습니다: {root_dir}")
+        return
+
+    cutoff_ts = time.time() - (float(retention_days) * 86400.0)
+    removed_files = 0
+    removed_dirs = 0
+
+    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+        for filename in filenames:
+            file_path = os.path.join(dirpath, filename)
+            try:
+                if os.path.getmtime(file_path) < cutoff_ts:
+                    os.remove(file_path)
+                    removed_files += 1
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                logger.warning(f"[Retention] 오래된 {label} 파일 삭제 실패: {file_path} | {e}")
+
+        if dirpath == root_dir:
+            continue
+
+        try:
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+                removed_dirs += 1
+        except OSError:
+            pass
+        except Exception as e:
+            logger.debug(f"[Retention] 빈 {label} 폴더 정리 실패: {dirpath} | {e}")
+
+    if removed_files or removed_dirs:
+        logger.info(f"[Retention] {label} {retention_days}일 보관 정리 완료: 파일 {removed_files}개, 빈 폴더 {removed_dirs}개 삭제")
+
+def run_output_retention_cleanup(retention_days):
+    # 이벤트 산출물: 원본 이미지, 원본 영상, infer JSONL, BBox JSON 등이 모두 포함됩니다.
+    cleanup_old_files(EVENT_ROOT_DIR, retention_days, "이벤트 산출물")
+    # 실행 로그도 같은 보관 정책으로 한 번 더 정리합니다.
+    # TimedRotatingFileHandler가 시간 단위 회전을 맡고, 이 함수가 오래된 날짜 파일을 보조 정리합니다.
+    cleanup_old_files(LOG_DIR, retention_days, "실행 로그")
 
 # ==========================================
 # [3] 딥엑스 NPU 엔진 및 환경변수 설정
@@ -3029,12 +3084,21 @@ def main():
         event_frame_save_max_count = max(1, int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5)))
     event_save_queues = {c.ip: deque(maxlen=event_frame_save_max_count) for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
+    output_retention_days = float(SYS_CFG.get("OUTPUT_RETENTION_DAYS", 14))
+    output_cleanup_interval_sec = float(SYS_CFG.get("OUTPUT_CLEANUP_INTERVAL_SEC", 86400))
+    last_output_cleanup_time = time.time()
+    logger.info(f"[Retention] 산출물 보관 정책: {output_retention_days:g}일 보관, {output_cleanup_interval_sec / 3600.0:.1f}시간마다 정리")
+    run_output_retention_cleanup(output_retention_days)
 
     try:
         psutil.cpu_percent(interval=None)
         
         while True:
             start_time = time.time()
+
+            if output_cleanup_interval_sec > 0 and (start_time - last_output_cleanup_time) >= output_cleanup_interval_sec:
+                run_output_retention_cleanup(output_retention_days)
+                last_output_cleanup_time = start_time
             
             if loop_count > 0 and loop_count % 45 == 0 and os.path.exists(config_file):
                 current_mtime = os.path.getmtime(config_file)
