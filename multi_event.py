@@ -2658,14 +2658,25 @@ class Camera:
                 if i + 1 < len(self.roi_lines): 
                     cv2.line(fr, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0, 0, 255), 2)
 
-        # Main Tracker BBox 렌더링
+        # -----------------------------------------------------------
+        # [핵심] 카메라별 설정된 이벤트에 따라 화면에 그릴 클래스(ID) 동적 필터링
+        # -----------------------------------------------------------
+        allowed_classes = set()
+        if "signal_vehicle" in self.events:
+            allowed_classes.add(ID_G_TRUCK) # 신호수 차량 감시: 트럭만 허용
+        if "no_helmet" in self.events or "conveyor_crossing" in self.events or "intrusion" in self.events:
+            allowed_classes.update([ID_G_PERSON, ID_PERSON_LOW]) # 안전모, 횡단, 침입 감시: 사람 및 하반신 허용
+        if "illegal_parking" in self.events or "intrusion" in self.events:
+            allowed_classes.update(TARGET_VEHICLES) # 주정차, 침입 감시: 모든 차량 허용
+
+        # 1. Main Tracker BBox 렌더링
         for t in t_main:
             tid = int(t[4])
             cls_id = int(t[6])
             is_alarmed = tid in alarms
             
-            # [수정] 일반 사람(2), 하반신(4), 메인모델 신호수(5) 객체는 시각적 혼란을 줄이기 위해 화면에서 완전히 숨김
-            if not is_alarmed and cls_id in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]: 
+            # [수정] 알람이 울린 객체가 아니고, 해당 카메라의 감시 대상 클래스가 아니면 화면에서 깔끔하게 숨김
+            if not is_alarmed and cls_id not in allowed_classes: 
                 continue 
 
             color = (0, 0, 255) if is_alarmed else (0, 255, 0)
@@ -2678,7 +2689,6 @@ class Camera:
 
             if cls_id == ID_G_PERSON: label = f"Person [{tid}]"
             elif cls_id == ID_PERSON_LOW: label, color = f"LowBody [{tid}]", (0, 150, 0)
-            elif cls_id == ID_REFLECTIVE_VEST: label, color = f"Signalman [{tid}]", (0, 255, 255)
             elif cls_id in TARGET_VEHICLES: label, color = f"Vehicle [{tid}]", (255, 100, 0)
             else: label = f"OBJ [{tid}]"
 
@@ -2689,26 +2699,26 @@ class Camera:
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # [수정] Signalman 커스텀 모델 전용 Tracker BBox 렌더링
-        for t in t_signalman:
-            tid = int(t[4])
+        # 2. Signalman 커스텀 모델 전용 Tracker BBox 렌더링 (신호수 이벤트가 있을 때만)
+        if "signal_vehicle" in self.events:
+            for t in t_signalman:
+                tid = int(t[4])
+                color, thickness = (0, 255, 255), 2 
+                cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
+                cv2.putText(fr, f"Signalman [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
-            # 트럭 등 배경과 명확히 구분되는 시안성 높은 노란색 계열 적용
-            color, thickness = (0, 255, 255), 2 
-            cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
-            cv2.putText(fr, f"Signalman [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-        # Helmet Tracker BBox 렌더링
-        for t in t_helmet:
-            tid = int(t[4])
-            color = (0, 0, 255)
-            label = f"Head [{tid}]"
-            
-            thickness = 3 if tid in alarms else 2
-            cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
-            cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # 3. Helmet Tracker BBox 렌더링 (안전모 이벤트가 있을 때만)
+        if "no_helmet" in self.events:
+            for t in t_helmet:
+                tid = int(t[4])
+                color = (0, 0, 255)
+                label = f"Head [{tid}]"
+                
+                thickness = 3 if tid in alarms else 2
+                cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
+                cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # [수정] 좌측 상단 카메라 ID 및 FPS 크기 1/3 축소 (배경 박스 및 글꼴 크기 대폭 감소)
+        # [수정] 좌측 상단 카메라 ID 및 FPS 크기 1/3 축소 
         cv2.rectangle(fr, (0, 0), (100, 40), (0, 0, 0), -1) 
         cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         
