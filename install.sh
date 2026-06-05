@@ -51,7 +51,19 @@ EOL
 fi
 
 echo "-----------------------------------------------------"
-echo " 3. DeepX 드라이버 및 런타임(.deb) 글로벌 설치"
+echo " 3. Python 환경 및 필수 패키지 설치"
+echo "-----------------------------------------------------"
+# python 명령어를 python3로 연결 (이미 존재해도 오류 안 나도록 -f 옵션 추가)
+echo "-> 'python' 심볼릭 링크를 생성합니다..."
+sudo ln -sf /usr/bin/python3 /usr/bin/python
+
+# 필수 파이썬 패키지 설치 (최신 우분투/데비안의 PEP-668 제약 우회를 위해 break-system-packages 옵션 추가 대비)
+echo "-> 필수 파이썬 패키지를 설치합니다 (pytz, psutil, requests, opencv-python)..."
+python -m pip install pytz psutil requests opencv-python || \
+python -m pip install pytz psutil requests opencv-python --break-system-packages
+
+echo "-----------------------------------------------------"
+echo " 4. DeepX 드라이버 및 런타임(.deb) 글로벌 설치"
 echo "-----------------------------------------------------"
 if ! python3 -c 'import dx_engine' > /dev/null 2>&1; then
     echo "-> 시스템에서 'dx_engine'을 찾을 수 없어 공식 패키지를 다운로드합니다..."
@@ -71,7 +83,7 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 4. 펌웨어(dx_fw) 전용 GitHub 클론 및 플래싱"
+echo " 5. 펌웨어(dx_fw) 전용 GitHub 클론 및 플래싱"
 echo "-----------------------------------------------------"
 if [ ! -d "$DX_DIR" ]; then
     echo "-> 펌웨어 파일을 가져오기 위해 저장소를 클론합니다..."
@@ -80,7 +92,6 @@ fi
 
 if command -v dxrt-cli &> /dev/null; then
     echo "-> M.2 / PCIe 기반 펌웨어(FW) 업데이트를 시도합니다..."
-    # 장치가 인식된 경우에만 펌웨어가 들어가며, 실패해도 스크립트를 멈추지 않고 넘기도록 처리
     dxrt-cli -u "$DX_DIR/dx_fw/m1/latest/mdot2/fw.bin" || echo "⚠️ [안내] 펌웨어 업데이트 건너뜀 (이미 최신이거나 재부팅 필요)"
     dxrt-cli -u "$DX_DIR/dx_fw/m1m/latest/mdot2/fw.bin" > /dev/null 2>&1 || true
 else
@@ -88,7 +99,7 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 5. dx_engine 최종 검증"
+echo " 6. dx_engine 최종 검증"
 echo "-----------------------------------------------------"
 if ! python3 -c 'import dx_engine' > /dev/null 2>&1; then
     echo "❌ [에러] 드라이버 설치 후에도 모듈을 로드할 수 없습니다."
@@ -100,7 +111,7 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 6. Systemd 백그라운드 서비스 등록"
+echo " 7. Systemd 백그라운드 서비스 등록"
 echo "-----------------------------------------------------"
 sudo bash -c "cat > $SERVICE_PATH" << EOL
 [Unit]
