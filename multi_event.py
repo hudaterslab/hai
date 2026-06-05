@@ -97,7 +97,7 @@ def load_system_config():
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
             "illegal_parking": {"enabled": False, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1},
-            "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True, "trigger_sec": 3.0},
+            "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True, "blur_plate": True, "trigger_sec": 3.0},
             "conveyor_crossing": {
                 "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", 
                 "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
@@ -107,13 +107,17 @@ def load_system_config():
         "models": {
             "MAIN": "hanjin_cctv.dxnn",
             "FACE": "yolov8m-face.dxnn",
-            "HELMET": "helmet_3cls_v8.dxnn"
+            "HELMET": "helmet_3cls_v8.dxnn",
+            "SIGNALMAN": "signalman.dxnn",
+            "PLATE": "license_plate_detector.dxnn"
         },
         "model_confidences": {
             "MAIN": 0.6,
             "FACE": 0.35,
             "HELMET": 0.55,
-            "PERSON": 0.35  # [추가] 사람 및 신호수 전용 기본 임계값 설정
+            "PERSON": 0.35, # [추가] 사람 및 신호수 전용 기본 임계값 설정
+            "SIGNALMAN": 0.5,
+            "PLATE": 0.35
         },
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
@@ -1413,9 +1417,12 @@ class SignalVehicleDetector(BaseEventDetector):
         prox_y_thresh = h_frame * self.prox_ratio_y
         
         # [수정] 신호수 좌표뿐만 아니라 ID도 함께 수집
+        signalman_tracks = kwargs.get('signalman_tracks', [])
+
         signalmen_info = [
             {'tid': int(t[4]), 'pt': get_foot_point(*t[:4])}
-            for t in tracks if track_map.get(int(t[4])) in [ID_G_PERSON, 5]
+            for t in signalman_tracks
+            if int(t[6]) in [ID_G_PERSON, ID_REFLECTIVE_VEST]
         ]
         
         for t in tracks:
@@ -2131,7 +2138,7 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_main, det_helmet, det_face, cam_id):
+    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, det_plate, cam_id):
         self.ip = ip
         self.conf = conf
         self.cam_id = cam_id
@@ -2140,9 +2147,12 @@ class Camera:
         self.det_main = det_main
         self.det_helmet = det_helmet
         self.det_face = det_face
+        self.det_signalman = det_signalman
+        self.det_plate = det_plate
         
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
+        self.trk_signalman = SimpleTracker()
         
         self.reader = FrameReader(conf.get('url', ''), ip)
         self.recorder = VideoRecorder(ip)
@@ -2554,6 +2564,71 @@ class Camera:
             
         return blur_img
 
+    def apply_plate_blur(self, frame, vehicle_boxes=None):
+        if frame is None or self.det_plate is None:
+            return frame
+
+        blur_img = frame.copy()
+
+        try:
+            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.35)
+
+            p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
+
+            h_img, w_img = blur_img.shape[:2]
+
+            for p in p_dets:
+                px1, py1, px2, py2 = map(int, p[:4])
+
+                px1 = max(0, min(px1, w_img - 1))
+                py1 = max(0, min(py1, h_img - 1))
+                px2 = max(0, min(px2, w_img))
+                py2 = max(0, min(py2, h_img))
+
+                pw = px2 - px1
+                ph = py2 - py1
+
+                if pw <= 0 or ph <= 0:
+                    continue
+
+                if pw > w_img * 0.6 or ph > h_img * 0.3:
+                    continue
+
+                pcx = px1 + pw / 2.0
+                pcy = py1 + ph / 2.0
+
+                is_valid_plate = True
+
+                if vehicle_boxes is not None and len(vehicle_boxes) > 0:
+                    is_valid_plate = False
+
+                    for v in vehicle_boxes:
+                        vx1, vy1, vx2, vy2 = map(int, v[:4])
+                        vw = vx2 - vx1
+                        vh = vy2 - vy1
+
+                        pad_x = vw * 0.10
+                        pad_y = vh * 0.10
+
+                        if (vx1 - pad_x) <= pcx <= (vx2 + pad_x) and (vy1 - pad_y) <= pcy <= (vy2 + pad_y):
+                            is_valid_plate = True
+                            break
+
+                if is_valid_plate:
+                    roi = blur_img[py1:py2, px1:px2]
+                    if roi.size > 0:
+                        small_w = max(1, pw // 12)
+                        small_h = max(1, ph // 12)
+                        small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                        blur_img[py1:py2, px1:px2] = cv2.resize(
+                            small, (pw, ph), interpolation=cv2.INTER_NEAREST
+                        )
+
+        except Exception as e:
+            logger.error(f"번호판 모자이크 처리 실패: {e}")
+
+        return blur_img
+
     def _serialize_detection(self, det):
         return {
             "box": [int(round(float(v))) for v in det[:4]],
@@ -2580,11 +2655,13 @@ class Camera:
             })
         return safe_objects
 
-    def build_inference_log(self, fid, frame, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events):
+    def build_inference_log(self, fid, frame, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events, d_signalman_res=None):
         # 한 프레임에서 AI가 무엇을 봤고 어떤 이벤트를 판단했는지 한 줄짜리 기록으로 만듭니다.
         # 이 함수의 결과가 영상 옆 ".infer.jsonl" 파일과 이벤트 프레임 로그에 저장됩니다.
         h, w = frame.shape[:2] if frame is not None else (0, 0)
         kst = pytz.timezone('Asia/Seoul')
+        if d_signalman_res is None:
+            d_signalman_res = np.empty((0, 6))
         return {
             # 기본 정보: 언제, 어느 카메라, 몇 번째 프레임인지 확인하는 값입니다.
             "ts": datetime.datetime.now(kst).isoformat(),
@@ -2596,11 +2673,12 @@ class Camera:
             # ROI 정보: AI가 어느 영역/선 기준으로 판단했는지 나중에 확인하기 위한 값입니다.
             "roi_poly": [[int(p[0]), int(p[1])] for p in (self.roi_poly or [])],
             "roi_lines": [[int(p[0]), int(p[1])] for p in (self.roi_lines or [])],
-            # detections는 모델이 프레임에서 바로 찾아낸 원본 탐지 결과입니다.
-            # 예: 사람/차량/헬멧 미착용 같은 객체의 위치와 점수
+            # detections는 모델이 프레임에서 바로 찾아낸 탐지 결과입니다.
+            # 예: 사람/차량/헬멧 미착용/신호수 같은 객체의 위치와 점수
             "detections": {
                 "main": [self._serialize_detection(d) for d in d_main_res],
-                "helmet": [self._serialize_detection(d) for d in d_helmet_res]
+                "helmet": [self._serialize_detection(d) for d in d_helmet_res],
+                "signalman": [self._serialize_detection(d) for d in d_signalman_res]
             },
             # tracks는 여러 프레임을 이어 보면서 같은 객체에 붙인 추적 ID입니다.
             # 같은 사람이 계속 같은 tid로 보이면 이동 흐름을 재현하기 쉽습니다.
@@ -2620,7 +2698,7 @@ class Camera:
             ]
         }
 
-    def run_logic(self, fr, fid, d_main_res, d_helmet_res):
+    def run_logic(self, fr, fid, d_main_res, d_helmet_res, d_signalman_res=None):
         if fr is None:
             return [], [], {}, []
 
@@ -2640,6 +2718,11 @@ class Camera:
         d_helmet_filtered = [d for d in d_helmet_res if int(d[5]) == ID_H_NO_HELMET]
         t_helmet = self.trk_helmet.update(d_helmet_filtered)
 
+        if d_signalman_res is None:
+            d_signalman_res = np.empty((0, 6))
+
+        t_signalman = self.trk_signalman.update(d_signalman_res)
+
         now = time.time()
         current_alarms = {} 
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
@@ -2650,7 +2733,12 @@ class Camera:
         record_fr = fr.copy()
 
         for ename, handler in self.handlers.items():
-            kwargs = {'helmet_tracks': t_helmet} if ename == "no_helmet" else {}
+            if ename == "no_helmet":
+                kwargs = {'helmet_tracks': t_helmet}
+            elif ename == "signal_vehicle":
+                kwargs = {'signalman_tracks': t_signalman}
+            else:
+                kwargs = {}
             
             try:
                 triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
@@ -2681,9 +2769,18 @@ class Camera:
                     # [수정] 이미 낮은 Confidence(person_conf)로 필터링되어 추적 중인 객체 중
                     # 사람과 관련된 클래스(일반 사람, 신호수, 하반신)만 발라내어 블러 함수로 전달
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
-                    
+                    blur_plate_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_plate", True)
+
                     person_boxes = [t for t in t_main if int(t[6]) in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]]
-                    saved_img = self.apply_face_blur(ev_frame, person_boxes) if blur_face_option else ev_frame
+                    vehicle_boxes = [t for t in t_main if int(t[6]) in TARGET_VEHICLES]
+
+                    saved_img = ev_frame
+
+                    if blur_face_option:
+                        saved_img = self.apply_face_blur(saved_img, person_boxes)
+
+                    if blur_plate_option:
+                        saved_img = self.apply_plate_blur(saved_img, vehicle_boxes)
                     
                     # 궤적 데이터 딕셔너리 구성
                     event_trajectories = {}
@@ -3029,6 +3126,8 @@ def main():
         d_main = YoLoDeepX(SYS_CFG["models"]["MAIN"])
         d_face = YoLoDeepX(SYS_CFG["models"]["FACE"])
         d_helmet = YoLoDeepX(SYS_CFG["models"]["HELMET"])
+        d_signalman = YoLoDeepX(SYS_CFG["models"]["SIGNALMAN"])
+        d_plate = YoLoDeepX(SYS_CFG["models"]["PLATE"])
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
@@ -3042,7 +3141,7 @@ def main():
             continue
             
         conf['url'] = rtsp
-        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, cam_id=i+1))
+        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, d_signalman, d_plate, cam_id=i+1))
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
     # 환경 변수 스로틀링 기준
@@ -3197,11 +3296,17 @@ def main():
                 d_helmet_res = []
                 if "no_helmet" in cams[idx].events:
                     d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
+
+                d_signalman_res = np.empty((0, 6))
+                if "signal_vehicle" in cams[idx].events:
+                    signalman_conf = SYS_CFG.get("model_confidences", {}).get("SIGNALMAN", 0.5)
+                    d_signalman_res = cams[idx].det_signalman.infer(fr, conf_override=signalman_conf)
                 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
-                t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res)
+                t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
                 infer_meta = cams[idx].build_inference_log(
-                    fid, fr, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events
+                    fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events,
+                    d_signalman_res=d_signalman_res
                 )
                 
                 # -----------------------------------------------------------
