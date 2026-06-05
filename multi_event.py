@@ -1311,7 +1311,9 @@ class SignalVehicleDetector(BaseEventDetector):
         self.last_auth_time = {}          
         self.last_auth_signalman = {}     
         
-        # [수정] 단순 ROI 진입 시간이 아닌, 실제 정차(Stationary) 타이머 도입
+        # [추가] 1프레임 미탐지 방어(Debounce)용 신호수 마지막 목격 시간 기억
+        self.last_signalman_seen_time = {}
+
         self.stationary_anchor = {}       
         self.stationary_start_time = {}   
         
@@ -1339,7 +1341,7 @@ class SignalVehicleDetector(BaseEventDetector):
                 curr_ids.add(int(t[4]))
 
         # ---------------------------------------------------------
-        # [핵심 1단계] 양방향 범용 상태 상속 (조건 대폭 강화)
+        # [1단계] 양방향 범용 상태 상속
         # ---------------------------------------------------------
         missing_tids = [tid for tid in self.last_seen_bbox.keys() if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) < 3.0]
 
@@ -1356,7 +1358,6 @@ class SignalVehicleDetector(BaseEventDetector):
                 old_fc = get_foot_point(*old_box)
                 dist = get_distance(curr_fc, old_fc)
 
-                # [수정] 신분 탈취 방지를 위해 IoU 0.3 이상 또는 거리 0.5배 이내로 엄격히 제한
                 if iou > 0.3 or dist < v_size * 0.5:
                     if old_tid in self.last_auth_time: 
                         self.last_auth_time[curr_tid] = self.last_auth_time[old_tid]
@@ -1370,6 +1371,10 @@ class SignalVehicleDetector(BaseEventDetector):
                     if old_tid in self.presence_start_time: 
                         self.presence_start_time[curr_tid] = self.presence_start_time[old_tid]
                         del self.presence_start_time[old_tid]
+                    # [추가] 목격 시간 상속
+                    if old_tid in self.last_signalman_seen_time:
+                        self.last_signalman_seen_time[curr_tid] = self.last_signalman_seen_time[old_tid]
+                        del self.last_signalman_seen_time[old_tid]
                     if old_tid in self.stationary_anchor: 
                         self.stationary_anchor[curr_tid] = self.stationary_anchor[old_tid]
                         del self.stationary_anchor[old_tid]
@@ -1384,7 +1389,7 @@ class SignalVehicleDetector(BaseEventDetector):
                     break
 
         # ---------------------------------------------------------
-        # [2단계] 완전 정차(Stationary) 기반 상태 업데이트
+        # [2단계] 완전 정차(Stationary) 기반 상태 업데이트 (디바운스 적용)
         # ---------------------------------------------------------
         for t in tracks:
             tid = int(t[4])
@@ -1404,14 +1409,12 @@ class SignalVehicleDetector(BaseEventDetector):
                     self.stationary_start_time[tid] = current_time
                 else:
                     dist_from_anchor = get_distance(self.stationary_anchor[tid], fc)
-                    tolerance = max(v_size * 0.1, 15.0) # BBox 떨림 보정
+                    tolerance = max(v_size * 0.1, 15.0) 
                     
                     if dist_from_anchor > tolerance:
-                        # [핵심] 트럭이 움직이면 정차 앵커와 타이머를 초기화
                         self.stationary_anchor[tid] = fc
                         self.stationary_start_time[tid] = current_time
                     else:
-                        # 완벽히 정차 상태를 유지 중일 때만 60초 승급 로직 작동
                         if current_time - self.stationary_start_time[tid] >= self.parked_threshold_sec:
                             self.is_parked.add(tid)
             else:
@@ -1429,16 +1432,21 @@ class SignalVehicleDetector(BaseEventDetector):
                     has_signalman, matched_sig_tid = True, s_info['tid']
                     break
 
+            # [핵심 수정] 신호수 탐지 1.5초 디바운스 적용
             if has_signalman:
+                self.last_signalman_seen_time[tid] = current_time
                 if tid not in self.presence_start_time: self.presence_start_time[tid] = current_time
                 if current_time - self.presence_start_time[tid] >= self.presence_threshold_sec:
                     self.last_auth_time[tid] = current_time
                     self.last_auth_signalman[tid] = matched_sig_tid
             else:
-                if tid in self.presence_start_time: del self.presence_start_time[tid]
+                last_seen = self.last_signalman_seen_time.get(tid, 0.0)
+                # 1.5초 이상 신호수 트랙을 완벽히 잃어버렸을 때만 타이머 완전 초기화
+                if current_time - last_seen > 1.5:
+                    if tid in self.presence_start_time: del self.presence_start_time[tid]
 
         # ---------------------------------------------------------
-        # [3단계] 이동 검지 및 알람 트리거 (주차된 트럭만 감시)
+        # [3단계] 이동 검지 및 알람 트리거 
         # ---------------------------------------------------------
         for t in tracks:
             tid = int(t[4])
@@ -1483,12 +1491,10 @@ class SignalVehicleDetector(BaseEventDetector):
                                 self.history[tid].clear()
                                 if tid in self.last_auth_time: del self.last_auth_time[tid]
                                 if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
-                                
-                                # [추가] 알람이 울린 트럭은 즉시 주차 상태를 박탈하여 상태머신 초기화
                                 if tid in self.is_parked: self.is_parked.remove(tid)
 
         # ---------------------------------------------------------
-        # [4단계] 상태 정리 (Cleanup) - 지연 삭제 적용
+        # [4단계] 상태 정리 (Cleanup)
         # ---------------------------------------------------------
         for tid in list(self.history.keys()):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
@@ -1508,6 +1514,10 @@ class SignalVehicleDetector(BaseEventDetector):
         for tid in list(self.presence_start_time.keys()):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
                 del self.presence_start_time[tid]
+                
+        for tid in list(self.last_signalman_seen_time.keys()):
+            if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
+                del self.last_signalman_seen_time[tid]
                 
         for tid in list(self.stationary_start_time.keys()):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
@@ -2634,7 +2644,7 @@ class Camera:
                         
         return t_main, t_helmet, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
-    def draw(self, fr, t_main, t_helmet, alarms, connected=True):
+    def draw(self, fr, t_main, t_helmet, t_signalman, alarms, connected=True):
         if fr is None or not connected:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
             cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
@@ -2643,11 +2653,9 @@ class Camera:
 
         h_frame, w_frame = fr.shape[:2]
         
-        # 화면 테두리 알람 마킹
         if len(alarms) > 0: 
             cv2.rectangle(fr, (0, 0), (w_frame, h_frame), (0, 0, 255), 20)
             
-        # ROI 다각형 및 라인 렌더링
         if len(self.roi_poly) > 2: 
             cv2.polylines(fr, [np.array(self.roi_poly, np.int32)], True, (0, 255, 255), 2)
         if self.roi_lines:
@@ -2659,22 +2667,42 @@ class Camera:
         for t in t_main:
             tid = int(t[4])
             cls_id = int(t[6])
-            color = (0, 255, 0)
+            is_alarmed = tid in alarms
             
+            # [수정] 일반 사람(2), 하반신(4), 메인모델 신호수(5) 객체는 시각적 혼란을 줄이기 위해 화면에서 완전히 숨김
+            if not is_alarmed and cls_id in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]: 
+                continue 
+
+            color = (0, 0, 255) if is_alarmed else (0, 255, 0)
+            thickness = 2 if is_alarmed else 1
+            
+            if tid in self.trk_main.tracks:
+                hist = list(self.trk_main.tracks[tid]['history'])
+                if len(hist) > 1:
+                    cv2.polylines(fr, [np.array(hist, np.int32)], False, color, 1, cv2.LINE_AA)
+
             if cls_id == ID_G_PERSON: label = f"Person [{tid}]"
             elif cls_id == ID_PERSON_LOW: label, color = f"LowBody [{tid}]", (0, 150, 0)
             elif cls_id == ID_REFLECTIVE_VEST: label, color = f"Signalman [{tid}]", (0, 255, 255)
             elif cls_id in TARGET_VEHICLES: label, color = f"Vehicle [{tid}]", (255, 100, 0)
             else: label = f"OBJ [{tid}]"
 
-            if tid in alarms: 
+            if is_alarmed: 
                 color = (0, 0, 255)
                 label = f"ALARM: {label}"
                 
-            thickness = 3 if tid in alarms else 2
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+        # [수정] Signalman 커스텀 모델 전용 Tracker BBox 렌더링
+        for t in t_signalman:
+            tid = int(t[4])
+            
+            # 트럭 등 배경과 명확히 구분되는 시안성 높은 노란색 계열 적용
+            color, thickness = (0, 255, 255), 2 
+            cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
+            cv2.putText(fr, f"Signalman [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
         # Helmet Tracker BBox 렌더링
         for t in t_helmet:
             tid = int(t[4])
@@ -3044,7 +3072,6 @@ def main():
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
-                # 기존 하드코딩 대신 변수(person_conf)를 적용합니다.
                 base_conf = min(main_conf, person_conf)
                 d_main_res = cams[idx].det_main.infer(fr, conf_override=base_conf)
                 
@@ -3053,40 +3080,53 @@ def main():
                     cls_id = int(d[5])
                     conf = float(d[4])
                     
-                    # ID_G_PERSON(2) 또는 ID_REFLECTIVE_VEST(5)인 경우 JSON에서 로드한 person_conf 적용
                     if cls_id in [ID_G_PERSON, ID_REFLECTIVE_VEST]:
                         if conf >= person_conf:
                             d_main_res_list.append(d)
                     else:
-                        # 차량 등 나머지 객체는 JSON에서 로드한 main_conf 유지
                         if conf >= main_conf:
                             d_main_res_list.append(d)
                             
+                # [적용] 삭제하는 대신 실제 파이프라인에 주입할 배열로 활용
                 t_main_input = np.array(d_main_res_list) if len(d_main_res_list) > 0 else np.empty((0, 6))
                 
                 d_helmet_res = []
                 if "no_helmet" in cams[idx].events:
                     d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
+                    
+                d_signal_res = []
+                if "signal_vehicle" in cams[idx].events:
+                    raw_signal = cams[idx].det_signalman.infer(fr, conf_override=person_conf)
+                    
+                    TARGET_SIGNALMAN_ID = 0 
+                    
+                    for d in raw_signal:
+                        if int(d[5]) == TARGET_SIGNALMAN_ID:
+                            d_signal_res.append(d)
                 
-                # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
-                t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res)
+                # [수정] main에서의 중복된 트래커 update() 호출 삭제
+                # 필터링이 완료된 d_signal_res를 바로 run_logic으로 전달합니다.
+                
+                # [수정] d_main_res 원본 대신 필터링이 적용된 t_main_input 전달
+                t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(
+                    fr, fid, t_main_input, d_helmet_res, d_signal_res
+                )
                 
                 # -----------------------------------------------------------
-                # [수정] BBox와 알람이 그려진 프레임을 생성하여 녹화기에 주입
+                # BBox와 알람이 그려진 프레임을 생성하여 녹화기에 주입
                 # -----------------------------------------------------------
                 if connected and fr is not None:
-                    # 원본 프레임 복사본에 BBox를 그립니다.
                     recorded_fr = fr.copy()
-                    recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, alarms, True)
+                    # [수정] t_signalman 파라미터 누락 복구
+                    recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, t_signalman, alarms, True)
                     
-                    # BBox가 그려진 프레임을 버퍼 및 녹화 큐에 업데이트합니다.
                     cams[idx].recorder.update(recorded_fr)
                     
                     if is_gui_mode:
                         final_imgs.append(recorded_fr)
                 else:
                     if is_gui_mode:
-                        final_imgs.append(cams[idx].draw(None, [], [], {}, False))
+                        final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                 # -----------------------------------------------------------
                     
                 if new_events:
