@@ -1301,177 +1301,222 @@ class SignalVehicleDetector(BaseEventDetector):
         super().__init__(config, roi_poly, roi_lines)
         self.history = defaultdict(lambda: deque(maxlen=30))
         self.motion_ratio = config.get("motion_threshold_ratio", 0.30)
-        
         self.auth_grace_sec = config.get("auth_grace_sec", 120.0) 
         self.presence_threshold_sec = config.get("presence_threshold_sec", 3.0) 
-        self.vehicle_roi_dwell_sec = config.get("vehicle_roi_dwell_sec", 3.0)
-        
+        self.parked_threshold_sec = config.get("parked_threshold_sec", 60.0) 
         self.prox_ratio_x = config.get("prox_ratio_x", 1.0)
         self.prox_ratio_y = config.get("prox_ratio_y", 1.0)
         
         self.presence_start_time = {}     
         self.last_auth_time = {}          
-        self.last_auth_pos = {}           
-        self.last_auth_signalman = {}     # [추가] 인가를 부여한 신호수 ID 기억
-        self.vehicle_roi_start_time = {}  
+        self.last_auth_signalman = {}     
+        
+        # [수정] 단순 ROI 진입 시간이 아닌, 실제 정차(Stationary) 타이머 도입
+        self.stationary_anchor = {}       
+        self.stationary_start_time = {}   
+        
+        self.last_seen_bbox = {} 
+        self.last_seen_time = {} 
+        self.is_parked = set() 
         
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         curr_ids = set()
         current_time = time.time()
         
-        if self.roi_poly.size == 0 or motion_mask is None or frame is None: 
-            return triggered
+        if self.roi_poly.size == 0 or motion_mask is None or frame is None: return triggered
             
         h_frame, w_frame = frame.shape[:2]
         h_mask, w_mask = motion_mask.shape[:2]
-        scale_x = w_mask / float(w_frame)
-        scale_y = h_mask / float(h_frame)
+        scale_x, scale_y = w_mask / float(w_frame), h_mask / float(h_frame)
+        prox_x_thresh, prox_y_thresh = w_frame * self.prox_ratio_x, h_frame * self.prox_ratio_y
         
-        prox_x_thresh = w_frame * self.prox_ratio_x
-        prox_y_thresh = h_frame * self.prox_ratio_y
-        
-        # [수정] 신호수 좌표뿐만 아니라 ID도 함께 수집
-        signalmen_info = [
-            {'tid': int(t[4]), 'pt': get_foot_point(*t[:4])}
-            for t in tracks if track_map.get(int(t[4])) in [ID_G_PERSON, 5]
-        ]
+        signalman_tracks = kwargs.get('signalman_tracks', [])
+        signalmen_info = [{'tid': int(t[4]), 'pt': get_foot_point(*t[:4])} for t in signalman_tracks]
         
         for t in tracks:
-            tid = int(t[4])
-            if track_map.get(tid) != ID_G_TRUCK:
-                continue
-                
-            curr_ids.add(tid)
-            x1, y1, x2, y2 = t[:4]
-            fc = get_foot_point(*t[:4])
-            c_pt = get_center_point(*t[:4])
-            v_size = max(x2 - x1, y2 - y1)
+            if track_map.get(int(t[4])) == ID_G_TRUCK:
+                curr_ids.add(int(t[4]))
+
+        # ---------------------------------------------------------
+        # [핵심 1단계] 양방향 범용 상태 상속 (조건 대폭 강화)
+        # ---------------------------------------------------------
+        missing_tids = [tid for tid in self.last_seen_bbox.keys() if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) < 3.0]
+
+        for curr_tid in curr_ids:
+            curr_box = next((t[:4] for t in tracks if int(t[4]) == curr_tid), None)
+            if curr_box is None: continue
             
+            curr_fc = get_foot_point(*curr_box)
+            v_size = max(curr_box[2]-curr_box[0], curr_box[3]-curr_box[1])
+
+            for old_tid in missing_tids:
+                old_box = self.last_seen_bbox[old_tid]
+                iou = calculate_iou(curr_box, old_box)
+                old_fc = get_foot_point(*old_box)
+                dist = get_distance(curr_fc, old_fc)
+
+                # [수정] 신분 탈취 방지를 위해 IoU 0.3 이상 또는 거리 0.5배 이내로 엄격히 제한
+                if iou > 0.3 or dist < v_size * 0.5:
+                    if old_tid in self.last_auth_time: 
+                        self.last_auth_time[curr_tid] = self.last_auth_time[old_tid]
+                        del self.last_auth_time[old_tid]
+                    if old_tid in self.last_auth_signalman: 
+                        self.last_auth_signalman[curr_tid] = self.last_auth_signalman[old_tid]
+                        del self.last_auth_signalman[old_tid]
+                    if old_tid in self.history: 
+                        self.history[curr_tid] = self.history[old_tid]
+                        del self.history[old_tid]
+                    if old_tid in self.presence_start_time: 
+                        self.presence_start_time[curr_tid] = self.presence_start_time[old_tid]
+                        del self.presence_start_time[old_tid]
+                    if old_tid in self.stationary_anchor: 
+                        self.stationary_anchor[curr_tid] = self.stationary_anchor[old_tid]
+                        del self.stationary_anchor[old_tid]
+                    if old_tid in self.stationary_start_time: 
+                        self.stationary_start_time[curr_tid] = self.stationary_start_time[old_tid]
+                        del self.stationary_start_time[old_tid]
+                    if old_tid in self.is_parked: 
+                        self.is_parked.add(curr_tid)
+                        self.is_parked.remove(old_tid)
+
+                    missing_tids.remove(old_tid)
+                    break
+
+        # ---------------------------------------------------------
+        # [2단계] 완전 정차(Stationary) 기반 상태 업데이트
+        # ---------------------------------------------------------
+        for t in tracks:
+            tid = int(t[4])
+            if track_map.get(tid) != ID_G_TRUCK: continue
+
+            x1, y1, x2, y2 = t[:4]
+            fc, c_pt = get_foot_point(*t[:4]), get_center_point(*t[:4])
+            v_size = max(x2 - x1, y2 - y1)
+
+            self.last_seen_bbox[tid] = t[:4]
+            self.last_seen_time[tid] = current_time
+
             is_in_roi = cv2.pointPolygonTest(self.roi_poly, c_pt, False) >= 0
             if is_in_roi:
-                if tid not in self.vehicle_roi_start_time:
-                    self.vehicle_roi_start_time[tid] = current_time
+                if tid not in self.stationary_anchor:
+                    self.stationary_anchor[tid] = fc
+                    self.stationary_start_time[tid] = current_time
+                else:
+                    dist_from_anchor = get_distance(self.stationary_anchor[tid], fc)
+                    tolerance = max(v_size * 0.1, 15.0) # BBox 떨림 보정
+                    
+                    if dist_from_anchor > tolerance:
+                        # [핵심] 트럭이 움직이면 정차 앵커와 타이머를 초기화
+                        self.stationary_anchor[tid] = fc
+                        self.stationary_start_time[tid] = current_time
+                    else:
+                        # 완벽히 정차 상태를 유지 중일 때만 60초 승급 로직 작동
+                        if current_time - self.stationary_start_time[tid] >= self.parked_threshold_sec:
+                            self.is_parked.add(tid)
             else:
-                if tid in self.vehicle_roi_start_time:
-                    del self.vehicle_roi_start_time[tid]
-            
-            if len(self.history[tid]) > 0 and get_distance(self.history[tid][-1], fc) > v_size * 0.6: 
+                if tid in self.stationary_anchor: del self.stationary_anchor[tid]
+                if tid in self.stationary_start_time: del self.stationary_start_time[tid]
+                if tid in self.is_parked: self.is_parked.remove(tid)
+
+            if len(self.history[tid]) > 0 and get_distance(self.history[tid][-1], fc) > v_size * 0.6:
                 self.history[tid].clear()
-                continue
-                
             self.history[tid].append(fc)
-            h_list = list(self.history[tid])
-            
-            has_signalman = False
-            matched_sig_tid = -1
+
+            has_signalman, matched_sig_tid = False, -1
             for s_info in signalmen_info:
                 if abs(fc[0] - s_info['pt'][0]) <= prox_x_thresh and abs(fc[1] - s_info['pt'][1]) <= prox_y_thresh:
-                    has_signalman = True
-                    matched_sig_tid = s_info['tid'] # 매칭된 신호수 ID 저장
+                    has_signalman, matched_sig_tid = True, s_info['tid']
                     break
-            
+
             if has_signalman:
-                if tid not in self.presence_start_time:
-                    self.presence_start_time[tid] = current_time
-                    
-                presence_sec = current_time - self.presence_start_time[tid]
-                if presence_sec >= self.presence_threshold_sec:
+                if tid not in self.presence_start_time: self.presence_start_time[tid] = current_time
+                if current_time - self.presence_start_time[tid] >= self.presence_threshold_sec:
                     self.last_auth_time[tid] = current_time
-                    self.last_auth_pos[tid] = fc
-                    self.last_auth_signalman[tid] = matched_sig_tid # 신호수 기록
+                    self.last_auth_signalman[tid] = matched_sig_tid
             else:
-                if tid in self.presence_start_time:
-                    del self.presence_start_time[tid]
-            
+                if tid in self.presence_start_time: del self.presence_start_time[tid]
+
+        # ---------------------------------------------------------
+        # [3단계] 이동 검지 및 알람 트리거 (주차된 트럭만 감시)
+        # ---------------------------------------------------------
+        for t in tracks:
+            tid = int(t[4])
+            if track_map.get(tid) != ID_G_TRUCK: continue
+            if tid not in self.is_parked: continue
+
+            x1, y1, x2, y2 = t[:4]
+            v_size = max(x2 - x1, y2 - y1)
+            c_pt = get_center_point(*t[:4])
+            is_in_roi = cv2.pointPolygonTest(self.roi_poly, c_pt, False) >= 0
+            h_list = list(self.history[tid])
+
             if len(h_list) > 5:
                 start_p = (sum(p[0] for p in h_list[:3])/3, sum(p[1] for p in h_list[:3])/3)
                 end_p = (sum(p[0] for p in h_list[-3:])/3, sum(p[1] for p in h_list[-3:])/3)
                 dist = get_distance(start_p, end_p)
                 min_movement = max(v_size * 0.15, 10.0)
-                
-                vehicle_dwell_sec = 0.0
-                if tid in self.vehicle_roi_start_time:
-                    vehicle_dwell_sec = current_time - self.vehicle_roi_start_time[tid]
-                
-                if dist >= min_movement and is_in_roi and vehicle_dwell_sec >= self.vehicle_roi_dwell_sec:
-                    mx1 = max(0, int(x1 * scale_x))
-                    my1 = max(0, int(y1 * scale_y))
-                    mx2 = min(w_mask, int(x2 * scale_x))
-                    my2 = min(h_mask, int(y2 * scale_y))
-                    
+
+                if dist >= min_movement and is_in_roi:
+                    mx1, my1 = max(0, int(x1 * scale_x)), max(0, int(y1 * scale_y))
+                    mx2, my2 = min(w_mask, int(x2 * scale_x)), min(h_mask, int(y2 * scale_y))
+
                     if mx2 > mx1 and my2 > my1:
                         car_roi = motion_mask[my1:my2, mx1:mx2]
                         _, m_only = cv2.threshold(car_roi, 250, 255, cv2.THRESH_BINARY)
-                        
                         total_px = (mx2 - mx1) * (my2 - my1)
+
                         if total_px > 0 and (cv2.countNonZero(m_only) / total_px) > self.motion_ratio:
-                            
                             last_auth = self.last_auth_time.get(tid, 0.0)
                             time_since_auth = current_time - last_auth
-                            
+
                             if last_auth == 0.0 or time_since_auth > self.auth_grace_sec:
                                 recent_auths = []
                                 for a_tid, auth_t in self.last_auth_time.items():
                                     remain = max(0, self.auth_grace_sec - (current_time - auth_t))
                                     sig_tid = self.last_auth_signalman.get(a_tid, "Unknown")
                                     recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t, 'sig_tid': sig_tid})
-                                
-                                recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
-                                top_1_auth = recent_auths[:1] # [수정] 1개만 API 페이로드용으로 추출
 
-                                triggered.append({
-                                    'tid': tid, 
-                                    'bbox': t[:4], 
-                                    'frame': frame.copy(),
-                                    'fid': fid,
-                                    'auth_tokens': top_1_auth
-                                })
+                                recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
+                                triggered.append({'tid': tid, 'bbox': t[:4], 'frame': frame.copy(), 'fid': fid, 'auth_tokens': recent_auths[:1]})
+
                                 self.history[tid].clear()
                                 if tid in self.last_auth_time: del self.last_auth_time[tid]
-                                if tid in self.last_auth_pos: del self.last_auth_pos[tid]
                                 if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
+                                
+                                # [추가] 알람이 울린 트럭은 즉시 주차 상태를 박탈하여 상태머신 초기화
+                                if tid in self.is_parked: self.is_parked.remove(tid)
 
-        # 상속(Inheritance) 로직에도 신호수 ID 전달
-        for t in tracks:
-            tid = int(t[4])
-            if track_map.get(tid) != ID_G_TRUCK: continue
-            if tid in self.last_auth_time: continue 
-            
-            fc = get_foot_point(*t[:4])
-            v_size = max(t[2]-t[0], t[3]-t[1])
-            
-            for auth_tid, auth_t in list(self.last_auth_time.items()):
-                if auth_tid in curr_ids: continue 
-                if auth_tid not in self.last_auth_pos: continue
-                
-                remain = self.auth_grace_sec - (current_time - auth_t)
-                if remain > 0:
-                    dist = get_distance(fc, self.last_auth_pos[auth_tid])
-                    if dist < v_size * 1.5:
-                        self.last_auth_time[tid] = auth_t
-                        self.last_auth_pos[tid] = fc
-                        self.last_auth_signalman[tid] = self.last_auth_signalman.get(auth_tid, "Unknown")
-                        
-                        del self.last_auth_time[auth_tid]
-                        del self.last_auth_pos[auth_tid]
-                        if auth_tid in self.last_auth_signalman: del self.last_auth_signalman[auth_tid]
-                        break
-
+        # ---------------------------------------------------------
+        # [4단계] 상태 정리 (Cleanup) - 지연 삭제 적용
+        # ---------------------------------------------------------
         for tid in list(self.history.keys()):
-            if tid not in curr_ids: del self.history[tid]
-            
+            if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
+                del self.history[tid]
+
         for tid in list(self.last_auth_time.keys()):
             if current_time - self.last_auth_time[tid] > self.auth_grace_sec:
                 del self.last_auth_time[tid]
-                if tid in self.last_auth_pos: del self.last_auth_pos[tid]
                 if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
-                    
+
+        for tid in list(self.last_seen_bbox.keys()):
+            if tid not in curr_ids and current_time - self.last_seen_time.get(tid, 0) > 5.0:
+                del self.last_seen_bbox[tid]
+                if tid in self.last_seen_time: del self.last_seen_time[tid]
+                if tid in self.is_parked: self.is_parked.remove(tid) 
+
         for tid in list(self.presence_start_time.keys()):
-            if tid not in curr_ids: del self.presence_start_time[tid]
-        for tid in list(self.vehicle_roi_start_time.keys()):
-            if tid not in curr_ids: del self.vehicle_roi_start_time[tid]
+            if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
+                del self.presence_start_time[tid]
                 
+        for tid in list(self.stationary_start_time.keys()):
+            if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
+                del self.stationary_start_time[tid]
+                
+        for tid in list(self.stationary_anchor.keys()):
+            if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0: 
+                del self.stationary_anchor[tid]
+
         return triggered
 
 EVENT_REGISTRY = {
