@@ -120,6 +120,8 @@ def load_system_config():
         "LOOP_FPS": 15,
         "REC_PRE_SEC": 10,
         "REC_POST_SEC": 10,
+        "EVENT_FRAME_SAVE_DELAY_SEC": 10.0,
+        "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
         "VISUAL_ALARM_DURATION": 5.0
     }
     
@@ -417,8 +419,19 @@ def _save_and_send_task(img, img_path, api_params):
     except Exception as e:
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
+def _write_jsonl_records(path, records):
+    # JSONL은 "한 줄에 기록 하나"인 로그 파일입니다.
+    # 영상 편집 프로그램이 없어도 메모장으로 열어서 특정 프레임의 탐지 결과를 줄 단위로 확인할 수 있습니다.
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"[InferLog] JSONL write failed: {path} | {e}")
+
 def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None, auth_tokens=None):
-    """프레임에 BBox, 다중 궤적, 신호수 토큰 적용 절대 시간을 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
+    """원본 프레임 이미지를 로컬에 저장하고 탐지 메타데이터를 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
         return
@@ -426,50 +439,11 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
     try:
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
-        
-        # 1. 다중 객체 궤적(Trajectory) 렌더링
-        #if trajectories:
-        #    for obj_tid, hist_pts in trajectories.items():
-        #        if len(hist_pts) > 1:
-                    # [수정] 궤적 굵기를 3에서 1로 얇게 수정
-        #            cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 1, cv2.LINE_AA)
-        #            cv2.circle(img, hist_pts[0], 3, (0, 255, 255), -1)
-        #            cv2.circle(img, hist_pts[-1], 4, (0, 0, 255), -1)
-                    
-        # 2. 메인 BBox 및 이벤트 정보 텍스트 렌더링
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
         now = datetime.datetime.now()
-        msg = f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}"
-        text_y = max(20, y1 - 10)
-        cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        
-        # 3. 신호수 유예 토큰 상태 렌더링 (화면 우측 하단 배치)
-        if event_type == "signal_vehicle":
-            safe_tokens = auth_tokens[:1] if auth_tokens else [] # 최대 1개 제한
-            h_img, w_img = img.shape[:2]
-            overlay = img.copy()
-            
-            box_w = 260
-            box_h = 35 + max(1, len(safe_tokens) * 2) * 20 # 1개당 2줄 차지하므로 높이 조정
-            x_start = w_img - box_w - 20
-            y_start = h_img - box_h - 20
 
-            cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
-
-            cv2.putText(img, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            if not safe_tokens:
-                cv2.putText(img, "No active tokens", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
-            else:
-                for i, token in enumerate(safe_tokens):
-                    auth_time_str = datetime.datetime.fromtimestamp(token['auth_t']).strftime('%H:%M:%S')
-                    # 1번째 줄: 트럭 정보
-                    cv2.putText(img, f"Truck [{token['tid']}] | Auth: {auth_time_str}", (x_start + 10, y_start + 45 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    # 2번째 줄: 신호수 정보
-                    cv2.putText(img, f"Authorized by: Signalman [{token['sig_tid']}]", (x_start + 10, y_start + 65 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-
-        # 4. 저장 경로 생성 및 비동기 API 전송 태스크 큐 등록
+        # 증거 이미지는 사람이 보기 좋게 꾸민 화면이 아니라, 카메라에서 들어온 원본을 저장합니다.
+        # 빨간 박스나 글자는 이미지에 직접 그리지 않고, 아래 API 정보와 infer JSONL 로그에 숫자로 남깁니다.
+        # 이렇게 해야 나중에 "그 순간 실제 화면"과 "AI가 판단한 위치"를 따로 검증할 수 있습니다.
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
         if not os.path.exists(dpath):
             os.makedirs(dpath, exist_ok=True)
@@ -703,11 +677,14 @@ class VideoRecorder:
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
 
-    def update(self, frame):
+    def update(self, frame, infer_meta=None):
         if frame is None: 
             return
-            
-        self.buffer.append(frame)
+
+        # 원본 프레임과 그 순간의 AI 판단 결과를 한 묶음으로 보관합니다.
+        # 나중에 영상의 특정 장면과 infer JSONL 한 줄을 맞춰보기 위한 준비입니다.
+        frame_item = (frame.copy(), infer_meta)
+        self.buffer.append(frame_item)
         
         if self.recording:
             if time.time() > self.record_end_time:
@@ -715,7 +692,7 @@ class VideoRecorder:
                 self.write_queue.put(None)
                 logger.info(f"🎬 [녹화종료] {self.ip} - {self.current_event}")
             else:
-                self.write_queue.put(frame)
+                self.write_queue.put(frame_item)
 
     def trigger(self, event_name, objects_meta=None): # [수정] objects_meta 매개변수 추가
         now = time.time()
@@ -731,22 +708,40 @@ class VideoRecorder:
             self.current_meta = objects_meta # [추가] 이벤트 발생 시점의 BBox 메타데이터 기억
             
             temp_buffer = list(self.buffer)
-            for f in temp_buffer: 
-                self.write_queue.put(f)
+            for item in temp_buffer:
+                self.write_queue.put(item)
 
     def _writer_loop(self):
         writer = None
+        # infer_log_file은 녹화 영상과 같은 이름의 ".infer.jsonl" 파일입니다.
+        # 예: 20260521_120000_192.168.0.10_no_helmet.mp4
+        #     20260521_120000_192.168.0.10_no_helmet.infer.jsonl
+        infer_log_file = None
+        infer_log_path = None
+        # video_frame_index는 녹화 파일 안에서 몇 번째 프레임인지 나타냅니다.
+        # 영상과 JSONL 로그를 함께 열었을 때 같은 장면을 찾기 쉽게 해줍니다.
+        video_frame_index = 0
         while self.running:
             try:
-                frame = self.write_queue.get(timeout=1.0)
+                item = self.write_queue.get(timeout=1.0)
             except queue.Empty: 
                 continue
 
-            if frame is None:
+            if item is None:
                 if writer: 
                     writer.release()
                     writer = None
+                if infer_log_file:
+                    infer_log_file.close()
+                    infer_log_file = None
+                infer_log_path = None
+                video_frame_index = 0
                 continue
+
+            if isinstance(item, tuple):
+                frame, infer_meta = item
+            else:
+                frame, infer_meta = item, None
 
             if writer is None:
                 dpath = os.path.join(EVENT_ROOT_DIR, "events", self.ip, "videos", self.current_event)
@@ -757,6 +752,9 @@ class VideoRecorder:
                 time_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
                 fname = f"{time_str}_{self.ip}_{self.current_event}.mp4"
                 fpath = os.path.join(dpath, fname)
+                # 영상 파일 옆에 같은 이름의 infer 로그 파일을 만듭니다.
+                # 영상은 원본 그대로 두고, AI가 본 박스/클래스/이벤트 정보는 이 파일에 저장합니다.
+                infer_log_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.infer.jsonl")
                 
                 # -----------------------------------------------------------
                 # [추가] 영상 생성 시점에 BBox 상세 수치 데이터(JSON)를 동시 저장
@@ -781,8 +779,28 @@ class VideoRecorder:
                     writer = None
                     continue
                     
+            if writer and infer_log_file is None and infer_log_path:
+                try:
+                    # 실제 영상 파일이 열린 뒤에 로그 파일도 함께 엽니다.
+                    # 영상 저장에 실패한 경우 불필요한 로그 파일만 생기지 않게 하기 위함입니다.
+                    infer_log_file = open(infer_log_path, 'w', encoding='utf-8')
+                    video_frame_index = 0
+                except Exception as e:
+                    logger.error(f"[InferLog] video inference log open failed: {infer_log_path} | {e}")
+
             if writer: 
+                if infer_log_file and infer_meta is not None:
+                    try:
+                        log_record = dict(infer_meta)
+                        # 이 두 값으로 "영상 파일의 N번째 프레임"과 "AI 판단 로그"를 연결합니다.
+                        log_record["video_frame_index"] = video_frame_index
+                        log_record["video_path"] = fpath
+                        infer_log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+                    except Exception as e:
+                        logger.error(f"[InferLog] video inference log write failed: {infer_log_path} | {e}")
+
                 writer.write(frame)
+                video_frame_index += 1
 
 class MotionDetector:
     def __init__(self, sensitivity=5):
@@ -2481,6 +2499,72 @@ class Camera:
             
         return blur_img
 
+    def _serialize_detection(self, det):
+        return {
+            "box": [int(round(float(v))) for v in det[:4]],
+            "score": round(float(det[4]), 4),
+            "class_id": int(det[5])
+        }
+
+    def _serialize_track(self, track):
+        return {
+            "box": [int(round(float(v))) for v in track[:4]],
+            "tid": int(track[4]),
+            "score": round(float(track[5]), 4),
+            "class_id": int(track[6])
+        }
+
+    def _serialize_event_objects(self, objects):
+        safe_objects = []
+        for obj in objects or []:
+            safe_objects.append({
+                "label": str(obj.get("label", "")),
+                "box": [int(round(float(v))) for v in obj.get("box", [])],
+                "score": round(float(obj.get("score", 0.0)), 4),
+                "tid": int(obj.get("tid", -1))
+            })
+        return safe_objects
+
+    def build_inference_log(self, fid, frame, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events):
+        # 한 프레임에서 AI가 무엇을 봤고 어떤 이벤트를 판단했는지 한 줄짜리 기록으로 만듭니다.
+        # 이 함수의 결과가 영상 옆 ".infer.jsonl" 파일과 이벤트 프레임 로그에 저장됩니다.
+        h, w = frame.shape[:2] if frame is not None else (0, 0)
+        kst = pytz.timezone('Asia/Seoul')
+        return {
+            # 기본 정보: 언제, 어느 카메라, 몇 번째 프레임인지 확인하는 값입니다.
+            "ts": datetime.datetime.now(kst).isoformat(),
+            "fid": int(fid),
+            "cam_id": int(self.cam_id),
+            "ip": str(self.ip),
+            "frame_shape": [int(h), int(w)],
+            "events": list(self.events),
+            # ROI 정보: AI가 어느 영역/선 기준으로 판단했는지 나중에 확인하기 위한 값입니다.
+            "roi_poly": [[int(p[0]), int(p[1])] for p in (self.roi_poly or [])],
+            "roi_lines": [[int(p[0]), int(p[1])] for p in (self.roi_lines or [])],
+            # detections는 모델이 프레임에서 바로 찾아낸 원본 탐지 결과입니다.
+            # 예: 사람/차량/헬멧 미착용 같은 객체의 위치와 점수
+            "detections": {
+                "main": [self._serialize_detection(d) for d in d_main_res],
+                "helmet": [self._serialize_detection(d) for d in d_helmet_res]
+            },
+            # tracks는 여러 프레임을 이어 보면서 같은 객체에 붙인 추적 ID입니다.
+            # 같은 사람이 계속 같은 tid로 보이면 이동 흐름을 재현하기 쉽습니다.
+            "tracks": {
+                "main": [self._serialize_track(t) for t in t_main],
+                "helmet": [self._serialize_track(t) for t in t_helmet]
+            },
+            # alarms/new_events는 실제 이벤트로 판단된 결과입니다.
+            # 단순히 객체가 보인 것과, 이벤트가 발생했다고 판단한 것을 구분하기 위해 둘 다 남깁니다.
+            "alarms": {str(int(tid)): evt for tid, evt in (alarms or {}).items()},
+            "new_events": [
+                {
+                    "event_name": str(ev.get("event_name", "")),
+                    "objects": self._serialize_event_objects(ev.get("objects", []))
+                }
+                for ev in (new_events or [])
+            ]
+        }
+
     def run_logic(self, fr, fid, d_main_res, d_helmet_res):
         if fr is None:
             return [], [], {}, []
@@ -2930,8 +3014,20 @@ def main():
         try: os.makedirs(RAM_DISK_DIR, exist_ok=True)
         except: RAM_DISK_DIR = "./web_frames" 
 
-    # [수정] 카메라별 5초 지연 큐(Debounce Queue) 및 타이머 초기화
-    event_save_queues = {c.ip: [] for c in cams}
+    # [수정] 카메라별 이벤트 저장 구간 큐 및 타이머 초기화
+    # 이벤트가 한 번 발생하면 바로 한 장만 저장하지 않고, 이후 몇 초 동안 원본 프레임을 더 모읍니다.
+    # 이렇게 하면 "이벤트 직전/직후 상황"을 사람이 다시 보면서 재현하기 쉽습니다.
+    event_frame_save_delay_sec = float(SYS_CFG.get("EVENT_FRAME_SAVE_DELAY_SEC", 10.0))
+    configured_event_frame_save_max_count = int(SYS_CFG.get("EVENT_FRAME_SAVE_MAX_COUNT", 0) or 0)
+    if configured_event_frame_save_max_count > 0:
+        # 현장 상황을 알고 있다면 system_config.json에서 최대 저장 장수를 직접 지정할 수 있습니다.
+        event_frame_save_max_count = configured_event_frame_save_max_count
+    else:
+        # 별도 지정이 없으면 녹화 FPS와 저장 시간을 기준으로 자동 계산합니다.
+        # 예: 10초, REC_FPS 3이면 약 45장까지 보관합니다. 실제 저장 장수는 들어온 프레임 수만큼입니다.
+        event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
+        event_frame_save_max_count = max(1, int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5)))
+    event_save_queues = {c.ip: deque(maxlen=event_frame_save_max_count) for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
 
     try:
@@ -3040,20 +3136,20 @@ def main():
                 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, alarms, new_events = cams[idx].run_logic(fr, fid, d_main_res, d_helmet_res)
+                infer_meta = cams[idx].build_inference_log(
+                    fid, fr, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events
+                )
                 
                 # -----------------------------------------------------------
-                # [수정] BBox와 알람이 그려진 프레임을 생성하여 녹화기에 주입
+                # [수정] 녹화기는 원본 프레임을 저장하고, GUI에만 오버레이를 표시합니다.
                 # -----------------------------------------------------------
                 if connected and fr is not None:
-                    # 원본 프레임 복사본에 BBox를 그립니다.
-                    recorded_fr = fr.copy()
-                    recorded_fr = cams[idx].draw(recorded_fr, t_main, t_helmet, alarms, True)
-                    
-                    # BBox가 그려진 프레임을 버퍼 및 녹화 큐에 업데이트합니다.
-                    cams[idx].recorder.update(recorded_fr)
+                    # 원본 프레임과 같은 시점의 추론 로그를 버퍼 및 녹화 큐에 업데이트합니다.
+                    cams[idx].recorder.update(fr, infer_meta)
                     
                     if is_gui_mode:
-                        final_imgs.append(recorded_fr)
+                        display_fr = cams[idx].draw(fr.copy(), t_main, t_helmet, alarms, True)
+                        final_imgs.append(display_fr)
                 else:
                     if is_gui_mode:
                         final_imgs.append(cams[idx].draw(None, [], [], {}, False))
@@ -3062,7 +3158,6 @@ def main():
                 if new_events:
                     # [수정] 디스크에 바로 쓰지 않고, 큐에 스택(Stacking)하며 이벤트 시간 갱신
                     # 메인 루프 참조 문제 방지를 위해 fr.copy() 사용
-                    event_save_queues[cams[idx].ip].append((fid, fr.copy()))
                     last_event_times[cams[idx].ip] = time.time()
                     
                     for ev_data in new_events:
@@ -3075,20 +3170,40 @@ def main():
                             })
                         logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
 
-            # [수정] 5초 지연(Debounce) 만료 체크 및 큐 비우기 (Flush)
+                # 이벤트가 발생한 뒤 설정된 시간 동안 원본 프레임과 AI 판단 로그를 계속 모읍니다.
+                # 이벤트가 연달아 발생하면 마지막 이벤트 시간을 갱신해서, 상황이 끝난 뒤 한 번에 저장합니다.
+                event_window_age = time.time() - last_event_times.get(cams[idx].ip, 0.0)
+                if last_event_times.get(cams[idx].ip, 0.0) > 0 and event_window_age <= event_frame_save_delay_sec:
+                    event_save_queues[cams[idx].ip].append((fid, fr.copy(), infer_meta))
+
+            # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
             for c in cams:
                 ip = c.ip
                 q = event_save_queues.get(ip, [])
                 
-                # 큐에 데이터가 있고, 마지막 이벤트로부터 5초 이상 경과했다면
-                if len(q) > 0 and (now_time - last_event_times.get(ip, 0.0) > 5.0):
-                    logger.debug(f"[{ip}] 5초 대기 완료. 쌓인 큐({len(q)}장)를 비동기 저장합니다.")
-                    for item_fid, item_fr in q:
+                # 큐에 데이터가 있고, 마지막 이벤트로부터 설정된 저장 구간 이상 경과했다면
+                if len(q) > 0 and (now_time - last_event_times.get(ip, 0.0) > event_frame_save_delay_sec):
+                    batch_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                    # 이벤트 프레임 묶음도 별도 infer 로그를 남깁니다.
+                    # 각 줄에는 저장된 이미지 경로(image_path)와 그 이미지의 AI 판단 결과가 같이 들어갑니다.
+                    infer_log_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{batch_ts}.infer.jsonl")
+                    infer_records = []
+                    logger.debug(f"[{ip}] {event_frame_save_delay_sec:.1f}초 저장 구간 완료. 쌓인 큐({len(q)}장)를 비동기 저장합니다.")
+                    for item_fid, item_fr, item_meta in list(q):
                         event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{item_fid}.jpg")
                         # 디스크 쓰기 병목 방지를 위해 스레드 풀에 작업 위임 (Off-loading)
                         IMAGE_SAVER_POOL.submit(cv2.imwrite, event_img_path, item_fr)
+                        if item_meta is not None:
+                            record = dict(item_meta)
+                            # 이 image_path가 실제 저장된 원본 이미지와 AI 판단 로그를 이어주는 연결고리입니다.
+                            record["image_path"] = event_img_path
+                            record["event_frame_window_sec"] = event_frame_save_delay_sec
+                            infer_records.append(record)
+                    if infer_records:
+                        IMAGE_SAVER_POOL.submit(_write_jsonl_records, infer_log_path, infer_records)
                     q.clear()
+                    last_event_times[ip] = 0.0
 
             if is_gui_mode:
                 if final_imgs:
