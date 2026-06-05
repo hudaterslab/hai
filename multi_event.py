@@ -443,32 +443,35 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         text_y = max(20, y1 - 10)
         cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
-        # 3. 신호수 유예 토큰 상태 렌더링 (화면 우측 하단 배치)
+        # 3. 신호수 유예 토큰 상태 렌더링 - [img_local 에만 엄격히 제한]
         if event_type == "signal_vehicle":
-            safe_tokens = auth_tokens[:1] if auth_tokens else [] # 최대 1개 제한
-            h_img, w_img = img.shape[:2]
-            overlay = img.copy()
+            safe_tokens = auth_tokens if auth_tokens else []
+            target_token = next((t for t in safe_tokens if t['tid'] == tid), None)
             
-            box_w = 260
-            box_h = 35 + max(1, len(safe_tokens) * 2) * 20 # 1개당 2줄 차지하므로 높이 조정
+            h_img, w_img = img_local.shape[:2]
+            box_w = 340
+            box_h = 75 
             x_start = w_img - box_w - 20
             y_start = h_img - box_h - 20
 
+            overlay = img_local.copy()
             cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+            cv2.addWeighted(overlay, 0.6, img_local, 0.4, 0, img_local)
 
-            cv2.putText(img, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(img_local, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-            if not safe_tokens:
-                cv2.putText(img, "No active tokens", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+            if target_token:
+                # [복구] API 로컬 이미지도 Truck ID 제외하고 남은 시간 표출
+                auth_time_str = datetime.datetime.fromtimestamp(target_token['auth_t']).strftime('%H:%M:%S')
+                sig_id = target_token.get('sig_tid', 'Unknown')
+                remain_time = target_token.get('remain', 0.0)
+                cv2.putText(img_local, f"Auth: {auth_time_str} | Remain: {remain_time:.1f}s", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(img_local, f"Authorized by: Signalman [{sig_id}]", (x_start + 10, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
             else:
-                for i, token in enumerate(safe_tokens):
-                    auth_time_str = datetime.datetime.fromtimestamp(token['auth_t']).strftime('%H:%M:%S')
-                    # 1번째 줄: 트럭 정보
-                    cv2.putText(img, f"Truck [{token['tid']}] | Auth: {auth_time_str}", (x_start + 10, y_start + 45 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    # 2번째 줄: 신호수 정보
-                    cv2.putText(img, f"Authorized by: Signalman [{token['sig_tid']}]", (x_start + 10, y_start + 65 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-
+                # [수정] 알람이 발생해서 API 이미지가 저장되는 시점이므로 여기서는 UNAUTH 표출이 맞음
+                cv2.putText(img_local, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                cv2.putText(img_local, "Reason: Moving without Signalman", (x_start + 10, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+                
         # 4. 저장 경로 생성 및 비동기 API 전송 태스크 큐 등록
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
         if not os.path.exists(dpath):
@@ -2105,21 +2108,18 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    # [수정] 파라미터에 det_signalman 추가
-    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, cam_id):
+    def __init__(self, ip, conf, det_main, det_face, cam_id):
         self.ip = ip
         self.conf = conf
         self.cam_id = cam_id
         self.events = conf.get('events', [])
         
         self.det_main = det_main
-        self.det_helmet = det_helmet
         self.det_face = det_face
-        self.det_signalman = det_signalman # [추가] 신호수 모델 내부 변수 할당
         
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
-        self.trk_signalman = SimpleTracker() # [추가] 신호수 전용 트래커 할당
+        self.trk_signalman = SimpleTracker()
         
         self.reader = FrameReader(conf.get('url', ''), ip)
         self.recorder = VideoRecorder(ip)
@@ -2746,55 +2746,75 @@ class Camera:
                     auth_time_str = datetime.datetime.fromtimestamp(auth_t).strftime('%H:%M:%S')
                     is_visible = any(int(t[4]) == a_tid for t in t_main if int(t[6]) == ID_G_TRUCK)
                     status_text = "Tracking" if is_visible else "Hidden"
-                    color = (0, 255, 0) if is_visible else (0, 180, 0) 
                     sig_id = sv_handler.last_auth_signalman.get(a_tid, "Unknown")
                     
+                    sort_score = auth_t
+                    if a_tid in alarms: sort_score = float('inf')
+                    
+                    # [복구] Truck ID 지우고 남은 시간(Remain) 표출
                     display_items.append({
-                        'tid': a_tid, 'sort_val': auth_t,
-                        'line1': f"Truck [{a_tid}] | Auth: {auth_time_str} ({status_text})",
+                        'tid': a_tid, 'sort_val': sort_score,
+                        'line1': f"Auth: {auth_time_str} | Remain: {remain:.1f}s ({status_text})",
                         'line2': f"Auth by: Signalman [{sig_id}]",
-                        'color': color
+                        'color': (0, 255, 0) if is_visible else (0, 180, 0)
                     })
-
-            display_items.sort(key=lambda x: x['sort_val'], reverse=True)
 
             current_trucks = [int(t[4]) for t in t_main if int(t[6]) == ID_G_TRUCK]
             auth_tids = [item['tid'] for item in display_items]
 
             for t_tid in current_trucks:
                 if t_tid not in auth_tids:
-                    if t_tid in sv_handler.presence_start_time:
-                        wait_sec = current_time - sv_handler.presence_start_time[t_tid]
+                    is_alarming = t_tid in alarms
+                    base_sort = float('inf') if is_alarming else 0
+                    
+                    # [수정] 1순위: 무단 출발로 알람이 터졌을 때만 강력한 빨간색 UNAUTH 표출
+                    if is_alarming:
                         display_items.append({
-                            'tid': t_tid, 'sort_val': 0,
-                            'line1': f"Truck [{t_tid}] | Wait: {wait_sec:.1f}s / {sv_handler.presence_threshold_sec}s",
-                            'line2': "Waiting for Signalman...",
-                            'color': (0, 165, 255)
-                        })
-                    else:
-                        display_items.append({
-                            'tid': t_tid, 'sort_val': 0,
-                            'line1': f"Truck [{t_tid}] | UNAUTH",
-                            'line2': "No Signalman Token",
+                            'tid': t_tid, 'sort_val': base_sort + 3,
+                            'line1': "Status: UNAUTH (ALARM)",
+                            'line2': "Reason: Moving without Signalman",
                             'color': (0, 0, 255)
                         })
+                    # 2순위: 신호수가 옆에 있어서 인증이 진행 중인 경우
+                    elif t_tid in sv_handler.presence_start_time:
+                        wait_sec = current_time - sv_handler.presence_start_time[t_tid]
+                        display_items.append({
+                            'tid': t_tid, 'sort_val': base_sort + 2,
+                            'line1': f"Wait: {wait_sec:.1f}s / {sv_handler.presence_threshold_sec}s",
+                            'line2': "Authenticating Signalman...",
+                            'color': (0, 165, 255) 
+                        })
+                    # 3순위: 60초가 지나 주차 상태이지만 알람은 없는 얌전한 상태
+                    elif t_tid in sv_handler.is_parked:
+                        display_items.append({
+                            'tid': t_tid, 'sort_val': base_sort + 1,
+                            'line1': "Status: PARKED (Monitoring)",
+                            'line2': "Awaiting Signalman",
+                            'color': (255, 150, 0) # 시야를 방해하지 않는 주황색 표출
+                        })
+                    # 4순위: 이제 막 진입해서 주차 중인 트럭
+                    else:
+                        dwell_sec = current_time - sv_handler.stationary_start_time.get(t_tid, current_time)
+                        display_items.append({
+                            'tid': t_tid, 'sort_val': -1, 
+                            'line1': f"Status: ARRIVING (Stop: {dwell_sec:.0f}s / {sv_handler.parked_threshold_sec}s)",
+                            'line2': "Ignoring Move (Parking in progress)",
+                            'color': (180, 180, 180) 
+                        })
 
-            # [핵심] 최대 1개의 상태(2줄)만 표시
+            display_items.sort(key=lambda x: x['sort_val'], reverse=True)
             display_items = display_items[:1]
 
-            box_w = 320 
-            box_h = 35 + max(1, len(display_items)) * 40 # 1개당 2줄
-            x_start = w_frame - box_w - 20
-            y_start = h_frame - box_h - 20
+            box_w, box_h = 340, 35 + max(1, len(display_items)) * 40
+            x_start, y_start = w_frame - box_w - 20, h_frame - box_h - 20
 
             overlay2 = fr.copy()
             cv2.rectangle(overlay2, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
             cv2.addWeighted(overlay2, 0.6, fr, 0.4, 0, fr)
-
             cv2.putText(fr, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             if not display_items:
-                cv2.putText(fr, "No active/tracked trucks", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+                cv2.putText(fr, "No active tokens", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
             else:
                 for i, item in enumerate(display_items):
                     cv2.putText(fr, item['line1'], (x_start + 10, y_start + 45 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, item['color'], 1)
@@ -2939,11 +2959,11 @@ def main():
         except: pass
 
     try:
-        logger.info("DeepX 모델을 VPU 메모리로 할당 중...")
-        d_main = YoLoDeepX(SYS_CFG["models"]["MAIN"])
-        d_face = YoLoDeepX(SYS_CFG["models"]["FACE"])
-        d_helmet = YoLoDeepX(SYS_CFG["models"]["HELMET"])
-        d_signalman = YoLoDeepX(os.path.join(PROJECT_ROOT, "signalman.dxnn"))
+        logger.info("🔥 [최적화] DeepX 단일 통합 모델을 VPU에 할당 중...")
+        # [핵심] 여러 모델을 로드하지 않고, 모든 클래스가 있는 signalman.dxnn 하나만 로드합니다.
+        d_main = YoLoDeepX(os.path.join(PROJECT_ROOT, "signalman.dxnn"))
+        # 얼굴 모자이크용은 독립적으로 유지
+        d_face = YoLoDeepX(SYS_CFG["models"]["FACE"]) 
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
@@ -2953,11 +2973,11 @@ def main():
         ip = extract_ip(rtsp)
         conf = camera_configs.get(ip)
         
-        if not conf or not conf.get('events'): 
-            continue
-            
+        if not conf or not conf.get('events'): continue
         conf['url'] = rtsp
-        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, d_signalman, cam_id=i+1))
+        
+        # [수정] 헬멧, 신호수 파라미터 싹 지우고 통합 모델(d_main) 하나만 넘김
+        cams.append(Camera(ip, conf, d_main, d_face, cam_id=i+1))
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
     # 환경 변수 스로틀링 기준
@@ -3068,44 +3088,37 @@ def main():
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
-                base_conf = min(main_conf, person_conf)
-                d_main_res = cams[idx].det_main.infer(fr, conf_override=base_conf)
+                base_conf = min(main_conf, person_conf, helmet_conf)
+                raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
                 
                 d_main_res_list = []
-                for d in d_main_res:
+                d_helmet_res = []
+                d_signal_res = []
+                
+                # 파이썬 리스트 컴프리헨션 수준에서 클래스별로 결과를 쪼개서 분배합니다. (NPU 병목 해소)
+                for d in raw_dets:
                     cls_id = int(d[5])
                     conf = float(d[4])
                     
-                    if cls_id in [ID_G_PERSON, ID_REFLECTIVE_VEST]:
+                    if cls_id == ID_REFLECTIVE_VEST: # 신호수(5)
+                        if conf >= person_conf:
+                            d_main_res_list.append(d) 
+                            d_signal_res.append(d)
+                    elif cls_id in [ID_H_HELMET, ID_H_NO_HELMET]: # 헬멧(0, 1)
+                        if conf >= helmet_conf:
+                            d_helmet_res.append(d)
+                    elif cls_id in [ID_G_PERSON, ID_PERSON_LOW]: # 사람(2, 4)
                         if conf >= person_conf:
                             d_main_res_list.append(d)
-                    else:
+                    else: # 차량 등(3, 6)
                         if conf >= main_conf:
                             d_main_res_list.append(d)
                             
-                # [적용] 삭제하는 대신 실제 파이프라인에 주입할 배열로 활용
                 t_main_input = np.array(d_main_res_list) if len(d_main_res_list) > 0 else np.empty((0, 6))
                 
-                d_helmet_res = []
-                if "no_helmet" in cams[idx].events:
-                    d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
-                    
-                d_signal_res = []
-                if "signal_vehicle" in cams[idx].events:
-                    raw_signal = cams[idx].det_signalman.infer(fr, conf_override=person_conf)
-                    
-                    TARGET_SIGNALMAN_ID = ID_REFLECTIVE_VEST 
-                    
-                    for d in raw_signal:
-                        if int(d[5]) == TARGET_SIGNALMAN_ID:
-                            d_signal_res.append(d)
-                
-                # [수정] main에서의 중복된 트래커 update() 호출 삭제
-                # 필터링이 완료된 d_signal_res를 바로 run_logic으로 전달합니다.
-                # 필터링된 진짜 신호수 객체만 전용 트래커로 넘겨 ID 핑퐁 방지
+                # 쪼개진 데이터를 각각의 트래커에 던져줍니다.
                 t_signalman = cams[idx].trk_signalman.update(d_signal_res)
                 
-                # [수정] 정확히 5개의 파라미터 전달: fr, fid, t_main_input, d_helmet_res, t_signalman
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(
                     fr, fid, t_main_input, d_helmet_res, t_signalman
                 )
