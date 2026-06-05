@@ -3094,7 +3094,7 @@ def main():
                 if "signal_vehicle" in cams[idx].events:
                     raw_signal = cams[idx].det_signalman.infer(fr, conf_override=person_conf)
                     
-                    TARGET_SIGNALMAN_ID = 0 
+                    TARGET_SIGNALMAN_ID = ID_REFLECTIVE_VEST 
                     
                     for d in raw_signal:
                         if int(d[5]) == TARGET_SIGNALMAN_ID:
