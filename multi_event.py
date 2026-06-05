@@ -2512,11 +2512,12 @@ class Camera:
         # [수정] 원본 영상을 바로 Recorder에 밀어넣지 않습니다. (run_logic에서 렌더링 후 삽입)
         return fr, fid, connected
 
-    def apply_face_blur(self, frame, person_boxes):
-        if frame is None or self.det_face is None: 
-            return frame
+    def apply_face_blur(self, frame, person_boxes, return_meta=False):
+        if frame is None or self.det_face is None:
+            return (frame, []) if return_meta else frame
             
         blur_img = frame.copy()
+        blurred_faces = []
         
         try:
             face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
@@ -2538,6 +2539,7 @@ class Camera:
                 is_valid_face = False
                 
                 # 3. 해당 얼굴이 '사람 객체' 내부에 속하는지 검증
+                matched_person_tid = -1
                 for p in person_boxes:
                     px1, py1, px2, py2 = map(int, p[:4])
                     pw, ph = px2 - px1, py2 - py1
@@ -2550,6 +2552,7 @@ class Camera:
                     # 얼굴 중심점이 확장된 사람 ROI 내부에 포함되는지 확인
                     if (px1 - pad_x) <= fcx <= (px2 + pad_x) and (py1 - pad_y_top) <= fcy <= (py2 + pad_y_bottom):
                         is_valid_face = True
+                        matched_person_tid = int(p[4]) if len(p) > 4 else -1
                         break
                         
                 # 4. 검증을 통과한 유효 얼굴(사람 내부)에만 모자이크 렌더링
@@ -2558,17 +2561,24 @@ class Camera:
                     if roi.size > 0:
                         small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
                         blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                        blurred_faces.append({
+                            "box": [fx1, fy1, fx2, fy2],
+                            "score": round(float(f[4]), 4) if len(f) > 4 else 0.0,
+                            "class_id": int(f[5]) if len(f) > 5 else -1,
+                            "matched_person_tid": matched_person_tid
+                        })
                         
         except Exception as e: 
             logger.error(f"모자이크 처리 실패: {e}")
             
-        return blur_img
+        return (blur_img, blurred_faces) if return_meta else blur_img
 
-    def apply_plate_blur(self, frame, vehicle_boxes=None):
+    def apply_plate_blur(self, frame, vehicle_boxes=None, return_meta=False):
         if frame is None or self.det_plate is None:
-            return frame
+            return (frame, []) if return_meta else frame
 
         blur_img = frame.copy()
+        blurred_plates = []
 
         try:
             plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.35)
@@ -2598,6 +2608,7 @@ class Camera:
                 pcy = py1 + ph / 2.0
 
                 is_valid_plate = True
+                matched_vehicle_tid = -1
 
                 if vehicle_boxes is not None and len(vehicle_boxes) > 0:
                     is_valid_plate = False
@@ -2612,6 +2623,7 @@ class Camera:
 
                         if (vx1 - pad_x) <= pcx <= (vx2 + pad_x) and (vy1 - pad_y) <= pcy <= (vy2 + pad_y):
                             is_valid_plate = True
+                            matched_vehicle_tid = int(v[4]) if len(v) > 4 else -1
                             break
 
                 if is_valid_plate:
@@ -2623,11 +2635,45 @@ class Camera:
                         blur_img[py1:py2, px1:px2] = cv2.resize(
                             small, (pw, ph), interpolation=cv2.INTER_NEAREST
                         )
+                        blurred_plates.append({
+                            "box": [px1, py1, px2, py2],
+                            "score": round(float(p[4]), 4) if len(p) > 4 else 0.0,
+                            "class_id": int(p[5]) if len(p) > 5 else -1,
+                            "matched_vehicle_tid": matched_vehicle_tid
+                        })
 
         except Exception as e:
             logger.error(f"번호판 모자이크 처리 실패: {e}")
 
-        return blur_img
+        return (blur_img, blurred_plates) if return_meta else blur_img
+
+    def apply_privacy_blur(self, frame, t_main, blur_face=True, blur_plate=True):
+        # 이벤트 산출물 저장 전에 개인정보 영역을 모자이크하고, 적용 위치를 로그용 메타데이터로 남깁니다.
+        # 녹화 MP4는 원본 유지가 목적이므로 이 함수는 대표 이미지/10초 이벤트 프레임 저장에만 사용합니다.
+        privacy_meta = {
+            "blur_face": bool(blur_face),
+            "blur_plate": bool(blur_plate),
+            "face": [],
+            "plate": []
+        }
+
+        if frame is None:
+            return frame, privacy_meta
+
+        blurred_img = frame.copy()
+        person_boxes = [t for t in t_main if int(t[6]) in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]]
+        vehicle_boxes = [t for t in t_main if int(t[6]) in TARGET_VEHICLES]
+
+        if blur_face:
+            blurred_img, face_blurs = self.apply_face_blur(blurred_img, person_boxes, return_meta=True)
+            privacy_meta["face"] = face_blurs
+
+        if blur_plate:
+            blurred_img, plate_blurs = self.apply_plate_blur(blurred_img, vehicle_boxes, return_meta=True)
+            privacy_meta["plate"] = plate_blurs
+
+        privacy_meta["applied"] = bool(privacy_meta["face"] or privacy_meta["plate"])
+        return blurred_img, privacy_meta
 
     def _serialize_detection(self, det):
         return {
@@ -2692,7 +2738,8 @@ class Camera:
             "new_events": [
                 {
                     "event_name": str(ev.get("event_name", "")),
-                    "objects": self._serialize_event_objects(ev.get("objects", []))
+                    "objects": self._serialize_event_objects(ev.get("objects", [])),
+                    "privacy_blur": ev.get("privacy_blur", {})
                 }
                 for ev in (new_events or [])
             ]
@@ -2771,16 +2818,12 @@ class Camera:
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
                     blur_plate_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_plate", True)
 
-                    person_boxes = [t for t in t_main if int(t[6]) in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]]
-                    vehicle_boxes = [t for t in t_main if int(t[6]) in TARGET_VEHICLES]
-
-                    saved_img = ev_frame
-
-                    if blur_face_option:
-                        saved_img = self.apply_face_blur(saved_img, person_boxes)
-
-                    if blur_plate_option:
-                        saved_img = self.apply_plate_blur(saved_img, vehicle_boxes)
+                    saved_img, privacy_blur_meta = self.apply_privacy_blur(
+                        ev_frame, t_main,
+                        blur_face=blur_face_option,
+                        blur_plate=blur_plate_option
+                    )
+                    privacy_blur_meta["scope"] = "event_snapshot"
                     
                     # 궤적 데이터 딕셔너리 구성
                     event_trajectories = {}
@@ -2807,7 +2850,8 @@ class Camera:
                     
                     newly_triggered_events.append({
                         'event_name': ename,
-                        'objects': objects_meta
+                        'objects': objects_meta,
+                        'privacy_blur': privacy_blur_meta
                     })
                     
                 current_alarms[tid] = ename
@@ -3180,7 +3224,7 @@ def main():
         # 별도 지정이 없으면 녹화 FPS와 저장 시간을 기준으로 자동 계산합니다.
         # 예: 10초, REC_FPS 3이면 약 45장까지 보관합니다. 실제 저장 장수는 들어온 프레임 수만큼입니다.
         event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
-        event_frame_save_max_count = max(1, int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5)))
+    event_frame_save_max_count = max(1, int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5)))
     event_save_queues = {c.ip: deque(maxlen=event_frame_save_max_count) for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
     output_retention_days = float(SYS_CFG.get("OUTPUT_RETENTION_DAYS", 14))
@@ -3339,11 +3383,16 @@ def main():
                             })
                         logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
 
-                # 이벤트가 발생한 뒤 설정된 시간 동안 원본 프레임과 AI 판단 로그를 계속 모읍니다.
-                # 이벤트가 연달아 발생하면 마지막 이벤트 시간을 갱신해서, 상황이 끝난 뒤 한 번에 저장합니다.
+                # 이벤트가 발생한 뒤 설정된 시간 동안 privacy blur가 적용된 프레임과 AI 판단 로그를 계속 모읍니다.
+                # 녹화 MP4는 원본으로 두고, 별도 이벤트 프레임 이미지에는 개인정보 보호 처리를 적용합니다.
                 event_window_age = time.time() - last_event_times.get(cams[idx].ip, 0.0)
                 if last_event_times.get(cams[idx].ip, 0.0) > 0 and event_window_age <= event_frame_save_delay_sec:
-                    event_save_queues[cams[idx].ip].append((fid, fr.copy(), infer_meta))
+                    event_frame, privacy_blur_meta = cams[idx].apply_privacy_blur(fr, t_main)
+                    privacy_blur_meta["scope"] = "event_frame_window"
+
+                    event_infer_meta = dict(infer_meta)
+                    event_infer_meta["privacy_blur"] = privacy_blur_meta
+                    event_save_queues[cams[idx].ip].append((fid, event_frame, event_infer_meta))
 
             # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
