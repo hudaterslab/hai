@@ -968,7 +968,7 @@ class CrossingDetector(BaseEventDetector):
         persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
         
-        #하반신 매칭 및 발 위치 정밀 계산
+        # 하반신 매칭 및 발 위치 정밀 계산
         for p in persons:
             p_tid = int(p[4])
             curr_ids.add(p_tid)
@@ -979,7 +979,8 @@ class CrossingDetector(BaseEventDetector):
             
             best_low_track = None
             max_ioa = 0
-            #해당 사람과 짝지어질 하반신을 찾습니다.
+            
+            # 해당 사람과 짝지어질 하반신 탐색
             for lb in low_bodies:
                 lx1, ly1, lx2, ly2 = lb[:4]
                 lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
@@ -994,8 +995,6 @@ class CrossingDetector(BaseEventDetector):
                     
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid}]
             
-            #하반신이 정상적으로 찾아진 경우:
-            #사람 전체 박스 기준 발 위치(p_foot)와 진짜 발 위치(curr_pos)의 차이값을 lb_offsets에 저장해 둡니다. (나중에 하반신을 놓쳤을 때 쓰기 위함)
             if max_ioa >= 0.4 and best_low_track is not None:
                 lx1, ly1, lx2, ly2 = best_low_track[:4]
                 low_height = max(1, ly2 - ly1)
@@ -1007,8 +1006,6 @@ class CrossingDetector(BaseEventDetector):
                 
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
             
-            #컨베이어 벨트에 가려지는 등 하반신을 찾지 못한 경우:
-            #과거에 저장해 두었던 오프셋(ox, oy)을 꺼내와, 대략적인 발 위치(p_foot)에 더해서 진짜 발 위치(curr_pos)를 역산해 냅니다.
             else:
                 if p_tid in self.lb_offsets:
                     ox, oy = self.lb_offsets[p_tid]
@@ -1017,7 +1014,8 @@ class CrossingDetector(BaseEventDetector):
                     event_bbox = (px1, py2 - low_height, px2, py2)
                 else: 
                     continue
-            #점프 방어
+                    
+            # 점프 방어 (너무 큰 순간 이동은 무시)
             if p_tid in self.prev:
                 jump_dist = get_distance(self.prev[p_tid], curr_pos)
                 if jump_dist > person_height * 0.2:
@@ -1025,8 +1023,7 @@ class CrossingDetector(BaseEventDetector):
                     self.prev[p_tid] = curr_pos
                     continue
                 
-            #횡단 판별: 아직 횡단 후보자가 아닌 경우, 과거 위치와 현재 위치를 이어 선분(trajectory)을 만듭니다.
-            #이 선분이 횡단선(p1, p2)과 교차(Intersect)했고, 그 진입 각도가 너무 평행하지 않다면(>= min_crossing_angle), 이 사람을 '선을 넘은 후보(candidates)'로 등록
+            # 횡단 판별: 궤적이 선분과 교차하는지 확인
             if p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 for p1, p2 in self.lines:
@@ -1038,6 +1035,7 @@ class CrossingDetector(BaseEventDetector):
                                 'timestamp_time': current_time,
                                 'line': (p1, p2), 
                                 'entry_side': ccw(p1, p2, trajectory[0]), 
+                                'crossed_pos': curr_pos, # [추가] 선을 넘은 직후의 첫 발 위치 앵커 기록
                                 'bbox': event_bbox, 
                                 'frame': frame.copy() if frame is not None else None,
                                 'fid': fid,
@@ -1045,15 +1043,19 @@ class CrossingDetector(BaseEventDetector):
                             }
                         break
                     
-            #수직 거리 기반 최종 알람 트리거
+            # 수직 거리 및 교차 후 실이동 거리 기반 최종 알람 트리거
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
                 curr_side = ccw(p1, p2, curr_pos)
                 
-                #선 밖으로 진입했던 방향과 현재 방향이 반대라면
+                # 완전히 반대편으로 진입한 상태라면
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
+                    # 1. 라인 기준 수직 침투 깊이
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
+                    # 2. [추가] 앵커(crossed_pos)로부터의 실제 추가 이동 거리
+                    post_cross_dist = get_distance(cand['crossed_pos'], curr_pos)
+                    
                     dx = abs(p2[0] - p1[0])
                     dy = abs(p2[1] - p1[1])
                     line_tilt_angle = math.degrees(math.atan2(dy, dx))
@@ -1061,7 +1063,8 @@ class CrossingDetector(BaseEventDetector):
                     tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
                     
-                    if perp_dist >= dynamic_threshold:
+                    # [핵심 보완] 수직 깊이를 충족하고, 동시에 1프레임 튐이 아니라 실제 발걸음이 발생했을 때만 트리거
+                    if perp_dist >= dynamic_threshold and post_cross_dist >= (dynamic_threshold * 0.6):
                         triggered.append({
                             'tid': p_tid, 
                             'bbox': cand['bbox'], 
@@ -1071,10 +1074,8 @@ class CrossingDetector(BaseEventDetector):
                         })
                         del self.candidates[p_tid]
                     else:
-                        # 알람은 안 울렸지만 현재 스코어가 어디까지 가고 있는지 상시 출력
                         if p_tid in self.candidates:
-                            print(f"[프레임 {fid}] ID {p_tid} 수직거리: {perp_dist:.2f} / 요구거리: {dynamic_threshold:.2f} (진행률: {(perp_dist/dynamic_threshold)*100:.1f}%)")
-                        
+                            print(f"[프레임 {fid}] ID {p_tid} 침투 깊이: {perp_dist:.2f} | 교차 후 실이동: {post_cross_dist:.2f} / 요구거리: {dynamic_threshold:.2f}")
                         
                 elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec: 
                     del self.candidates[p_tid]
