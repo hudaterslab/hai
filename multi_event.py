@@ -1620,7 +1620,20 @@ class SignalVehicleDetector(BaseEventDetector):
                                     recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t, 'sig_tid': sig_tid})
 
                                 recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
-                                triggered.append({'tid': tid, 'bbox': t[:4], 'frame': frame.copy(), 'fid': fid, 'auth_tokens': recent_auths[:1]})
+                                triggered.append({
+                                    'tid': tid,
+                                    'bbox': t[:4],
+                                    'frame': frame.copy(),
+                                    'fid': fid,
+                                    'auth_tokens': recent_auths[:1],
+                                    'objects': [{
+                                        'label': 'LineTruck',
+                                        'box': [int(x) for x in t[:4]],
+                                        'score': float(t[5]),
+                                        'tid': tid,
+                                        'class_id': ID_G_TRUCK
+                                    }]
+                                })
 
                                 self.history[tid].clear()
                                 if tid in self.last_auth_time: del self.last_auth_time[tid]
@@ -2799,7 +2812,8 @@ class Camera:
                 "label": str(obj.get("label", "")),
                 "box": [int(round(float(v))) for v in obj.get("box", [])],
                 "score": round(float(obj.get("score", 0.0)), 4),
-                "tid": int(obj.get("tid", -1))
+                "tid": int(obj.get("tid", -1)),
+                "class_id": int(obj.get("class_id", -1))
             })
         return safe_objects
 
@@ -3031,7 +3045,8 @@ class Camera:
 
             if cls_id == ID_G_PERSON: label = f"Person [{tid}]"
             elif cls_id == ID_PERSON_LOW: label, color = f"LowBody [{tid}]", (0, 150, 0)
-            elif cls_id in TARGET_VEHICLES: label, color = f"Vehicle [{tid}]", (255, 100, 0)
+            elif cls_id == ID_G_CAR: label, color = f"Car [{tid}]", (255, 100, 0)
+            elif cls_id == ID_G_TRUCK: label, color = f"LineTruck [{tid}]", (255, 100, 0)
             else: label = f"OBJ [{tid}]"
 
             if is_alarmed:
