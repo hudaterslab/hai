@@ -30,6 +30,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     sudo -u "$ACTUAL_USER" bash -c "cat > $SYS_CONFIG_FILE" << EOL
 {
     "terminal_id": "$USER_TERM_ID",
+    "INFERENCE_MODE": "auto",
     "logging": {"dir": "./logs", "level": "INFO"},
     "event_config": {
         "intrusion": {"enabled": false, "cooldown_sec": 600},
@@ -39,11 +40,14 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "signal_vehicle": {"enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10}
     },
     "models": {
+        "UNIFIED": "signalman.dxnn",
         "MAIN": "hanjin_cctv.dxnn",
         "FACE": "yolov8m-face.dxnn",
-        "HELMET": "helmet_3cls_v8.dxnn"
+        "HELMET": "helmet_3cls_v8.dxnn",
+        "SIGNALMAN": "signalman.dxnn",
+        "PLATE": "license_plate_detector.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55},
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.35},
     "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10, "VISUAL_ALARM_DURATION": 5.0
 }
 EOL

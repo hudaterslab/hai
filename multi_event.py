@@ -105,6 +105,7 @@ def load_system_config():
             "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30}
         },
         "models": {
+            "UNIFIED": "signalman.dxnn",
             "MAIN": "hanjin_cctv.dxnn",
             "FACE": "yolov8m-face.dxnn",
             "HELMET": "helmet_3cls_v8.dxnn",
@@ -119,6 +120,7 @@ def load_system_config():
             "SIGNALMAN": 0.5,
             "PLATE": 0.35
         },
+        "INFERENCE_MODE": "auto",  # auto: 통합 모델 파일이 있으면 단일 모델, 없으면 기존 별도 모델
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
         "LOOP_FPS": 15,
@@ -145,6 +147,52 @@ def load_system_config():
 SYS_CFG = load_system_config()
 BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
 IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+def resolve_model_path(model_path):
+    """설정 파일의 모델 경로가 상대 경로면 프로젝트 폴더 기준 절대 경로로 바꿉니다."""
+    if not model_path:
+        return model_path
+    if os.path.isabs(model_path):
+        return model_path
+    return os.path.join(PROJECT_ROOT, model_path)
+
+def detection_array(rows):
+    """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
+    if rows is None or len(rows) == 0:
+        return np.empty((0, 6))
+    return np.array(rows, dtype=float)
+
+def split_unified_event_detections(raw_dets, events, main_conf, person_conf, helmet_conf, signalman_conf):
+    # 단일 통합 모델 출력에서 이벤트별로 필요한 탐지 결과만 나눕니다.
+    # 이렇게 하면 NPU 추론은 한 번만 하고, 기존 트래커/이벤트 핸들러 입력 형태는 그대로 유지됩니다.
+    d_main_res_list = []
+    d_helmet_res_list = []
+    d_signalman_res_list = []
+
+    for d in raw_dets:
+        cls_id = int(d[5])
+        conf = float(d[4])
+
+        if cls_id == ID_REFLECTIVE_VEST:
+            if conf >= person_conf:
+                d_main_res_list.append(d)
+            if "signal_vehicle" in events and conf >= signalman_conf:
+                d_signalman_res_list.append(d)
+        elif cls_id in [ID_H_HELMET, ID_H_NO_HELMET]:
+            if "no_helmet" in events and conf >= helmet_conf:
+                d_helmet_res_list.append(d)
+        elif cls_id in [ID_G_PERSON, ID_PERSON_LOW]:
+            if conf >= person_conf:
+                d_main_res_list.append(d)
+        else:
+            if conf >= main_conf:
+                d_main_res_list.append(d)
+
+    return (
+        detection_array(d_main_res_list),
+        detection_array(d_helmet_res_list),
+        detection_array(d_signalman_res_list),
+    )
 
 # ==========================================
 # [2] 로깅 시스템 초기화
@@ -2191,10 +2239,11 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, det_plate, cam_id):
+    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, det_plate, cam_id, event_inference_mode="separate"):
         self.ip = ip
         self.conf = conf
         self.cam_id = cam_id
+        self.event_inference_mode = event_inference_mode
         self.events = conf.get('events', [])
 
         self.det_main = det_main
@@ -2768,6 +2817,7 @@ class Camera:
             "cam_id": int(self.cam_id),
             "ip": str(self.ip),
             "frame_shape": [int(h), int(w)],
+            "inference_mode": str(self.event_inference_mode),
             "events": list(self.events),
             # ROI 정보: AI가 어느 영역/선 기준으로 판단했는지 나중에 확인하기 위한 값입니다.
             "roi_poly": [[int(p[0]), int(p[1])] for p in (self.roi_poly or [])],
@@ -3263,13 +3313,35 @@ def main():
                 json.dump(camera_configs, f, indent=4)
         except: pass
 
+    models_cfg = SYS_CFG.get("models", {})
+    inference_mode = str(SYS_CFG.get("INFERENCE_MODE", "auto")).strip().lower()
+    use_unified_event_model = inference_mode in ["auto", "unified", "single"]
+    unified_model_path = resolve_model_path(models_cfg.get("UNIFIED", "signalman.dxnn"))
+
+    if use_unified_event_model and not os.path.exists(unified_model_path):
+        logger.warning(
+            f"통합 이벤트 모델을 찾을 수 없어 기존 별도 모델 구조로 동작합니다: {unified_model_path}"
+        )
+        use_unified_event_model = False
+
+    event_inference_mode = "unified" if use_unified_event_model else "separate"
+
     try:
-        logger.info("DeepX 모델을 VPU 메모리로 할당 중...")
-        d_main = YoLoDeepX(SYS_CFG["models"]["MAIN"])
-        d_face = YoLoDeepX(SYS_CFG["models"]["FACE"])
-        d_helmet = YoLoDeepX(SYS_CFG["models"]["HELMET"])
-        d_signalman = YoLoDeepX(SYS_CFG["models"]["SIGNALMAN"])
-        d_plate = YoLoDeepX(SYS_CFG["models"]["PLATE"])
+        logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
+
+        if use_unified_event_model:
+            # 이벤트 판단용 객체는 통합 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
+            d_main = YoLoDeepX(unified_model_path)
+            d_helmet = None
+            d_signalman = None
+        else:
+            d_main = YoLoDeepX(resolve_model_path(models_cfg["MAIN"]))
+            d_helmet = YoLoDeepX(resolve_model_path(models_cfg["HELMET"]))
+            d_signalman = YoLoDeepX(resolve_model_path(models_cfg["SIGNALMAN"]))
+
+        # 개인정보 블러는 이벤트 판단 모델과 목적이 달라 별도 모델을 유지합니다.
+        d_face = YoLoDeepX(resolve_model_path(models_cfg["FACE"]))
+        d_plate = YoLoDeepX(resolve_model_path(models_cfg["PLATE"]))
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
@@ -3281,7 +3353,11 @@ def main():
 
         if not conf or not conf.get('events'): continue
         conf['url'] = rtsp
-        cams.append(Camera(ip, conf, d_main, d_helmet, d_face, d_signalman, d_plate, cam_id=i+1))
+        cams.append(Camera(
+            ip, conf, d_main, d_helmet, d_face, d_signalman, d_plate,
+            cam_id=i+1,
+            event_inference_mode=event_inference_mode
+        ))
         logger.info(f"Loaded [CAM {i+1}]: {ip}")
 
     # 환경 변수 스로틀링 기준
@@ -3289,6 +3365,7 @@ def main():
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
     person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35)  # [추가] 설정값 로드
+    signalman_conf = SYS_CFG.get("model_confidences", {}).get("SIGNALMAN", person_conf)
     loop_count = 0
     fps_calc_interval = 30
     last_fps_time = time.time()
@@ -3413,34 +3490,45 @@ def main():
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
-                # 기존 하드코딩 대신 변수(person_conf)를 적용합니다.
-                base_conf = min(main_conf, person_conf)
-                d_main_res = cams[idx].det_main.infer(fr, conf_override=base_conf)
+                if use_unified_event_model:
+                    base_conf = min(main_conf, person_conf, helmet_conf, signalman_conf)
+                    raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
+                    t_main_input, d_helmet_res, d_signalman_res = split_unified_event_detections(
+                        raw_dets,
+                        cams[idx].events,
+                        main_conf=main_conf,
+                        person_conf=person_conf,
+                        helmet_conf=helmet_conf,
+                        signalman_conf=signalman_conf
+                    )
+                else:
+                    # 기존 하드코딩 대신 변수(person_conf)를 적용합니다.
+                    base_conf = min(main_conf, person_conf)
+                    d_main_res = cams[idx].det_main.infer(fr, conf_override=base_conf)
 
-                d_main_res_list = []
-                for d in d_main_res:
-                    cls_id = int(d[5])
-                    conf = float(d[4])
+                    d_main_res_list = []
+                    for d in d_main_res:
+                        cls_id = int(d[5])
+                        conf = float(d[4])
 
-                    # ID_G_PERSON(2), ID_PERSON_LOW(4), ID_REFLECTIVE_VEST(5)인 경우 JSON에서 로드한 person_conf 적용
-                    if cls_id in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]:
-                        if conf >= person_conf:
-                            d_main_res_list.append(d)
-                    else:
-                        # 차량 등 나머지 객체는 JSON에서 로드한 main_conf 유지
-                        if conf >= main_conf:
-                            d_main_res_list.append(d)
+                        # ID_G_PERSON(2), ID_PERSON_LOW(4), ID_REFLECTIVE_VEST(5)인 경우 JSON에서 로드한 person_conf 적용
+                        if cls_id in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]:
+                            if conf >= person_conf:
+                                d_main_res_list.append(d)
+                        else:
+                            # 차량 등 나머지 객체는 JSON에서 로드한 main_conf 유지
+                            if conf >= main_conf:
+                                d_main_res_list.append(d)
 
-                t_main_input = np.array(d_main_res_list) if len(d_main_res_list) > 0 else np.empty((0, 6))
+                    t_main_input = detection_array(d_main_res_list)
 
-                d_helmet_res = []
-                if "no_helmet" in cams[idx].events:
-                    d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
+                    d_helmet_res = np.empty((0, 6))
+                    if "no_helmet" in cams[idx].events:
+                        d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
 
-                d_signalman_res = np.empty((0, 6))
-                if "signal_vehicle" in cams[idx].events:
-                    signalman_conf = SYS_CFG.get("model_confidences", {}).get("SIGNALMAN", 0.5)
-                    d_signalman_res = cams[idx].det_signalman.infer(fr, conf_override=signalman_conf)
+                    d_signalman_res = np.empty((0, 6))
+                    if "signal_vehicle" in cams[idx].events:
+                        d_signalman_res = cams[idx].det_signalman.infer(fr, conf_override=signalman_conf)
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
