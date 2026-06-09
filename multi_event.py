@@ -130,6 +130,7 @@ def load_system_config():
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
         "OUTPUT_RETENTION_DAYS": 14,
         "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
+        "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
         "VISUAL_ALARM_DURATION": 5.0
     }
 
@@ -1687,6 +1688,48 @@ EVENT_REGISTRY = {
 # ==========================================
 # [9] 터미널 마법사 및 설정 UI
 # ==========================================
+def _flush_terminal_input():
+    """원격 터미널에서 다음 질문으로 넘어온 잔여 키 입력을 비웁니다."""
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return
+
+        if os.name == "nt":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception as e:
+        logger.debug(f"터미널 입력 버퍼 정리 실패: {e}")
+
+def _flush_cv2_key_buffer(duration_sec=0.10):
+    """OpenCV 창에 남은 Enter/ESC 키 이벤트가 다음 단계로 넘어가지 않게 비웁니다."""
+    end_time = time.time() + max(0.0, float(duration_sec))
+    while time.time() < end_time:
+        try:
+            cv2.waitKey(1)
+        except Exception:
+            break
+        time.sleep(0.01)
+
+def guard_interactive_input(delay_sec=None, flush_cv=True, flush_terminal=True):
+    # RDP/VNC/SSH 환경에서는 키 입력이 늦게 도착해 다음 input/ROI 창에 들어가는 경우가 있습니다.
+    # 짧게 기다린 뒤 OpenCV 키 큐와 터미널 입력 큐를 비워 연속 Enter 오입력을 줄입니다.
+    guard_sec = SYS_CFG.get("INTERACTIVE_INPUT_GUARD_SEC", 0.35) if delay_sec is None else delay_sec
+    guard_sec = max(0.0, float(guard_sec))
+    if guard_sec > 0:
+        time.sleep(guard_sec)
+    if flush_cv:
+        _flush_cv2_key_buffer(min(0.15, guard_sec if guard_sec > 0 else 0.10))
+    if flush_terminal:
+        _flush_terminal_input()
+
+def guarded_input(prompt, delay_sec=None):
+    guard_interactive_input(delay_sec=delay_sec)
+    return input(prompt)
+
 def capture_snapshot(url):
     """설정 마법사용 스냅샷 캡처"""
     try:
@@ -1708,6 +1751,8 @@ def get_roi_points_scaled(frame, title, mode="poly"):
     scale = 960 / orig_w
     disp_h = int(orig_h * scale)
     disp_frame = cv2.resize(frame, (960, disp_h))
+
+    guard_interactive_input()
 
     cv2.namedWindow(title)
     def mouse_cb(e, x, y, f, p):
@@ -1749,6 +1794,7 @@ def get_roi_points_scaled(frame, title, mode="poly"):
             break
 
     cv2.destroyWindow(title)
+    guard_interactive_input()
     return normalize_roi_points(pts, orig_w, orig_h)
 
 def run_wizard_batch_mode(rtsp_list, existing_configs=None):
@@ -1786,7 +1832,7 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
         cv2.imshow("Select Cameras", mosaic)
         cv2.waitKey(1)
 
-        sel = input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: 1,3,5 / 건너뛰기: 엔터): ").strip()
+        sel = guarded_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: 1,3,5 / 건너뛰기: 엔터): ").strip()
         if not sel:
             continue
 
@@ -1798,7 +1844,7 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     ip = extract_ip(url)
 
                     print(f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량")
-                    evts = input(f"[{ip}] 이벤트 선택 (예: 1,4): ")
+                    evts = guarded_input(f"[{ip}] 이벤트 선택 (예: 1,4): ")
                     events = []
 
                     if '1' in evts: events.append("intrusion")
@@ -1818,7 +1864,7 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                             l = get_roi_points_scaled(frames[n-1], f"Line - CAM: {ip}", mode="line")
                             if len(l) == 2:
                                 roi_l.extend(l)
-                            if input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y':
+                            if guarded_input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y':
                                 break
 
                     configs[ip] = {
@@ -3297,7 +3343,7 @@ def main():
     config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
 
-    debug_ans = input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
+    debug_ans = guarded_input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
     DEBUG_MODE = True if debug_ans == 'y' else False
     if DEBUG_MODE:
         _log_level_str = SYS_CFG.get("logging", {}).get("level", "INFO").upper()
@@ -3312,7 +3358,7 @@ def main():
             logger.error(f"cameras.json 로드 실패: {e}")
             pass
 
-        reset_ans = input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
+        reset_ans = guarded_input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
         if reset_ans == 'y':
             logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
             camera_configs = run_wizard_batch_mode(rtsp_list, camera_configs)
