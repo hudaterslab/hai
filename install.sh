@@ -55,7 +55,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "SIGNALMAN": "signalman.dxnn",
         "PLATE": "license_plate_detector.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.35},
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.3},
     "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0

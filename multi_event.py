@@ -109,7 +109,10 @@ def load_system_config():
                 "line_truck_car_veto_frames": 5,
                 "line_truck_min_conf": 0.7,
                 "line_truck_car_veto_iou": 0.10,
-                "line_truck_car_veto_distance_ratio": 0.60
+                "line_truck_car_veto_distance_ratio": 0.60,
+                "state_inherit_distance_ratio": 0.5,
+                "state_inherit_max_size_ratio": 2.5,
+                "state_inherit_max_area_ratio": 6.0
             }
         },
         "models": {
@@ -126,7 +129,7 @@ def load_system_config():
             "HELMET": 0.55,
             "PERSON": 0.35, # [추가] 사람 및 신호수 전용 기본 임계값 설정
             "SIGNALMAN": 0.5,
-            "PLATE": 0.35
+            "PLATE": 0.3
         },
         "INFERENCE_MODE": "auto",  # auto: 통합 모델 파일이 있으면 단일 모델, 없으면 기존 별도 모델
         "BATCH_SIZE": 9,
@@ -1458,6 +1461,9 @@ class SignalVehicleDetector(BaseEventDetector):
         self.line_truck_min_conf = float(config.get("line_truck_min_conf", 0.7))
         self.line_truck_car_veto_iou = float(config.get("line_truck_car_veto_iou", 0.10))
         self.line_truck_car_veto_distance_ratio = float(config.get("line_truck_car_veto_distance_ratio", 0.60))
+        self.state_inherit_distance_ratio = float(config.get("state_inherit_distance_ratio", 0.5))
+        self.state_inherit_max_size_ratio = max(1.0, float(config.get("state_inherit_max_size_ratio", 2.5)))
+        self.state_inherit_max_area_ratio = max(1.0, float(config.get("state_inherit_max_area_ratio", 6.0)))
         self.line_truck_votes = defaultdict(lambda: deque(maxlen=self.line_truck_confirm_frames))
         self.recent_car_observations = deque(maxlen=max(30, self.line_truck_car_veto_frames * 10))
         self.process_seq = 0
@@ -1520,6 +1526,28 @@ class SignalVehicleDetector(BaseEventDetector):
 
         return False
 
+    def _box_size_meta(self, box):
+        w = max(1.0, float(box[2] - box[0]))
+        h = max(1.0, float(box[3] - box[1]))
+        return w, h, max(w, h), w * h
+
+    def _can_inherit_track_state(self, curr_box, old_box, iou, dist):
+        _, _, curr_size, curr_area = self._box_size_meta(curr_box)
+        _, _, old_size, old_area = self._box_size_meta(old_box)
+
+        # A sudden oversized detection must not make the distance gate loose.
+        distance_gate = min(curr_size, old_size) * self.state_inherit_distance_ratio
+        spatial_match = iou > 0.3 or dist < distance_gate
+        if not spatial_match:
+            return False, "spatial_mismatch"
+
+        size_ratio = max(curr_size / old_size, old_size / curr_size)
+        area_ratio = max(curr_area / old_area, old_area / curr_area)
+        if size_ratio > self.state_inherit_max_size_ratio or area_ratio > self.state_inherit_max_area_ratio:
+            return False, f"size_jump:size={size_ratio:.2f},area={area_ratio:.2f}"
+
+        return True, "ok"
+
     def _is_confirmed_line_truck(self, track):
         # LineTruck 후보가 몇 프레임 연속으로 안정적인지 확인합니다.
         # 한두 프레임짜리 오탐은 여기서 걸러지고, 충분히 누적된 후보만 신호수 차량 이벤트 판정에 들어갑니다.
@@ -1572,15 +1600,15 @@ class SignalVehicleDetector(BaseEventDetector):
             if curr_box is None: continue
 
             curr_fc = get_foot_point(*curr_box)
-            v_size = max(curr_box[2]-curr_box[0], curr_box[3]-curr_box[1])
 
             for old_tid in missing_tids:
                 old_box = self.last_seen_bbox[old_tid]
                 iou = calculate_iou(curr_box, old_box)
                 old_fc = get_foot_point(*old_box)
                 dist = get_distance(curr_fc, old_fc)
+                can_inherit, inherit_reason = self._can_inherit_track_state(curr_box, old_box, iou, dist)
 
-                if iou > 0.3 or dist < v_size * 0.5:
+                if can_inherit:
                     if old_tid in self.last_auth_time:
                         self.last_auth_time[curr_tid] = self.last_auth_time[old_tid]
                         del self.last_auth_time[old_tid]
@@ -1609,6 +1637,11 @@ class SignalVehicleDetector(BaseEventDetector):
 
                     missing_tids.remove(old_tid)
                     break
+                elif inherit_reason.startswith("size_jump"):
+                    logger.debug(
+                        f"[SignalVehicle] state inherit blocked by bbox size jump | "
+                        f"old_tid={old_tid} curr_tid={curr_tid} iou={iou:.3f} dist={dist:.1f} reason={inherit_reason}"
+                    )
 
         # ---------------------------------------------------------
         # [2단계] 완전 정차(Stationary) 기반 상태 업데이트 (디바운스 적용)
@@ -2838,7 +2871,7 @@ class Camera:
         blurred_plates = []
 
         try:
-            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.35)
+            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.3)
 
             p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
 
