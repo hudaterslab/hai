@@ -102,7 +102,15 @@ def load_system_config():
                 "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment",
                 "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
             },
-            "signal_vehicle": {"enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30}
+            "signal_vehicle": {
+                "enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30,
+                "line_truck_confirm_frames": 10,
+                "line_truck_confirm_ratio": 0.7,
+                "line_truck_car_veto_frames": 5,
+                "line_truck_min_conf": 0.7,
+                "line_truck_car_veto_iou": 0.10,
+                "line_truck_car_veto_distance_ratio": 0.60
+            }
         },
         "models": {
             "UNIFIED": "signalman.dxnn",
@@ -1442,6 +1450,19 @@ class SignalVehicleDetector(BaseEventDetector):
         self.prox_ratio_x = config.get("prox_ratio_x", 1.0)
         self.prox_ratio_y = config.get("prox_ratio_y", 1.0)
 
+        # 일반 차량이 순간적으로 LineTruck(ID 6)으로 튀는 경우를 막기 위한 확정 필터입니다.
+        # LineTruck이 일반 차량으로 튀는 경우는 거의 없다는 전제를 이용해, Car 이력은 강한 제외 조건으로 봅니다.
+        self.line_truck_confirm_frames = max(1, int(config.get("line_truck_confirm_frames", 10)))
+        self.line_truck_confirm_ratio = min(1.0, max(0.0, float(config.get("line_truck_confirm_ratio", 0.7))))
+        self.line_truck_car_veto_frames = max(0, int(config.get("line_truck_car_veto_frames", 5)))
+        self.line_truck_min_conf = float(config.get("line_truck_min_conf", 0.7))
+        self.line_truck_car_veto_iou = float(config.get("line_truck_car_veto_iou", 0.10))
+        self.line_truck_car_veto_distance_ratio = float(config.get("line_truck_car_veto_distance_ratio", 0.60))
+        self.line_truck_votes = defaultdict(lambda: deque(maxlen=self.line_truck_confirm_frames))
+        self.recent_car_observations = deque(maxlen=max(30, self.line_truck_car_veto_frames * 10))
+        self.process_seq = 0
+        self.confirmed_line_truck_ids = set()
+
         self.presence_start_time = {}
         self.last_auth_time = {}
         self.last_auth_signalman = {}
@@ -1456,10 +1477,69 @@ class SignalVehicleDetector(BaseEventDetector):
         self.last_seen_time = {}
         self.is_parked = set()
 
+    def _remember_recent_cars(self, tracks, track_map):
+        # 현재 프레임에서 일반 차량으로 확인된 위치를 잠깐 기억합니다.
+        # 같은 위치에서 바로 LineTruck 후보가 생기면 일반 차량 오탐 가능성이 높으므로 제외하기 위함입니다.
+        for t in tracks:
+            if track_map.get(int(t[4])) != ID_G_CAR:
+                continue
+            self.recent_car_observations.append({
+                "seq": self.process_seq,
+                "bbox": np.array(t[:4], dtype=float),
+                "foot": get_foot_point(*t[:4])
+            })
+
+        while self.recent_car_observations:
+            oldest = self.recent_car_observations[0]
+            if self.process_seq - oldest["seq"] <= self.line_truck_car_veto_frames:
+                break
+            self.recent_car_observations.popleft()
+
+    def _has_recent_car_veto(self, truck_box):
+        # 최근 Car 위치와 많이 겹치거나 너무 가까우면 LineTruck 확정을 막습니다.
+        # 현장 가정상 LineTruck이 Car로 잘못 내려오는 일은 없고, Car가 LineTruck으로 튀는 쪽만 문제이기 때문입니다.
+        if self.line_truck_car_veto_frames <= 0:
+            return False
+
+        truck_box = np.array(truck_box, dtype=float)
+        truck_foot = get_foot_point(*truck_box)
+        truck_size = max(truck_box[2] - truck_box[0], truck_box[3] - truck_box[1])
+
+        for obs in self.recent_car_observations:
+            if self.process_seq - obs["seq"] > self.line_truck_car_veto_frames:
+                continue
+
+            car_box = obs["bbox"]
+            car_size = max(car_box[2] - car_box[0], car_box[3] - car_box[1])
+            near_distance = max(truck_size, car_size) * self.line_truck_car_veto_distance_ratio
+
+            if calculate_iou(truck_box, car_box) >= self.line_truck_car_veto_iou:
+                return True
+            if get_distance(truck_foot, obs["foot"]) <= near_distance:
+                return True
+
+        return False
+
+    def _is_confirmed_line_truck(self, track):
+        # LineTruck 후보가 몇 프레임 연속으로 안정적인지 확인합니다.
+        # 한두 프레임짜리 오탐은 여기서 걸러지고, 충분히 누적된 후보만 신호수 차량 이벤트 판정에 들어갑니다.
+        tid = int(track[4])
+        score = float(track[5])
+        box = track[:4]
+        high_conf_truck = score >= self.line_truck_min_conf
+        car_veto = self._has_recent_car_veto(box)
+
+        self.line_truck_votes[tid].append(high_conf_truck and not car_veto)
+        votes = list(self.line_truck_votes[tid])
+        required_votes = max(1, int(math.ceil(self.line_truck_confirm_frames * self.line_truck_confirm_ratio)))
+
+        return len(votes) >= self.line_truck_confirm_frames and sum(votes) >= required_votes
+
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         curr_ids = set()
         current_time = time.time()
+        self.process_seq += 1
 
         if self.roi_poly.size == 0 or motion_mask is None or frame is None: return triggered
 
@@ -1471,9 +1551,16 @@ class SignalVehicleDetector(BaseEventDetector):
         signalman_tracks = kwargs.get('signalman_tracks', [])
         signalmen_info = [{'tid': int(t[4]), 'pt': get_foot_point(*t[:4])} for t in signalman_tracks]
 
+        self._remember_recent_cars(tracks, track_map)
+
+        # [0단계] LineTruck 확정 필터
+        # 일반 차량이 잠깐 LineTruck으로 오탐된 경우를 막기 위해, 확정된 LineTruck ID만 아래 상태 머신으로 보냅니다.
+        self.confirmed_line_truck_ids = set()
         for t in tracks:
-            if track_map.get(int(t[4])) == ID_G_TRUCK:
-                curr_ids.add(int(t[4]))
+            tid = int(t[4])
+            if track_map.get(tid) == ID_G_TRUCK and self._is_confirmed_line_truck(t):
+                curr_ids.add(tid)
+                self.confirmed_line_truck_ids.add(tid)
 
         # ---------------------------------------------------------
         # [1단계] 양방향 범용 상태 상속
@@ -1528,7 +1615,7 @@ class SignalVehicleDetector(BaseEventDetector):
         # ---------------------------------------------------------
         for t in tracks:
             tid = int(t[4])
-            if track_map.get(tid) != ID_G_TRUCK: continue
+            if tid not in self.confirmed_line_truck_ids: continue
 
             x1, y1, x2, y2 = t[:4]
             fc, c_pt = get_foot_point(*t[:4]), get_center_point(*t[:4])
@@ -1585,7 +1672,7 @@ class SignalVehicleDetector(BaseEventDetector):
         # ---------------------------------------------------------
         for t in tracks:
             tid = int(t[4])
-            if track_map.get(tid) != ID_G_TRUCK: continue
+            if tid not in self.confirmed_line_truck_ids: continue
             if tid not in self.is_parked: continue
 
             x1, y1, x2, y2 = t[:4]
@@ -1626,6 +1713,7 @@ class SignalVehicleDetector(BaseEventDetector):
                                     'bbox': t[:4],
                                     'frame': frame.copy(),
                                     'fid': fid,
+                                    'confidence': float(t[5]),
                                     'auth_tokens': recent_auths[:1],
                                     'objects': [{
                                         'label': 'LineTruck',
@@ -1658,6 +1746,7 @@ class SignalVehicleDetector(BaseEventDetector):
                 del self.last_seen_bbox[tid]
                 if tid in self.last_seen_time: del self.last_seen_time[tid]
                 if tid in self.is_parked: self.is_parked.remove(tid)
+                if tid in self.line_truck_votes: del self.line_truck_votes[tid]
 
         for tid in list(self.presence_start_time.keys()):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0:
@@ -1674,6 +1763,13 @@ class SignalVehicleDetector(BaseEventDetector):
         for tid in list(self.stationary_anchor.keys()):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0:
                 del self.stationary_anchor[tid]
+
+        # 아직 LineTruck으로 확정되지 못한 후보 track도 사라지면 vote 기록을 지웁니다.
+        # 이 정리가 없으면 일반 차량 오탐 후보가 지나간 뒤에도 작은 기록들이 계속 메모리에 남을 수 있습니다.
+        visible_tids = {int(t[4]) for t in tracks}
+        for tid in list(self.line_truck_votes.keys()):
+            if tid not in visible_tids and tid not in curr_ids:
+                del self.line_truck_votes[tid]
 
         return triggered
 
@@ -3160,12 +3256,13 @@ class Camera:
             sv_handler = self.handlers["signal_vehicle"]
             current_time = time.time()
             display_items = []
+            confirmed_line_truck_ids = set(getattr(sv_handler, "confirmed_line_truck_ids", set()))
 
             for a_tid, auth_t in list(sv_handler.last_auth_time.items()):
                 remain = sv_handler.auth_grace_sec - (current_time - auth_t)
                 if remain > 0:
                     auth_time_str = datetime.datetime.fromtimestamp(auth_t).strftime('%H:%M:%S')
-                    is_visible = any(int(t[4]) == a_tid for t in t_main if int(t[6]) == ID_G_TRUCK)
+                    is_visible = a_tid in confirmed_line_truck_ids
                     status_text = "Tracking" if is_visible else "Hidden"
                     sig_id = sv_handler.last_auth_signalman.get(a_tid, "Unknown")
 
@@ -3179,7 +3276,12 @@ class Camera:
                         'color': (0, 255, 0) if is_visible else (0, 180, 0)
                     })
 
-            current_trucks = [int(t[4]) for t in t_main if int(t[6]) == ID_G_TRUCK]
+            # 화면 하단 인증 상태창도 확정된 LineTruck만 보여줍니다.
+            # 일반 차량이 순간적으로 ID 6으로 튄 후보는 이벤트 판정뿐 아니라 상태 표시에서도 제외합니다.
+            current_trucks = [
+                int(t[4]) for t in t_main
+                if int(t[6]) == ID_G_TRUCK and int(t[4]) in confirmed_line_truck_ids
+            ]
             auth_tids = [item['tid'] for item in display_items]
 
             for t_tid in current_trucks:
