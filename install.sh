@@ -161,7 +161,9 @@ else
     sudo systemctl start $SERVICE_NAME
     echo "▶️ CCTV AI 백그라운드 서비스가 구동되었습니다."
 fi
-
+sudo apt install -y openssh-server
+sudo systemctl enable ssh
+sudo systemctl start ssh
 echo "====================================================="
 echo " 🎉 설치 완료! 쾌적하고 안정적인 Global 환경으로 설정되었습니다."
 echo " ※ 만약 AI 인퍼런스가 정상 작동하지 않는다면, PC를 1회 껐다 켜주세요 (Cold Boot 권장)."
