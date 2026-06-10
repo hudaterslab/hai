@@ -3,7 +3,9 @@
 # 1. 사용자 및 경로 설정
 ACTUAL_USER=${SUDO_USER:-$USER}
 USER_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
-PROJECT_DIR=$(pwd)
+
+# [수정] 스크립트가 실제 위치한 절대 경로를 동적으로 가져옵니다. (어느 위치에서 실행해도 무방함)
+PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 SERVICE_NAME="cctv_ai.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
@@ -11,7 +13,6 @@ CAM_CONFIG_FILE="$PROJECT_DIR/cameras.json"
 SYS_CONFIG_FILE="$PROJECT_DIR/system_config.json"
 TARGET_SCRIPT="$PROJECT_DIR/multi_event.py"
 DX_DIR="$USER_HOME/dx-runtime"
-
 echo "====================================================="
 echo " Raspberry Pi Edge AI CCTV 서비스 하이브리드 설치"
 echo "====================================================="
@@ -26,7 +27,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     echo "⚙️ [설정 생성] 'system_config.json' 파일을 생성합니다."
     read -p ">> 이 장비의 고유 Terminal ID를 입력하세요 (예: 10001): " USER_TERM_ID
     if [ -z "$USER_TERM_ID" ]; then USER_TERM_ID="99999"; fi
-    
+
     sudo -u "$ACTUAL_USER" bash -c "cat > $SYS_CONFIG_FILE" << EOL
 {
     "terminal_id": "$USER_TERM_ID",
@@ -36,7 +37,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "intrusion": {"enabled": false, "cooldown_sec": 600},
         "illegal_parking": {"enabled": false, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1},
         "no_helmet": {"enabled": false, "cooldown_sec": 600, "blur_face": true, "trigger_sec": 3.0},
-        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0},
+        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0, "low_body_fallback_sec": 2.0},
         "signal_vehicle": {
             "enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10,
             "line_truck_confirm_frames": 10,
@@ -89,7 +90,7 @@ if ! python3 -c 'import dx_engine' > /dev/null 2>&1; then
 
     sudo apt install -y "$DOWNLOAD_DIR/dxrt-driver-dkms_2.4.0-2_all.deb"
     sudo apt install -y "$DOWNLOAD_DIR/libdxrt_3.3.2_all.deb"
-    
+
     # 설치 직후 서비스 강제 재시작 (장치 인식 유도)
     sudo systemctl restart dxrt.service 2>/dev/null || true
 else
@@ -100,9 +101,14 @@ echo "-----------------------------------------------------"
 echo " 5. 펌웨어(dx_fw) 전용 GitHub 클론 및 플래싱"
 echo "-----------------------------------------------------"
 if [ ! -d "$DX_DIR" ]; then
-    echo "-> 펌웨어 파일을 가져오기 위해 저장소를 클론합니다..."
+    echo "-> 펌웨어 및 라이브러리 파일을 가져오기 위해 저장소를 클론합니다..."
     sudo -u "$ACTUAL_USER" git clone --depth 1 https://github.com/DEEPX-AI/dx-runtime.git "$DX_DIR"
 fi
+
+# [수정] 서브쉘을 열어 dx-runtime 내부로 이동 후 install.sh를 실행합니다.
+# 괄호()로 묶었기 때문에 설치가 끝나면 메인 스크립트의 경로 상태에 영향을 주지 않습니다.
+echo "-> dx-runtime 내장 설치 스크립트(install.sh)를 실행하여 종속성을 설정합니다..."
+(cd "$DX_DIR" && sudo bash install.sh)
 
 if command -v dxrt-cli &> /dev/null; then
     echo "-> M.2 / PCIe 기반 펌웨어(FW) 업데이트를 시도합니다..."
