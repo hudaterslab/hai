@@ -100,8 +100,7 @@ def load_system_config():
             "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True, "blur_plate": True, "trigger_sec": 3.0},
             "conveyor_crossing": {
                 "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment",
-                "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0,
-                "low_body_fallback_sec": 2.0
+                "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
             },
             "signal_vehicle": {
                 "enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30,
@@ -542,7 +541,53 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
     except Exception as e:
         logger.error(f"⚠️ [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
-def _save_and_send_task(img, img_path, api_params):
+def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None):
+    """Create an API-only image with event boxes drawn on top."""
+    api_img = frame.copy()
+    target_tid = int(tid) if tid is not None else None
+    drawn = False
+
+    draw_items = objects_meta or [{'label': event_type, 'box': bbox, 'score': 0.95, 'tid': tid}]
+    for obj in draw_items:
+        try:
+            x1, y1, x2, y2 = int_box(obj.get('box', bbox))
+        except Exception:
+            continue
+
+        obj_tid_raw = obj.get('tid')
+        obj_tid = None
+        if obj_tid_raw is not None:
+            try:
+                obj_tid = int(obj_tid_raw)
+            except Exception:
+                obj_tid = None
+
+        is_target = target_tid is not None and obj_tid == target_tid
+        color = (0, 0, 255) if is_target else (0, 165, 255)
+        thickness = 3 if is_target else 2
+        cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
+
+        label = str(obj.get('label', event_type))
+        if obj_tid is not None:
+            label = f"{label} #{obj_tid}"
+        if obj.get('score') is not None:
+            try:
+                label = f"{label} {float(obj.get('score')):.2f}"
+            except Exception:
+                pass
+
+        text_y = max(20, y1 - 8)
+        cv2.putText(api_img, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        drawn = True
+
+    if not drawn:
+        x1, y1, x2, y2 = map(int, bbox)
+        cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        cv2.putText(api_img, str(event_type), (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
+    return api_img
+
+def _save_and_send_task(img, img_path, api_img, api_img_path, api_params):
     """비동기 스레드에서 파일 쓰기 및 API 전송을 처리합니다."""
     try:
         cv2.imwrite(img_path, img)
@@ -551,8 +596,15 @@ def _save_and_send_task(img, img_path, api_params):
         return
 
     try:
+        os.makedirs(os.path.dirname(api_img_path), exist_ok=True)
+        cv2.imwrite(api_img_path, api_img)
+    except Exception as e:
+        logger.error(f"[API image save failed] path: {api_img_path} | error: {e}")
+        return
+
+    try:
         send_event_image_to_receiver(
-            image_path=img_path,
+            image_path=api_img_path,
             event_name=api_params['event_name'],
             terminal_id=api_params['terminal_id'],
             cctv_id=api_params['cctv_id'],
@@ -589,29 +641,35 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         # 빨간 박스나 글자는 이미지에 직접 그리지 않고, 아래 API 정보와 infer JSONL 로그에 숫자로 남깁니다.
         # 이렇게 해야 나중에 "그 순간 실제 화면"과 "AI가 판단한 위치"를 따로 검증할 수 있습니다.
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
-        if not os.path.exists(dpath):
-            os.makedirs(dpath, exist_ok=True)
+        api_dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images_api", str(event_type))
+        os.makedirs(dpath, exist_ok=True)
+        os.makedirs(api_dpath, exist_ok=True)
 
         fname = f"{now.strftime('%Y%m%d_%H%M%S')}_{ip}_{event_type}_{tid}.jpg"
         img_path = os.path.join(dpath, fname)
+        api_img_path = os.path.join(api_dpath, fname)
+        api_img = _draw_event_api_image(img, event_type, [x1, y1, x2, y2], tid, objects_meta)
 
         h, w = frame.shape[:2]
 
         if objects_meta:
-            ai_detected_bboxes = [
-                {
+            ai_detected_bboxes = []
+            for o in objects_meta:
+                item = {
                     "box": [int(b) for b in o['box']],
                     "label": str(o['label']),
                     "score": round(float(o.get('score', 0.95)), 2)
                 }
-                for o in objects_meta
-            ]
+                if o.get('tid') is not None:
+                    item["tid"] = int(o.get('tid'))
+                ai_detected_bboxes.append(item)
         else:
             ai_detected_bboxes = [
                 {
                     "box": [x1, y1, x2, y2],
                     "label": str(event_type),
-                    "score": 0.95
+                    "score": 0.95,
+                    "tid": int(tid)
                 }
             ]
 
@@ -625,7 +683,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
             'img_height': h
         }
 
-        IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, api_params)
+        IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, api_img, api_img_path, api_params)
 
     except Exception as e:
         logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
@@ -1085,15 +1143,11 @@ class CrossingDetector(BaseEventDetector):
 
         self.prev = {}
         self.candidates = {}
-        self.lb_offsets = {}
-        self.lb_last_height = {}
-        self.lb_last_seen_time = {}
 
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
 
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
-        self.low_body_fallback_sec = float(config.get("low_body_fallback_sec", 2.0))
 
     def _is_intersect(self, p1, p2, p3, p4):
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
@@ -1151,7 +1205,6 @@ class CrossingDetector(BaseEventDetector):
 
             px1, py1, px2, py2 = p[:4]
             person_height = max(1, py2 - py1)
-            p_foot = (int((px1 + px2) / 2), int(py2))
 
             best_low_track = None
             max_ioa = 0
@@ -1170,44 +1223,19 @@ class CrossingDetector(BaseEventDetector):
                     best_low_track = lb
 
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid}]
-            has_low_body_match = False
-            used_low_body_fallback = False
-            fallback_age_sec = None
-
             if max_ioa >= 0.4 and best_low_track is not None:
                 lx1, ly1, lx2, ly2 = best_low_track[:4]
                 low_height = max(1, ly2 - ly1)
                 curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
 
-                self.lb_offsets[p_tid] = (curr_pos[0] - p_foot[0], curr_pos[1] - p_foot[1])
-                self.lb_last_height[p_tid] = low_height
-                self.lb_last_seen_time[p_tid] = current_time
-                has_low_body_match = True
                 event_bbox = tuple(best_low_track[:4])
 
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
 
             else:
-                last_low_seen = self.lb_last_seen_time.get(p_tid, 0.0)
-                can_use_fallback = (
-                    p_tid in self.lb_offsets and
-                    last_low_seen > 0.0 and
-                    current_time - last_low_seen <= self.low_body_fallback_sec
-                )
-
-                if can_use_fallback:
-                    # 하반신이 잠깐 사라진 경우만 이전 offset으로 2초까지 보정합니다.
-                    # 오래된 offset으로 새 crossing 후보를 만들면 컨베이어 옆 작업 자세가 오탐으로 이어질 수 있습니다.
-                    used_low_body_fallback = True
-                    fallback_age_sec = current_time - last_low_seen
-                    ox, oy = self.lb_offsets[p_tid]
-                    curr_pos = (p_foot[0] + ox, p_foot[1] + oy)
-                    low_height = self.lb_last_height.get(p_tid, person_height * 0.4)
-                    event_bbox = (px1, py2 - low_height, px2, py2)
-                else:
-                    if p_tid in self.candidates:
-                        del self.candidates[p_tid]
-                    continue
+                if p_tid in self.candidates and current_time - self.candidates[p_tid]['timestamp_time'] > self.candidate_ttl_sec:
+                    del self.candidates[p_tid]
+                continue
 
             # 점프 방어 (너무 큰 순간 이동은 무시)
             if p_tid in self.prev:
@@ -1218,7 +1246,7 @@ class CrossingDetector(BaseEventDetector):
                     continue
 
             # 횡단 판별: 궤적이 선분과 교차하는지 확인
-            if has_low_body_match and p_tid in self.prev and p_tid not in self.candidates:
+            if p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
@@ -1286,10 +1314,7 @@ class CrossingDetector(BaseEventDetector):
                                 'dynamic_threshold': round(float(dynamic_threshold), 3),
                                 'distance_ratio': round(float(self.distance_ratio), 4),
                                 'tilt_factor': round(float(tilt_factor), 4),
-                                'used_low_body': bool(has_low_body_match),
-                                'used_low_body_fallback': bool(used_low_body_fallback),
-                                'fallback_age_sec': None if fallback_age_sec is None else round(float(fallback_age_sec), 3),
-                                'fallback_limit_sec': round(float(self.low_body_fallback_sec), 3),
+                                'used_low_body': True,
                                 'low_body_ioa': round(float(max_ioa), 4),
                                 'person_height': round(float(cand['person_height']), 3)
                             }
@@ -1308,9 +1333,6 @@ class CrossingDetector(BaseEventDetector):
             if tid not in curr_ids:
                 del self.prev[tid]
                 if tid in self.candidates: del self.candidates[tid]
-                if tid in self.lb_offsets: del self.lb_offsets[tid]
-                if tid in self.lb_last_height: del self.lb_last_height[tid]
-                if tid in self.lb_last_seen_time: del self.lb_last_seen_time[tid]
 
         return triggered
 

@@ -36,7 +36,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "intrusion": {"enabled": false, "cooldown_sec": 600},
         "illegal_parking": {"enabled": false, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1},
         "no_helmet": {"enabled": false, "cooldown_sec": 600, "blur_face": true, "trigger_sec": 3.0},
-        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0, "low_body_fallback_sec": 2.0},
+        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0},
         "signal_vehicle": {
             "enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10,
             "line_truck_confirm_frames": 10,
