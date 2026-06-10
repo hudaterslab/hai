@@ -3,7 +3,9 @@
 # 1. 사용자 및 경로 설정
 ACTUAL_USER=${SUDO_USER:-$USER}
 USER_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
-PROJECT_DIR=$(pwd)
+
+# [수정] 스크립트가 실제 위치한 절대 경로를 동적으로 가져옵니다. (어느 위치에서 실행해도 무방함)
+PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 SERVICE_NAME="cctv_ai.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
@@ -100,9 +102,14 @@ echo "-----------------------------------------------------"
 echo " 5. 펌웨어(dx_fw) 전용 GitHub 클론 및 플래싱"
 echo "-----------------------------------------------------"
 if [ ! -d "$DX_DIR" ]; then
-    echo "-> 펌웨어 파일을 가져오기 위해 저장소를 클론합니다..."
+    echo "-> 펌웨어 및 라이브러리 파일을 가져오기 위해 저장소를 클론합니다..."
     sudo -u "$ACTUAL_USER" git clone --depth 1 https://github.com/DEEPX-AI/dx-runtime.git "$DX_DIR"
 fi
+
+# [수정] 서브쉘을 열어 dx-runtime 내부로 이동 후 install.sh를 실행합니다.
+# 괄호()로 묶었기 때문에 설치가 끝나면 메인 스크립트의 경로 상태에 영향을 주지 않습니다.
+echo "-> dx-runtime 내장 설치 스크립트(install.sh)를 실행하여 종속성을 설정합니다..."
+(cd "$DX_DIR" && sudo bash install.sh)
 
 if command -v dxrt-cli &> /dev/null; then
     echo "-> M.2 / PCIe 기반 펌웨어(FW) 업데이트를 시도합니다..."
