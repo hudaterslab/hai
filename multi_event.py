@@ -541,13 +541,13 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
     except Exception as e:
         logger.error(f"⚠️ [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
-def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None):
+def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_tokens=None):
     """Create an API-only image with event boxes drawn on top."""
     api_img = frame.copy()
     target_tid = int(tid) if tid is not None else None
     drawn = False
 
-    draw_items = objects_meta or [{'label': event_type, 'box': bbox, 'score': 0.95, 'tid': tid}]
+    draw_items = objects_meta or [{'label': event_type, 'box': bbox, 'tid': tid}]
     for obj in draw_items:
         try:
             x1, y1, x2, y2 = int_box(obj.get('box', bbox))
@@ -567,14 +567,17 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None):
         thickness = 3 if is_target else 2
         cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
 
-        label = str(obj.get('label', event_type))
+        label_name = str(obj.get('label', event_type))
+        class_id = obj.get('class_id')
+        
+        # [수정] Confidence(Score) 표출 제거 및 Class ID 표출 적용
+        if class_id is not None:
+            label = f"{label_name}(ID:{class_id})"
+        else:
+            label = label_name
+
         if obj_tid is not None:
             label = f"{label} #{obj_tid}"
-        if obj.get('score') is not None:
-            try:
-                label = f"{label} {float(obj.get('score')):.2f}"
-            except Exception:
-                pass
 
         text_y = max(20, y1 - 8)
         cv2.putText(api_img, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
@@ -584,6 +587,28 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None):
         x1, y1, x2, y2 = map(int, bbox)
         cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
         cv2.putText(api_img, str(event_type), (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
+    # 관제 서버로 전송되는 증거 이미지 우측 하단에 Signalman 상태창 강제 베이킹 (유지)
+    if event_type == "signal_vehicle":
+        h_frame, w_frame = api_img.shape[:2]
+        token_count = max(1, len(auth_tokens) if auth_tokens else 1)
+        box_w, box_h = 340, 35 + token_count * 40
+        x_start, y_start = w_frame - box_w - 20, h_frame - box_h - 20
+
+        overlay = api_img.copy()
+        cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
+        cv2.putText(api_img, "Signalman Auth [EVIDENCE]", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        if not auth_tokens:
+            cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(api_img, "Reason: Moving without Signalman", (x_start + 10, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+        else:
+            for i, tkn in enumerate(auth_tokens):
+                remain = tkn.get('remain', 0)
+                sig_tid = tkn.get('sig_tid', 'Unknown')
+                cv2.putText(api_img, f"Auth Remain: {remain:.1f}s", (x_start + 10, y_start + 45 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(api_img, f"Auth by: Signalman [{sig_tid}]", (x_start + 10, y_start + 65 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
     return api_img
 
@@ -637,9 +662,6 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         x1, y1, x2, y2 = map(int, bbox)
         now = datetime.datetime.now()
 
-        # 증거 이미지는 사람이 보기 좋게 꾸민 화면이 아니라, 카메라에서 들어온 원본을 저장합니다.
-        # 빨간 박스나 글자는 이미지에 직접 그리지 않고, 아래 API 정보와 infer JSONL 로그에 숫자로 남깁니다.
-        # 이렇게 해야 나중에 "그 순간 실제 화면"과 "AI가 판단한 위치"를 따로 검증할 수 있습니다.
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
         api_dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images_api", str(event_type))
         os.makedirs(dpath, exist_ok=True)
@@ -648,7 +670,9 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         fname = f"{now.strftime('%Y%m%d_%H%M%S')}_{ip}_{event_type}_{tid}.jpg"
         img_path = os.path.join(dpath, fname)
         api_img_path = os.path.join(api_dpath, fname)
-        api_img = _draw_event_api_image(img, event_type, [x1, y1, x2, y2], tid, objects_meta)
+        
+        # [수정] auth_tokens 데이터를 _draw_event_api_image 로 전달
+        api_img = _draw_event_api_image(img, event_type, [x1, y1, x2, y2], tid, objects_meta, auth_tokens)
 
         h, w = frame.shape[:2]
 
@@ -1222,7 +1246,7 @@ class CrossingDetector(BaseEventDetector):
                     max_ioa = ioa
                     best_low_track = lb
 
-            curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid}]
+            curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid, 'class_id': ID_G_PERSON}]
             if max_ioa >= 0.4 and best_low_track is not None:
                 lx1, ly1, lx2, ly2 = best_low_track[:4]
                 low_height = max(1, ly2 - ly1)
@@ -1230,7 +1254,7 @@ class CrossingDetector(BaseEventDetector):
 
                 event_bbox = tuple(best_low_track[:4])
 
-                curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
+                curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4]), 'class_id': ID_PERSON_LOW})
 
             else:
                 if p_tid in self.candidates and current_time - self.candidates[p_tid]['timestamp_time'] > self.candidate_ttl_sec:
@@ -1486,8 +1510,8 @@ class HelmetDetector(BaseEventDetector):
                         'roi_passed': True
                     },
                     'objects': [
-                        {'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid},
-                        {'label': 'no_helmet', 'box': [int(x) for x in nh_track_match[:4]], 'score': float(nh_track_match[5]), 'tid': int(nh_track_match[4])}
+                        # [수정] 사람(Person) BBox를 페이로드에서 제외하고, 미착용 머리 객체만 전송
+                        {'label': 'no_helmet', 'box': [int(x) for x in nh_track_match[:4]], 'score': float(nh_track_match[5]), 'tid': int(nh_track_match[4]), 'class_id': ID_H_NO_HELMET}
                     ]
                 })
 
@@ -3505,15 +3529,14 @@ class Camera:
                         'color': (0, 255, 0) if is_visible else (0, 180, 0)
                     })
 
-            # 화면 하단 인증 상태창도 확정된 LineTruck만 보여줍니다.
-            # 일반 차량이 순간적으로 ID 6으로 튄 후보는 이벤트 판정뿐 아니라 상태 표시에서도 제외합니다.
-            current_trucks = [
-                int(t[4]) for t in t_main
-                if int(t[6]) == ID_G_TRUCK and int(t[4]) in confirmed_line_truck_ids
-            ]
             auth_tids = [item['tid'] for item in display_items]
 
-            for t_tid in current_trucks:
+            # [수정] BBox가 사라져도 알람이 울린 대상은 화면에 강제로 유지합니다.
+            current_trucks = set([int(t[4]) for t in t_main if int(t[6]) == ID_G_TRUCK and int(t[4]) in confirmed_line_truck_ids])
+            alarmed_tids = set([tid for tid, evt in alarms.items() if evt == "signal_vehicle"])
+            target_tids = current_trucks.union(alarmed_tids)
+
+            for t_tid in target_tids:
                 if t_tid not in auth_tids:
                     is_alarming = t_tid in alarms
                     base_sort = float('inf') if is_alarming else 0
