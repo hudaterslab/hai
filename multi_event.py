@@ -100,7 +100,8 @@ def load_system_config():
             "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True, "blur_plate": True, "trigger_sec": 3.0},
             "conveyor_crossing": {
                 "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment",
-                "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
+                "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0,
+                "low_body_fallback_sec": 2.0
             },
             "signal_vehicle": {
                 "enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30,
@@ -129,7 +130,7 @@ def load_system_config():
             "HELMET": 0.55,
             "PERSON": 0.35, # [추가] 사람 및 신호수 전용 기본 임계값 설정
             "SIGNALMAN": 0.5,
-            "PLATE": 0.3
+            "PLATE": 0.2
         },
         "INFERENCE_MODE": "auto",  # auto: 통합 모델 파일이 있으면 단일 모델, 없으면 기존 별도 모델
         "BATCH_SIZE": 9,
@@ -413,6 +414,30 @@ def get_center_point(x1, y1, x2, y2):
 def get_distance(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
+def to_json_safe(value):
+    """numpy 값, tuple, deque 등을 JSON 저장 가능한 기본 타입으로 바꿉니다."""
+    if isinstance(value, dict):
+        return {str(k): to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, deque)):
+        return [to_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return to_json_safe(value.tolist())
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    return value
+
+def int_box(box):
+    return [int(round(float(v))) for v in box]
+
+def int_point(pt):
+    return [int(round(float(pt[0]))), int(round(float(pt[1])))]
+
 def ccw(p1, p2, p3):
     """세 점의 방향성을 판별합니다. (선분 교차 알고리즘용)"""
     val = (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
@@ -545,7 +570,7 @@ def _write_jsonl_records(path, records):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'a', encoding='utf-8') as f:
             for record in records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(json.dumps(to_json_safe(record), ensure_ascii=False) + "\n")
     except Exception as e:
         logger.error(f"[InferLog] JSONL write failed: {path} | {e}")
 
@@ -813,7 +838,7 @@ class VideoRecorder:
             else:
                 self.write_queue.put(frame_item)
 
-    def trigger(self, event_name, objects_meta=None): # [수정] objects_meta 매개변수 추가
+    def trigger(self, event_name, objects_meta=None, event_meta=None): # [수정] objects_meta 매개변수 추가
         now = time.time()
         post_sec = SYS_CFG.get("REC_POST_SEC", 10)
 
@@ -824,7 +849,9 @@ class VideoRecorder:
             self.recording = True
             self.record_end_time = now + post_sec
             self.current_event = event_name
-            self.current_meta = objects_meta # [추가] 이벤트 발생 시점의 BBox 메타데이터 기억
+            # MP4 옆 JSON에는 BBox뿐 아니라 이벤트 판단 근거(decision_trace)까지 함께 남깁니다.
+            # event_meta가 없는 예전 호출은 objects_meta만 저장해 기존 동작을 유지합니다.
+            self.current_meta = event_meta if event_meta is not None else objects_meta
 
             temp_buffer = list(self.buffer)
             for item in temp_buffer:
@@ -883,7 +910,7 @@ class VideoRecorder:
                     meta_path = os.path.join(dpath, meta_fname)
                     try:
                         with open(meta_path, 'w', encoding='utf-8') as f_meta:
-                            json.dump(self.current_meta, f_meta, indent=4, ensure_ascii=False)
+                            json.dump(to_json_safe(self.current_meta), f_meta, indent=4, ensure_ascii=False)
                         logger.info(f"📝 [BBox 데이터 저장 완료] 경로: {meta_path}")
                     except Exception as e:
                         logger.error(f"⚠️ BBox JSON 메타데이터 저장 실패: {e}")
@@ -914,7 +941,7 @@ class VideoRecorder:
                         # 이 두 값으로 "영상 파일의 N번째 프레임"과 "AI 판단 로그"를 연결합니다.
                         log_record["video_frame_index"] = video_frame_index
                         log_record["video_path"] = fpath
-                        infer_log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+                        infer_log_file.write(json.dumps(to_json_safe(log_record), ensure_ascii=False) + "\n")
                     except Exception as e:
                         logger.error(f"[InferLog] video inference log write failed: {infer_log_path} | {e}")
 
@@ -1023,7 +1050,20 @@ class ParkingDetector(BaseEventDetector):
                                 'tid': tid,
                                 'bbox': self.states[tid]['bbox'],
                                 'frame': self.states[tid]['frame'],
-                                'fid': self.states[tid]['fid']
+                                'fid': self.states[tid]['fid'],
+                                'decision_trace': {
+                                    'detector': 'ParkingDetector',
+                                    'reason': 'stationary_duration_exceeded',
+                                    'class_id': int(track_map.get(tid, -1)),
+                                    'roi_check_point': int_point(get_check_point(*t[:4])),
+                                    'anchor_center': int_point(self.states[tid]['pos']),
+                                    'current_center': int_point(c),
+                                    'duration_sec': round(float(duration_sec), 3),
+                                    'trigger_sec': round(float(self.trigger_sec), 3),
+                                    'move_threshold_ratio': round(float(self.move_threshold_ratio), 4),
+                                    'dynamic_move_threshold': round(float(dynamic_move_threshold), 3),
+                                    'vehicle_size': round(float(vehicle_size), 3)
+                                }
                             })
                             self.states[tid]['triggered'] = True
 
@@ -1047,11 +1087,13 @@ class CrossingDetector(BaseEventDetector):
         self.candidates = {}
         self.lb_offsets = {}
         self.lb_last_height = {}
+        self.lb_last_seen_time = {}
 
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
 
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
+        self.low_body_fallback_sec = float(config.get("low_body_fallback_sec", 2.0))
 
     def _is_intersect(self, p1, p2, p3, p4):
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
@@ -1128,6 +1170,9 @@ class CrossingDetector(BaseEventDetector):
                     best_low_track = lb
 
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid}]
+            has_low_body_match = False
+            used_low_body_fallback = False
+            fallback_age_sec = None
 
             if max_ioa >= 0.4 and best_low_track is not None:
                 lx1, ly1, lx2, ly2 = best_low_track[:4]
@@ -1136,17 +1181,32 @@ class CrossingDetector(BaseEventDetector):
 
                 self.lb_offsets[p_tid] = (curr_pos[0] - p_foot[0], curr_pos[1] - p_foot[1])
                 self.lb_last_height[p_tid] = low_height
+                self.lb_last_seen_time[p_tid] = current_time
+                has_low_body_match = True
                 event_bbox = tuple(best_low_track[:4])
 
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
 
             else:
-                if p_tid in self.lb_offsets:
+                last_low_seen = self.lb_last_seen_time.get(p_tid, 0.0)
+                can_use_fallback = (
+                    p_tid in self.lb_offsets and
+                    last_low_seen > 0.0 and
+                    current_time - last_low_seen <= self.low_body_fallback_sec
+                )
+
+                if can_use_fallback:
+                    # 하반신이 잠깐 사라진 경우만 이전 offset으로 2초까지 보정합니다.
+                    # 오래된 offset으로 새 crossing 후보를 만들면 컨베이어 옆 작업 자세가 오탐으로 이어질 수 있습니다.
+                    used_low_body_fallback = True
+                    fallback_age_sec = current_time - last_low_seen
                     ox, oy = self.lb_offsets[p_tid]
                     curr_pos = (p_foot[0] + ox, p_foot[1] + oy)
                     low_height = self.lb_last_height.get(p_tid, person_height * 0.4)
                     event_bbox = (px1, py2 - low_height, px2, py2)
                 else:
+                    if p_tid in self.candidates:
+                        del self.candidates[p_tid]
                     continue
 
             # 점프 방어 (너무 큰 순간 이동은 무시)
@@ -1158,7 +1218,7 @@ class CrossingDetector(BaseEventDetector):
                     continue
 
             # 횡단 판별: 궤적이 선분과 교차하는지 확인
-            if p_tid in self.prev and p_tid not in self.candidates:
+            if has_low_body_match and p_tid in self.prev and p_tid not in self.candidates:
                 trajectory = (self.prev[p_tid], curr_pos)
                 for p1, p2 in self.lines:
                     if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
@@ -1169,6 +1229,8 @@ class CrossingDetector(BaseEventDetector):
                                 'timestamp_time': current_time,
                                 'line': (p1, p2),
                                 'entry_side': ccw(p1, p2, trajectory[0]),
+                                'cross_angle': cross_angle,
+                                'candidate_trajectory': [trajectory[0], trajectory[1]],
                                 'crossed_pos': curr_pos, # [추가] 선을 넘은 직후의 첫 발 위치 앵커 기록
                                 'bbox': event_bbox,
                                 'frame': frame.copy() if frame is not None else None,
@@ -1204,7 +1266,33 @@ class CrossingDetector(BaseEventDetector):
                             'bbox': cand['bbox'],
                             'frame': cand['frame'],
                             'fid': cand['fid'],
-                            'objects': cand['objects']
+                            'objects': cand['objects'],
+                            'decision_trace': {
+                                'detector': 'CrossingDetector',
+                                'reason': 'line_crossed_after_candidate',
+                                'line': [int_point(p1), int_point(p2)],
+                                'entry_side': int(cand['entry_side']),
+                                'current_side': int(curr_side),
+                                'candidate_fid': int(cand.get('fid', fid)),
+                                'trigger_fid': int(fid),
+                                'candidate_age_sec': round(float(current_time - cand['timestamp_time']), 3),
+                                'candidate_trajectory': [int_point(p) for p in cand.get('candidate_trajectory', [])],
+                                'crossed_pos': int_point(cand['crossed_pos']),
+                                'current_pos': int_point(curr_pos),
+                                'cross_angle': round(float(cand.get('cross_angle', 0.0)), 3),
+                                'min_crossing_angle': round(float(self.min_crossing_angle), 3),
+                                'perp_dist': round(float(perp_dist), 3),
+                                'post_cross_dist': round(float(post_cross_dist), 3),
+                                'dynamic_threshold': round(float(dynamic_threshold), 3),
+                                'distance_ratio': round(float(self.distance_ratio), 4),
+                                'tilt_factor': round(float(tilt_factor), 4),
+                                'used_low_body': bool(has_low_body_match),
+                                'used_low_body_fallback': bool(used_low_body_fallback),
+                                'fallback_age_sec': None if fallback_age_sec is None else round(float(fallback_age_sec), 3),
+                                'fallback_limit_sec': round(float(self.low_body_fallback_sec), 3),
+                                'low_body_ioa': round(float(max_ioa), 4),
+                                'person_height': round(float(cand['person_height']), 3)
+                            }
                         })
                         del self.candidates[p_tid]
                     else:
@@ -1222,6 +1310,7 @@ class CrossingDetector(BaseEventDetector):
                 if tid in self.candidates: del self.candidates[tid]
                 if tid in self.lb_offsets: del self.lb_offsets[tid]
                 if tid in self.lb_last_height: del self.lb_last_height[tid]
+                if tid in self.lb_last_seen_time: del self.lb_last_seen_time[tid]
 
         return triggered
 
@@ -1355,10 +1444,25 @@ class HelmetDetector(BaseEventDetector):
                 if not self._is_no_helmet_in_roi(nh_track_match[:4]):
                     continue
 
+                hx1, hy1, hx2, hy2 = nh_track_match[:4]
+                head_center = ((hx1 + hx2) / 2, (hy1 + hy2) / 2)
                 current_nh_persons.append({
                     'tid': p_tid,
                     'head_bbox': nh_track_match[:4],
                     'person_bbox': p[:4],
+                    'decision_context': {
+                        'person_tid': p_tid,
+                        'no_helmet_tid': int(nh_track_match[4]),
+                        'no_helmet_score': float(nh_track_match[5]),
+                        'ioa_with_person': float(max_ioa),
+                        'min_ioa': 0.5,
+                        'head_center': int_point(head_center),
+                        'person_top40_y': int(round(float(py1 + person_height * 0.4))),
+                        'person_width': int(round(float(person_width))),
+                        'ignore_top_ratio': round(float(self.ignore_top_ratio), 4),
+                        'roi_checked': bool(self.roi_poly is not None and self.roi_poly.size > 0),
+                        'roi_passed': True
+                    },
                     'objects': [
                         {'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid},
                         {'label': 'no_helmet', 'box': [int(x) for x in nh_track_match[:4]], 'score': float(nh_track_match[5]), 'tid': int(nh_track_match[4])}
@@ -1388,6 +1492,7 @@ class HelmetDetector(BaseEventDetector):
                 matched_session['frame'] = frame.copy() if frame is not None else None
                 matched_session['fid'] = fid
                 matched_session['objects'] = nh_p['objects']
+                matched_session['decision_context'] = nh_p.get('decision_context', {})
 
                 if roi_crop is not None:
                     matched_session['roi_buffer'].append(roi_crop)
@@ -1407,7 +1512,8 @@ class HelmetDetector(BaseEventDetector):
                     'fid': fid,
                     'triggered': False,
                     'roi_buffer': new_buffer,
-                    'objects': nh_p['objects']
+                    'objects': nh_p['objects'],
+                    'decision_context': nh_p.get('decision_context', {})
                 })
 
         active_sessions = []
@@ -1416,10 +1522,14 @@ class HelmetDetector(BaseEventDetector):
             if current_time - session['start_time'] > self.window_sec: continue
 
             total_valid_sec = 0.0
+            valid_streaks = []
             for streak in session['streaks']:
                 streak_duration = streak['end_time'] - streak['start_time']
                 if streak_duration >= self.min_streak_sec:
                     total_valid_sec += streak_duration
+                    valid_streaks.append({
+                        'duration_sec': round(float(streak_duration), 3)
+                    })
 
             if not session['triggered'] and total_valid_sec >= self.trigger_total_sec:
                 is_red_helmet = self._is_red_helmet_median(session['roi_buffer'])
@@ -1431,7 +1541,20 @@ class HelmetDetector(BaseEventDetector):
                         'bbox': session['bbox'],
                         'frame': session['frame'],
                         'fid': session['fid'],
-                        'objects': session['objects']
+                        'objects': session['objects'],
+                        'decision_trace': {
+                            'detector': 'HelmetDetector',
+                            'reason': 'no_helmet_duration_exceeded',
+                            'session_age_sec': round(float(current_time - session['start_time']), 3),
+                            'total_valid_sec': round(float(total_valid_sec), 3),
+                            'trigger_total_sec': round(float(self.trigger_total_sec), 3),
+                            'min_streak_sec': round(float(self.min_streak_sec), 3),
+                            'max_gap_sec': round(float(self.max_gap_sec), 3),
+                            'valid_streaks': valid_streaks,
+                            'red_helmet_veto': False,
+                            'roi_buffer_size': int(len(session.get('roi_buffer', []))),
+                            **session.get('decision_context', {})
+                        }
                     })
                 session['triggered'] = True
 
@@ -1482,6 +1605,7 @@ class SignalVehicleDetector(BaseEventDetector):
         self.last_seen_bbox = {}
         self.last_seen_time = {}
         self.is_parked = set()
+        self.state_inherit_sources = {}
 
     def _remember_recent_cars(self, tracks, track_map):
         # 현재 프레임에서 일반 차량으로 확인된 위치를 잠깐 기억합니다.
@@ -1609,6 +1733,13 @@ class SignalVehicleDetector(BaseEventDetector):
                 can_inherit, inherit_reason = self._can_inherit_track_state(curr_box, old_box, iou, dist)
 
                 if can_inherit:
+                    self.state_inherit_sources[curr_tid] = {
+                        'from_tid': int(old_tid),
+                        'to_tid': int(curr_tid),
+                        'iou': round(float(iou), 4),
+                        'distance': round(float(dist), 3),
+                        'reason': inherit_reason
+                    }
                     if old_tid in self.last_auth_time:
                         self.last_auth_time[curr_tid] = self.last_auth_time[old_tid]
                         del self.last_auth_time[old_tid]
@@ -1728,8 +1859,9 @@ class SignalVehicleDetector(BaseEventDetector):
                         car_roi = motion_mask[my1:my2, mx1:mx2]
                         _, m_only = cv2.threshold(car_roi, 250, 255, cv2.THRESH_BINARY)
                         total_px = (mx2 - mx1) * (my2 - my1)
+                        motion_ratio_value = (cv2.countNonZero(m_only) / total_px) if total_px > 0 else 0.0
 
-                        if total_px > 0 and (cv2.countNonZero(m_only) / total_px) > self.motion_ratio:
+                        if total_px > 0 and motion_ratio_value > self.motion_ratio:
                             last_auth = self.last_auth_time.get(tid, 0.0)
                             time_since_auth = current_time - last_auth
 
@@ -1741,6 +1873,8 @@ class SignalVehicleDetector(BaseEventDetector):
                                     recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t, 'sig_tid': sig_tid})
 
                                 recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
+                                votes = list(self.line_truck_votes.get(tid, []))
+                                stationary_start = self.stationary_start_time.get(tid, current_time)
                                 triggered.append({
                                     'tid': tid,
                                     'bbox': t[:4],
@@ -1754,13 +1888,37 @@ class SignalVehicleDetector(BaseEventDetector):
                                         'score': float(t[5]),
                                         'tid': tid,
                                         'class_id': ID_G_TRUCK
-                                    }]
+                                    }],
+                                    'decision_trace': {
+                                        'detector': 'SignalVehicleDetector',
+                                        'reason': 'moving_confirmed_line_truck_without_recent_signalman',
+                                        'confirmed_line_truck': True,
+                                        'line_truck_vote_count': int(sum(votes)),
+                                        'line_truck_vote_window': int(len(votes)),
+                                        'line_truck_confirm_frames': int(self.line_truck_confirm_frames),
+                                        'line_truck_confirm_ratio': round(float(self.line_truck_confirm_ratio), 4),
+                                        'line_truck_min_conf': round(float(self.line_truck_min_conf), 4),
+                                        'is_parked': bool(tid in self.is_parked),
+                                        'stationary_sec': round(float(current_time - stationary_start), 3),
+                                        'parked_threshold_sec': round(float(self.parked_threshold_sec), 3),
+                                        'movement_dist': round(float(dist), 3),
+                                        'min_movement': round(float(min_movement), 3),
+                                        'motion_ratio': round(float(motion_ratio_value), 4),
+                                        'motion_threshold_ratio': round(float(self.motion_ratio), 4),
+                                        'roi_passed': bool(is_in_roi),
+                                        'last_auth_age_sec': None if last_auth == 0.0 else round(float(time_since_auth), 3),
+                                        'auth_grace_sec': round(float(self.auth_grace_sec), 3),
+                                        'recent_auths': recent_auths[:1],
+                                        'state_inherited': self.state_inherit_sources.get(tid),
+                                        'history_len': int(len(h_list))
+                                    }
                                 })
 
                                 self.history[tid].clear()
                                 if tid in self.last_auth_time: del self.last_auth_time[tid]
                                 if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
                                 if tid in self.is_parked: self.is_parked.remove(tid)
+                                if tid in self.state_inherit_sources: del self.state_inherit_sources[tid]
 
         # ---------------------------------------------------------
         # [4단계] 상태 정리 (Cleanup)
@@ -1780,6 +1938,7 @@ class SignalVehicleDetector(BaseEventDetector):
                 if tid in self.last_seen_time: del self.last_seen_time[tid]
                 if tid in self.is_parked: self.is_parked.remove(tid)
                 if tid in self.line_truck_votes: del self.line_truck_votes[tid]
+                if tid in self.state_inherit_sources: del self.state_inherit_sources[tid]
 
         for tid in list(self.presence_start_time.keys()):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0:
@@ -2871,7 +3030,7 @@ class Camera:
         blurred_plates = []
 
         try:
-            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.3)
+            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.2)
 
             p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
 
@@ -3031,7 +3190,8 @@ class Camera:
                 {
                     "event_name": str(ev.get("event_name", "")),
                     "objects": self._serialize_event_objects(ev.get("objects", [])),
-                    "privacy_blur": ev.get("privacy_blur", {})
+                    "privacy_blur": to_json_safe(ev.get("privacy_blur", {})),
+                    "decision_trace": to_json_safe(ev.get("decision_trace", {}))
                 }
                 for ev in (new_events or [])
             ]
@@ -3093,6 +3253,10 @@ class Camera:
 
                 actual_score = score_map_main.get(tid, 0.95)
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
+                decision_trace = to_json_safe(ev.get('decision_trace', {
+                    'detector': handler.__class__.__name__,
+                    'reason': 'event_triggered_without_detail'
+                }))
 
                 if ename not in self.alerted[tid] and (now - self.last_evt_t.get(ename, 0) >= cooldown):
                     objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
@@ -3123,6 +3287,20 @@ class Camera:
                             event_trajectories[obj_tid] = list(self.trk_helmet.tracks[obj_tid]['history'])
 
                     auth_tokens = ev.get('auth_tokens', None)
+                    event_meta = {
+                        'event_name': ename,
+                        'terminal_id': str(SYS_CFG.get("terminal_id", "99999")),
+                        'cctv_id': int(self.cam_id),
+                        'ip': str(self.ip),
+                        'tid': int(tid),
+                        'bbox': int_box(bbox),
+                        'fid': int(ev.get('fid', fid)),
+                        'objects': self._serialize_event_objects(objects_meta),
+                        'trajectories': to_json_safe(event_trajectories),
+                        'auth_tokens': to_json_safe(auth_tokens or []),
+                        'privacy_blur': to_json_safe(privacy_blur_meta),
+                        'decision_trace': decision_trace
+                    }
 
                     save_event_image_with_mark(
                         frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid,
@@ -3131,14 +3309,15 @@ class Camera:
                         auth_tokens=auth_tokens
                     )
 
-                    self.recorder.trigger(ename, objects_meta=objects_meta)
+                    self.recorder.trigger(ename, objects_meta=objects_meta, event_meta=event_meta)
                     self.alerted[tid].add(ename)
                     self.last_evt_t[ename] = now
 
                     newly_triggered_events.append({
                         'event_name': ename,
                         'objects': objects_meta,
-                        'privacy_blur': privacy_blur_meta
+                        'privacy_blur': privacy_blur_meta,
+                        'decision_trace': decision_trace
                     })
 
                 current_alarms[tid] = ename
@@ -3526,9 +3705,10 @@ def main():
         logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
 
         if use_unified_event_model:
-            # 이벤트 판단용 객체는 통합 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
+            # 이벤트 판단용 기본 객체와 신호수는 통합 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
+            # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
             d_main = YoLoDeepX(unified_model_path)
-            d_helmet = None
+            d_helmet = YoLoDeepX(resolve_model_path(models_cfg["HELMET"]))
             d_signalman = None
         else:
             d_main = YoLoDeepX(resolve_model_path(models_cfg["MAIN"]))
@@ -3687,9 +3867,10 @@ def main():
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
                 if use_unified_event_model:
-                    base_conf = min(main_conf, person_conf, helmet_conf, signalman_conf)
+                    # 헬멧 미착용은 아래 전용 모델에서 따로 추론하므로 통합 모델 기준에는 helmet_conf를 섞지 않습니다.
+                    base_conf = min(main_conf, person_conf, signalman_conf)
                     raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
-                    t_main_input, d_helmet_res, d_signalman_res = split_unified_event_detections(
+                    t_main_input, _, d_signalman_res = split_unified_event_detections(
                         raw_dets,
                         cams[idx].events,
                         main_conf=main_conf,
@@ -3697,6 +3878,11 @@ def main():
                         helmet_conf=helmet_conf,
                         signalman_conf=signalman_conf
                     )
+
+                    d_helmet_res = np.empty((0, 6))
+                    if "no_helmet" in cams[idx].events:
+                        # 통합 signalman 모델의 헬멧 클래스는 쓰지 않고, 기존 helmet_3cls_v8 전용 모델 결과를 사용합니다.
+                        d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
                 else:
                     # 기존 하드코딩 대신 변수(person_conf)를 적용합니다.
                     base_conf = min(main_conf, person_conf)
