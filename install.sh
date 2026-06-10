@@ -13,7 +13,9 @@ CAM_CONFIG_FILE="$PROJECT_DIR/cameras.json"
 SYS_CONFIG_FILE="$PROJECT_DIR/system_config.json"
 TARGET_SCRIPT="$PROJECT_DIR/multi_event.py"
 DX_DIR="$USER_HOME/dx-runtime"
+
 sudo apt install ssh -y
+
 echo "====================================================="
 echo " Raspberry Pi Edge AI CCTV 서비스 하이브리드 설치"
 echo "====================================================="
