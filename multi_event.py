@@ -3078,12 +3078,9 @@ class Camera:
                 pcx = px1 + pw / 2.0
                 pcy = py1 + ph / 2.0
 
-                is_valid_plate = True
                 matched_vehicle_tid = -1
 
                 if vehicle_boxes is not None and len(vehicle_boxes) > 0:
-                    is_valid_plate = False
-
                     for v in vehicle_boxes:
                         vx1, vy1, vx2, vy2 = map(int, v[:4])
                         vw = vx2 - vx1
@@ -3093,25 +3090,23 @@ class Camera:
                         pad_y = vh * 0.10
 
                         if (vx1 - pad_x) <= pcx <= (vx2 + pad_x) and (vy1 - pad_y) <= pcy <= (vy2 + pad_y):
-                            is_valid_plate = True
                             matched_vehicle_tid = int(v[4]) if len(v) > 4 else -1
                             break
 
-                if is_valid_plate:
-                    roi = blur_img[py1:py2, px1:px2]
-                    if roi.size > 0:
-                        small_w = max(1, pw // 12)
-                        small_h = max(1, ph // 12)
-                        small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-                        blur_img[py1:py2, px1:px2] = cv2.resize(
-                            small, (pw, ph), interpolation=cv2.INTER_NEAREST
-                        )
-                        blurred_plates.append({
-                            "box": [px1, py1, px2, py2],
-                            "score": round(float(p[4]), 4) if len(p) > 4 else 0.0,
-                            "class_id": int(p[5]) if len(p) > 5 else -1,
-                            "matched_vehicle_tid": matched_vehicle_tid
-                        })
+                roi = blur_img[py1:py2, px1:px2]
+                if roi.size > 0:
+                    small_w = max(1, pw // 12)
+                    small_h = max(1, ph // 12)
+                    small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                    blur_img[py1:py2, px1:px2] = cv2.resize(
+                        small, (pw, ph), interpolation=cv2.INTER_NEAREST
+                    )
+                    blurred_plates.append({
+                        "box": [px1, py1, px2, py2],
+                        "score": round(float(p[4]), 4) if len(p) > 4 else 0.0,
+                        "class_id": int(p[5]) if len(p) > 5 else -1,
+                        "matched_vehicle_tid": matched_vehicle_tid
+                    })
 
         except Exception as e:
             logger.error(f"번호판 모자이크 처리 실패: {e}")
