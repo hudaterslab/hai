@@ -418,61 +418,43 @@ def _save_and_send_task(img, img_path, api_params):
         logger.error(f"[Task 내부 API 호출 에러] {e}")
 
 def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None, auth_tokens=None):
-    """프레임에 BBox, 다중 궤적, 신호수 토큰 적용 절대 시간을 마킹하고 이미지를 로컬에 저장한 후 API 큐에 등록합니다."""
+    """API 전송 및 웹 UI 표출용 스냅샷 이미지에 최소한의 BBox와 Class ID(Label) 정보만 깔끔하게 마킹하여 저장합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
         return
         
     try:
+        # 원본 클린 프레임 복사 (궤적 및 인증창 오버레이 배제)
         img = frame.copy()
-        x1, y1, x2, y2 = map(int, bbox)
         
-        # 1. 다중 객체 궤적(Trajectory) 렌더링
-        #if trajectories:
-        #    for obj_tid, hist_pts in trajectories.items():
-        #        if len(hist_pts) > 1:
-                    # [수정] 궤적 굵기를 3에서 1로 얇게 수정
-        #            cv2.polylines(img, [np.array(hist_pts, np.int32)], False, (255, 0, 255), 1, cv2.LINE_AA)
-        #            cv2.circle(img, hist_pts[0], 3, (0, 255, 255), -1)
-        #            cv2.circle(img, hist_pts[-1], 4, (0, 0, 255), -1)
-                    
-        # 2. 메인 BBox 및 이벤트 정보 텍스트 렌더링
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        now = datetime.datetime.now()
-        msg = f"{event_type} ID:{tid} {now.strftime('%H:%M:%S')}"
-        text_y = max(20, y1 - 10)
-        cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # [수정] 웹 이미지 노이즈 최소화: 궤적선 드로잉 및 신호수 인증 상태창 오버레이 로직 전면 제거
         
-        # 3. 신호수 유예 토큰 상태 렌더링 - [img_local 에만 엄격히 제한]
-        if event_type == "signal_vehicle":
-            safe_tokens = auth_tokens if auth_tokens else []
-            target_token = next((t for t in safe_tokens if t['tid'] == tid), None)
-            
-            h_img, w_img = img_local.shape[:2]
-            box_w = 340
-            box_h = 75 
-            x_start = w_img - box_w - 20
-            y_start = h_img - box_h - 20
-
-            overlay = img_local.copy()
-            cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.6, img_local, 0.4, 0, img_local)
-
-            cv2.putText(img_local, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            if target_token:
-                # [복구] API 로컬 이미지도 Truck ID 제외하고 남은 시간 표출
-                auth_time_str = datetime.datetime.fromtimestamp(target_token['auth_t']).strftime('%H:%M:%S')
-                sig_id = target_token.get('sig_tid', 'Unknown')
-                remain_time = target_token.get('remain', 0.0)
-                cv2.putText(img_local, f"Auth: {auth_time_str} | Remain: {remain_time:.1f}s", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.putText(img_local, f"Authorized by: Signalman [{sig_id}]", (x_start + 10, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-            else:
-                # [수정] 알람이 발생해서 API 이미지가 저장되는 시점이므로 여기서는 UNAUTH 표출이 맞음
-                cv2.putText(img_local, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                cv2.putText(img_local, "Reason: Moving without Signalman", (x_start + 10, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+        # objects_meta를 기반으로 이벤트 연관 객체들의 최소 BBox와 라벨/ID만 마킹
+        if objects_meta:
+            for obj in objects_meta:
+                o_box = obj.get('box', [0, 0, 0, 0])
+                o_label = obj.get('label', 'obj')
+                o_tid = obj.get('tid', 'Unknown')
+                ox1, oy1, ox2, oy2 = map(int, o_box)
                 
-        # 4. 저장 경로 생성 및 비동기 API 전송 태스크 큐 등록
+                # 주 객체(이벤트 트리거 객체)는 빨간색, 연관 서브 객체는 주황색으로 구분하여 가시성 확보
+                color = (0, 0, 255) if str(o_tid) == str(tid) else (0, 165, 255)
+                cv2.rectangle(img, (ox1, oy1), (ox2, oy2), color, 2)
+                
+                # 웹 가독성을 고려한 텍스트 마킹 (라벨 및 객체 고유 ID 결합)
+                msg = f"{o_label} [{o_tid}]"
+                text_y = max(20, oy1 - 8)
+                cv2.putText(img, msg, (ox1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        else:
+            # 메타데이터가 없는 예외 케이스를 위한 폴백 단일 마킹
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            msg = f"{event_type} [{tid}]"
+            text_y = max(20, y1 - 8)
+            cv2.putText(img, msg, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+        # 디렉토리 생성 및 비동기 저장/전송 태스크 등록
+        now = datetime.datetime.now()
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
         if not os.path.exists(dpath):
             os.makedirs(dpath, exist_ok=True)
@@ -487,16 +469,18 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
                 {
                     "box": [int(b) for b in o['box']], 
                     "label": str(o['label']), 
-                    "score": round(float(o.get('score', 0.95)), 2)
+                    "score": round(float(o.get('score', 0.95)), 2),
+                    "tid": int(o.get('tid', -1))
                 } 
                 for o in objects_meta
             ]
         else:
             ai_detected_bboxes = [
                 {
-                    "box": [x1, y1, x2, y2], 
+                    "box": [int(b) for b in bbox], 
                     "label": str(event_type), 
-                    "score": 0.95
+                    "score": 0.95,
+                    "tid": int(tid)
                 }
             ]
         
@@ -510,11 +494,12 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
             'img_height': h
         }
         
+        # 파일 쓰기 및 리시버 API 통신을 비동기 풀에 할당
         IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, api_params)
         
     except Exception as e: 
-        logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
-
+        logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}\n{traceback.format_exc()}")
+        
 # ==========================================
 # [6] DeepX NPU 모델 추론 (YOLOv8 버그 픽스 반영)
 # ==========================================
@@ -971,6 +956,9 @@ class CrossingDetector(BaseEventDetector):
         # 하반신 매칭 및 발 위치 정밀 계산
         for p in persons:
             p_tid = int(p[4])
+            
+            # [핵심 수정] 하체가 안 보여도 사람 자체의 추적 상태(과거 이력)는 소멸시키지 않고 얼려둡니다(Freeze).
+            # 이를 통해 컨베이어 벨트를 넘는 도중 발생하는 필연적 하체 가려짐(Occlusion) 시 미탐을 방지합니다.
             curr_ids.add(p_tid)
             
             px1, py1, px2, py2 = p[:4]
@@ -983,7 +971,7 @@ class CrossingDetector(BaseEventDetector):
             # 해당 사람과 짝지어질 하반신 탐색
             for lb in low_bodies:
                 lx1, ly1, lx2, ly2 = lb[:4]
-                lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+                lcy = (ly1 + ly2) / 2
                 
                 if lcy < py1 + person_height * 0.4: 
                     continue
@@ -1007,14 +995,10 @@ class CrossingDetector(BaseEventDetector):
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4])})
             
             else:
-                if p_tid in self.lb_offsets:
-                    ox, oy = self.lb_offsets[p_tid]
-                    curr_pos = (p_foot[0] + ox, p_foot[1] + oy)
-                    low_height = self.lb_last_height.get(p_tid, person_height * 0.4)
-                    event_bbox = (px1, py2 - low_height, px2, py2)
-                else: 
-                    continue
-                    
+                # [오탐 유발 로직 제거] 하반신 미탐지 시, 사람 객체를 기준으로 가상의 발 위치를 억지로 계산하던 폴백 로직 삭제.
+                # 명확한 하체 매칭이 되지 않은 해당 프레임의 위치 업데이트 계산을 스킵(건너뜀)합니다.
+                continue
+                
             # 점프 방어 (너무 큰 순간 이동은 무시)
             if p_tid in self.prev:
                 jump_dist = get_distance(self.prev[p_tid], curr_pos)
@@ -1035,7 +1019,7 @@ class CrossingDetector(BaseEventDetector):
                                 'timestamp_time': current_time,
                                 'line': (p1, p2), 
                                 'entry_side': ccw(p1, p2, trajectory[0]), 
-                                'crossed_pos': curr_pos, # [추가] 선을 넘은 직후의 첫 발 위치 앵커 기록
+                                'crossed_pos': curr_pos, 
                                 'bbox': event_bbox, 
                                 'frame': frame.copy() if frame is not None else None,
                                 'fid': fid,
@@ -1051,9 +1035,7 @@ class CrossingDetector(BaseEventDetector):
                 
                 # 완전히 반대편으로 진입한 상태라면
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
-                    # 1. 라인 기준 수직 침투 깊이
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
-                    # 2. [추가] 앵커(crossed_pos)로부터의 실제 추가 이동 거리
                     post_cross_dist = get_distance(cand['crossed_pos'], curr_pos)
                     
                     dx = abs(p2[0] - p1[0])
@@ -1063,7 +1045,6 @@ class CrossingDetector(BaseEventDetector):
                     tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
                     
-                    # [핵심 보완] 수직 깊이를 충족하고, 동시에 1프레임 튐이 아니라 실제 발걸음이 발생했을 때만 트리거
                     if perp_dist >= dynamic_threshold and post_cross_dist >= (dynamic_threshold * 0.6):
                         triggered.append({
                             'tid': p_tid, 
@@ -1073,9 +1054,6 @@ class CrossingDetector(BaseEventDetector):
                             'objects': cand['objects']
                         })
                         del self.candidates[p_tid]
-                    else:
-                        if p_tid in self.candidates:
-                            print(f"[프레임 {fid}] ID {p_tid} 침투 깊이: {perp_dist:.2f} | 교차 후 실이동: {post_cross_dist:.2f} / 요구거리: {dynamic_threshold:.2f}")
                         
                 elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec: 
                     del self.candidates[p_tid]
@@ -1090,7 +1068,7 @@ class CrossingDetector(BaseEventDetector):
                 if tid in self.lb_last_height: del self.lb_last_height[tid]
                 
         return triggered
-
+    
 class HelmetDetector(BaseEventDetector):
     gui_name = "NO-HELMET"
     
