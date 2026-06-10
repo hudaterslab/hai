@@ -447,15 +447,19 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         if event_type == "signal_vehicle":
             safe_tokens = auth_tokens[:1] if auth_tokens else [] # 최대 1개 제한
             h_img, w_img = img.shape[:2]
-            overlay = img.copy()
             
             box_w = 260
-            box_h = 35 + max(1, len(safe_tokens) * 2) * 20 # 1개당 2줄 차지하므로 높이 조정
+            box_h = 35 + max(1, len(safe_tokens)) * 40 # 1개당 2줄 차지하므로 높이 조정
             x_start = w_img - box_w - 20
             y_start = h_img - box_h - 20
 
-            cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+            # [성능 최적화] 전체 프레임 복사 대신 ROI 영역만 잘라내어 블렌딩 연산 수행
+            roi = img[y_start:y_start+box_h, x_start:x_start+box_w]
+            black_bg = np.zeros_like(roi)
+            cv2.addWeighted(black_bg, 0.4, roi, 0.6, 0, roi)
+            
+            # UI 테두리 추가로 시인성 확보
+            cv2.rectangle(img, (x_start, y_start), (x_start + box_w, y_start + box_h), (255, 255, 255), 1)
 
             cv2.putText(img, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
@@ -2680,7 +2684,7 @@ class Camera:
             y_pos += 20
             
         # -----------------------------------------------------------
-        # [수정] Signalman Auth (최대 1개 / 2줄 표출)
+        # [수정] Signalman Auth 라이브 뷰어 (최대 1개 / 2줄 표출)
         # -----------------------------------------------------------
         if "signal_vehicle" in self.events and "signal_vehicle" in self.handlers:
             sv_handler = self.handlers["signal_vehicle"]
@@ -2734,10 +2738,13 @@ class Camera:
             x_start = w_frame - box_w - 20
             y_start = h_frame - box_h - 20
 
-            overlay2 = fr.copy()
-            cv2.rectangle(overlay2, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay2, 0.6, fr, 0.4, 0, fr)
-
+            # [성능 최적화] 라이브 영상 렌더링 시 전체 프레임 복사(fr.copy()) 방지
+            roi2 = fr[y_start:y_start+box_h, x_start:x_start+box_w]
+            black_bg2 = np.zeros_like(roi2)
+            cv2.addWeighted(black_bg2, 0.4, roi2, 0.6, 0, roi2)
+            
+            # UI 테두리 추가
+            cv2.rectangle(fr, (x_start, y_start), (x_start + box_w, y_start + box_h), (255, 255, 255), 1)
             cv2.putText(fr, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             if not display_items:
