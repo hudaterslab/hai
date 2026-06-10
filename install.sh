@@ -30,21 +30,35 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     sudo -u "$ACTUAL_USER" bash -c "cat > $SYS_CONFIG_FILE" << EOL
 {
     "terminal_id": "$USER_TERM_ID",
+    "INFERENCE_MODE": "auto",
     "logging": {"dir": "./logs", "level": "INFO"},
     "event_config": {
         "intrusion": {"enabled": false, "cooldown_sec": 600},
         "illegal_parking": {"enabled": false, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1},
         "no_helmet": {"enabled": false, "cooldown_sec": 600, "blur_face": true, "trigger_sec": 3.0},
-        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0},
-        "signal_vehicle": {"enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10}
+        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0, "low_body_fallback_sec": 2.0},
+        "signal_vehicle": {
+            "enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10,
+            "line_truck_confirm_frames": 10,
+            "line_truck_confirm_ratio": 0.7,
+            "line_truck_car_veto_frames": 5,
+            "line_truck_min_conf": 0.7,
+            "line_truck_car_veto_iou": 0.10,
+            "line_truck_car_veto_distance_ratio": 0.60
+        }
     },
     "models": {
+        "UNIFIED": "signalman.dxnn",
         "MAIN": "hanjin_cctv.dxnn",
         "FACE": "yolov8m-face.dxnn",
-        "HELMET": "helmet_3cls_v8.dxnn"
+        "HELMET": "helmet_3cls_v8.dxnn",
+        "SIGNALMAN": "signalman.dxnn",
+        "PLATE": "license_plate_detector.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55},
-    "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10, "VISUAL_ALARM_DURATION": 5.0
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.2},
+    "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
+    "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
+    "VISUAL_ALARM_DURATION": 5.0
 }
 EOL
     echo "✅ 기본 설정 생성이 완료되었습니다."
@@ -147,7 +161,9 @@ else
     sudo systemctl start $SERVICE_NAME
     echo "▶️ CCTV AI 백그라운드 서비스가 구동되었습니다."
 fi
-
+sudo apt install -y openssh-server
+sudo systemctl enable ssh
+sudo systemctl start ssh
 echo "====================================================="
 echo " 🎉 설치 완료! 쾌적하고 안정적인 Global 환경으로 설정되었습니다."
 echo " ※ 만약 AI 인퍼런스가 정상 작동하지 않는다면, PC를 1회 껐다 켜주세요 (Cold Boot 권장)."
