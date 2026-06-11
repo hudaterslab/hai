@@ -96,14 +96,16 @@ def load_system_config():
         "logging": {"dir": "./logs", "level": "INFO", "retention_days": 14},
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
-            "illegal_parking": {"enabled": False, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1},
+            "illegal_parking": {"enabled": False, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1, "blur_plate": True},
             "no_helmet": {"enabled": False, "cooldown_sec": 600, "blur_face": True, "blur_plate": True, "trigger_sec": 3.0},
             "conveyor_crossing": {
                 "enabled": False, "cooldown_sec": 600, "snapshot_mode": "crossing_moment",
-                "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0
+                "distance_ratio": 0.9, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0,
+                "blur_face": True, "blur_plate": True
             },
             "signal_vehicle": {
                 "enabled": False, "cooldown_sec": 600, "motion_threshold_ratio": 0.30,
+                "blur_plate": True,
                 "line_truck_confirm_frames": 10,
                 "line_truck_confirm_ratio": 0.7,
                 "line_truck_car_veto_frames": 5,
@@ -129,7 +131,7 @@ def load_system_config():
             "HELMET": 0.55,
             "PERSON": 0.35, # [추가] 사람 및 신호수 전용 기본 임계값 설정
             "SIGNALMAN": 0.5,
-            "PLATE": 0.2
+            "PLATE": 0.1
         },
         "INFERENCE_MODE": "auto",  # auto: 통합 모델 파일이 있으면 단일 모델, 없으면 기존 별도 모델
         "BATCH_SIZE": 9,
@@ -572,9 +574,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         thickness = 3 if is_target else 2
         cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
 
-        label_name = str(obj.get('label', event_type))
-        class_id = obj.get('class_id')
-        label = f"{label_name}"
+        label = str(event_type)
         # [수정] Confidence(Score) 표출 제거 및 Class ID 표출 적용
         # if class_id is not None:
             # label = f"{label_name}(ID:{class_id})"
@@ -687,7 +687,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
             for o in objects_meta:
                 item = {
                     "box": [int(b) for b in o['box']],
-                    "label": str(o['label']),
+                    "label": str(event_type),
                     "score": round(float(o.get('score', 0.95)), 2)
                 }
                 if o.get('tid') is not None:
@@ -3082,7 +3082,7 @@ class Camera:
         blurred_plates = []
 
         try:
-            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.2)
+            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.1)
 
             p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
 
@@ -3170,6 +3170,54 @@ class Camera:
 
         privacy_meta["applied"] = bool(privacy_meta["face"] or privacy_meta["plate"])
         return blurred_img, privacy_meta
+
+    def _privacy_tracks_from_event_objects(self, objects):
+        label_to_class = {
+            "person": ID_G_PERSON,
+            "low_body": ID_PERSON_LOW,
+            "reflective_vest": ID_REFLECTIVE_VEST,
+            "car": ID_G_CAR,
+            "truck": ID_G_TRUCK,
+            "vehicle": ID_G_CAR
+        }
+        allowed_classes = {ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST, *TARGET_VEHICLES}
+        tracks = []
+
+        for obj in objects or []:
+            try:
+                box = obj.get("box", [])
+                if len(box) < 4:
+                    continue
+
+                class_id = obj.get("class_id")
+                try:
+                    class_id = int(class_id)
+                except Exception:
+                    class_id = None
+                if class_id is None or class_id < 0:
+                    class_id = label_to_class.get(str(obj.get("label", "")).lower())
+                if class_id is None:
+                    continue
+
+                class_id = int(class_id)
+                if class_id not in allowed_classes:
+                    continue
+
+                try:
+                    obj_tid = int(obj.get("tid", -1))
+                except Exception:
+                    obj_tid = -1
+
+                tracks.append([
+                    float(box[0]), float(box[1]), float(box[2]), float(box[3]),
+                    obj_tid,
+                    float(obj.get("score", 0.95)),
+                    class_id
+                ])
+            except Exception:
+                continue
+
+        return tracks
 
     def _serialize_detection(self, det):
         return {
@@ -3300,6 +3348,8 @@ class Camera:
 
                 actual_score = score_map_main.get(tid, 0.95)
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
+                event_privacy_tracks = self._privacy_tracks_from_event_objects(objects_meta)
+                privacy_reference_tracks = event_privacy_tracks if event_privacy_tracks else t_main
                 decision_trace = to_json_safe(ev.get('decision_trace', {
                     'detector': handler.__class__.__name__,
                     'reason': 'event_triggered_without_detail'
@@ -3319,11 +3369,12 @@ class Camera:
                     blur_plate_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_plate", True)
 
                     saved_img, privacy_blur_meta = self.apply_privacy_blur(
-                        ev_frame, t_main,
+                        ev_frame, privacy_reference_tracks,
                         blur_face=blur_face_option,
                         blur_plate=blur_plate_option
                     )
                     privacy_blur_meta["scope"] = "event_snapshot"
+                    privacy_blur_meta["reference_tracks"] = "event_objects" if event_privacy_tracks else "current_tracks"
 
                     event_trajectories = {}
                     for obj in objects_meta:
@@ -3990,7 +4041,7 @@ def main():
                         for obj in ev_data['objects']:
                             api_payload.append({
                                 "box": obj['box'],
-                                "label": obj['label'],
+                                "label": ev_data['event_name'],
                                 "score": obj['score']
                             })
                         logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
