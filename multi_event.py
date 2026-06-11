@@ -3728,18 +3728,7 @@ def main():
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
     parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
-    parser.add_argument(
-        '--dummy-api-image',
-        nargs='?',
-        const=os.path.join(PROJECT_ROOT, "dummy_event_api_image.jpg"),
-        help="Create a dummy API event image and exit. Optional value sets the output path."
-    )
     args = parser.parse_args()
-
-    if args.dummy_api_image:
-        output_path = create_dummy_event_api_image(args.dummy_api_image)
-        print(f"Dummy API image saved: {output_path}")
-        return
 
     is_gui_mode = args.gui
 
