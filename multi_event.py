@@ -618,51 +618,6 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
 
     return api_img
 
-def create_dummy_event_api_image(output_path=None):
-    """Create a sample event API image for checking box/label rendering."""
-    output_path = output_path or os.path.join(PROJECT_ROOT, "dummy_event_api_image.jpg")
-    width, height = 1280, 720
-    frame = np.full((height, width, 3), (42, 45, 48), dtype=np.uint8)
-
-    # Simple scene guides so the dummy image is easier to inspect.
-    cv2.rectangle(frame, (0, 500), (width, height), (64, 68, 70), -1)
-    cv2.line(frame, (0, 500), (width, 500), (110, 110, 110), 2)
-    for x in range(80, width, 160):
-        cv2.line(frame, (x, 540), (x + 80, 540), (150, 150, 150), 3)
-
-    event_type = "signal_vehicle"
-    objects_meta = [
-        {
-            "label": "truck",
-            "box": [470, 250, 910, 535],
-            "tid": 101,
-            "score": 0.96,
-            "class_id": ID_G_TRUCK
-        },
-        {
-            "label": "person",
-            "box": [230, 295, 350, 540],
-            "tid": 22,
-            "score": 0.91,
-            "class_id": ID_G_PERSON
-        }
-    ]
-    auth_tokens = [{"sig_tid": 22, "remain": 8.5}]
-
-    api_img = _draw_event_api_image(
-        frame,
-        event_type,
-        objects_meta[0]["box"],
-        objects_meta[0]["tid"],
-        objects_meta,
-        auth_tokens
-    )
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    if not cv2.imwrite(output_path, api_img):
-        raise RuntimeError(f"failed to write dummy event API image: {output_path}")
-    return output_path
-
 def _save_and_send_task(img, img_path, api_img, api_img_path, api_params):
     """비동기 스레드에서 파일 쓰기 및 API 전송을 처리합니다."""
     try:
