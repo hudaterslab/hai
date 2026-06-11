@@ -549,6 +549,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
 
     draw_items = objects_meta or [{'label': event_type, 'box': bbox, 'tid': tid}]
     for obj in draw_items:
+
         try:
             x1, y1, x2, y2 = int_box(obj.get('box', bbox))
         except Exception:
@@ -562,6 +563,10 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
             except Exception:
                 obj_tid = None
 
+        # [수정] conveyor_crossing 이벤트일 때 low_body 클래스는 그리지 않음
+        if event_type == "conveyor_crossing" and obj.get('label') == 'low_body':
+            continue
+
         is_target = target_tid is not None and obj_tid == target_tid
         color = (0, 0, 255) # if is_target else (0, 165, 255) 고객사 요청으로 그냥 빨간색 표시
         thickness = 3 if is_target else 2
@@ -569,13 +574,13 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
 
         label_name = str(obj.get('label', event_type))
         class_id = obj.get('class_id')
-        
+        label = f"{label_name}"
         # [수정] Confidence(Score) 표출 제거 및 Class ID 표출 적용
-        if class_id is not None:
+        # if class_id is not None:
             # label = f"{label_name}(ID:{class_id})"
-            label = f"{label_name}"
-        else:
-            label = label_name
+            # label = f"{label_name}"
+        # else:
+        #     label = label_name
 
         # if obj_tid is not None:
         #     label = f"{label} #{obj_tid}"
@@ -612,6 +617,51 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
                 cv2.putText(api_img, f"Auth by: Signalman [{sig_tid}]", (x_start + 10, y_start + 65 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
     return api_img
+
+def create_dummy_event_api_image(output_path=None):
+    """Create a sample event API image for checking box/label rendering."""
+    output_path = output_path or os.path.join(PROJECT_ROOT, "dummy_event_api_image.jpg")
+    width, height = 1280, 720
+    frame = np.full((height, width, 3), (42, 45, 48), dtype=np.uint8)
+
+    # Simple scene guides so the dummy image is easier to inspect.
+    cv2.rectangle(frame, (0, 500), (width, height), (64, 68, 70), -1)
+    cv2.line(frame, (0, 500), (width, 500), (110, 110, 110), 2)
+    for x in range(80, width, 160):
+        cv2.line(frame, (x, 540), (x + 80, 540), (150, 150, 150), 3)
+
+    event_type = "signal_vehicle"
+    objects_meta = [
+        {
+            "label": "truck",
+            "box": [470, 250, 910, 535],
+            "tid": 101,
+            "score": 0.96,
+            "class_id": ID_G_TRUCK
+        },
+        {
+            "label": "person",
+            "box": [230, 295, 350, 540],
+            "tid": 22,
+            "score": 0.91,
+            "class_id": ID_G_PERSON
+        }
+    ]
+    auth_tokens = [{"sig_tid": 22, "remain": 8.5}]
+
+    api_img = _draw_event_api_image(
+        frame,
+        event_type,
+        objects_meta[0]["box"],
+        objects_meta[0]["tid"],
+        objects_meta,
+        auth_tokens
+    )
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    if not cv2.imwrite(output_path, api_img):
+        raise RuntimeError(f"failed to write dummy event API image: {output_path}")
+    return output_path
 
 def _save_and_send_task(img, img_path, api_img, api_img_path, api_params):
     """비동기 스레드에서 파일 쓰기 및 API 전송을 처리합니다."""
@@ -3678,7 +3728,18 @@ def main():
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
     parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
+    parser.add_argument(
+        '--dummy-api-image',
+        nargs='?',
+        const=os.path.join(PROJECT_ROOT, "dummy_event_api_image.jpg"),
+        help="Create a dummy API event image and exit. Optional value sets the output path."
+    )
     args = parser.parse_args()
+
+    if args.dummy_api_image:
+        output_path = create_dummy_event_api_image(args.dummy_api_image)
+        print(f"Dummy API image saved: {output_path}")
+        return
 
     is_gui_mode = args.gui
 
