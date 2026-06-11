@@ -38,11 +38,11 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "logging": {"dir": "./logs", "level": "INFO"},
     "event_config": {
         "intrusion": {"enabled": false, "cooldown_sec": 600},
-        "illegal_parking": {"enabled": false, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1},
-        "no_helmet": {"enabled": false, "cooldown_sec": 600, "blur_face": true, "trigger_sec": 3.0},
-        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0, "low_body_fallback_sec": 2.0},
+        "illegal_parking": {"enabled": false, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1, "blur_plate": true},
+        "no_helmet": {"enabled": false, "cooldown_sec": 600, "blur_face": true, "blur_plate": true, "trigger_sec": 3.0},
+        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0, "low_body_fallback_sec": 2.0, "blur_face": true, "blur_plate": true},
         "signal_vehicle": {
-            "enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10,
+            "enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10, "blur_plate": true,
             "line_truck_confirm_frames": 10,
             "line_truck_confirm_ratio": 0.7,
             "line_truck_car_veto_frames": 5,
@@ -59,7 +59,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "SIGNALMAN": "signalman.dxnn",
         "PLATE": "license_plate_detector.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.2},
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
