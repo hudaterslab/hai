@@ -563,7 +563,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
                 obj_tid = None
 
         is_target = target_tid is not None and obj_tid == target_tid
-        color = (0, 0, 255) if is_target else (0, 165, 255)
+        color = (0, 0, 255) # if is_target else (0, 165, 255) 고객사 요청으로 그냥 빨간색 표시
         thickness = 3 if is_target else 2
         cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
 
@@ -572,13 +572,14 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         
         # [수정] Confidence(Score) 표출 제거 및 Class ID 표출 적용
         if class_id is not None:
-            label = f"{label_name}(ID:{class_id})"
+            # label = f"{label_name}(ID:{class_id})"
+            label = f"{label_name}"
         else:
             label = label_name
 
-        if obj_tid is not None:
-            label = f"{label} #{obj_tid}"
-
+        # if obj_tid is not None:
+        #     label = f"{label} #{obj_tid}"
+        # 고객사 요청으로  Image Label은 이벤트 명만 표시
         text_y = max(20, y1 - 8)
         cv2.putText(api_img, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         drawn = True
@@ -598,7 +599,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         overlay = api_img.copy()
         cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
-        cv2.putText(api_img, "Signalman Auth [EVIDENCE]", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if not auth_tokens:
             cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
