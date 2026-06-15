@@ -54,16 +54,14 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         }
     },
     "models": {
-        "UNIFIED": "signalman.dxnn",
-        "MAIN": "hanjin_cctv.dxnn",
-        "FACE": "yolov8m-face.dxnn",
-        "HELMET": "helmet_3cls_v8.dxnn",
-        "SIGNALMAN": "signalman.dxnn",
-        "PLATE": "license_plate_detector.dxnn"
+        "MAIN": "hanjin_cctv_v2.dxnn",
+        "FACE": "yolov8m-face_ppu.dxnn",
+        "HELMET": "helmet_3cls_v8_ppu.dxnn",
+        "PLATE": "license_plate_detector_ppu.dxnn"
     },
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
-    "model_output_formats": {"UNIFIED": "auto", "MAIN": "auto", "FACE": "auto", "HELMET": "auto", "SIGNALMAN": "auto", "PLATE": "auto"},
-    "model_engine_pool_sizes": {"UNIFIED": 1, "MAIN": 1, "FACE": 1, "HELMET": 1, "SIGNALMAN": 1, "PLATE": 1},
+    "model_output_formats": {"MAIN": "auto", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
+    "model_engine_pool_sizes": {"MAIN": 1, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
@@ -94,16 +92,14 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
         }
     },
     "models": {
-        "UNIFIED": "signalman.dxnn",
-        "MAIN": "hanjin_cctv.dxnn",
-        "FACE": "yolov8m-face.dxnn",
-        "HELMET": "helmet_3cls_v8.dxnn",
-        "SIGNALMAN": "signalman.dxnn",
-        "PLATE": "license_plate_detector.dxnn"
+        "MAIN": "hanjin_cctv_v2.dxnn",
+        "FACE": "yolov8m-face_ppu.dxnn",
+        "HELMET": "helmet_3cls_v8_ppu.dxnn",
+        "PLATE": "license_plate_detector_ppu.dxnn"
     },
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
-    "model_output_formats": {"UNIFIED": "auto", "MAIN": "auto", "FACE": "auto", "HELMET": "auto", "SIGNALMAN": "auto", "PLATE": "auto"},
-    "model_engine_pool_sizes": {"UNIFIED": 1, "MAIN": 1, "FACE": 1, "HELMET": 1, "SIGNALMAN": 1, "PLATE": 1},
+    "model_output_formats": {"MAIN": "auto", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
+    "model_engine_pool_sizes": {"MAIN": 1, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0

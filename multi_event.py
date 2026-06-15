@@ -39,7 +39,7 @@ SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 WATCHDOG_TIMEOUT = 30.0
 
-# YOLOv8 클래스 ID 정의 (hanjin_cctv.dxnn 기준)
+# YOLOv8 클래스 ID 정의 (hanjin_cctv_v2.dxnn 기준)
 ID_H_HELMET = 0
 ID_H_NO_HELMET = 1
 ID_G_PERSON = 2
@@ -118,12 +118,10 @@ def load_system_config():
             }
         },
         "models": {
-            "UNIFIED": "signalman.dxnn",
-            "MAIN": "hanjin_cctv.dxnn",
-            "FACE": "yolov8m-face.dxnn",
-            "HELMET": "helmet_3cls_v8.dxnn",
-            "SIGNALMAN": "signalman.dxnn",
-            "PLATE": "license_plate_detector.dxnn"
+            "MAIN": "hanjin_cctv_v2.dxnn",
+            "FACE": "yolov8m-face_ppu.dxnn",
+            "HELMET": "helmet_3cls_v8_ppu.dxnn",
+            "PLATE": "license_plate_detector_ppu.dxnn"
         },
         "model_confidences": {
             "MAIN": 0.6,
@@ -134,22 +132,18 @@ def load_system_config():
             "PLATE": 0.1
         },
         "model_output_formats": {
-            "UNIFIED": "auto",
             "MAIN": "auto",
             "FACE": "auto",
             "HELMET": "auto",
-            "SIGNALMAN": "auto",
             "PLATE": "auto"
         },
         "model_engine_pool_sizes": {
-            "UNIFIED": 1,
             "MAIN": 1,
             "FACE": 1,
             "HELMET": 1,
-            "SIGNALMAN": 1,
             "PLATE": 1
         },
-        "INFERENCE_MODE": "auto",  # auto: 통합 모델 파일이 있으면 단일 모델, 없으면 기존 별도 모델
+        "INFERENCE_MODE": "auto",  # compatibility setting; event inference uses MAIN model detections
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
         "LOOP_FPS": 15,
@@ -3961,50 +3955,31 @@ def main():
 
     models_cfg = SYS_CFG.get("models", {})
     inference_mode = str(SYS_CFG.get("INFERENCE_MODE", "auto")).strip().lower()
-    use_unified_event_model = inference_mode in ["auto", "unified", "single"]
-    unified_model_path = resolve_model_path(models_cfg.get("UNIFIED", "signalman.dxnn"))
+    event_inference_mode = "main"
+    main_model_path = resolve_model_path(models_cfg.get("MAIN", "hanjin_cctv_v2.dxnn"))
 
-    if use_unified_event_model and not os.path.exists(unified_model_path):
-        logger.warning(
-            f"통합 이벤트 모델을 찾을 수 없어 기존 별도 모델 구조로 동작합니다: {unified_model_path}"
-        )
-        use_unified_event_model = False
-
-    event_inference_mode = "unified" if use_unified_event_model else "separate"
+    if not os.path.exists(main_model_path):
+        logger.error(f"MAIN model file not found: {main_model_path}")
+        return
+    if inference_mode not in ["auto", "unified", "single", "main"]:
+        logger.info(f"INFERENCE_MODE={inference_mode} is handled with MAIN model inference.")
 
     try:
         logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
 
-        if use_unified_event_model:
-            # 이벤트 판단용 기본 객체와 신호수는 통합 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
-            # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
-            d_main = YoLoDeepX(
-                unified_model_path,
-                output_format=get_model_output_format("UNIFIED"),
-                pool_size=get_model_engine_pool_size("UNIFIED")
-            )
-            d_helmet = YoLoDeepX(
-                resolve_model_path(models_cfg["HELMET"]),
-                output_format=get_model_output_format("HELMET"),
-                pool_size=get_model_engine_pool_size("HELMET")
-            )
-            d_signalman = None
-        else:
-            d_main = YoLoDeepX(
-                resolve_model_path(models_cfg["MAIN"]),
-                output_format=get_model_output_format("MAIN"),
-                pool_size=get_model_engine_pool_size("MAIN")
-            )
-            d_helmet = YoLoDeepX(
-                resolve_model_path(models_cfg["HELMET"]),
-                output_format=get_model_output_format("HELMET"),
-                pool_size=get_model_engine_pool_size("HELMET")
-            )
-            d_signalman = YoLoDeepX(
-                resolve_model_path(models_cfg["SIGNALMAN"]),
-                output_format=get_model_output_format("SIGNALMAN"),
-                pool_size=get_model_engine_pool_size("SIGNALMAN")
-            )
+        # 이벤트 판단용 기본 객체와 신호수는 MAIN 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
+        # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
+        d_main = YoLoDeepX(
+            main_model_path,
+            output_format=get_model_output_format("MAIN"),
+            pool_size=get_model_engine_pool_size("MAIN")
+        )
+        d_helmet = YoLoDeepX(
+            resolve_model_path(models_cfg["HELMET"]),
+            output_format=get_model_output_format("HELMET"),
+            pool_size=get_model_engine_pool_size("HELMET")
+        )
+        d_signalman = None
 
         # 개인정보 블러는 이벤트 판단 모델과 목적이 달라 별도 모델을 유지합니다.
         d_face = YoLoDeepX(
@@ -4165,51 +4140,21 @@ def main():
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
-                if use_unified_event_model:
-                    # 헬멧 미착용은 아래 전용 모델에서 따로 추론하므로 통합 모델 기준에는 helmet_conf를 섞지 않습니다.
-                    base_conf = min(main_conf, person_conf, signalman_conf)
-                    raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
-                    t_main_input, _, d_signalman_res = split_unified_event_detections(
-                        raw_dets,
-                        cams[idx].events,
-                        main_conf=main_conf,
-                        person_conf=person_conf,
-                        helmet_conf=helmet_conf,
-                        signalman_conf=signalman_conf
-                    )
+                # 헬멧 미착용은 아래 전용 모델에서 따로 추론하므로 MAIN 모델 기준에는 helmet_conf를 섞지 않습니다.
+                base_conf = min(main_conf, person_conf, signalman_conf)
+                raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
+                t_main_input, _, d_signalman_res = split_unified_event_detections(
+                    raw_dets,
+                    cams[idx].events,
+                    main_conf=main_conf,
+                    person_conf=person_conf,
+                    helmet_conf=helmet_conf,
+                    signalman_conf=signalman_conf
+                )
 
-                    d_helmet_res = np.empty((0, 6))
-                    if "no_helmet" in cams[idx].events:
-                        # 통합 signalman 모델의 헬멧 클래스는 쓰지 않고, 기존 helmet_3cls_v8 전용 모델 결과를 사용합니다.
-                        d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
-                else:
-                    # 기존 하드코딩 대신 변수(person_conf)를 적용합니다.
-                    base_conf = min(main_conf, person_conf)
-                    d_main_res = cams[idx].det_main.infer(fr, conf_override=base_conf)
-
-                    d_main_res_list = []
-                    for d in d_main_res:
-                        cls_id = int(d[5])
-                        conf = float(d[4])
-
-                        # ID_G_PERSON(2), ID_PERSON_LOW(4), ID_REFLECTIVE_VEST(5)인 경우 JSON에서 로드한 person_conf 적용
-                        if cls_id in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]:
-                            if conf >= person_conf:
-                                d_main_res_list.append(d)
-                        else:
-                            # 차량 등 나머지 객체는 JSON에서 로드한 main_conf 유지
-                            if conf >= main_conf:
-                                d_main_res_list.append(d)
-
-                    t_main_input = detection_array(d_main_res_list)
-
-                    d_helmet_res = np.empty((0, 6))
-                    if "no_helmet" in cams[idx].events:
-                        d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
-
-                    d_signalman_res = np.empty((0, 6))
-                    if "signal_vehicle" in cams[idx].events:
-                        d_signalman_res = cams[idx].det_signalman.infer(fr, conf_override=signalman_conf)
+                d_helmet_res = np.empty((0, 6))
+                if "no_helmet" in cams[idx].events:
+                    d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
