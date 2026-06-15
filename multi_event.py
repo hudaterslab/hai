@@ -184,6 +184,18 @@ def get_model_output_format(model_key):
     formats = SYS_CFG.get("model_output_formats", {})
     return str(formats.get(model_key, "auto")).strip().lower()
 
+def get_main_model_output_format(model_path):
+    fmt = get_model_output_format("MAIN")
+    model_name = os.path.basename(str(model_path or "")).lower()
+    if model_name == "hanjin_cctv_v2.dxnn":
+        if fmt != "ppu":
+            logger.warning(
+                f"[DeepX] MAIN model {model_name} requires PPU decode. "
+                f"Ignoring configured output_format={fmt}."
+            )
+        return "ppu"
+    return fmt
+
 def get_model_engine_pool_size(model_key, default=1):
     sizes = SYS_CFG.get("model_engine_pool_sizes", {})
     try:
@@ -3971,7 +3983,7 @@ def main():
         # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
         d_main = YoLoDeepX(
             main_model_path,
-            output_format=get_model_output_format("MAIN"),
+            output_format=get_main_model_output_format(main_model_path),
             pool_size=get_model_engine_pool_size("MAIN")
         )
         d_helmet = YoLoDeepX(
