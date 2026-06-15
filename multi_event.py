@@ -129,7 +129,7 @@ def load_system_config():
             "MAIN": 0.6,
             "FACE": 0.35,
             "HELMET": 0.55,
-            "PERSON": 0.35, # [추가] 사람 및 신호수 전용 기본 임계값 설정
+            "PERSON": 0.5, # [추가] 사람 및 신호수 전용 기본 임계값 설정
             "SIGNALMAN": 0.5,
             "PLATE": 0.1
         },
