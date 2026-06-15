@@ -4169,14 +4169,19 @@ def main():
                         final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                     continue
 
-                if not connected:
+                if not connected or fr is None:
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                     continue
 
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
-                t_main_input, d_helmet_res, d_signalman_res = inference_futures[idx].result()
+                future = inference_futures.get(idx)
+                if future is None:
+                    final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
+                    continue
+
+                t_main_input, d_helmet_res, d_signalman_res = future.result()
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
