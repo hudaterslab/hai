@@ -1075,16 +1075,24 @@ class SimpleTracker:
         return np.array(res_tracks)
 
 class VideoRecorder:
-    def __init__(self, ip):
+    def __init__(self, ip, cam_id=None):
         self.ip = ip
+        self.cam_id = cam_id if cam_id is not None else "-"
         self.fps = SYS_CFG.get("REC_FPS", 3)
-        self.buffer = deque(maxlen=self.fps * SYS_CFG.get("REC_PRE_SEC", 10))
+        self.pre_sec = SYS_CFG.get("REC_PRE_SEC", 10)
+        self.buffer = deque(maxlen=max(1, int(self.fps * self.pre_sec)))
         self.write_queue = queue.Queue()
 
         self.recording = False
         self.record_end_time = 0
         self.current_event = "unknown"
         self.running = True
+        logger.info(
+            f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:init | "
+            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:0.0 | "
+            f"Frames -> recorder pre-buffer max={self.buffer.maxlen} "
+            f"(REC_FPS={self.fps}, REC_PRE_SEC={self.pre_sec})"
+        )
 
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
@@ -1106,7 +1114,7 @@ class VideoRecorder:
             else:
                 self.write_queue.put(frame_item)
 
-    def trigger(self, event_name, objects_meta=None, event_meta=None): # [수정] objects_meta 매개변수 추가
+    def trigger(self, event_name, objects_meta=None, event_meta=None, current_fps=0.0): # [수정] objects_meta 매개변수 추가
         now = time.time()
         post_sec = SYS_CFG.get("REC_POST_SEC", 10)
 
@@ -1122,6 +1130,18 @@ class VideoRecorder:
             self.current_meta = event_meta if event_meta is not None else objects_meta
 
             temp_buffer = list(self.buffer)
+            tids = []
+            if objects_meta:
+                for obj in objects_meta:
+                    obj_tid = obj.get("tid")
+                    if obj_tid is not None:
+                        tids.append(str(obj_tid))
+            tid_text = ",".join(tids) if tids else "-"
+            logger.info(
+                f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:{event_name} | "
+                f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid_text} | FPS:{current_fps:.1f} | "
+                f"Frames -> recorder pre-buffer kept={len(temp_buffer)}/{self.buffer.maxlen}"
+            )
             for item in temp_buffer:
                 self.write_queue.put(item)
 
@@ -2836,7 +2856,7 @@ class Camera:
         self.trk_signalman = SimpleTracker()
 
         self.reader = FrameReader(conf.get('url', ''), ip)
-        self.recorder = VideoRecorder(ip)
+        self.recorder = VideoRecorder(ip, cam_id=self.cam_id)
         self.motion_det = MotionDetector()
 
         self.alerted = defaultdict(set)
@@ -3587,7 +3607,12 @@ class Camera:
                         auth_tokens=auth_tokens
                     )
 
-                    self.recorder.trigger(ename, objects_meta=objects_meta, event_meta=event_meta)
+                    self.recorder.trigger(
+                        ename,
+                        objects_meta=objects_meta,
+                        event_meta=event_meta,
+                        current_fps=self.current_fps
+                    )
                     self.alerted[tid].add(ename)
                     self.last_evt_t[ename] = now
 
@@ -4052,16 +4077,24 @@ def main():
     # 이렇게 하면 "이벤트 직전/직후 상황"을 사람이 다시 보면서 재현하기 쉽습니다.
     event_frame_save_delay_sec = float(SYS_CFG.get("EVENT_FRAME_SAVE_DELAY_SEC", 10.0))
     configured_event_frame_save_max_count = int(SYS_CFG.get("EVENT_FRAME_SAVE_MAX_COUNT", 0) or 0)
+    event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
     if configured_event_frame_save_max_count > 0:
         # 현장 상황을 알고 있다면 system_config.json에서 최대 저장 장수를 직접 지정할 수 있습니다.
         event_frame_save_max_count = configured_event_frame_save_max_count
     else:
         # 별도 지정이 없으면 녹화 FPS와 저장 시간을 기준으로 자동 계산합니다.
         # 예: 10초, REC_FPS 3이면 약 45장까지 보관합니다. 실제 저장 장수는 들어온 프레임 수만큼입니다.
-        event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
-    event_frame_save_max_count = max(1, int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5)))
+        event_frame_save_max_count = int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5))
+    event_frame_save_max_count = max(1, int(event_frame_save_max_count))
     event_save_queues = {c.ip: deque(maxlen=event_frame_save_max_count) for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
+    for c in cams:
+        logger.info(
+            f"[EVENT FRAME BUFFER] CAM:{c.cam_id}({c.ip}) | Event:init | "
+            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:{c.current_fps:.1f} | "
+            f"Frames -> event-frame buffer max={event_save_queues[c.ip].maxlen} "
+            f"(window={event_frame_save_delay_sec:.1f}s, fps_basis={event_frame_save_fps:.1f})"
+        )
     output_retention_days = float(SYS_CFG.get("OUTPUT_RETENTION_DAYS", 14))
     output_cleanup_interval_sec = float(SYS_CFG.get("OUTPUT_CLEANUP_INTERVAL_SEC", 86400))
     last_output_cleanup_time = time.time()
@@ -4208,7 +4241,25 @@ def main():
                 if new_events:
                     # [수정] 디스크에 바로 쓰지 않고, 큐에 스택(Stacking)하며 이벤트 시간 갱신
                     # 메인 루프 참조 문제 방지를 위해 fr.copy() 사용
-                    last_event_times[cams[idx].ip] = time.time()
+                    cam_ip = cams[idx].ip
+                    last_event_times[cam_ip] = time.time()
+                    event_queue = event_save_queues.get(cam_ip)
+                    if event_queue is not None:
+                        event_names = ",".join(str(ev.get("event_name", "unknown")) for ev in new_events)
+                        event_tids = []
+                        for ev in new_events:
+                            for obj in ev.get("objects", []):
+                                obj_tid = obj.get("tid")
+                                if obj_tid is not None:
+                                    event_tids.append(str(obj_tid))
+                        event_tid_text = ",".join(event_tids) if event_tids else "-"
+                        logger.info(
+                            f"[EVENT FRAME BUFFER] CAM:{cams[idx].cam_id}({cam_ip}) | Event:{event_names} | "
+                            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{event_tid_text} | "
+                            f"FPS:{cams[idx].current_fps:.1f} | "
+                            f"Frames -> start keeping frames {len(event_queue)}/{event_queue.maxlen} "
+                            f"(window={event_frame_save_delay_sec:.1f}s)"
+                        )
 
                     for ev_data in new_events:
                         api_payload = []
@@ -4246,7 +4297,12 @@ def main():
                     # 각 줄에는 저장된 이미지 경로(image_path)와 그 이미지의 AI 판단 결과가 같이 들어갑니다.
                     infer_log_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{batch_ts}.infer.jsonl")
                     infer_records = []
-                    logger.debug(f"[{ip}] {event_frame_save_delay_sec:.1f}초 저장 구간 완료. 쌓인 큐({len(q)}장)를 비동기 저장합니다.")
+                    logger.info(
+                        f"[EVENT FRAME BUFFER] CAM:{c.cam_id}({ip}) | Event:flush | "
+                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:{c.current_fps:.1f} | "
+                        f"Frames -> flush kept={len(q)}/{q.maxlen} "
+                        f"(window={event_frame_save_delay_sec:.1f}s)"
+                    )
                     for item_fid, item_fr, item_meta in list(q):
                         event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{item_fid}.jpg")
                         # 디스크 쓰기 병목 방지를 위해 스레드 풀에 작업 위임 (Off-loading)
