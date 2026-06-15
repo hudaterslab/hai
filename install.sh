@@ -10,8 +10,10 @@ PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SERVICE_NAME="cctv_ai.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 CAM_CONFIG_FILE="$PROJECT_DIR/cameras.json"
+CAM_CSV_FILE="$PROJECT_DIR/cameras.csv"
 SYS_CONFIG_FILE="$PROJECT_DIR/system_config.json"
 TARGET_SCRIPT="$PROJECT_DIR/multi_event.py"
+MODEL_DOWNLOAD_SCRIPT="$PROJECT_DIR/downdxnn.sh"
 DX_DIR="$USER_HOME/dx-runtime"
 
 sudo apt install ssh -y
@@ -70,6 +72,99 @@ EOL
     echo "✅ 기본 설정 생성이 완료되었습니다."
 fi
 
+DEFAULT_SYS_CONFIG_FILE="$(mktemp)"
+cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
+{
+    "terminal_id": "99999",
+    "INFERENCE_MODE": "auto",
+    "logging": {"dir": "./logs", "level": "INFO"},
+    "event_config": {
+        "intrusion": {"enabled": false, "cooldown_sec": 600},
+        "illegal_parking": {"enabled": false, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1, "blur_plate": true},
+        "no_helmet": {"enabled": false, "cooldown_sec": 600, "blur_face": true, "blur_plate": true, "trigger_sec": 3.0},
+        "conveyor_crossing": {"enabled": false, "cooldown_sec": 600, "snapshot_mode": "crossing_moment", "distance_ratio": 0.5, "min_crossing_angle": 20.0, "candidate_ttl_sec": 5.0, "low_body_fallback_sec": 2.0, "blur_face": true, "blur_plate": true},
+        "signal_vehicle": {
+            "enabled": false, "cooldown_sec": 600, "motion_threshold_ratio": 0.10, "blur_plate": true,
+            "line_truck_confirm_frames": 10,
+            "line_truck_confirm_ratio": 0.7,
+            "line_truck_car_veto_frames": 5,
+            "line_truck_min_conf": 0.7,
+            "line_truck_car_veto_iou": 0.10,
+            "line_truck_car_veto_distance_ratio": 0.60
+        }
+    },
+    "models": {
+        "UNIFIED": "signalman.dxnn",
+        "MAIN": "hanjin_cctv.dxnn",
+        "FACE": "yolov8m-face.dxnn",
+        "HELMET": "helmet_3cls_v8.dxnn",
+        "SIGNALMAN": "signalman.dxnn",
+        "PLATE": "license_plate_detector.dxnn"
+    },
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
+    "model_output_formats": {"UNIFIED": "auto", "MAIN": "auto", "FACE": "auto", "HELMET": "auto", "SIGNALMAN": "auto", "PLATE": "auto"},
+    "model_engine_pool_sizes": {"UNIFIED": 1, "MAIN": 1, "FACE": 1, "HELMET": 1, "SIGNALMAN": 1, "PLATE": 1},
+    "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
+    "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
+    "VISUAL_ALARM_DURATION": 5.0
+}
+EOL
+
+if [ -f "$SYS_CONFIG_FILE" ]; then
+    echo "-> system_config.json을 기본 템플릿과 비교합니다. terminal_id는 보존합니다."
+    python3 - "$SYS_CONFIG_FILE" "$DEFAULT_SYS_CONFIG_FILE" << 'PY'
+import copy
+import json
+import shutil
+import sys
+import time
+
+current_path, default_path = sys.argv[1], sys.argv[2]
+
+with open(default_path, "r", encoding="utf-8") as f:
+    default_cfg = json.load(f)
+
+already_backed_up = False
+try:
+    with open(current_path, "r", encoding="utf-8") as f:
+        current_cfg = json.load(f)
+except Exception as exc:
+    backup_path = f"{current_path}.invalid.{time.strftime('%Y%m%d_%H%M%S')}"
+    shutil.copy2(current_path, backup_path)
+    already_backed_up = True
+    current_cfg = {}
+    print(f"[system_config] invalid JSON backed up: {backup_path} ({exc})")
+
+candidate_cfg = copy.deepcopy(default_cfg)
+candidate_cfg["terminal_id"] = current_cfg.get("terminal_id", default_cfg.get("terminal_id", "99999"))
+
+def without_terminal_id(value):
+    copied = copy.deepcopy(value)
+    if isinstance(copied, dict):
+        copied.pop("terminal_id", None)
+    return copied
+
+if without_terminal_id(current_cfg) == without_terminal_id(candidate_cfg):
+    print("[system_config] unchanged")
+    sys.exit(0)
+
+if not already_backed_up:
+    backup_path = f"{current_path}.bak.{time.strftime('%Y%m%d_%H%M%S')}"
+    shutil.copy2(current_path, backup_path)
+else:
+    backup_path = "(invalid backup above)"
+
+with open(current_path, "w", encoding="utf-8") as f:
+    json.dump(candidate_cfg, f, ensure_ascii=False, indent=4)
+    f.write("\n")
+
+print(f"[system_config] updated from template; terminal_id preserved; backup: {backup_path}")
+PY
+    sudo chown "$ACTUAL_USER:$(id -gn "$ACTUAL_USER")" "$SYS_CONFIG_FILE" 2>/dev/null || true
+fi
+
+rm -f "$DEFAULT_SYS_CONFIG_FILE"
+
 echo "-----------------------------------------------------"
 echo " 3. Python 환경 및 필수 패키지 설치"
 echo "-----------------------------------------------------"
@@ -83,9 +178,38 @@ python -m pip install pytz psutil requests opencv-python || \
 python -m pip install pytz psutil requests opencv-python --break-system-packages
 
 echo "-----------------------------------------------------"
-echo " 4. DeepX 드라이버 및 런타임(.deb) 글로벌 설치"
+echo " 4. DX runtime precheck"
 echo "-----------------------------------------------------"
-if ! python3 -c 'import dx_engine' > /dev/null 2>&1; then
+
+DX_ENGINE_READY=false
+DXRT_CLI_READY=false
+DXRT_SERVICE_ACTIVE=false
+
+if python3 -c 'import dx_engine' > /dev/null 2>&1; then
+    DX_ENGINE_READY=true
+    echo "-> dx_engine import: OK"
+else
+    echo "-> dx_engine import: missing"
+fi
+
+if command -v dxrt-cli > /dev/null 2>&1; then
+    DXRT_CLI_READY=true
+    echo "-> dxrt-cli: OK ($(command -v dxrt-cli))"
+else
+    echo "-> dxrt-cli: missing"
+fi
+
+if systemctl is-active --quiet dxrt.service 2>/dev/null; then
+    DXRT_SERVICE_ACTIVE=true
+    echo "-> dxrt.service: active"
+else
+    echo "-> dxrt.service: inactive or not installed"
+fi
+
+echo "-----------------------------------------------------"
+echo " 5. DeepX 드라이버 및 런타임 설치/복구"
+echo "-----------------------------------------------------"
+if [ "$DX_ENGINE_READY" != "true" ]; then
     echo "-> 시스템에서 'dx_engine'을 찾을 수 없어 공식 패키지를 다운로드합니다..."
     DOWNLOAD_DIR="$USER_HOME/Downloads"
     sudo -u "$ACTUAL_USER" mkdir -p "$DOWNLOAD_DIR"
@@ -103,17 +227,23 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 5. 펌웨어(dx_fw) 전용 GitHub 클론 및 플래싱"
+echo " 6. dx-runtime 설치 보강 및 펌웨어 플래싱"
 echo "-----------------------------------------------------"
 if [ ! -d "$DX_DIR" ]; then
     echo "-> 펌웨어 및 라이브러리 파일을 가져오기 위해 저장소를 클론합니다 (서브모듈 포함)..."
     # [수정] 서브모듈(fw.bin 등)을 함께 다운로드하기 위해 --recurse-submodules 옵션 추가
     sudo -u "$ACTUAL_USER" git clone --recurse-submodules https://github.com/DEEPX-AI/dx-runtime.git "$DX_DIR"
+else
+    echo "-> 기존 dx-runtime 저장소를 사용합니다: $DX_DIR"
+    sudo -u "$ACTUAL_USER" git -C "$DX_DIR" submodule update --init --recursive || true
 fi
 
-# 서브쉘을 열어 dx-runtime 내부로 이동 후 install.sh를 실행합니다.
-echo "-> dx-runtime 내장 설치 스크립트(install.sh)를 실행하여 종속성을 설정합니다..."
-(cd "$DX_DIR" && sudo bash install.sh)
+if [ "$DX_ENGINE_READY" != "true" ] || [ "$DXRT_CLI_READY" != "true" ]; then
+    echo "-> dx-runtime 내장 설치 스크립트(install.sh)를 실행하여 누락 항목을 보강합니다..."
+    (cd "$DX_DIR" && sudo bash install.sh)
+else
+    echo "-> dx_engine과 dxrt-cli가 이미 확인되어 dx-runtime install.sh 실행을 건너뜁니다."
+fi
 
 if command -v dxrt-cli &> /dev/null; then
     echo "-> M.2 / PCIe 기반 펌웨어(FW) 업데이트를 시도합니다..."
@@ -124,7 +254,7 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 6. dx_engine 최종 검증"
+echo " 7. dx_engine 최종 검증"
 echo "-----------------------------------------------------"
 if ! python3 -c 'import dx_engine' > /dev/null 2>&1; then
     echo "❌ [에러] 드라이버 설치 후에도 모듈을 로드할 수 없습니다."
@@ -136,7 +266,49 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 7. Systemd 백그라운드 서비스 등록"
+echo " 8. 모델 파일 다운로드 및 확인"
+echo "-----------------------------------------------------"
+MODEL_FILES_READY=true
+if [ -f "$MODEL_DOWNLOAD_SCRIPT" ]; then
+    echo "-> downdxnn.sh를 실행하여 모델 파일을 확인/다운로드합니다..."
+    (cd "$PROJECT_DIR" && bash "$MODEL_DOWNLOAD_SCRIPT")
+else
+    echo "⚠️ downdxnn.sh 파일이 없어 모델 다운로드를 건너뜁니다: $MODEL_DOWNLOAD_SCRIPT"
+fi
+
+if ! python3 - "$SYS_CONFIG_FILE" "$PROJECT_DIR" << 'PY'
+import json
+import os
+import sys
+
+config_path, project_dir = sys.argv[1], sys.argv[2]
+try:
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception as exc:
+    print(f"[model-check] system_config.json read failed: {exc}")
+    sys.exit(1)
+
+missing = []
+for key, value in sorted((cfg.get("models") or {}).items()):
+    if not value:
+        continue
+    path = value if os.path.isabs(value) else os.path.join(project_dir, value)
+    if not os.path.exists(path):
+        missing.append(f"{key}={value}")
+
+if missing:
+    print("[model-check] missing model files: " + ", ".join(missing))
+    sys.exit(1)
+
+print("[model-check] all configured model files exist")
+PY
+then
+    MODEL_FILES_READY=false
+fi
+
+echo "-----------------------------------------------------"
+echo " 9. Systemd 백그라운드 서비스 등록"
 echo "-----------------------------------------------------"
 sudo bash -c "cat > $SERVICE_PATH" << EOL
 [Unit]
@@ -165,9 +337,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
 sudo systemctl stop $SERVICE_NAME
 
-CAM_CSV_FILE="$PROJECT_DIR/cameras.csv"
 if [ ! -f "$CAM_CSV_FILE" ]; then
     echo "⚠️ 'cameras.csv' (카메라 설정 파일)이 없어 서비스가 대기 모드로 진입합니다."
+elif [ "$MODEL_FILES_READY" != "true" ]; then
+    echo "⚠️ 모델 파일이 부족하여 서비스 시작을 보류합니다. downdxnn.sh 또는 system_config.json의 models 경로를 확인하세요."
 else
     sudo systemctl start $SERVICE_NAME
     echo "▶️ CCTV AI 백그라운드 서비스가 구동되었습니다."
