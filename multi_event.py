@@ -208,6 +208,59 @@ def split_unified_event_detections(raw_dets, events, main_conf, person_conf, hel
         detection_array(d_signalman_res_list),
     )
 
+def create_roi_snapshot(cam, frame):
+    """현재 카메라 프레임에 ROI와 설정된 이벤트 명만 그립니다."""
+    if frame is None: return None
+    img = frame.copy()
+
+    # 1. ROI Polygon 그리기
+    if cam.roi_poly and len(cam.roi_poly) > 2:
+        cv2.polylines(img, [np.array(cam.roi_poly, np.int32)], True, (0, 255, 255), 2)
+
+    # 2. ROI Line 그리기
+    if cam.roi_lines:
+        for i in range(0, len(cam.roi_lines), 2):
+            if i + 1 < len(cam.roi_lines):
+                cv2.line(img, tuple(cam.roi_lines[i]), tuple(cam.roi_lines[i+1]), (0, 0, 255), 2)
+
+    # 3. 설정된 이벤트 명 좌측 상단에 표시
+    y_pos = 30
+    for evt in cam.events:
+        display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
+        cv2.putText(img, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        y_pos += 30
+
+    return img
+
+def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h, is_req_setup=False):
+    """관제 서버로 ROI 스냅샷을 백그라운드에서 전송합니다."""
+    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
+    try:
+        _, img_encoded = cv2.imencode('.jpg', img)
+        
+        data = {
+            "terminalId": str(terminal_id),
+            "cctvId": int(cam_id),
+            "imageWidth": int(w),
+            "imageHeight": int(h),
+            "cctvServerId": "1",
+            "isReqRoiSetup": "true" if is_req_setup else "false", # 화각 틀어짐 감지 시 true
+            "roiInfo": roi_info_str
+        }
+        
+        files = {
+            "image": (f"snapshot_cam{cam_id}.jpg", img_encoded.tobytes(), "image/jpeg")
+        }
+        
+        resp = requests.post(url, data=data, files=files, verify=False, timeout=15)
+
+        if resp.status_code == 200:
+            logger.info(f"📸 [ROI Snapshot] CAM:{cam_id} 스냅샷 전송 성공 (ReqSetup: {data['isReqRoiSetup']})")
+        else:
+            logger.error(f"⚠️ [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        logger.error(f"⚠️ [ROI Snapshot] CAM:{cam_id} 전송 실패: {e}")
+        
 # ==========================================
 # [2] 로깅 시스템 초기화
 # ==========================================
@@ -494,7 +547,7 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.debug(f"[API 스킵] 기본 단말 ID(99999) 사용 중: {image_path}")
         return
 
-    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
+    url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
     event_type_mapping = {
         "conveyor_crossing": 1,
         "no_helmet": 2,
@@ -2678,7 +2731,7 @@ class Camera:
 
         self.roi_frame_shape = None # 해상도 변경 감지용
         self.status_history = deque(maxlen=10)
-        #self._reset_alignment_state("ALIGN INIT")
+        self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
 
     def _reset_alignment_state(self, status_text="ALIGN RESET"):
@@ -2720,7 +2773,7 @@ class Camera:
         self.roi_lines = []
         self.roi_frame_shape = None
 
-        #self._reset_alignment_state("ALIGN RESET")
+        self._reset_alignment_state("ALIGN RESET")
         self._rebuild_handlers()
 
         try:
@@ -2946,20 +2999,38 @@ class Camera:
 
         # 2) 매칭 성공 + 실제 ROI 좌표가 충분히 움직인 경우
         elif ok and roi_shifted:
-            self.aligned_roi_poly = new_roi_poly
-            self.aligned_roi_lines = new_roi_lines
-            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+            # self.aligned_roi_poly = new_roi_poly
+            # self.aligned_roi_lines = new_roi_lines
+            # self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+            self.needs_roi_setup = True
+            now = time.time()
+            if not hasattr(self, "_last_roi_alert_time") or (now - getattr(self, "_last_roi_alert_time", 0)) > 60:
+                self._last_roi_alert_time = now
+                logger.warning(f"🚨 [CAM:{self.cam_id}] 화각 틀어짐 감지! 관제 서버에 ROI 재설정을 요청합니다.")
+                
+                # 현재 프레임으로 스냅샷 생성 및 전송
+                snap_img = create_roi_snapshot(self, frame)
+                if snap_img is not None:
+                    h_img, w_img = snap_img.shape[:2]
+                    roi_info = {
+                        "roi_poly_norm": self.roi_poly_norm,
+                        "roi_lines_norm": self.roi_lines_norm
+                    }
+                    IMAGE_SAVER_POOL.submit(
+                        _send_roi_snapshot_task,
+                        self.cam_id, 
+                        SYS_CFG.get("terminal_id", "99999"), 
+                        snap_img, 
+                        json.dumps(roi_info), 
+                        w_img, h_img,
+                        is_req_setup=True  # 이 값이 핵심!
+                    )
 
             self.align_status_text = (
-                f"ALIGN APPLIED {method} "
-                f"status={status} g={good} i={inliers} r={ratio:.2f} "
-                f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
-                f"scale={scale:.3f} persp={perspective:.5f} | "
-                f"h_shifted={h_shifted} | "
+                f"ALIGN DETECTED BUT HOLD (Manual Setup Required) {method} "
+                f"status={status} g={good} i={inliers} | "
                 f"roi_shift max={roi_max_shift:.1f}px mean={roi_mean_shift:.1f}px | "
-                f"poly_shift mean={poly_mean_shift:.1f}px max={poly_max_shift:.1f}px | "
-                f"line_shift mean={line_mean_shift:.1f}px max={line_max_shift:.1f}px | "
-                f"threshold={ROI_APPLY_MIN_SHIFT_PX:.1f}px | action=roi_updated"
+                f"action=request_manual_roi_setup"
             )
 
         # 3) 매칭은 성공했지만 실제 ROI 좌표 변화가 너무 작아서 유지
@@ -3303,7 +3374,7 @@ class Camera:
             self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
 
         self._initialize_base_roi_if_needed(fr)
-        #self._update_alignment(fr)
+        self._update_alignment(fr)
         motion_mask = self.motion_det.apply(fr)
 
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
@@ -3673,8 +3744,9 @@ def get_system_temperature():
     return 0.0 # 센서가 없는 PC 환경 등의 폴백(Fallback)
 
 class HealthCheckDaemon:
-    def __init__(self, terminal_id, version="v1.1.0", interval_sec=60):
+    def __init__(self, terminal_id, cams, version="v1.1.0", interval_sec=60):
         self.terminal_id = terminal_id
+        self.cams = cams  # 카메라 객체들 참조
         self.version = version
         self.interval = interval_sec
         self.running = True
@@ -3688,14 +3760,15 @@ class HealthCheckDaemon:
     def _run(self):
         while self.running:
             try:
-                # 자원 수집
                 cpu = psutil.cpu_percent(interval=1.0)
                 mem = psutil.virtual_memory().percent
                 temp = get_system_temperature()
 
-                # ISO 8601 포맷
                 kst = pytz.timezone('Asia/Seoul')
                 reported_at = datetime.datetime.now(kst).strftime('%Y-%m-%dT%H:%M:%S')
+
+                # 카메라들 중 하나라도 화각이 틀어졌다면 True로 설정
+                needs_setup = any(getattr(c, 'needs_roi_setup', False) for c in self.cams)
 
                 data = {
                     "terminalId": str(self.terminal_id),
@@ -3703,21 +3776,38 @@ class HealthCheckDaemon:
                     "cpuUsage": round(cpu, 1),
                     "memoryUsage": round(mem, 1),
                     "temperature": round(temp, 1),
-                    "softwareVersion": self.version
+                    "softwareVersion": self.version,
+                    "isRoiSetupRequired": needs_setup
                 }
 
-                # requests 모듈은 딕셔너리를 data= 에 넘기면 자동으로 application/x-www-form-urlencoded 로 처리합니다.
                 headers = {"accept": "application/json"}
-
                 response = requests.post(self.url, headers=headers, data=data, timeout=10, verify=False)
 
                 if response.status_code == 200:
                     logger.debug(f"🩺 [Health Check] 전송 성공 (CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%)")
+                    res_json = response.json()
+                    
+                    # -------------------------------------------------------------
+                    # [핵심] 관제 웹에서 ROI가 수정되어 서버가 새 데이터를 내려준 시점!
+                    # -------------------------------------------------------------
+                    # 예: if res_json.get("roiChanged") == True:
+                    #     new_roi_data = res_json.get("roiInfo")
+                    #     
+                    #     # 1. cameras.json 파일 업데이트
+                    #     self._update_local_cameras_json(new_roi_data)
+                    #
+                    #     # 2. 카메라 객체에 새 설정 반영 및 상태 원복 (False)
+                    #     for c in self.cams:
+                    #         if c.ip in new_roi_data:
+                    #             c.update_config(new_roi_data[c.ip])
+                    #             c.needs_roi_setup = False  <-- 여기서 드디어 False로 바뀜!
+                    #             logger.info(f"✅ [CAM:{c.ip}] 신규 ROI 적용 완료. 알람 상태 해제.")
+                    
                 else:
-                    logger.error(f"⚠️ [Health Check] API 응답 에러 (상태코드: {response.status_code}) - {response.text}")
+                    logger.error(f"⚠️ [Health Check] API 응답 에러 ({response.status_code}): {response.text}")
 
             except Exception as e:
-                logger.error(f"⚠️ [Health Check] 네트워크 연결 예외 발생: {e}")
+                logger.error(f"⚠️ [Health Check] 네트워크 예외 발생: {e}")
 
             # interval(300초)을 통으로 sleep하지 않고, 1초마다 running 상태를 체크하여 빠른 셧다운을 지원
             for _ in range(self.interval):
@@ -3847,7 +3937,7 @@ def main():
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
-    health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=60)
+    health_daemon = HealthCheckDaemon(terminal_id=terminal_id, cams=cams, version=software_version, interval_sec=60)
 
     last_config_mtime = 0
     if os.path.exists(config_file):
@@ -3878,7 +3968,9 @@ def main():
     last_output_cleanup_time = time.time()
     logger.info(f"[Retention] 산출물 보관 정책: {output_retention_days:g}일 보관, {output_cleanup_interval_sec / 3600.0:.1f}시간마다 정리")
     run_output_retention_cleanup(output_retention_days)
-
+    last_roi_snapshot_time = time.time() - 3540.0  # 시작 후 60초 뒤 첫 전송
+    ROI_SNAPSHOT_INTERVAL_SEC = 3600.0  # 1시간 주기
+    
     try:
         psutil.cpu_percent(interval=None)
 
@@ -3938,6 +4030,28 @@ def main():
             raw_data = [c.process_frame() for c in cams]
             final_imgs = []
 
+            # --- [추가] 1시간 주기 ROI 스냅샷 전송 로직 ---
+            now_time = time.time()
+            if (now_time - last_roi_snapshot_time) >= ROI_SNAPSHOT_INTERVAL_SEC:
+                for idx, c in enumerate(cams):
+                    fr, fid, connected = raw_data[idx]
+                    if connected and fr is not None:
+                        snap_img = create_roi_snapshot(c, fr)
+                        h, w = snap_img.shape[:2]
+                        roi_info = {
+                            "roi_poly_norm": c.roi_poly_norm,
+                            "roi_lines_norm": c.roi_lines_norm
+                        }
+                        
+                        # c.needs_roi_setup 값(True/False)이 해제되기 전까지 그대로 전송됨
+                        IMAGE_SAVER_POOL.submit(
+                            _send_roi_snapshot_task,
+                            c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h,
+                            is_req_setup=getattr(c, 'needs_roi_setup', False)
+                        )
+                last_roi_snapshot_time = now_time
+            # ----------------------------------------------
+            
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
 
