@@ -4068,6 +4068,24 @@ def main():
     logger.info(f"[Retention] 산출물 보관 정책: {output_retention_days:g}일 보관, {output_cleanup_interval_sec / 3600.0:.1f}시간마다 정리")
     run_output_retention_cleanup(output_retention_days)
 
+    def run_camera_inference(cam, fr):
+        base_conf = min(main_conf, person_conf, signalman_conf)
+        raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
+        t_main_input, _, d_signalman_res = split_unified_event_detections(
+            raw_dets,
+            cam.events,
+            main_conf=main_conf,
+            person_conf=person_conf,
+            helmet_conf=helmet_conf,
+            signalman_conf=signalman_conf
+        )
+
+        d_helmet_res = np.empty((0, 6))
+        if "no_helmet" in cam.events:
+            d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
+
+        return t_main_input, d_helmet_res, d_signalman_res
+
     try:
         psutil.cpu_percent(interval=None)
 
@@ -4126,6 +4144,12 @@ def main():
 
             raw_data = [c.process_frame() for c in cams]
             final_imgs = []
+            inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+            inference_futures = {}
+            for idx, res in enumerate(raw_data):
+                fr, _, connected = res
+                if connected and fr is not None and cams[idx].events:
+                    inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
 
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
@@ -4152,21 +4176,7 @@ def main():
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
-                # 헬멧 미착용은 아래 전용 모델에서 따로 추론하므로 MAIN 모델 기준에는 helmet_conf를 섞지 않습니다.
-                base_conf = min(main_conf, person_conf, signalman_conf)
-                raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
-                t_main_input, _, d_signalman_res = split_unified_event_detections(
-                    raw_dets,
-                    cams[idx].events,
-                    main_conf=main_conf,
-                    person_conf=person_conf,
-                    helmet_conf=helmet_conf,
-                    signalman_conf=signalman_conf
-                )
-
-                d_helmet_res = np.empty((0, 6))
-                if "no_helmet" in cams[idx].events:
-                    d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
+                t_main_input, d_helmet_res, d_signalman_res = inference_futures[idx].result()
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
@@ -4215,6 +4225,8 @@ def main():
                     event_infer_meta = dict(infer_meta)
                     event_infer_meta["privacy_blur"] = privacy_blur_meta
                     event_save_queues[cams[idx].ip].append((fid, event_frame, event_infer_meta))
+
+            inference_executor.shutdown(wait=True)
 
             # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
@@ -4275,6 +4287,12 @@ def main():
                     model.release()
                 except Exception:
                     pass
+
+        if 'inference_executor' in locals():
+            try:
+                inference_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                inference_executor.shutdown(wait=False)
 
         if is_gui_mode:
             cv2.destroyAllWindows()
