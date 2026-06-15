@@ -138,7 +138,7 @@ def load_system_config():
             "PLATE": "auto"
         },
         "model_engine_pool_sizes": {
-            "MAIN": 1,
+            "MAIN": 3,
             "FACE": 1,
             "HELMET": 1,
             "PLATE": 1
@@ -3984,7 +3984,7 @@ def main():
         d_main = YoLoDeepX(
             main_model_path,
             output_format=get_main_model_output_format(main_model_path),
-            pool_size=get_model_engine_pool_size("MAIN")
+            pool_size=max(3, get_model_engine_pool_size("MAIN"))
         )
         d_helmet = YoLoDeepX(
             resolve_model_path(models_cfg["HELMET"]),
