@@ -133,6 +133,22 @@ def load_system_config():
             "SIGNALMAN": 0.5,
             "PLATE": 0.1
         },
+        "model_output_formats": {
+            "UNIFIED": "auto",
+            "MAIN": "auto",
+            "FACE": "auto",
+            "HELMET": "auto",
+            "SIGNALMAN": "auto",
+            "PLATE": "auto"
+        },
+        "model_engine_pool_sizes": {
+            "UNIFIED": 1,
+            "MAIN": 1,
+            "FACE": 1,
+            "HELMET": 1,
+            "SIGNALMAN": 1,
+            "PLATE": 1
+        },
         "INFERENCE_MODE": "auto",  # auto: 통합 모델 파일이 있으면 단일 모델, 없으면 기존 별도 모델
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
@@ -169,6 +185,17 @@ def resolve_model_path(model_path):
     if os.path.isabs(model_path):
         return model_path
     return os.path.join(PROJECT_ROOT, model_path)
+
+def get_model_output_format(model_key):
+    formats = SYS_CFG.get("model_output_formats", {})
+    return str(formats.get(model_key, "auto")).strip().lower()
+
+def get_model_engine_pool_size(model_key, default=1):
+    sizes = SYS_CFG.get("model_engine_pool_sizes", {})
+    try:
+        return max(1, int(sizes.get(model_key, default)))
+    except Exception:
+        return max(1, int(default))
 
 def detection_array(rows):
     """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
@@ -722,21 +749,93 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
 # [6] DeepX NPU 모델 추론 (YOLOv8 버그 픽스 반영)
 # ==========================================
 class YoLoDeepX:
-    def __init__(self, engine_path):
-        # [수정] 객체 생성 시점에 NPU 환경인지 체크하여 안전하게 방어
+    def __init__(self, engine_path, output_format="auto", pool_size=1):
         if not HAS_DX_ENGINE:
-            raise RuntimeError("dx_engine이 설치되지 않은 서버/PC 환경에서는 YoLoDeepX(NPU) 객체를 생성할 수 없습니다.")
+            raise RuntimeError("dx_engine is not installed; YoLoDeepX can only run on a DeepX/NPU runtime.")
 
         self.engine_path = engine_path
+        self.output_format = self._resolve_output_format(output_format)
+        self.pool_size = max(1, int(pool_size or 1))
+        self.engine_pool = queue.Queue(maxsize=self.pool_size)
+        self.engines_ref = []
+        self.input_height = 640
+        self.input_width = 640
+        self.input_layout = "hwc"
+        self.input_has_batch = False
+
         try:
             io = InferenceOption()
-            self.engine = InferenceEngine(self.engine_path, io)
-            logger.info(f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)}")
+            for _ in range(self.pool_size):
+                engine = InferenceEngine(self.engine_path, io)
+                self.engine_pool.put(engine)
+                self.engines_ref.append(engine)
+
+            self._load_input_shape(self.engines_ref[0])
+            logger.info(
+                f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)} "
+                f"(output={self.output_format}, pool={self.pool_size}, "
+                f"input={self.input_width}x{self.input_height}, layout={self.input_layout})"
+            )
         except Exception as e:
             logger.error(f"[DeepX Load Fail] 엔진 초기화 실패 ({engine_path}): {e}")
             raise e
 
-    def letter_box(self, img, new_shape=(640,640)):
+    def __del__(self):
+        self.release()
+
+    def release(self):
+        while hasattr(self, "engine_pool") and not self.engine_pool.empty():
+            try:
+                self.engine_pool.get_nowait()
+            except Exception:
+                break
+        for engine in getattr(self, "engines_ref", []):
+            try:
+                del engine
+            except Exception:
+                pass
+        self.engines_ref = []
+
+    def _resolve_output_format(self, output_format):
+        fmt = str(output_format or "auto").strip().lower()
+        if fmt in ["", "auto"]:
+            model_name = os.path.basename(str(self.engine_path or "")).lower()
+            return "ppu" if "_ppu" in model_name or "-ppu" in model_name else "yolo"
+        if fmt in ["ppu", "deepx_ppu", "yolov8_ppu"]:
+            return "ppu"
+        if fmt in ["yolo", "yolov8", "raw", "standard", "raw_yolo"]:
+            return "yolo"
+        logger.warning(f"[DeepX] 알 수 없는 모델 출력 포맷({output_format})입니다. yolo 후처리로 동작합니다.")
+        return "yolo"
+
+    def _load_input_shape(self, engine):
+        try:
+            input_info = engine.get_input_tensors_info()
+            shape = list(input_info[0].get("shape", []))
+        except Exception as e:
+            logger.warning(f"[DeepX] 입력 텐서 shape 확인 실패. 640x640 기본값을 사용합니다: {e}")
+            return
+
+        if len(shape) == 4:
+            self.input_has_batch = True
+            if shape[-1] in [1, 3, 4]:
+                self.input_layout = "nhwc"
+                self.input_height, self.input_width = int(shape[1]), int(shape[2])
+            elif shape[1] in [1, 3, 4]:
+                self.input_layout = "nchw"
+                self.input_height, self.input_width = int(shape[2]), int(shape[3])
+        elif len(shape) == 3:
+            self.input_has_batch = False
+            if shape[-1] in [1, 3, 4]:
+                self.input_layout = "hwc"
+                self.input_height, self.input_width = int(shape[0]), int(shape[1])
+            elif shape[0] in [1, 3, 4]:
+                self.input_layout = "chw"
+                self.input_height, self.input_width = int(shape[1]), int(shape[2])
+
+    def letter_box(self, img, new_shape=None):
+        if new_shape is None:
+            new_shape = (self.input_height, self.input_width)
         h, w = img.shape[:2]
         scale = min(new_shape[0]/h, new_shape[1]/w)
         nw, nh = int(w*scale), int(h*scale)
@@ -748,6 +847,19 @@ class YoLoDeepX:
         canvas[dh:dh+nh, dw:dw+nw] = resized
 
         return canvas, scale, (dw, dh)
+
+    def _prepare_input_tensor(self, npu_input):
+        input_tensor = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+
+        # Keep the historical HWC path for standard YOLO models. PPU models are
+        # stricter about matching the SDK-reported input shape.
+        if self.output_format == "ppu":
+            if self.input_layout in ["nchw", "chw"]:
+                input_tensor = np.transpose(input_tensor, (2, 0, 1))
+            if self.input_has_batch:
+                input_tensor = np.expand_dims(input_tensor, axis=0)
+
+        return np.ascontiguousarray(input_tensor, dtype=np.uint8)
 
     def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
         try:
@@ -797,19 +909,79 @@ class YoLoDeepX:
             logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
             return []
 
+    def postprocess_ppu(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+        try:
+            raw_data = output_tensor[0]
+            if isinstance(raw_data, bytes):
+                flat = np.frombuffer(raw_data, dtype=np.uint8).copy()
+            else:
+                flat = np.ascontiguousarray(raw_data).view(np.uint8).ravel().copy()
+
+            if len(flat) == 0:
+                return []
+
+            stride = 32
+            if len(flat) % stride != 0:
+                logger.error(f"[DeepX PPU] 출력 버퍼 길이({len(flat)})가 {stride}의 배수가 아닙니다.")
+                return []
+
+            flat_stride = flat.reshape(len(flat) // stride, stride)
+            boxes_raw = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(-1, 4)
+            scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
+            labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+
+            mask = scores >= conf_thres
+            if not np.any(mask):
+                return []
+
+            boxes_raw = boxes_raw[mask]
+            scores = scores[mask]
+            labels = labels[mask]
+
+            cx = boxes_raw[:, 0]
+            cy = boxes_raw[:, 1]
+            bw = boxes_raw[:, 2]
+            bh = boxes_raw[:, 3]
+
+            x1 = cx - bw * 0.5
+            y1 = cy - bh * 0.5
+            x2 = cx + bw * 0.5
+            y2 = cy + bh * 0.5
+
+            max_wh = 7680
+            class_offset = labels.astype(np.float32) * max_wh
+            boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, bw, bh])
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+            if indices is None or len(indices) == 0:
+                return []
+
+            results = []
+            for i in np.array(indices).reshape(-1):
+                results.append([[x1[i], y1[i], x2[i], y2[i]], scores[i], labels[i]])
+
+            return results
+        except Exception as e:
+            logger.error(f"NPU PPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
+
     def infer(self, img, conf_override=None):
         if img is None:
             return np.empty((0,6))
 
         h_orig, w_orig = img.shape[:2]
         npu_input, scale, offset = self.letter_box(img)
-        npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+        input_tensor = self._prepare_input_tensor(npu_input)
+        engine = self.engine_pool.get()
 
         try:
-            output_tensor = self.engine.run([npu_input_rgb])
+            output_tensor = engine.run([input_tensor])
 
             thres = conf_override if conf_override is not None else 0.40
-            raw_dets = self.postprocess(output_tensor, conf_thres=thres)
+            if self.output_format == "ppu":
+                raw_dets = self.postprocess_ppu(output_tensor, conf_thres=thres)
+            else:
+                raw_dets = self.postprocess(output_tensor, conf_thres=thres)
 
             if not raw_dets:
                 return np.empty((0,6))
@@ -825,10 +997,12 @@ class YoLoDeepX:
 
                 res.append([x1, y1, x2, y2, score, cls_id])
 
-            return np.array(res)
+            return np.array(res, dtype=float)
         except Exception as e:
             logger.error(f"NPU Inference Error: {e}")
             return np.empty((0,6))
+        finally:
+            self.engine_pool.put(engine)
 
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
@@ -3804,17 +3978,45 @@ def main():
         if use_unified_event_model:
             # 이벤트 판단용 기본 객체와 신호수는 통합 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
             # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
-            d_main = YoLoDeepX(unified_model_path)
-            d_helmet = YoLoDeepX(resolve_model_path(models_cfg["HELMET"]))
+            d_main = YoLoDeepX(
+                unified_model_path,
+                output_format=get_model_output_format("UNIFIED"),
+                pool_size=get_model_engine_pool_size("UNIFIED")
+            )
+            d_helmet = YoLoDeepX(
+                resolve_model_path(models_cfg["HELMET"]),
+                output_format=get_model_output_format("HELMET"),
+                pool_size=get_model_engine_pool_size("HELMET")
+            )
             d_signalman = None
         else:
-            d_main = YoLoDeepX(resolve_model_path(models_cfg["MAIN"]))
-            d_helmet = YoLoDeepX(resolve_model_path(models_cfg["HELMET"]))
-            d_signalman = YoLoDeepX(resolve_model_path(models_cfg["SIGNALMAN"]))
+            d_main = YoLoDeepX(
+                resolve_model_path(models_cfg["MAIN"]),
+                output_format=get_model_output_format("MAIN"),
+                pool_size=get_model_engine_pool_size("MAIN")
+            )
+            d_helmet = YoLoDeepX(
+                resolve_model_path(models_cfg["HELMET"]),
+                output_format=get_model_output_format("HELMET"),
+                pool_size=get_model_engine_pool_size("HELMET")
+            )
+            d_signalman = YoLoDeepX(
+                resolve_model_path(models_cfg["SIGNALMAN"]),
+                output_format=get_model_output_format("SIGNALMAN"),
+                pool_size=get_model_engine_pool_size("SIGNALMAN")
+            )
 
         # 개인정보 블러는 이벤트 판단 모델과 목적이 달라 별도 모델을 유지합니다.
-        d_face = YoLoDeepX(resolve_model_path(models_cfg["FACE"]))
-        d_plate = YoLoDeepX(resolve_model_path(models_cfg["PLATE"]))
+        d_face = YoLoDeepX(
+            resolve_model_path(models_cfg["FACE"]),
+            output_format=get_model_output_format("FACE"),
+            pool_size=get_model_engine_pool_size("FACE")
+        )
+        d_plate = YoLoDeepX(
+            resolve_model_path(models_cfg["PLATE"]),
+            output_format=get_model_output_format("PLATE"),
+            pool_size=get_model_engine_pool_size("PLATE")
+        )
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
@@ -4108,6 +4310,14 @@ def main():
         for c in cams:
             c.reader.running = False
             c.recorder.running = False
+
+        for model_name in ["d_main", "d_helmet", "d_signalman", "d_face", "d_plate"]:
+            model = locals().get(model_name)
+            if model is not None and hasattr(model, "release"):
+                try:
+                    model.release()
+                except Exception:
+                    pass
 
         if is_gui_mode:
             cv2.destroyAllWindows()
