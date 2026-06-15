@@ -132,7 +132,7 @@ def load_system_config():
             "PLATE": 0.1
         },
         "model_output_formats": {
-            "MAIN": "auto",
+            "MAIN": "ppu",
             "FACE": "auto",
             "HELMET": "auto",
             "PLATE": "auto"
