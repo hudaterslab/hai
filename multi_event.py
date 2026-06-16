@@ -151,6 +151,7 @@ def load_system_config():
             "hw_device": "/dev/dri/renderD128",
             "vaapi_driver": "iHD",
             "fallback_to_cpu": True,
+            "fps_limit": 15.0,
             "log_interval_sec": 10.0,
             "print_pipeline_logs": True
         },
@@ -2956,6 +2957,13 @@ class FrameReader:
         out_height = max(2, int(round((height * ratio) / 2.0) * 2))
         return 720, out_height
 
+    def _decode_fps_limit(self):
+        try:
+            fps_limit = float(self.decode_cfg.get("fps_limit", 15.0) or 0.0)
+        except Exception:
+            fps_limit = 15.0
+        return fps_limit if fps_limit > 0 else None
+
     def _run_ffmpeg_vaapi_pipe(self):
         shape = self._probe_stream_shape()
         if shape is None:
@@ -2965,14 +2973,20 @@ class FrameReader:
         out_w, out_h = self._scaled_output_shape(in_w, in_h)
         frame_size = out_w * out_h * 3
         hw_device = str(self.decode_cfg.get("hw_device", "/dev/dri/renderD128")).strip()
+        fps_limit = self._decode_fps_limit()
 
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
         if self.url.lower().startswith("rtsp://"):
             cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000", "-fflags", "nobuffer", "-flags", "low_delay"])
         cmd.extend(["-hwaccel", "vaapi", "-hwaccel_device", hw_device, "-i", self.url, "-an"])
 
+        vf_chain = []
         if (out_w, out_h) != (in_w, in_h):
-            cmd.extend(["-vf", f"scale={out_w}:{out_h}"])
+            vf_chain.append(f"scale={out_w}:{out_h}")
+        if fps_limit is not None:
+            vf_chain.append(f"fps={fps_limit:g}")
+        if vf_chain:
+            cmd.extend(["-vf", ",".join(vf_chain)])
 
         cmd.extend(["-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"])
 
@@ -2993,7 +3007,7 @@ class FrameReader:
                 shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
                 pid=proc.pid,
                 cmd=cmd,
-                extra=f"device={hw_device} driver={vaapi_driver or '-'} frame_bytes={frame_size}"
+                extra=f"device={hw_device} driver={vaapi_driver or '-'} fps_limit={fps_limit or '-'} frame_bytes={frame_size}"
             )
             self._decode_mode_logged = True
             self.last_t = time.time()
