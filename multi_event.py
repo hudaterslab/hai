@@ -146,9 +146,9 @@ def load_system_config():
             "HELMET": 1,
             "PLATE": 1
         },
-        "INFERENCE_BACKEND": "dx_engine",
+        "INFERENCE_BACKEND": "dx_stream",
         "dx_stream": {
-            "enabled": False,
+            "enabled": True,
             "runtime_config_dir": "./.dxstream_runtime",
             "postprocess_config_dir": "/usr/local/share/gstdxstream/configs/HAI_PPU",
             "python_paths": [],

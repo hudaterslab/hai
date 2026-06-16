@@ -1,15 +1,19 @@
 #!/bin/bash
 
-INSTALL_DX_STREAM=${INSTALL_DX_STREAM:-false}
+INSTALL_DX_STREAM=${INSTALL_DX_STREAM:-true}
 
 for arg in "$@"; do
     case "$arg" in
         --dx-stream|--with-dx-stream)
             INSTALL_DX_STREAM=true
             ;;
+        --no-dx-stream|--without-dx-stream)
+            INSTALL_DX_STREAM=false
+            ;;
         -h|--help)
-            echo "Usage: $0 [--dx-stream]"
-            echo "  --dx-stream    Build and install DEEPX dx_stream GStreamer plugins"
+            echo "Usage: $0 [--dx-stream|--no-dx-stream]"
+            echo "  --dx-stream       Build/install DEEPX dx_stream GStreamer plugins (default on this branch)"
+            echo "  --no-dx-stream    Keep dx_engine inference config and skip dx_stream plugin install"
             echo ""
             echo "Optional dx_stream HAI_PPU artifact:"
             echo "  HAI_DXSTREAM_POSTPROCESS_SO=/path/to/libpostprocess_hai_ppu.so $0 --dx-stream"
@@ -20,7 +24,7 @@ for arg in "$@"; do
             ;;
         *)
             echo "Unknown option: $arg"
-            echo "Usage: $0 [--dx-stream]"
+            echo "Usage: $0 [--dx-stream|--no-dx-stream]"
             exit 1
             ;;
     esac
@@ -49,6 +53,14 @@ HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR=${HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR:-"/u
 HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR=${HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR:-"/usr/local/share/gstdxstream/configs/HAI_PPU"}
 HAI_DXSTREAM_POSTPROCESS_CONFIG_SOURCE_DIR=${HAI_DXSTREAM_POSTPROCESS_CONFIG_SOURCE_DIR:-"$PROJECT_DIR"}
 MODEL_DOWNLOAD_DONE=false
+
+if [ "$INSTALL_DX_STREAM" = "true" ]; then
+    DEFAULT_INFERENCE_BACKEND="dx_stream"
+    DEFAULT_DX_STREAM_ENABLED="true"
+else
+    DEFAULT_INFERENCE_BACKEND="dx_engine"
+    DEFAULT_DX_STREAM_ENABLED="false"
+fi
 
 sudo apt install ssh -y
 
@@ -177,7 +189,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
 {
     "terminal_id": "$USER_TERM_ID",
     "INFERENCE_MODE": "auto",
-    "INFERENCE_BACKEND": "dx_engine",
+    "INFERENCE_BACKEND": "$DEFAULT_INFERENCE_BACKEND",
     "logging": {"dir": "./logs", "level": "INFO"},
     "event_config": {
         "intrusion": {"enabled": false, "cooldown_sec": 600},
@@ -204,7 +216,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "dx_stream": {
-        "enabled": false,
+        "enabled": $DEFAULT_DX_STREAM_ENABLED,
         "runtime_config_dir": "./.dxstream_runtime",
         "postprocess_config_dir": "/usr/local/share/gstdxstream/configs/HAI_PPU",
         "python_paths": [],
@@ -229,7 +241,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
 {
     "terminal_id": "99999",
     "INFERENCE_MODE": "auto",
-    "INFERENCE_BACKEND": "dx_engine",
+    "INFERENCE_BACKEND": "$DEFAULT_INFERENCE_BACKEND",
     "logging": {"dir": "./logs", "level": "INFO"},
     "event_config": {
         "intrusion": {"enabled": false, "cooldown_sec": 600},
@@ -256,7 +268,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "dx_stream": {
-        "enabled": false,
+        "enabled": $DEFAULT_DX_STREAM_ENABLED,
         "runtime_config_dir": "./.dxstream_runtime",
         "postprocess_config_dir": "/usr/local/share/gstdxstream/configs/HAI_PPU",
         "python_paths": [],
@@ -454,7 +466,7 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 8. dx_stream GStreamer 플러그인 선택 설치"
+echo " 8. dx_stream GStreamer 플러그인 설치"
 echo "-----------------------------------------------------"
 if [ "$INSTALL_DX_STREAM" = "true" ]; then
     echo "-> dx_stream 설치가 요청되었습니다: $DX_STREAM_DIR"
@@ -515,7 +527,7 @@ Environment=LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/l
         exit 1
     fi
 else
-    echo "-> dx_stream 설치를 건너뜁니다. 필요 시 INSTALL_DX_STREAM=true 또는 --dx-stream 옵션을 사용하세요."
+    echo "-> dx_stream 설치가 비활성화되었습니다. 필요 시 INSTALL_DX_STREAM=true 또는 --dx-stream 옵션을 사용하세요."
 fi
 
 echo "-----------------------------------------------------"
