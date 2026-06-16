@@ -3126,6 +3126,11 @@ class Camera:
 
         self.fps_queue = deque(maxlen=30)
         self.current_fps = 0.0
+        self.logic_perf_last_log_time = time.time()
+        self.logic_perf_samples = 0
+        self.logic_perf_totals = defaultdict(float)
+        self.logic_perf_handler_totals = defaultdict(float)
+        self.logic_perf_handler_counts = defaultdict(int)
 
         self.roi_poly_norm = conf.get('roi_poly_norm', [])
         self.roi_lines_norm = conf.get('roi_lines_norm', [])
@@ -3753,10 +3758,70 @@ class Camera:
             ]
         }
 
+    def _record_run_logic_timing(self, timing, handler_timing, handler_counts):
+        perf_log_interval_sec = float(SYS_CFG.get("PERF_LOG_INTERVAL_SEC", 10.0))
+        if perf_log_interval_sec <= 0:
+            return
+
+        self.logic_perf_samples += 1
+        for key, value in timing.items():
+            self.logic_perf_totals[key] += float(value)
+        for ename, value in handler_timing.items():
+            self.logic_perf_handler_totals[ename] += float(value)
+        for ename, value in handler_counts.items():
+            self.logic_perf_handler_counts[ename] += int(value)
+
+        now = time.time()
+        elapsed = now - self.logic_perf_last_log_time
+        if elapsed < perf_log_interval_sec or self.logic_perf_samples <= 0:
+            return
+
+        samples = self.logic_perf_samples
+
+        def avg_ms(key):
+            return self.logic_perf_totals.get(key, 0.0) / max(1, samples)
+
+        handler_parts = []
+        for ename in sorted(self.logic_perf_handler_totals.keys()):
+            count = max(1, self.logic_perf_handler_counts.get(ename, 0))
+            handler_parts.append(f"{ename}:{self.logic_perf_handler_totals[ename] / count:.1f}ms")
+        handler_text = ",".join(handler_parts) if handler_parts else "-"
+
+        logger.info(
+            f"[RUN_LOGIC TIMING] CAM:{self.cam_id}({self.ip}) "
+            f"samples={samples} fps={samples / max(0.001, elapsed):.2f} "
+            f"total={avg_ms('total_ms'):.1f}ms "
+            f"prep={avg_ms('prep_ms'):.1f}ms "
+            f"motion={avg_ms('motion_ms'):.1f}ms "
+            f"tracker={avg_ms('tracker_ms'):.1f}ms "
+            f"maps={avg_ms('maps_ms'):.1f}ms "
+            f"handlers={avg_ms('handlers_ms'):.1f}ms "
+            f"event_trigger={avg_ms('event_trigger_ms'):.1f}ms "
+            f"alarm={avg_ms('alarm_ms'):.1f}ms "
+            f"record_copy={avg_ms('record_copy_ms'):.1f}ms "
+            f"record_overlay={avg_ms('record_overlay_ms'):.1f}ms "
+            f"main_tracks={self.logic_perf_totals.get('main_tracks_count', 0.0) / max(1, samples):.1f} "
+            f"helmet_tracks={self.logic_perf_totals.get('helmet_tracks_count', 0.0) / max(1, samples):.1f} "
+            f"signalman_tracks={self.logic_perf_totals.get('signalman_tracks_count', 0.0) / max(1, samples):.1f} "
+            f"handler_detail={handler_text}"
+        )
+
+        self.logic_perf_samples = 0
+        self.logic_perf_totals.clear()
+        self.logic_perf_handler_totals.clear()
+        self.logic_perf_handler_counts.clear()
+        self.logic_perf_last_log_time = now
+
     def run_logic(self, fr, fid, d_main_res, d_helmet_res, d_signalman_res=None):
         if fr is None:
             return [], [], [], {}, []
 
+        logic_perf_start = time.perf_counter()
+        logic_timing = defaultdict(float)
+        handler_timing = defaultdict(float)
+        handler_counts = defaultdict(int)
+
+        t_stage = time.perf_counter()
         now_t = time.time()
         self.fps_queue.append(now_t)
         if len(self.fps_queue) > 1:
@@ -3765,8 +3830,13 @@ class Camera:
 
         self._initialize_base_roi_if_needed(fr)
         #self._update_alignment(fr)
-        motion_mask = self.motion_det.apply(fr)
+        logic_timing["prep_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
+        t_stage = time.perf_counter()
+        motion_mask = self.motion_det.apply(fr)
+        logic_timing["motion_ms"] += (time.perf_counter() - t_stage) * 1000.0
+
+        t_stage = time.perf_counter()
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
 
@@ -3778,14 +3848,19 @@ class Camera:
             d_signalman_res = np.empty((0, 6))
 
         t_signalman = self.trk_signalman.update(d_signalman_res)
+        logic_timing["tracker_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
+        t_stage = time.perf_counter()
         now = time.time()
         current_alarms = {}
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
         score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
         newly_triggered_events = []
+        logic_timing["maps_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
+        t_stage = time.perf_counter()
         record_fr = fr.copy()
+        logic_timing["record_copy_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
         for ename, handler in self.handlers.items():
             if ename == "no_helmet":
@@ -3795,13 +3870,20 @@ class Camera:
             else:
                 kwargs = {}
 
+            t_handler = time.perf_counter()
             try:
                 triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
             except Exception as e:
                 logger.error(f"🚨 [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
+            finally:
+                handler_elapsed_ms = (time.perf_counter() - t_handler) * 1000.0
+                logic_timing["handlers_ms"] += handler_elapsed_ms
+                handler_timing[ename] += handler_elapsed_ms
+                handler_counts[ename] += 1
 
             for ev in triggered:
+                t_event_stage = time.perf_counter()
                 tid = ev['tid']
                 bbox = ev['bbox']
                 ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
@@ -3885,7 +3967,9 @@ class Camera:
                     })
 
                 current_alarms[tid] = ename
+                logic_timing["event_trigger_ms"] += (time.perf_counter() - t_event_stage) * 1000.0
 
+        t_stage = time.perf_counter()
         alarm_duration = SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0)
         for tid, ename in current_alarms.items():
             self.visual_alarms[tid] = {'evt': ename, 'expire': now + alarm_duration}
@@ -3893,7 +3977,9 @@ class Camera:
         for tid in list(self.visual_alarms.keys()):
             if now > self.visual_alarms[tid]['expire']:
                 del self.visual_alarms[tid]
+        logic_timing["alarm_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
+        t_stage = time.perf_counter()
         if record_fr is not None:
             for t in t_main:
                 t_id = int(t[4])
@@ -3911,6 +3997,13 @@ class Camera:
                         cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, thickness, cv2.LINE_AA)
 
         # [수정] draw 메서드에서 렌더링할 수 있도록 t_signalman을 리턴에 포함
+        logic_timing["record_overlay_ms"] += (time.perf_counter() - t_stage) * 1000.0
+        logic_timing["total_ms"] += (time.perf_counter() - logic_perf_start) * 1000.0
+        logic_timing["main_tracks_count"] += len(t_main)
+        logic_timing["helmet_tracks_count"] += len(t_helmet)
+        logic_timing["signalman_tracks_count"] += len(t_signalman)
+        self._record_run_logic_timing(logic_timing, handler_timing, handler_counts)
+
         return t_main, t_helmet, t_signalman, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
     def draw(self, fr, t_main, t_helmet, t_signalman, alarms, connected=True):
