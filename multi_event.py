@@ -3793,6 +3793,7 @@ class Camera:
             f"total={avg_ms('total_ms'):.1f}ms "
             f"prep={avg_ms('prep_ms'):.1f}ms "
             f"motion={avg_ms('motion_ms'):.1f}ms "
+            f"motion_applied={avg_ms('motion_applied_count'):.2f} "
             f"tracker={avg_ms('tracker_ms'):.1f}ms "
             f"maps={avg_ms('maps_ms'):.1f}ms "
             f"handlers={avg_ms('handlers_ms'):.1f}ms "
@@ -3833,8 +3834,12 @@ class Camera:
         logic_timing["prep_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
         t_stage = time.perf_counter()
-        motion_mask = self.motion_det.apply(fr)
+        motion_mask = None
+        motion_required = "signal_vehicle" in self.handlers
+        if motion_required:
+            motion_mask = self.motion_det.apply(fr)
         logic_timing["motion_ms"] += (time.perf_counter() - t_stage) * 1000.0
+        logic_timing["motion_applied_count"] += 1.0 if motion_required else 0.0
 
         t_stage = time.perf_counter()
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
@@ -3859,7 +3864,9 @@ class Camera:
         logic_timing["maps_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
         t_stage = time.perf_counter()
-        record_fr = fr.copy()
+        # Recording currently uses the original frame in the main loop.
+        # record_fr = fr.copy()
+        record_fr = None
         logic_timing["record_copy_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
         for ename, handler in self.handlers.items():
