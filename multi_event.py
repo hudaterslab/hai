@@ -5,8 +5,71 @@ import json
 import csv
 import shutil
 import subprocess
-import cv2
 import math
+
+
+def _early_init_dxstream_gst():
+    """Initialize GStreamer before numpy/cv2 to avoid dx_stream loader crashes."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    try:
+        root = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(root, "system_config.json")
+        cfg = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    cfg = loaded
+
+        backend = str(cfg.get("INFERENCE_BACKEND", "") or "").strip().lower()
+        dx_cfg = cfg.get("dx_stream", {}) if isinstance(cfg.get("dx_stream", {}), dict) else {}
+        should_init = (
+            not cfg
+            or bool(dx_cfg.get("enabled", False))
+            or backend in ("dx_stream", "dxstream", "gstreamer", "gstreamer_dxstream")
+        )
+        if not should_init:
+            return
+
+        configured = dx_cfg.get("gst_plugin_paths", [])
+        if isinstance(configured, str):
+            configured = [configured]
+
+        paths = []
+        existing = os.environ.get("GST_PLUGIN_PATH", "")
+        if existing:
+            paths.extend([p for p in existing.split(os.pathsep) if p])
+        paths.extend(configured or [])
+        paths.extend([
+            "/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0",
+            "/usr/local/lib/gstreamer-1.0",
+        ])
+
+        valid_paths = []
+        seen = set()
+        for path in paths:
+            path = os.path.expanduser(str(path))
+            if path and os.path.isdir(path) and path not in seen:
+                valid_paths.append(path)
+                seen.add(path)
+        if valid_paths:
+            os.environ["GST_PLUGIN_PATH"] = os.pathsep.join(valid_paths)
+
+        import gi
+        gi.require_version("Gst", "1.0")
+        gi.require_version("GstApp", "1.0")
+        from gi.repository import Gst
+
+        Gst.init(None)
+    except Exception:
+        pass
+
+
+_early_init_dxstream_gst()
+
+import cv2
 import numpy as np
 import time
 import datetime
