@@ -398,11 +398,28 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;30000
 
 # [수정] sys.exit(1) 강제 종료를 제거하고 상태 플래그(HAS_DX_ENGINE) 도입
 HAS_DX_ENGINE = False
-try:
-    from dx_engine import InferenceEngine, InferenceOption
-    HAS_DX_ENGINE = True
-except ImportError:
-    logger.warning("💡 [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
+InferenceEngine = None
+InferenceOption = None
+
+def ensure_dx_engine_loaded():
+    global HAS_DX_ENGINE, InferenceEngine, InferenceOption
+    if HAS_DX_ENGINE:
+        return True
+    try:
+        from dx_engine import InferenceEngine as _InferenceEngine
+        from dx_engine import InferenceOption as _InferenceOption
+        InferenceEngine = _InferenceEngine
+        InferenceOption = _InferenceOption
+        HAS_DX_ENGINE = True
+        return True
+    except ImportError:
+        logger.warning("💡 [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
+        return False
+
+if get_inference_backend() == "dx_stream":
+    logger.info("[dx_stream] dx_engine import skipped to avoid mixed-runtime crash.")
+else:
+    ensure_dx_engine_loaded()
 
 # ==========================================
 # [4] 공통 유틸리티 함수
@@ -803,7 +820,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
 # ==========================================
 class YoLoDeepX:
     def __init__(self, engine_path, output_format="auto", pool_size=1):
-        if not HAS_DX_ENGINE:
+        if not ensure_dx_engine_loaded():
             raise RuntimeError("dx_engine is not installed; YoLoDeepX can only run on a DeepX/NPU runtime.")
 
         self.engine_path = engine_path
