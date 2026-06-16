@@ -3864,7 +3864,9 @@ class Camera:
         logic_timing["maps_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
         t_stage = time.perf_counter()
-        record_fr = fr.copy()
+        # Recording currently uses the original frame in the main loop.
+        # record_fr = fr.copy()
+        record_fr = None
         logic_timing["record_copy_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
         for ename, handler in self.handlers.items():
