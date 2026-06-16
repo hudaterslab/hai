@@ -146,6 +146,25 @@ def load_system_config():
             "HELMET": 1,
             "PLATE": 1
         },
+        "INFERENCE_BACKEND": "dx_engine",
+        "dx_stream": {
+            "enabled": False,
+            "runtime_config_dir": "./.dxstream_runtime",
+            "postprocess_config_dir": "/usr/local/share/gstdxstream/configs/HAI_PPU",
+            "python_paths": [],
+            "gst_plugin_paths": ["/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"],
+            "appsink_timeout_sec": 2.0,
+            "preprocess": {
+                "resize_width": 640,
+                "resize_height": 640,
+                "keep_ratio": True,
+                "pad_value": 114,
+                "interval": 0
+            },
+            "inference_id": 1,
+            "preprocess_id": 1,
+            "use_ort": False
+        },
         "video_decode": {
             "backend": "gstreamer",
             "hw_acceleration": "auto",
@@ -218,6 +237,17 @@ def get_model_engine_pool_size(model_key, default=1):
         return max(1, int(sizes.get(model_key, default)))
     except Exception:
         return max(1, int(default))
+
+def get_inference_backend():
+    backend = str(SYS_CFG.get("INFERENCE_BACKEND", "") or "").strip().lower()
+    dx_stream_cfg = SYS_CFG.get("dx_stream", {}) or {}
+    if bool(dx_stream_cfg.get("enabled", False)) and backend in ["", "auto", "dx_engine", "deepx", "python"]:
+        return "dx_stream"
+    if backend in ["", "auto"]:
+        return "dx_stream" if bool(dx_stream_cfg.get("enabled", False)) else "dx_engine"
+    if backend in ["dxstream", "dx_stream", "gstreamer", "gstreamer_dxstream"]:
+        return "dx_stream"
+    return "dx_engine"
 
 def detection_array(rows):
     """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
@@ -1025,6 +1055,377 @@ class YoLoDeepX:
             return np.empty((0,6))
         finally:
             self.engine_pool.put(engine)
+
+DX_STREAM_POSTPROCESS_FILES = {
+    "MAIN": "postprocess_hai_main_ppu.json",
+    "HELMET": "postprocess_hai_helmet_ppu.json",
+    "FACE": "postprocess_hai_face_ppu.json",
+    "PLATE": "postprocess_hai_plate_ppu.json",
+}
+
+DX_STREAM_POSTPROCESS_MIN_CONF = {
+    "MAIN": 0.35,
+    "HELMET": 0.55,
+    "FACE": 0.35,
+    "PLATE": 0.10,
+}
+
+class DxStreamDeepX:
+    _runtime_lock = threading.Lock()
+    _runtime = None
+
+    def __init__(self, engine_path, model_key, output_format="ppu", pool_size=1):
+        self.engine_path = os.path.abspath(engine_path)
+        self.model_key = str(model_key or "MAIN").strip().upper()
+        self.output_format = output_format
+        self.pool_size = max(1, int(pool_size or 1))
+        self.dx_stream_cfg = SYS_CFG.get("dx_stream", {}) or {}
+        self.runtime_config_dir = self._resolve_runtime_config_dir()
+        self.postprocess_config_dir = self.dx_stream_cfg.get(
+            "postprocess_config_dir",
+            "/usr/local/share/gstdxstream/configs/HAI_PPU"
+        )
+        self.preprocess_config_path = os.path.join(
+            self.runtime_config_dir,
+            f"preprocess_{self.model_key.lower()}.json"
+        )
+        self.inference_config_path = os.path.join(
+            self.runtime_config_dir,
+            f"inference_{self.model_key.lower()}.json"
+        )
+        self.postprocess_config_path = os.path.join(
+            self.postprocess_config_dir,
+            DX_STREAM_POSTPROCESS_FILES.get(self.model_key, f"postprocess_hai_{self.model_key.lower()}_ppu.json")
+        )
+        self.appsink_timeout_ns = int(float(self.dx_stream_cfg.get("appsink_timeout_sec", 2.0)) * 1_000_000_000)
+        self.postprocess_min_conf = DX_STREAM_POSTPROCESS_MIN_CONF.get(self.model_key)
+        self._conf_floor_warned = False
+
+        self.Gst, self.pydxs = self._load_runtime()
+        self._write_runtime_configs()
+
+        self.slots = []
+        self.slot_pool = queue.Queue(maxsize=self.pool_size)
+        for idx in range(self.pool_size):
+            self.slots.append({
+                "pipeline": None,
+                "appsrc": None,
+                "appsink": None,
+                "width": None,
+                "height": None,
+                "frame_idx": 0,
+            })
+            self.slot_pool.put(idx)
+
+        logger.info(
+            f"[dx_stream] model={self.model_key} loaded "
+            f"({os.path.basename(self.engine_path)}, pool={self.pool_size}, "
+            f"postprocess={self.postprocess_config_path})"
+        )
+
+    def __del__(self):
+        self.release()
+
+    def _resolve_runtime_config_dir(self):
+        path = str(self.dx_stream_cfg.get("runtime_config_dir", "./.dxstream_runtime") or "./.dxstream_runtime")
+        if not os.path.isabs(path):
+            path = os.path.join(PROJECT_ROOT, path)
+        return path
+
+    @classmethod
+    def _candidate_python_paths(cls, cfg):
+        paths = []
+        env_path = os.environ.get("DX_STREAM_PYTHONPATH", "")
+        if env_path:
+            paths.extend([p for p in env_path.split(os.pathsep) if p])
+
+        configured = cfg.get("python_paths", [])
+        if isinstance(configured, str):
+            configured = [configured]
+        paths.extend(configured or [])
+
+        if cfg.get("venv_site_packages"):
+            paths.append(cfg.get("venv_site_packages"))
+
+        py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        home = os.path.expanduser("~")
+        paths.extend([
+            os.path.join(home, "dx-runtime", "dx_stream", "venv-dx_stream", "lib", py_tag, "site-packages"),
+            os.path.join("/home", "hudaters", "dx-runtime", "dx_stream", "venv-dx_stream", "lib", py_tag, "site-packages"),
+            os.path.join("/home", "recomputer", "dx-runtime", "dx_stream", "venv-dx_stream", "lib", py_tag, "site-packages"),
+        ])
+
+        seen = set()
+        result = []
+        for path in paths:
+            if not path:
+                continue
+            path = os.path.expanduser(str(path))
+            if path not in seen:
+                result.append(path)
+                seen.add(path)
+        return result
+
+    @classmethod
+    def _configure_gst_plugin_path(cls, cfg):
+        paths = []
+        existing = os.environ.get("GST_PLUGIN_PATH", "")
+        if existing:
+            paths.extend([p for p in existing.split(os.pathsep) if p])
+
+        configured = cfg.get("gst_plugin_paths", [])
+        if isinstance(configured, str):
+            configured = [configured]
+        paths.extend(configured or [])
+        paths.extend([
+            "/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0",
+            "/usr/local/lib/gstreamer-1.0",
+        ])
+
+        seen = set()
+        valid_paths = []
+        for path in paths:
+            path = os.path.expanduser(str(path))
+            if path and os.path.isdir(path) and path not in seen:
+                valid_paths.append(path)
+                seen.add(path)
+
+        if valid_paths:
+            os.environ["GST_PLUGIN_PATH"] = os.pathsep.join(valid_paths)
+
+    @classmethod
+    def _load_runtime(cls):
+        with cls._runtime_lock:
+            if cls._runtime is not None:
+                return cls._runtime
+
+            cfg = SYS_CFG.get("dx_stream", {}) or {}
+            cls._configure_gst_plugin_path(cfg)
+            for path in cls._candidate_python_paths(cfg):
+                if os.path.isdir(path) and path not in sys.path:
+                    sys.path.insert(0, path)
+
+            try:
+                import gi
+                gi.require_version("Gst", "1.0")
+                gi.require_version("GstApp", "1.0")
+                from gi.repository import Gst
+                from gi.repository import GstApp  # noqa: F401
+                import pydxs
+            except Exception as e:
+                raise RuntimeError(
+                    "dx_stream runtime import failed. Check GStreamer, pydxs, and dx_stream venv path. "
+                    f"Last error: {e}"
+                ) from e
+
+            Gst.init(None)
+            cls._runtime = (Gst, pydxs)
+            return cls._runtime
+
+    def _write_json_if_changed(self, path, payload):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        text = json.dumps(payload, ensure_ascii=False, indent=4) + "\n"
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    if f.read() == text:
+                        return
+        except Exception:
+            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _write_runtime_configs(self):
+        if not os.path.exists(self.engine_path):
+            raise FileNotFoundError(f"dx_stream model not found: {self.engine_path}")
+        if not os.path.exists(self.postprocess_config_path):
+            raise FileNotFoundError(f"dx_stream postprocess config not found: {self.postprocess_config_path}")
+
+        preprocess_source = self.dx_stream_cfg.get("preprocess", {}) or {}
+        preprocess_cfg = {
+            "preprocess_id": int(self.dx_stream_cfg.get("preprocess_id", 1)),
+            "resize_width": int(preprocess_source.get("resize_width", 640)),
+            "resize_height": int(preprocess_source.get("resize_height", 640)),
+            "keep_ratio": bool(preprocess_source.get("keep_ratio", True)),
+            "pad_value": int(preprocess_source.get("pad_value", 114)),
+            "interval": int(preprocess_source.get("interval", 0)),
+        }
+        inference_cfg = {
+            "preprocess_id": int(self.dx_stream_cfg.get("preprocess_id", 1)),
+            "inference_id": int(self.dx_stream_cfg.get("inference_id", 1)),
+            "model_path": self.engine_path,
+            "use-ort": bool(self.dx_stream_cfg.get("use_ort", False)),
+        }
+
+        self._write_json_if_changed(self.preprocess_config_path, preprocess_cfg)
+        self._write_json_if_changed(self.inference_config_path, inference_cfg)
+
+    def _gst_path(self, path):
+        return str(path).replace("\\", "/").replace('"', '\\"')
+
+    def _build_pipeline_description(self, width, height):
+        caps = f"video/x-raw,format=RGB,width={int(width)},height={int(height)},framerate=30/1"
+        return (
+            f'appsrc name=src is-live=true format=time do-timestamp=true block=true caps="{caps}" ! '
+            f'videoconvert ! video/x-raw,format=RGB ! '
+            f'dxpreprocess config-file-path="{self._gst_path(self.preprocess_config_path)}" ! '
+            f'dxinfer config-file-path="{self._gst_path(self.inference_config_path)}" ! '
+            f'dxpostprocess config-file-path="{self._gst_path(self.postprocess_config_path)}" ! '
+            f'appsink name=sink emit-signals=false sync=false max-buffers=1 drop=false wait-on-eos=false'
+        )
+
+    def _ensure_pipeline(self, slot, width, height):
+        if (
+            slot["pipeline"] is not None
+            and slot["width"] == width
+            and slot["height"] == height
+        ):
+            return slot
+
+        if slot["pipeline"] is not None:
+            try:
+                slot["pipeline"].set_state(self.Gst.State.NULL)
+            except Exception:
+                pass
+
+        desc = self._build_pipeline_description(width, height)
+        pipeline = self.Gst.parse_launch(desc)
+        appsrc = pipeline.get_by_name("src")
+        appsink = pipeline.get_by_name("sink")
+        if appsrc is None or appsink is None:
+            raise RuntimeError("dx_stream appsrc/appsink pipeline creation failed")
+
+        ret = pipeline.set_state(self.Gst.State.PLAYING)
+        if ret == self.Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("dx_stream pipeline failed to enter PLAYING state")
+
+        slot.update({
+            "pipeline": pipeline,
+            "appsrc": appsrc,
+            "appsink": appsink,
+            "width": width,
+            "height": height,
+            "frame_idx": 0,
+        })
+        return slot
+
+    def _log_bus_messages(self, slot):
+        pipeline = slot.get("pipeline")
+        if pipeline is None:
+            return
+        bus = pipeline.get_bus()
+        while True:
+            msg = bus.pop_filtered(self.Gst.MessageType.ERROR | self.Gst.MessageType.WARNING)
+            if msg is None:
+                break
+            if msg.type == self.Gst.MessageType.ERROR:
+                err, debug = msg.parse_error()
+                logger.error(f"[dx_stream] {self.model_key} pipeline error: {err} | {debug}")
+            elif msg.type == self.Gst.MessageType.WARNING:
+                warn, debug = msg.parse_warning()
+                logger.warning(f"[dx_stream] {self.model_key} pipeline warning: {warn} | {debug}")
+
+    def _pull_sample(self, appsink):
+        if hasattr(appsink, "try_pull_sample"):
+            return appsink.try_pull_sample(self.appsink_timeout_ns)
+        return appsink.emit("try-pull-sample", self.appsink_timeout_ns)
+
+    def _objects_to_detections(self, meta, conf_threshold, width, height):
+        if meta is None:
+            return np.empty((0, 6))
+
+        rows = []
+        for obj in getattr(meta, "object_meta_list", []) or []:
+            try:
+                score = float(getattr(obj, "confidence"))
+                cls_id = int(getattr(obj, "label"))
+                box = [float(v) for v in getattr(obj, "box")]
+                if len(box) < 4 or score < conf_threshold:
+                    continue
+                x1 = np.clip(box[0], 0, width)
+                y1 = np.clip(box[1], 0, height)
+                x2 = np.clip(box[2], 0, width)
+                y2 = np.clip(box[3], 0, height)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                rows.append([x1, y1, x2, y2, score, cls_id])
+            except Exception:
+                continue
+
+        return detection_array(rows)
+
+    def infer(self, img, conf_override=None):
+        if img is None:
+            return np.empty((0, 6))
+
+        conf_threshold = float(conf_override if conf_override is not None else 0.40)
+        if (
+            self.postprocess_min_conf is not None
+            and conf_threshold < self.postprocess_min_conf
+            and not self._conf_floor_warned
+        ):
+            logger.warning(
+                f"[dx_stream] {self.model_key} requested conf={conf_threshold:.2f}, "
+                f"but HAI_PPU postprocess floor is {self.postprocess_min_conf:.2f}."
+            )
+            self._conf_floor_warned = True
+
+        height, width = img.shape[:2]
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+
+        slot_idx = self.slot_pool.get()
+        try:
+            slot = self._ensure_pipeline(self.slots[slot_idx], width, height)
+
+            gst_buffer = self.Gst.Buffer.new_wrapped(rgb.tobytes())
+            duration = self.Gst.util_uint64_scale_int(1, self.Gst.SECOND, 30)
+            gst_buffer.pts = slot["frame_idx"] * duration
+            gst_buffer.duration = duration
+            slot["frame_idx"] += 1
+
+            flow = slot["appsrc"].emit("push-buffer", gst_buffer)
+            if flow != self.Gst.FlowReturn.OK:
+                logger.error(f"[dx_stream] {self.model_key} push-buffer failed: {flow}")
+                self._log_bus_messages(slot)
+                return np.empty((0, 6))
+
+            sample = self._pull_sample(slot["appsink"])
+            if sample is None:
+                logger.warning(f"[dx_stream] {self.model_key} appsink timeout")
+                self._log_bus_messages(slot)
+                return np.empty((0, 6))
+
+            out_buffer = sample.get_buffer()
+            meta = self.pydxs.dx_get_frame_meta(hash(out_buffer))
+            return self._objects_to_detections(meta, conf_threshold, width, height)
+        except Exception as e:
+            logger.error(f"[dx_stream] {self.model_key} inference error: {e}")
+            return np.empty((0, 6))
+        finally:
+            self.slot_pool.put(slot_idx)
+
+    def release(self):
+        for slot in getattr(self, "slots", []):
+            pipeline = slot.get("pipeline")
+            appsrc = slot.get("appsrc")
+            if appsrc is not None:
+                try:
+                    appsrc.emit("end-of-stream")
+                except Exception:
+                    pass
+            if pipeline is not None:
+                try:
+                    pipeline.set_state(self.Gst.State.NULL)
+                except Exception:
+                    pass
+            slot.update({
+                "pipeline": None,
+                "appsrc": None,
+                "appsink": None,
+                "width": None,
+                "height": None,
+            })
 
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
@@ -4488,6 +4889,7 @@ def main():
 
     models_cfg = SYS_CFG.get("models", {})
     inference_mode = str(SYS_CFG.get("INFERENCE_MODE", "auto")).strip().lower()
+    inference_backend = get_inference_backend()
     event_inference_mode = "main"
     main_model_path = resolve_model_path(models_cfg.get("MAIN", "hanjin_cctv_v2.dxnn"))
 
@@ -4498,16 +4900,35 @@ def main():
         logger.info(f"INFERENCE_MODE={inference_mode} is handled with MAIN model inference.")
 
     try:
-        logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
+        logger.info(
+            f"DeepX 모델을 VPU 메모리로 할당 중... "
+            f"(event inference: {event_inference_mode}, backend: {inference_backend})"
+        )
+
+        def create_detector(model_key, model_path, output_format, pool_size):
+            if inference_backend == "dx_stream":
+                return DxStreamDeepX(
+                    model_path,
+                    model_key=model_key,
+                    output_format=output_format,
+                    pool_size=pool_size
+                )
+            return YoLoDeepX(
+                model_path,
+                output_format=output_format,
+                pool_size=pool_size
+            )
 
         # 이벤트 판단용 기본 객체와 신호수는 MAIN 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
         # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
-        d_main = YoLoDeepX(
+        d_main = create_detector(
+            "MAIN",
             main_model_path,
             output_format=get_main_model_output_format(main_model_path),
             pool_size=max(3, get_model_engine_pool_size("MAIN"))
         )
-        d_helmet = YoLoDeepX(
+        d_helmet = create_detector(
+            "HELMET",
             resolve_model_path(models_cfg["HELMET"]),
             output_format=get_model_output_format("HELMET"),
             pool_size=get_model_engine_pool_size("HELMET")
@@ -4515,12 +4936,14 @@ def main():
         d_signalman = None
 
         # 개인정보 블러는 이벤트 판단 모델과 목적이 달라 별도 모델을 유지합니다.
-        d_face = YoLoDeepX(
+        d_face = create_detector(
+            "FACE",
             resolve_model_path(models_cfg["FACE"]),
             output_format=get_model_output_format("FACE"),
             pool_size=get_model_engine_pool_size("FACE")
         )
-        d_plate = YoLoDeepX(
+        d_plate = create_detector(
+            "PLATE",
             resolve_model_path(models_cfg["PLATE"]),
             output_format=get_model_output_format("PLATE"),
             pool_size=get_model_engine_pool_size("PLATE")

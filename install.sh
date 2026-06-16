@@ -177,6 +177,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
 {
     "terminal_id": "$USER_TERM_ID",
     "INFERENCE_MODE": "auto",
+    "INFERENCE_BACKEND": "dx_engine",
     "logging": {"dir": "./logs", "level": "INFO"},
     "event_config": {
         "intrusion": {"enabled": false, "cooldown_sec": 600},
@@ -202,6 +203,18 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
+    "dx_stream": {
+        "enabled": false,
+        "runtime_config_dir": "./.dxstream_runtime",
+        "postprocess_config_dir": "/usr/local/share/gstdxstream/configs/HAI_PPU",
+        "python_paths": [],
+        "gst_plugin_paths": ["/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"],
+        "appsink_timeout_sec": 2.0,
+        "preprocess": {"resize_width": 640, "resize_height": 640, "keep_ratio": true, "pad_value": 114, "interval": 0},
+        "inference_id": 1,
+        "preprocess_id": 1,
+        "use_ort": false
+    },
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "print_pipeline_logs": true},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
@@ -216,6 +229,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
 {
     "terminal_id": "99999",
     "INFERENCE_MODE": "auto",
+    "INFERENCE_BACKEND": "dx_engine",
     "logging": {"dir": "./logs", "level": "INFO"},
     "event_config": {
         "intrusion": {"enabled": false, "cooldown_sec": 600},
@@ -241,6 +255,18 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
+    "dx_stream": {
+        "enabled": false,
+        "runtime_config_dir": "./.dxstream_runtime",
+        "postprocess_config_dir": "/usr/local/share/gstdxstream/configs/HAI_PPU",
+        "python_paths": [],
+        "gst_plugin_paths": ["/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"],
+        "appsink_timeout_sec": 2.0,
+        "preprocess": {"resize_width": 640, "resize_height": 640, "keep_ratio": true, "pad_value": 114, "interval": 0},
+        "inference_id": 1,
+        "preprocess_id": 1,
+        "use_ort": false
+    },
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "print_pipeline_logs": true},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
