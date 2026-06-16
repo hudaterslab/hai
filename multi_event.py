@@ -150,7 +150,9 @@ def load_system_config():
             "hw_acceleration": "auto",
             "hw_device": "/dev/dri/renderD128",
             "vaapi_driver": "iHD",
-            "fallback_to_cpu": True
+            "fallback_to_cpu": True,
+            "log_interval_sec": 10.0,
+            "print_pipeline_logs": True
         },
         "INFERENCE_MODE": "auto",  # compatibility setting; event inference uses MAIN model detections
         "BATCH_SIZE": 9,
@@ -2803,13 +2805,98 @@ class FrameReader:
         self.lock = threading.Lock()
         self.decode_cfg = SYS_CFG.get("video_decode", {})
         self._decode_mode_logged = False
+        self._decode_mode = "init"
+        self._decode_pid = "-"
+        self._decode_shape = "-"
+        self._decode_restarts = 0
+        self._decode_read_failures = 0
+        self._decode_frame_count = 0
+        self._decode_window_frames = 0
+        self._decode_window_bytes = 0
+        self._decode_window_start = time.time()
 
         threading.Thread(target=self._run, daemon=True).start()
 
+    def _decode_log_interval(self):
+        try:
+            return max(1.0, float(self.decode_cfg.get("log_interval_sec", 10.0)))
+        except Exception:
+            return 10.0
+
+    def _emit_decode_log(self, message, level="info"):
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(message)
+        if bool(self.decode_cfg.get("print_pipeline_logs", True)):
+            print(message, flush=True)
+
+    def _mask_pipeline_text(self, text):
+        return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
+
+    def _cmd_text(self, cmd):
+        return self._mask_pipeline_text(" ".join(str(part) for part in cmd))
+
+    def _set_decode_pipeline(self, mode, shape="-", pid="-", cmd=None, extra=""):
+        self._decode_mode = mode
+        self._decode_pid = str(pid)
+        self._decode_shape = shape
+        self._decode_restarts += 1
+        self._decode_frame_count = 0
+        self._decode_window_frames = 0
+        self._decode_window_bytes = 0
+        self._decode_window_start = time.time()
+
+        detail = f" extra={extra}" if extra else ""
+        self._emit_decode_log(
+            f"[DECODE PIPELINE] CAM:{self.ip} restart={self._decode_restarts} "
+            f"mode={mode} pid={self._decode_pid} shape={shape}{detail}"
+        )
+        if cmd:
+            self._emit_decode_log(f"[DECODE PIPELINE] CAM:{self.ip} cmd={self._cmd_text(cmd)}")
+
+    def _note_decode_frame(self, frame_bytes, shape):
+        self._decode_frame_count += 1
+        self._decode_window_frames += 1
+        self._decode_window_bytes += int(frame_bytes or 0)
+        self._decode_shape = shape
+
+        now = time.time()
+        elapsed = now - self._decode_window_start
+        if elapsed < self._decode_log_interval():
+            return
+
+        fps = self._decode_window_frames / max(0.001, elapsed)
+        mbps = (self._decode_window_bytes * 8.0) / max(0.001, elapsed) / 1_000_000.0
+        self._emit_decode_log(
+            f"[DECODE FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
+            f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
+            f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
+            f"restarts={self._decode_restarts} connected={self.connected}"
+        )
+        self._decode_window_frames = 0
+        self._decode_window_bytes = 0
+        self._decode_window_start = now
+
+    def _note_decode_failure(self, reason, level="warning"):
+        self._decode_read_failures += 1
+        self._emit_decode_log(
+            f"[DECODE FAIL] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
+            f"reason={reason} failures={self._decode_read_failures} "
+            f"frames={self._decode_frame_count} restarts={self._decode_restarts}",
+            level=level
+        )
+
     def _open_capture(self):
         cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-        if cap.isOpened() and not self._decode_mode_logged:
-            logger.info(f"✅ [CAM:{self.ip}] FFmpeg CPU decode enabled.")
+        if cap.isOpened():
+            src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            shape = f"{src_w}x{src_h}" if src_w > 0 and src_h > 0 else "unknown"
+            self._set_decode_pipeline(
+                "opencv_ffmpeg_cpu",
+                shape=shape,
+                extra=f"backend=CAP_FFMPEG source_fps={src_fps:.2f}"
+            )
             self._decode_mode_logged = True
         return cap
 
@@ -2901,19 +2988,24 @@ class FrameReader:
                 return False
 
             self.connected = True
-            if not self._decode_mode_logged:
-                logger.info(f"✅ [CAM:{self.ip}] FFmpeg VAAPI pipe enabled: {in_w}x{in_h} -> {out_w}x{out_h} device={hw_device}")
-                self._decode_mode_logged = True
+            self._set_decode_pipeline(
+                "ffmpeg_vaapi_pipe",
+                shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
+                pid=proc.pid,
+                cmd=cmd,
+                extra=f"device={hw_device} driver={vaapi_driver or '-'} frame_bytes={frame_size}"
+            )
+            self._decode_mode_logged = True
             self.last_t = time.time()
 
             while self.running:
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
-                    logger.error(f"🚨 [CAM:{self.ip}] VAAPI pipe 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
+                    self._note_decode_failure(f"vaapi_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
                     break
 
                 raw = proc.stdout.read(frame_size)
                 if len(raw) != frame_size:
-                    logger.error(f"🚨 [CAM:{self.ip}] VAAPI pipe 프레임 읽기 실패({len(raw)}/{frame_size}).")
+                    self._note_decode_failure(f"vaapi_short_read_{len(raw)}_of_{frame_size}", level="error")
                     break
 
                 fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
@@ -2921,6 +3013,7 @@ class FrameReader:
                     self.frame = fr
                     self.fid += 1
                     self.last_t = time.time()
+                self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
 
             return True
         except Exception as e:
@@ -2968,7 +3061,7 @@ class FrameReader:
 
                 ret, fr = cap.read()
                 if not ret:
-                    logger.error(f"🚨 [CAM:{self.ip}] 프레임 읽기 실패(EOF 또는 스트림 끊김).")
+                    self._note_decode_failure("opencv_read_failed", level="error")
                     break
 
                 if fr is not None:
@@ -2979,6 +3072,7 @@ class FrameReader:
                         self.frame = fr
                         self.fid += 1
                         self.last_t = time.time()
+                    self._note_decode_frame(fr.nbytes, f"{fr.shape[1]}x{fr.shape[0]}")
                 time.sleep(0.005)
 
             self.connected = False
