@@ -1096,8 +1096,9 @@ def dx_stream_objects_to_detections(meta, conf_threshold, width, height):
     return detection_array(rows)
 
 class DxStreamDeepX:
-    _runtime_lock = threading.Lock()
+    _runtime_lock = threading.RLock()
     _runtime = None
+    _pydxs = None
 
     def __init__(self, engine_path, model_key, output_format="ppu", pool_size=1):
         self.engine_path = os.path.abspath(engine_path)
@@ -1236,16 +1237,32 @@ class DxStreamDeepX:
                 gi.require_version("GstApp", "1.0")
                 from gi.repository import Gst
                 from gi.repository import GstApp  # noqa: F401
-                import pydxs
             except Exception as e:
                 raise RuntimeError(
-                    "dx_stream runtime import failed. Check GStreamer, pydxs, and dx_stream venv path. "
+                    "dx_stream runtime import failed. Check GStreamer and dx_stream venv path. "
                     f"Last error: {e}"
                 ) from e
 
             Gst.init(None)
-            cls._runtime = (Gst, pydxs)
+            cls._runtime = (Gst, None)
             return cls._runtime
+
+    @classmethod
+    def _load_pydxs(cls):
+        with cls._runtime_lock:
+            if cls._pydxs is not None:
+                return cls._pydxs
+            if cls._runtime is None:
+                cls._load_runtime()
+            try:
+                import pydxs
+            except Exception as e:
+                raise RuntimeError(
+                    "dx_stream pydxs import failed. Check pydxs and dx_stream venv path. "
+                    f"Last error: {e}"
+                ) from e
+            cls._pydxs = pydxs
+            return cls._pydxs
 
     def _write_json_if_changed(self, path, payload):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1401,6 +1418,8 @@ class DxStreamDeepX:
                 return np.empty((0, 6))
 
             out_buffer = sample.get_buffer()
+            if self.pydxs is None:
+                self.pydxs = self._load_pydxs()
             meta = self.pydxs.dx_get_frame_meta(hash(out_buffer))
             return self._objects_to_detections(meta, conf_threshold, width, height)
         except Exception as e:
@@ -3708,7 +3727,7 @@ class FrameReader:
             return False
 
         try:
-            Gst, pydxs = DxStreamDeepX._load_runtime()
+            Gst, _ = DxStreamDeepX._load_runtime()
             model_specs = self._dxstream_model_specs()
             model_configs = []
             for model_key, model_path, inference_id in model_specs:
@@ -3780,6 +3799,7 @@ class FrameReader:
             self._decode_mode_logged = True
             self.last_t = time.time()
             first_frame_logged = False
+            pydxs = None
             timeout_ns = int(float((SYS_CFG.get("dx_stream", {}) or {}).get("appsink_timeout_sec", 2.0)) * 1_000_000_000)
 
             while self.running:
@@ -3808,6 +3828,8 @@ class FrameReader:
                 dets_by_model = {}
                 for model_key, sample in samples.items():
                     out_buffer = sample.get_buffer()
+                    if pydxs is None:
+                        pydxs = DxStreamDeepX._load_pydxs()
                     meta = pydxs.dx_get_frame_meta(hash(out_buffer))
                     if model_key == "MAIN":
                         det_width, det_height = width, height
