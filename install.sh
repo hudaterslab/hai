@@ -62,6 +62,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
+    "video_decode": {"backend": "auto", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true},
     "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
@@ -100,6 +101,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
+    "video_decode": {"backend": "auto", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true},
     "BATCH_SIZE": 9, "REC_FPS": 3, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
@@ -172,6 +174,10 @@ sudo ln -sf /usr/bin/python3 /usr/bin/python
 echo "-> 필수 파이썬 패키지를 설치합니다 (pytz, psutil, requests, opencv-python)..."
 python -m pip install pytz psutil requests opencv-python || \
 python -m pip install pytz psutil requests opencv-python --break-system-packages
+
+echo "-> FFmpeg VAAPI 하드웨어 디코딩 패키지를 설치합니다..."
+sudo apt install -y ffmpeg intel-media-va-driver vainfo
+sudo usermod -aG render,video "$ACTUAL_USER" 2>/dev/null || true
 
 echo "-----------------------------------------------------"
 echo " 4. DX runtime precheck"

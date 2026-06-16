@@ -3,6 +3,8 @@ import sys
 import gc
 import json
 import csv
+import shutil
+import subprocess
 import cv2
 import math
 import numpy as np
@@ -142,6 +144,13 @@ def load_system_config():
             "FACE": 1,
             "HELMET": 1,
             "PLATE": 1
+        },
+        "video_decode": {
+            "backend": "auto",
+            "hw_acceleration": "auto",
+            "hw_device": "/dev/dri/renderD128",
+            "vaapi_driver": "iHD",
+            "fallback_to_cpu": True
         },
         "INFERENCE_MODE": "auto",  # compatibility setting; event inference uses MAIN model detections
         "BATCH_SIZE": 9,
@@ -2792,12 +2801,155 @@ class FrameReader:
         self.connected = False
         self.last_t = time.time()
         self.lock = threading.Lock()
+        self.decode_cfg = SYS_CFG.get("video_decode", {})
+        self._decode_mode_logged = False
 
         threading.Thread(target=self._run, daemon=True).start()
 
+    def _open_capture(self):
+        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        if cap.isOpened() and not self._decode_mode_logged:
+            logger.info(f"✅ [CAM:{self.ip}] FFmpeg CPU decode enabled.")
+            self._decode_mode_logged = True
+        return cap
+
+    def _should_use_ffmpeg_vaapi_pipe(self):
+        backend = str(self.decode_cfg.get("backend", "auto")).strip().lower()
+        if backend in ("opencv", "cv2", "ffmpeg_opencv"):
+            return False
+
+        mode = str(self.decode_cfg.get("hw_acceleration", "auto")).strip().lower()
+        if mode in ("", "none", "off", "cpu", "false", "0"):
+            return False
+
+        if not sys.platform.startswith("linux"):
+            return False
+
+        hw_device = str(self.decode_cfg.get("hw_device", "/dev/dri/renderD128")).strip()
+        if mode not in ("auto", "vaapi") or not hw_device or not os.path.exists(hw_device):
+            return False
+
+        return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+    def _probe_stream_shape(self):
+        cmd = ["ffprobe", "-v", "error"]
+        if self.url.lower().startswith("rtsp://"):
+            cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000"])
+        cmd.extend([
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+            self.url,
+        ])
+
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=8, text=True).strip()
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] ffprobe stream shape failed: {e}")
+            return None
+
+        for line in out.splitlines():
+            if "x" not in line:
+                continue
+            try:
+                width_str, height_str = line.strip().split("x", 1)
+                width, height = int(width_str), int(height_str)
+                if width > 0 and height > 0:
+                    return width, height
+            except Exception:
+                continue
+
+        logger.warning(f"[CAM:{self.ip}] ffprobe returned no usable video shape: {out}")
+        return None
+
+    def _scaled_output_shape(self, width, height):
+        if width <= 720:
+            return width, height
+        ratio = 720.0 / float(width)
+        out_height = max(2, int(round((height * ratio) / 2.0) * 2))
+        return 720, out_height
+
+    def _run_ffmpeg_vaapi_pipe(self):
+        shape = self._probe_stream_shape()
+        if shape is None:
+            return False
+
+        in_w, in_h = shape
+        out_w, out_h = self._scaled_output_shape(in_w, in_h)
+        frame_size = out_w * out_h * 3
+        hw_device = str(self.decode_cfg.get("hw_device", "/dev/dri/renderD128")).strip()
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        if self.url.lower().startswith("rtsp://"):
+            cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000", "-fflags", "nobuffer", "-flags", "low_delay"])
+        cmd.extend(["-hwaccel", "vaapi", "-hwaccel_device", hw_device, "-i", self.url, "-an"])
+
+        if (out_w, out_h) != (in_w, in_h):
+            cmd.extend(["-vf", f"scale={out_w}:{out_h}"])
+
+        cmd.extend(["-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"])
+
+        env = os.environ.copy()
+        vaapi_driver = str(self.decode_cfg.get("vaapi_driver", "")).strip()
+        if vaapi_driver:
+            env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
+
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            if proc.stdout is None:
+                return False
+
+            self.connected = True
+            if not self._decode_mode_logged:
+                logger.info(f"✅ [CAM:{self.ip}] FFmpeg VAAPI pipe enabled: {in_w}x{in_h} -> {out_w}x{out_h} device={hw_device}")
+                self._decode_mode_logged = True
+            self.last_t = time.time()
+
+            while self.running:
+                if time.time() - self.last_t > WATCHDOG_TIMEOUT:
+                    logger.error(f"🚨 [CAM:{self.ip}] VAAPI pipe 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
+                    break
+
+                raw = proc.stdout.read(frame_size)
+                if len(raw) != frame_size:
+                    logger.error(f"🚨 [CAM:{self.ip}] VAAPI pipe 프레임 읽기 실패({len(raw)}/{frame_size}).")
+                    break
+
+                fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
+                with self.lock:
+                    self.frame = fr
+                    self.fid += 1
+                    self.last_t = time.time()
+
+            return True
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] FFmpeg VAAPI pipe failed: {e}")
+            return False
+        finally:
+            self.connected = False
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
     def _run(self):
         while self.running:
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            if self._should_use_ffmpeg_vaapi_pipe():
+                used_vaapi_pipe = self._run_ffmpeg_vaapi_pipe()
+                if used_vaapi_pipe:
+                    continue
+                if not self.decode_cfg.get("fallback_to_cpu", True):
+                    time.sleep(5)
+                    continue
+                logger.warning(f"[CAM:{self.ip}] VAAPI pipe unavailable; trying OpenCV FFmpeg reader")
+
+            cap = self._open_capture()
             if not cap.isOpened():
                 # 💡 [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
                 logger.error(f"🚨 [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
