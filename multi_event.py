@@ -2819,6 +2819,7 @@ class FrameReader:
         self._decode_window_frames = 0
         self._decode_window_bytes = 0
         self._decode_window_start = time.time()
+        self._gst_check_logged = False
 
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -2833,6 +2834,12 @@ class FrameReader:
         log_fn(message)
         if bool(self.decode_cfg.get("print_pipeline_logs", True)):
             print(message, flush=True)
+
+    def _emit_gst_check_once(self, message, level="info"):
+        if self._gst_check_logged:
+            return
+        self._gst_check_logged = True
+        self._emit_decode_log(message, level=level)
 
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
@@ -2928,16 +2935,41 @@ class FrameReader:
         if backend in ("opencv", "cv2", "ffmpeg_opencv", "ffmpeg", "ffmpeg_vaapi", "vaapi"):
             return False
 
+        if backend not in ("auto", "gstreamer", "gst", "gst_vaapi"):
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=unsupported_backend backend={backend}"
+            )
+            return False
+
         if not sys.platform.startswith("linux"):
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=non_linux platform={sys.platform} backend={backend}"
+            )
             return False
 
-        if not shutil.which("gst-launch-1.0") or not shutil.which("gst-inspect-1.0"):
+        gst_launch = shutil.which("gst-launch-1.0")
+        gst_inspect = shutil.which("gst-inspect-1.0")
+        if not gst_launch or not gst_inspect:
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=missing_gstreamer_tools "
+                f"backend={backend} gst-launch={gst_launch or '-'} gst-inspect={gst_inspect or '-'}",
+                level="warning"
+            )
             return False
 
-        if not shutil.which("ffprobe"):
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffprobe_path:
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=missing_ffprobe backend={backend}",
+                level="warning"
+            )
             return False
 
-        return backend in ("auto", "gstreamer", "gst", "gst_vaapi")
+        self._emit_gst_check_once(
+            f"[GSTREAMER CHECK] CAM:{self.ip} enabled backend={backend} "
+            f"gst-launch={gst_launch} gst-inspect={gst_inspect} ffprobe={ffprobe_path}"
+        )
+        return True
 
     def _probe_stream_info(self):
         cmd = ["ffprobe", "-v", "error"]
@@ -3063,6 +3095,10 @@ class FrameReader:
         depay, parser, decoder, decoder_kind = decoder_info
         latency_ms = int(self.decode_cfg.get("gstreamer_latency_ms", 50) or 50)
         protocols = str(self.decode_cfg.get("gstreamer_protocols", "tcp") or "tcp").strip().lower()
+        self._emit_decode_log(
+            f"[GSTREAMER SELECT] CAM:{self.ip} codec={codec or '-'} "
+            f"decoder={decoder} decoder_kind={decoder_kind} fps_limit={fps_limit or '-'}"
+        )
 
         caps_parts = ["video/x-raw", "format=BGR", f"width={out_w}", f"height={out_h}"]
         framerate_caps = self._gst_framerate_caps(fps_limit)
@@ -3109,6 +3145,7 @@ class FrameReader:
             )
             self._decode_mode_logged = True
             self.last_t = time.time()
+            first_frame_logged = False
 
             while self.running:
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
@@ -3126,6 +3163,12 @@ class FrameReader:
                     self.fid += 1
                     self.last_t = time.time()
                 self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
+                if not first_frame_logged:
+                    self._emit_decode_log(
+                        f"[GSTREAMER READY] CAM:{self.ip} first_frame shape={out_w}x{out_h} "
+                        f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind}"
+                    )
+                    first_frame_logged = True
 
             return True
         except Exception as e:
@@ -3313,11 +3356,6 @@ class Camera:
 
         self.fps_queue = deque(maxlen=30)
         self.current_fps = 0.0
-        self.logic_perf_last_log_time = time.time()
-        self.logic_perf_samples = 0
-        self.logic_perf_totals = defaultdict(float)
-        self.logic_perf_handler_totals = defaultdict(float)
-        self.logic_perf_handler_counts = defaultdict(int)
 
         self.roi_poly_norm = conf.get('roi_poly_norm', [])
         self.roi_lines_norm = conf.get('roi_lines_norm', [])
@@ -3945,71 +3983,10 @@ class Camera:
             ]
         }
 
-    def _record_run_logic_timing(self, timing, handler_timing, handler_counts):
-        perf_log_interval_sec = float(SYS_CFG.get("PERF_LOG_INTERVAL_SEC", 10.0))
-        if perf_log_interval_sec <= 0:
-            return
-
-        self.logic_perf_samples += 1
-        for key, value in timing.items():
-            self.logic_perf_totals[key] += float(value)
-        for ename, value in handler_timing.items():
-            self.logic_perf_handler_totals[ename] += float(value)
-        for ename, value in handler_counts.items():
-            self.logic_perf_handler_counts[ename] += int(value)
-
-        now = time.time()
-        elapsed = now - self.logic_perf_last_log_time
-        if elapsed < perf_log_interval_sec or self.logic_perf_samples <= 0:
-            return
-
-        samples = self.logic_perf_samples
-
-        def avg_ms(key):
-            return self.logic_perf_totals.get(key, 0.0) / max(1, samples)
-
-        handler_parts = []
-        for ename in sorted(self.logic_perf_handler_totals.keys()):
-            count = max(1, self.logic_perf_handler_counts.get(ename, 0))
-            handler_parts.append(f"{ename}:{self.logic_perf_handler_totals[ename] / count:.1f}ms")
-        handler_text = ",".join(handler_parts) if handler_parts else "-"
-
-        logger.info(
-            f"[RUN_LOGIC TIMING] CAM:{self.cam_id}({self.ip}) "
-            f"samples={samples} fps={samples / max(0.001, elapsed):.2f} "
-            f"total={avg_ms('total_ms'):.1f}ms "
-            f"prep={avg_ms('prep_ms'):.1f}ms "
-            f"motion={avg_ms('motion_ms'):.1f}ms "
-            f"motion_applied={avg_ms('motion_applied_count'):.2f} "
-            f"tracker={avg_ms('tracker_ms'):.1f}ms "
-            f"maps={avg_ms('maps_ms'):.1f}ms "
-            f"handlers={avg_ms('handlers_ms'):.1f}ms "
-            f"event_trigger={avg_ms('event_trigger_ms'):.1f}ms "
-            f"alarm={avg_ms('alarm_ms'):.1f}ms "
-            f"record_copy={avg_ms('record_copy_ms'):.1f}ms "
-            f"record_overlay={avg_ms('record_overlay_ms'):.1f}ms "
-            f"main_tracks={self.logic_perf_totals.get('main_tracks_count', 0.0) / max(1, samples):.1f} "
-            f"helmet_tracks={self.logic_perf_totals.get('helmet_tracks_count', 0.0) / max(1, samples):.1f} "
-            f"signalman_tracks={self.logic_perf_totals.get('signalman_tracks_count', 0.0) / max(1, samples):.1f} "
-            f"handler_detail={handler_text}"
-        )
-
-        self.logic_perf_samples = 0
-        self.logic_perf_totals.clear()
-        self.logic_perf_handler_totals.clear()
-        self.logic_perf_handler_counts.clear()
-        self.logic_perf_last_log_time = now
-
     def run_logic(self, fr, fid, d_main_res, d_helmet_res, d_signalman_res=None):
         if fr is None:
             return [], [], [], {}, []
 
-        logic_perf_start = time.perf_counter()
-        logic_timing = defaultdict(float)
-        handler_timing = defaultdict(float)
-        handler_counts = defaultdict(int)
-
-        t_stage = time.perf_counter()
         now_t = time.time()
         self.fps_queue.append(now_t)
         if len(self.fps_queue) > 1:
@@ -4018,17 +3995,11 @@ class Camera:
 
         self._initialize_base_roi_if_needed(fr)
         #self._update_alignment(fr)
-        logic_timing["prep_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
-        t_stage = time.perf_counter()
         motion_mask = None
-        motion_required = "signal_vehicle" in self.handlers
-        if motion_required:
+        if "signal_vehicle" in self.handlers:
             motion_mask = self.motion_det.apply(fr)
-        logic_timing["motion_ms"] += (time.perf_counter() - t_stage) * 1000.0
-        logic_timing["motion_applied_count"] += 1.0 if motion_required else 0.0
 
-        t_stage = time.perf_counter()
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
 
@@ -4040,21 +4011,16 @@ class Camera:
             d_signalman_res = np.empty((0, 6))
 
         t_signalman = self.trk_signalman.update(d_signalman_res)
-        logic_timing["tracker_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
-        t_stage = time.perf_counter()
         now = time.time()
         current_alarms = {}
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
         score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
         newly_triggered_events = []
-        logic_timing["maps_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
-        t_stage = time.perf_counter()
         # Recording currently uses the original frame in the main loop.
         # record_fr = fr.copy()
         record_fr = None
-        logic_timing["record_copy_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
         for ename, handler in self.handlers.items():
             if ename == "no_helmet":
@@ -4064,20 +4030,13 @@ class Camera:
             else:
                 kwargs = {}
 
-            t_handler = time.perf_counter()
             try:
                 triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
             except Exception as e:
                 logger.error(f"🚨 [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
-            finally:
-                handler_elapsed_ms = (time.perf_counter() - t_handler) * 1000.0
-                logic_timing["handlers_ms"] += handler_elapsed_ms
-                handler_timing[ename] += handler_elapsed_ms
-                handler_counts[ename] += 1
 
             for ev in triggered:
-                t_event_stage = time.perf_counter()
                 tid = ev['tid']
                 bbox = ev['bbox']
                 ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
@@ -4161,9 +4120,7 @@ class Camera:
                     })
 
                 current_alarms[tid] = ename
-                logic_timing["event_trigger_ms"] += (time.perf_counter() - t_event_stage) * 1000.0
 
-        t_stage = time.perf_counter()
         alarm_duration = SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0)
         for tid, ename in current_alarms.items():
             self.visual_alarms[tid] = {'evt': ename, 'expire': now + alarm_duration}
@@ -4171,9 +4128,7 @@ class Camera:
         for tid in list(self.visual_alarms.keys()):
             if now > self.visual_alarms[tid]['expire']:
                 del self.visual_alarms[tid]
-        logic_timing["alarm_ms"] += (time.perf_counter() - t_stage) * 1000.0
 
-        t_stage = time.perf_counter()
         if record_fr is not None:
             for t in t_main:
                 t_id = int(t[4])
@@ -4191,13 +4146,6 @@ class Camera:
                         cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, thickness, cv2.LINE_AA)
 
         # [수정] draw 메서드에서 렌더링할 수 있도록 t_signalman을 리턴에 포함
-        logic_timing["record_overlay_ms"] += (time.perf_counter() - t_stage) * 1000.0
-        logic_timing["total_ms"] += (time.perf_counter() - logic_perf_start) * 1000.0
-        logic_timing["main_tracks_count"] += len(t_main)
-        logic_timing["helmet_tracks_count"] += len(t_helmet)
-        logic_timing["signalman_tracks_count"] += len(t_signalman)
-        self._record_run_logic_timing(logic_timing, handler_timing, handler_counts)
-
         return t_main, t_helmet, t_signalman, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
     def draw(self, fr, t_main, t_helmet, t_signalman, alarms, connected=True):
@@ -4606,10 +4554,17 @@ def main():
     last_fps_time = time.time()
     cpu_usage = 0.0
     dynamic_delay = 1.0 / target_fps
-    perf_log_interval_sec = float(SYS_CFG.get("PERF_LOG_INTERVAL_SEC", 10.0))
-    perf_last_log_time = time.time()
-    perf_totals = defaultdict(float)
-    perf_samples = 0
+    try:
+        current_fps_log_interval_sec = max(
+            1.0,
+            float(SYS_CFG.get(
+                "CURRENT_FPS_LOG_INTERVAL_SEC",
+                SYS_CFG.get("video_decode", {}).get("log_interval_sec", 10.0)
+            ))
+        )
+    except Exception:
+        current_fps_log_interval_sec = 10.0
+    current_fps_last_print = {}
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
@@ -4676,16 +4631,6 @@ def main():
 
         while True:
             start_time = time.time()
-            loop_perf_start = time.perf_counter()
-            timing_read_ms = 0.0
-            timing_submit_ms = 0.0
-            timing_infer_wait_ms = 0.0
-            timing_logic_ms = 0.0
-            timing_meta_ms = 0.0
-            timing_recorder_ms = 0.0
-            timing_draw_ms = 0.0
-            timing_imshow_ms = 0.0
-            timing_event_ms = 0.0
 
             if output_cleanup_interval_sec > 0 and (start_time - last_output_cleanup_time) >= output_cleanup_interval_sec:
                 run_output_retention_cleanup(output_retention_days)
@@ -4737,19 +4682,15 @@ def main():
                 if mem_usage > 80 or q_size > 20:
                     logger.warning(f"⚠️ [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
 
-            t_stage = time.perf_counter()
             raw_data = [c.process_frame() for c in cams]
-            timing_read_ms = (time.perf_counter() - t_stage) * 1000.0
 
             final_imgs = []
-            t_stage = time.perf_counter()
             inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
             for idx, res in enumerate(raw_data):
                 fr, _, connected = res
                 if connected and fr is not None and cams[idx].events:
                     inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
-            timing_submit_ms = (time.perf_counter() - t_stage) * 1000.0
 
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
@@ -4764,19 +4705,13 @@ def main():
 
                 if not cams[idx].events:
                     if connected and fr is not None:
-                        t_stage = time.perf_counter()
                         final_imgs.append(cams[idx].draw(fr, [], [], [], {}, True))
-                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     else:
-                        t_stage = time.perf_counter()
                         final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     continue
 
                 if not connected or fr is None:
-                    t_stage = time.perf_counter()
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                    timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     continue
 
                 # ---------------------------------------------------------
@@ -4784,45 +4719,41 @@ def main():
                 # ---------------------------------------------------------
                 future = inference_futures.get(idx)
                 if future is None:
-                    t_stage = time.perf_counter()
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                    timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     continue
 
-                t_stage = time.perf_counter()
                 t_main_input, d_helmet_res, d_signalman_res = future.result()
-                timing_infer_wait_ms += (time.perf_counter() - t_stage) * 1000.0
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
-                t_stage = time.perf_counter()
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
-                timing_logic_ms += (time.perf_counter() - t_stage) * 1000.0
-                t_stage = time.perf_counter()
+                now_fps_log = time.time()
+                cam_ip = cams[idx].ip
+                if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
+                    print(
+                        f"[POST INFER FPS] CAM:{cams[idx].cam_id}({cam_ip}) "
+                        f"current_fps={cams[idx].current_fps:.1f} fid={fid} "
+                        f"connected={connected} events={','.join(cams[idx].events) or '-'}",
+                        flush=True
+                    )
+                    current_fps_last_print[cam_ip] = now_fps_log
                 infer_meta = cams[idx].build_inference_log(
                     fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events,
                     d_signalman_res=d_signalman_res
                 )
-                timing_meta_ms += (time.perf_counter() - t_stage) * 1000.0
 
                 # -----------------------------------------------------------
                 # [수정] 녹화기는 원본 프레임을 저장하고, GUI에만 오버레이를 표시합니다.
                 # -----------------------------------------------------------
                 if connected and fr is not None:
                     # 원본 프레임과 같은 시점의 추론 로그를 버퍼 및 녹화 큐에 업데이트합니다.
-                    t_stage = time.perf_counter()
                     cams[idx].recorder.update(fr, infer_meta)
-                    timing_recorder_ms += (time.perf_counter() - t_stage) * 1000.0
 
                     if is_gui_mode:
-                        t_stage = time.perf_counter()
                         display_fr = cams[idx].draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
                         final_imgs.append(display_fr)
-                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                 else:
                     if is_gui_mode:
-                        t_stage = time.perf_counter()
                         final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                 # -----------------------------------------------------------
 
                 if new_events:
@@ -4906,51 +4837,11 @@ def main():
                     last_event_times[ip] = 0.0
 
             if is_gui_mode:
-                t_stage = time.perf_counter()
                 if final_imgs:
                     cv2.imshow("Monitor", create_mosaic_image(final_imgs))
                 key = cv2.waitKey(1)
-                timing_imshow_ms += (time.perf_counter() - t_stage) * 1000.0
                 if key == ord('q'):
                     break
-
-            timing_loop_total_ms = (time.perf_counter() - loop_perf_start) * 1000.0
-            perf_samples += 1
-            perf_totals["read_ms"] += timing_read_ms
-            perf_totals["submit_ms"] += timing_submit_ms
-            perf_totals["infer_wait_ms"] += timing_infer_wait_ms
-            perf_totals["logic_ms"] += timing_logic_ms
-            perf_totals["meta_ms"] += timing_meta_ms
-            perf_totals["recorder_ms"] += timing_recorder_ms
-            perf_totals["draw_ms"] += timing_draw_ms
-            perf_totals["imshow_ms"] += timing_imshow_ms
-            perf_totals["event_ms"] += timing_event_ms
-            perf_totals["loop_total_ms"] += timing_loop_total_ms
-
-            now_for_perf = time.time()
-            perf_elapsed = now_for_perf - perf_last_log_time
-            if perf_elapsed >= perf_log_interval_sec and perf_samples > 0:
-                loop_fps = perf_samples / max(0.001, perf_elapsed)
-                cam_ai_fps = ",".join(f"{c.cam_id}:{c.current_fps:.1f}" for c in cams)
-                logger.info(
-                    "[LOOP TIMING] "
-                    f"samples={perf_samples} loop_fps={loop_fps:.2f} "
-                    f"read={perf_totals['read_ms'] / perf_samples:.1f}ms "
-                    f"submit={perf_totals['submit_ms'] / perf_samples:.1f}ms "
-                    f"infer_wait={perf_totals['infer_wait_ms'] / perf_samples:.1f}ms "
-                    f"logic={perf_totals['logic_ms'] / perf_samples:.1f}ms "
-                    f"meta={perf_totals['meta_ms'] / perf_samples:.1f}ms "
-                    f"recorder={perf_totals['recorder_ms'] / perf_samples:.1f}ms "
-                    f"draw={perf_totals['draw_ms'] / perf_samples:.1f}ms "
-                    f"imshow={perf_totals['imshow_ms'] / perf_samples:.1f}ms "
-                    f"event={perf_totals['event_ms'] / perf_samples:.1f}ms "
-                    f"total={perf_totals['loop_total_ms'] / perf_samples:.1f}ms "
-                    f"target={target_fps:.1f} cpu={cpu_usage:.1f}% "
-                    f"cam_ai_fps={cam_ai_fps}"
-                )
-                perf_totals.clear()
-                perf_samples = 0
-                perf_last_log_time = now_for_perf
 
             sleep_time = dynamic_delay - (time.time() - start_time)
             if sleep_time > 0:
