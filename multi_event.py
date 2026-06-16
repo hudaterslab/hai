@@ -3337,6 +3337,10 @@ class FrameReader:
         self._decode_window_frames = 0
         self._decode_window_bytes = 0
         self._decode_window_start = time.time()
+        self._infer_input_frame_count = 0
+        self._infer_input_window_frames = 0
+        self._infer_input_window_bytes = 0
+        self._infer_input_window_start = time.time()
         self._gst_check_logged = False
         self._dxstream_check_logged = False
         self._dxstream_main_warned = False
@@ -3410,6 +3414,12 @@ class FrameReader:
         fps = self._decode_window_frames / max(0.001, elapsed)
         mbps = (self._decode_window_bytes * 8.0) / max(0.001, elapsed) / 1_000_000.0
         self._emit_decode_log(
+            f"[DECISION INPUT FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
+            f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
+            f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
+            f"restarts={self._decode_restarts} connected={self.connected}"
+        )
+        self._emit_decode_log(
             f"[DECODE FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
             f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
             f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
@@ -3418,6 +3428,27 @@ class FrameReader:
         self._decode_window_frames = 0
         self._decode_window_bytes = 0
         self._decode_window_start = now
+
+    def _note_infer_input_frame(self, frame_bytes, shape):
+        self._infer_input_frame_count += 1
+        self._infer_input_window_frames += 1
+        self._infer_input_window_bytes += int(frame_bytes or 0)
+
+        now = time.time()
+        elapsed = now - self._infer_input_window_start
+        if elapsed < self._decode_log_interval():
+            return
+
+        fps = self._infer_input_window_frames / max(0.001, elapsed)
+        mbps = (self._infer_input_window_bytes * 8.0) / max(0.001, elapsed) / 1_000_000.0
+        self._emit_decode_log(
+            f"[INFER INPUT FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
+            f"fps={fps:.2f} frames={self._infer_input_frame_count} shape={shape} "
+            f"pipe_mbps={mbps:.1f} connected={self.connected}"
+        )
+        self._infer_input_window_frames = 0
+        self._infer_input_window_bytes = 0
+        self._infer_input_window_start = now
 
     def _note_decode_failure(self, reason, level="warning"):
         self._decode_read_failures += 1
@@ -3845,6 +3876,7 @@ class FrameReader:
             f'latency={latency_ms} drop-on-latency=true tcp-timeout=3000000 ! '
             f'{depay} ! {parser} ! {decoder} ! '
             f'videoconvert ! videoscale ! {rate_stage}{caps} ! '
+            f'identity name=infer_input_meter signal-handoffs=true silent=true ! '
             f'tee name=t '
             + " ".join(branches)
         )
@@ -3852,6 +3884,17 @@ class FrameReader:
         pipeline = None
         try:
             pipeline = Gst.parse_launch(desc)
+            input_meter = pipeline.get_by_name("infer_input_meter")
+            if input_meter is not None:
+                def on_infer_input_handoff(identity, buffer, *args):
+                    try:
+                        frame_bytes = buffer.get_size()
+                    except Exception:
+                        frame_bytes = 0
+                    self._note_infer_input_frame(frame_bytes, f"{out_w}x{out_h}")
+
+                input_meter.connect("handoff", on_infer_input_handoff)
+
             appsinks = {}
             for model_key, _ in model_configs:
                 sink_name = f"{model_key.lower()}_sink"
@@ -5401,6 +5444,24 @@ def main():
         )
 
         def create_detector(model_key, model_path, output_format, pool_size):
+            model_key_upper = str(model_key).upper()
+            main_helmet_only = os.environ.get("HAI_MAIN_HELMET_ONLY", "0") == "1"
+            main_only = os.environ.get("HAI_MAIN_ONLY", "0") == "1"
+            if (main_helmet_only and model_key_upper not in ("MAIN", "HELMET")) or (
+                main_only and model_key_upper != "MAIN"
+            ):
+                class _DisabledDetector:
+                    engine_path = None
+
+                    def infer(self, *args, **kwargs):
+                        return np.empty((0, 6))
+
+                    def release(self):
+                        return None
+
+                logger.info(f"[COMPARE] detector disabled by env: {model_key}")
+                return _DisabledDetector()
+
             if inference_backend == "dx_stream":
                 return DxStreamDeepX(
                     model_path,
@@ -5485,6 +5546,28 @@ def main():
     current_fps_last_print = {}
     last_processed_fids = {c.ip: -1 for c in cams}
     duplicate_fid_skips = defaultdict(int)
+    last_draw_states = {}
+
+    def _clone_tracks_for_draw(tracks):
+        if tracks is None:
+            return []
+        if isinstance(tracks, np.ndarray):
+            return tracks.copy()
+        cloned = []
+        for item in tracks:
+            try:
+                cloned.append(np.array(item, copy=True))
+            except Exception:
+                cloned.append(item)
+        return cloned
+
+    def _make_draw_state(t_main, t_helmet, t_signalman, alarms):
+        return {
+            "t_main": _clone_tracks_for_draw(t_main),
+            "t_helmet": _clone_tracks_for_draw(t_helmet),
+            "t_signalman": _clone_tracks_for_draw(t_signalman),
+            "alarms": dict(alarms or {}),
+        }
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
@@ -5654,12 +5737,24 @@ def main():
                     continue
 
                 if not connected or fr is None:
+                    last_draw_states.pop(cams[idx].ip, None)
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                     continue
 
                 if not new_frame_flags.get(idx, False):
                     if is_gui_mode:
-                        final_imgs.append(cams[idx].draw(fr, [], [], [], {}, True))
+                        draw_state = last_draw_states.get(cams[idx].ip)
+                        if draw_state:
+                            final_imgs.append(cams[idx].draw(
+                                fr.copy(),
+                                draw_state["t_main"],
+                                draw_state["t_helmet"],
+                                draw_state["t_signalman"],
+                                draw_state["alarms"],
+                                True
+                            ))
+                        else:
+                            final_imgs.append(cams[idx].draw(fr.copy(), [], [], [], {}, True))
                     continue
 
                 # ---------------------------------------------------------
@@ -5675,17 +5770,22 @@ def main():
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
                 last_processed_fids[cams[idx].ip] = int(fid)
+                last_draw_states[cams[idx].ip] = _make_draw_state(t_main, t_helmet, t_signalman, alarms)
                 now_fps_log = time.time()
                 cam_ip = cams[idx].ip
                 if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
                     helmet_meta_source = "reader" if helmet_dets is not None else ("detector" if "no_helmet" in cams[idx].events else "-")
-                    print(
-                        f"[POST INFER FPS] CAM:{cams[idx].cam_id}({cam_ip}) "
+                    decision_output_fps_msg = (
+                        f"CAM:{cams[idx].cam_id}({cam_ip}) "
                         f"current_fps={cams[idx].current_fps:.1f} fid={fid} "
                         f"main_meta={'reader' if main_dets is not None else 'detector'} "
                         f"helmet_meta={helmet_meta_source} "
                         f"duplicate_fid_skips={duplicate_fid_skips.get(cam_ip, 0)} "
-                        f"connected={connected} events={','.join(cams[idx].events) or '-'}",
+                        f"connected={connected} events={','.join(cams[idx].events) or '-'}"
+                    )
+                    print(f"[DECISION OUTPUT FPS] {decision_output_fps_msg}", flush=True)
+                    print(
+                        f"[POST INFER FPS] {decision_output_fps_msg}",
                         flush=True
                     )
                     current_fps_last_print[cam_ip] = now_fps_log
