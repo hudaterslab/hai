@@ -2432,16 +2432,21 @@ class ROIAlignLearningStore:
                 state["consecutive_over_threshold"] = 0
                 state["consecutive_alignment_unknown"] = int(state.get("consecutive_alignment_unknown", 0)) + 1
 
-                decision = "hold_low_quality"
+                unknown_count = int(state["consecutive_alignment_unknown"])
+                unknown_required = int(params.get("alignment_unknown_confirm_count", ALIGN_UNKNOWN_CONFIRM_COUNT))
+
+                confirmed_unknown = unknown_count >= unknown_required
+                decision = "alignment_unknown" if confirmed_unknown else "hold_low_quality"
+
                 state["last_decision"] = decision
                 state["last_shift_px"] = shift_px
                 state["last_debug"] = debug or {}
 
                 return _result(
                     decision,
-                    confirmed=False,
+                    confirmed=confirmed_unknown,
                     over_count=0,
-                    alignment_unknown_count=state["consecutive_alignment_unknown"]
+                    alignment_unknown_count=unknown_count
                 )
 
             if shift_px > threshold:
