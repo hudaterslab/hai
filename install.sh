@@ -52,6 +52,7 @@ HAI_DXSTREAM_POSTPROCESS_SO=${HAI_DXSTREAM_POSTPROCESS_SO:-"$PROJECT_DIR/$HAI_DX
 HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR=${HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR:-"/usr/local/share/gstdxstream/lib"}
 HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR=${HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR:-"/usr/local/share/gstdxstream/configs/HAI_PPU"}
 HAI_DXSTREAM_POSTPROCESS_CONFIG_SOURCE_DIR=${HAI_DXSTREAM_POSTPROCESS_CONFIG_SOURCE_DIR:-"$PROJECT_DIR"}
+DX_STREAM_GST_PLUGIN_DIR=${DX_STREAM_GST_PLUGIN_DIR:-"/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"}
 MODEL_DOWNLOAD_DONE=false
 
 if [ "$INSTALL_DX_STREAM" = "true" ]; then
@@ -116,6 +117,20 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=4)
     f.write("\n")
 PY
+}
+
+prepare_dxstream_runtime_env() {
+    export GST_PLUGIN_PATH="$DX_STREAM_GST_PLUGIN_DIR:${GST_PLUGIN_PATH:-}"
+    export LD_LIBRARY_PATH="$DX_STREAM_GST_PLUGIN_DIR:$HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR:${LD_LIBRARY_PATH:-}"
+}
+
+is_dxstream_plugin_ready() {
+    command -v gst-inspect-1.0 >/dev/null 2>&1 || return 1
+    prepare_dxstream_runtime_env
+    gst-inspect-1.0 dxpreprocess >/dev/null 2>&1 || return 1
+    gst-inspect-1.0 dxinfer >/dev/null 2>&1 || return 1
+    gst-inspect-1.0 dxpostprocess >/dev/null 2>&1 || return 1
+    return 0
 }
 
 install_hai_dxstream_postprocess_artifact() {
@@ -471,6 +486,13 @@ echo "-----------------------------------------------------"
 echo " 8. dx_stream GStreamer 플러그인 설치"
 echo "-----------------------------------------------------"
 if [ "$INSTALL_DX_STREAM" = "true" ]; then
+    DX_STREAM_BUILD_SKIPPED=false
+    if is_dxstream_plugin_ready; then
+        echo "-> dx_stream GStreamer 플러그인이 이미 설치되어 있어 의존 패키지/빌드 단계를 건너뜁니다."
+        DX_STREAM_BUILD_SKIPPED=true
+    fi
+
+    if [ "$DX_STREAM_BUILD_SKIPPED" != "true" ]; then
     echo "-> dx_stream 설치가 요청되었습니다: $DX_STREAM_DIR"
 
     if [ ! -d "$DX_STREAM_DIR" ]; then
@@ -510,20 +532,23 @@ if [ "$INSTALL_DX_STREAM" = "true" ]; then
         }
     fi
 
+    fi
+
     run_model_downloads_once
     install_hai_dxstream_postprocess_artifact
 
-    sudo chown -R "$ACTUAL_USER:$(id -gn "$ACTUAL_USER")" "$DX_STREAM_DIR" 2>/dev/null || true
+    if [ -d "$DX_STREAM_DIR" ]; then
+        sudo chown -R "$ACTUAL_USER:$(id -gn "$ACTUAL_USER")" "$DX_STREAM_DIR" 2>/dev/null || true
+    fi
     sudo rm -rf "$USER_HOME/.cache/gstreamer-1.0" 2>/dev/null || true
     sudo -u "$ACTUAL_USER" mkdir -p "$USER_HOME/.cache" 2>/dev/null || true
 
-    export GST_PLUGIN_PATH="/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0:${GST_PLUGIN_PATH:-}"
-    export LD_LIBRARY_PATH="/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/local/share/gstdxstream/lib:${LD_LIBRARY_PATH:-}"
+    prepare_dxstream_runtime_env
 
-    if gst-inspect-1.0 dxstream >/dev/null 2>&1; then
+    if is_dxstream_plugin_ready; then
         echo "✅ [dx_stream] gst-inspect-1.0 dxstream 검증 성공"
-        DX_STREAM_SERVICE_ENV='Environment=GST_PLUGIN_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
-Environment=LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/local/share/gstdxstream/lib'
+        DX_STREAM_SERVICE_ENV="Environment=GST_PLUGIN_PATH=$DX_STREAM_GST_PLUGIN_DIR
+Environment=LD_LIBRARY_PATH=$DX_STREAM_GST_PLUGIN_DIR:$HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR"
     else
         echo "❌ [dx_stream] GStreamer 플러그인 검증에 실패했습니다."
         exit 1
