@@ -21,6 +21,7 @@ import concurrent.futures
 import re
 import requests
 import pytz
+from fractions import Fraction
 from urllib.parse import urlsplit, unquote
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
 import argparse
@@ -146,12 +147,14 @@ def load_system_config():
             "PLATE": 1
         },
         "video_decode": {
-            "backend": "auto",
+            "backend": "gstreamer",
             "hw_acceleration": "auto",
             "hw_device": "/dev/dri/renderD128",
             "vaapi_driver": "iHD",
             "fallback_to_cpu": True,
             "fps_limit": 15.0,
+            "gstreamer_latency_ms": 50,
+            "gstreamer_protocols": "tcp",
             "log_interval_sec": 10.0,
             "print_pipeline_logs": True
         },
@@ -2904,7 +2907,7 @@ class FrameReader:
 
     def _should_use_ffmpeg_vaapi_pipe(self):
         backend = str(self.decode_cfg.get("backend", "auto")).strip().lower()
-        if backend in ("opencv", "cv2", "ffmpeg_opencv"):
+        if backend in ("opencv", "cv2", "ffmpeg_opencv", "gstreamer", "gst", "gst_vaapi"):
             return False
 
         mode = str(self.decode_cfg.get("hw_acceleration", "auto")).strip().lower()
@@ -2920,36 +2923,61 @@ class FrameReader:
 
         return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
-    def _probe_stream_shape(self):
+    def _should_use_gstreamer_pipe(self):
+        backend = str(self.decode_cfg.get("backend", "auto")).strip().lower()
+        if backend in ("opencv", "cv2", "ffmpeg_opencv", "ffmpeg", "ffmpeg_vaapi", "vaapi"):
+            return False
+
+        if not sys.platform.startswith("linux"):
+            return False
+
+        if not shutil.which("gst-launch-1.0") or not shutil.which("gst-inspect-1.0"):
+            return False
+
+        if not shutil.which("ffprobe"):
+            return False
+
+        return backend in ("auto", "gstreamer", "gst", "gst_vaapi")
+
+    def _probe_stream_info(self):
         cmd = ["ffprobe", "-v", "error"]
         if self.url.lower().startswith("rtsp://"):
             cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000"])
         cmd.extend([
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0:s=x",
+            "-show_entries", "stream=width,height,codec_name",
+            "-of", "json",
             self.url,
         ])
 
         try:
             out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=8, text=True).strip()
         except Exception as e:
-            logger.warning(f"[CAM:{self.ip}] ffprobe stream shape failed: {e}")
+            logger.warning(f"[CAM:{self.ip}] ffprobe stream info failed: {e}")
             return None
 
-        for line in out.splitlines():
-            if "x" not in line:
-                continue
-            try:
-                width_str, height_str = line.strip().split("x", 1)
-                width, height = int(width_str), int(height_str)
-                if width > 0 and height > 0:
-                    return width, height
-            except Exception:
-                continue
+        try:
+            data = json.loads(out)
+            streams = data.get("streams", [])
+            if not streams:
+                raise ValueError("no video stream")
+            stream = streams[0]
+            width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+            codec = str(stream.get("codec_name") or "").strip().lower()
+            if width > 0 and height > 0:
+                return width, height, codec
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] ffprobe stream info parse failed: {e}")
 
-        logger.warning(f"[CAM:{self.ip}] ffprobe returned no usable video shape: {out}")
+        logger.warning(f"[CAM:{self.ip}] ffprobe returned no usable video info: {out}")
         return None
+
+    def _probe_stream_shape(self):
+        info = self._probe_stream_info()
+        if info is None:
+            return None
+        width, height, _ = info
+        return width, height
 
     def _scaled_output_shape(self, width, height):
         if width <= 720:
@@ -2964,6 +2992,156 @@ class FrameReader:
         except Exception:
             fps_limit = 15.0
         return fps_limit if fps_limit > 0 else None
+
+    def _gst_element_exists(self, element_name):
+        try:
+            subprocess.run(
+                ["gst-inspect-1.0", element_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=True
+            )
+            return True
+        except Exception:
+            return False
+
+    def _first_gst_element(self, candidates):
+        for element_name in candidates:
+            if self._gst_element_exists(element_name):
+                return element_name
+        return None
+
+    def _gst_framerate_caps(self, fps_limit):
+        if fps_limit is None:
+            return None
+        fraction = Fraction(float(fps_limit)).limit_denominator(1000)
+        return f"{fraction.numerator}/{fraction.denominator}"
+
+    def _select_gstreamer_decoder(self, codec):
+        codec = str(codec or "").strip().lower()
+        mode = str(self.decode_cfg.get("hw_acceleration", "auto")).strip().lower()
+        allow_hw = mode not in ("", "none", "off", "cpu", "false", "0")
+
+        if codec in ("h264", "avc1"):
+            depay, parser = "rtph264depay", "h264parse"
+            hw_candidates = ["vaapih264dec", "vah264dec"]
+            cpu_candidates = ["avdec_h264", "openh264dec"]
+        elif codec in ("hevc", "h265"):
+            depay, parser = "rtph265depay", "h265parse"
+            hw_candidates = ["vaapih265dec", "vah265dec"]
+            cpu_candidates = ["avdec_h265"]
+        else:
+            return None
+
+        decoder = None
+        decoder_kind = "cpu"
+        if allow_hw:
+            decoder = self._first_gst_element(hw_candidates)
+            decoder_kind = "vaapi" if decoder else "cpu"
+        if decoder is None:
+            decoder = self._first_gst_element(cpu_candidates)
+        if decoder is None:
+            return None
+
+        return depay, parser, decoder, decoder_kind
+
+    def _run_gstreamer_pipe(self):
+        info = self._probe_stream_info()
+        if info is None:
+            return False
+
+        in_w, in_h, codec = info
+        out_w, out_h = self._scaled_output_shape(in_w, in_h)
+        frame_size = out_w * out_h * 3
+        fps_limit = self._decode_fps_limit()
+        decoder_info = self._select_gstreamer_decoder(codec)
+        if decoder_info is None:
+            self._note_decode_failure(f"gstreamer_unsupported_codec_{codec or 'unknown'}")
+            return False
+
+        depay, parser, decoder, decoder_kind = decoder_info
+        latency_ms = int(self.decode_cfg.get("gstreamer_latency_ms", 50) or 50)
+        protocols = str(self.decode_cfg.get("gstreamer_protocols", "tcp") or "tcp").strip().lower()
+
+        caps_parts = ["video/x-raw", "format=BGR", f"width={out_w}", f"height={out_h}"]
+        framerate_caps = self._gst_framerate_caps(fps_limit)
+        if framerate_caps:
+            caps_parts.append(f"framerate={framerate_caps}")
+        caps = ",".join(caps_parts)
+
+        cmd = [
+            "gst-launch-1.0", "-q",
+            "rtspsrc", f"location={self.url}", f"protocols={protocols}",
+            f"latency={latency_ms}", "drop-on-latency=true", "tcp-timeout=3000000",
+            "!", depay,
+            "!", parser,
+            "!", decoder,
+            "!", "videoconvert",
+            "!", "videoscale",
+            "!", "videorate",
+            "!", caps,
+            "!", "fdsink", "fd=1", "sync=false"
+        ]
+
+        env = os.environ.copy()
+        vaapi_driver = str(self.decode_cfg.get("vaapi_driver", "")).strip()
+        if vaapi_driver:
+            env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
+
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            if proc.stdout is None:
+                return False
+
+            self.connected = True
+            self._set_decode_pipeline(
+                "gstreamer_pipe",
+                shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
+                pid=proc.pid,
+                cmd=cmd,
+                extra=(
+                    f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
+                    f"latency_ms={latency_ms} protocols={protocols} fps_limit={fps_limit or '-'} "
+                    f"frame_bytes={frame_size}"
+                )
+            )
+            self._decode_mode_logged = True
+            self.last_t = time.time()
+
+            while self.running:
+                if time.time() - self.last_t > WATCHDOG_TIMEOUT:
+                    self._note_decode_failure(f"gstreamer_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
+                    break
+
+                raw = proc.stdout.read(frame_size)
+                if len(raw) != frame_size:
+                    self._note_decode_failure(f"gstreamer_short_read_{len(raw)}_of_{frame_size}", level="error")
+                    break
+
+                fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
+                with self.lock:
+                    self.frame = fr
+                    self.fid += 1
+                    self.last_t = time.time()
+                self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
+
+            return True
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] GStreamer pipe failed: {e}")
+            return False
+        finally:
+            self.connected = False
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
 
     def _run_ffmpeg_vaapi_pipe(self):
         shape = self._probe_stream_shape()
@@ -3048,6 +3226,15 @@ class FrameReader:
 
     def _run(self):
         while self.running:
+            if self._should_use_gstreamer_pipe():
+                used_gstreamer_pipe = self._run_gstreamer_pipe()
+                if used_gstreamer_pipe:
+                    continue
+                if not self.decode_cfg.get("fallback_to_cpu", True):
+                    time.sleep(5)
+                    continue
+                logger.warning(f"[CAM:{self.ip}] GStreamer pipe unavailable; trying FFmpeg/OpenCV fallback")
+
             if self._should_use_ffmpeg_vaapi_pipe():
                 used_vaapi_pipe = self._run_ffmpeg_vaapi_pipe()
                 if used_vaapi_pipe:

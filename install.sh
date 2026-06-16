@@ -62,7 +62,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
-    "video_decode": {"backend": "auto", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "log_interval_sec": 10.0, "print_pipeline_logs": true},
+    "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "print_pipeline_logs": true},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
@@ -101,7 +101,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
-    "video_decode": {"backend": "auto", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "log_interval_sec": 10.0, "print_pipeline_logs": true},
+    "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "print_pipeline_logs": true},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
@@ -177,6 +177,26 @@ python -m pip install pytz psutil requests opencv-python --break-system-packages
 
 echo "-> FFmpeg VAAPI 하드웨어 디코딩 패키지를 설치합니다..."
 sudo apt install -y ffmpeg intel-media-va-driver vainfo
+
+echo "-> GStreamer RTSP/VAAPI decode plugins install..."
+sudo apt install -y \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    gstreamer1.0-vaapi \
+    libgstreamer1.0-0 \
+    libgstreamer-plugins-base1.0-0
+
+if command -v gst-inspect-1.0 >/dev/null 2>&1; then
+    gst-inspect-1.0 rtspsrc >/dev/null 2>&1 || echo "[GStreamer] rtspsrc plugin missing"
+    gst-inspect-1.0 rtph264depay >/dev/null 2>&1 || echo "[GStreamer] rtph264depay plugin missing"
+    gst-inspect-1.0 avdec_h264 >/dev/null 2>&1 || echo "[GStreamer] avdec_h264 plugin missing"
+    gst-inspect-1.0 vaapih264dec >/dev/null 2>&1 || gst-inspect-1.0 vah264dec >/dev/null 2>&1 || \
+        echo "[GStreamer] VAAPI H264 decoder missing; CPU decoder fallback will be used"
+fi
 sudo usermod -aG render,video "$ACTUAL_USER" 2>/dev/null || true
 
 echo "-----------------------------------------------------"
