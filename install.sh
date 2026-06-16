@@ -200,7 +200,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "HELMET": "helmet_3cls_v8_ppu.dxnn",
         "PLATE": "license_plate_detector_ppu.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "dx_stream": {
@@ -252,7 +252,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
         "HELMET": "helmet_3cls_v8_ppu.dxnn",
         "PLATE": "license_plate_detector_ppu.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "dx_stream": {
