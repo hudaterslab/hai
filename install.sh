@@ -1,5 +1,25 @@
 #!/bin/bash
 
+INSTALL_DX_STREAM=${INSTALL_DX_STREAM:-false}
+
+for arg in "$@"; do
+    case "$arg" in
+        --dx-stream|--with-dx-stream)
+            INSTALL_DX_STREAM=true
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--dx-stream]"
+            echo "  --dx-stream    Build and install DEEPX dx_stream GStreamer plugins"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            echo "Usage: $0 [--dx-stream]"
+            exit 1
+            ;;
+    esac
+done
+
 # 1. 사용자 및 경로 설정
 ACTUAL_USER=${SUDO_USER:-$USER}
 USER_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
@@ -15,6 +35,8 @@ SYS_CONFIG_FILE="$PROJECT_DIR/system_config.json"
 TARGET_SCRIPT="$PROJECT_DIR/multi_event.py"
 MODEL_DOWNLOAD_SCRIPT="$PROJECT_DIR/downdxnn.sh"
 DX_DIR="$USER_HOME/dx-runtime"
+DX_STREAM_DIR="$DX_DIR/dx_stream"
+DX_STREAM_SERVICE_ENV=""
 
 sudo apt install ssh -y
 
@@ -288,7 +310,69 @@ else
 fi
 
 echo "-----------------------------------------------------"
-echo " 8. 모델 파일 다운로드 및 확인"
+echo " 8. dx_stream GStreamer 플러그인 선택 설치"
+echo "-----------------------------------------------------"
+if [ "$INSTALL_DX_STREAM" = "true" ]; then
+    echo "-> dx_stream 설치가 요청되었습니다: $DX_STREAM_DIR"
+
+    if [ ! -d "$DX_STREAM_DIR" ]; then
+        echo "-> dx-runtime 서브모듈에서 dx_stream을 초기화합니다..."
+        sudo -u "$ACTUAL_USER" git -C "$DX_DIR" submodule update --init --recursive dx_stream || true
+    fi
+
+    if [ ! -d "$DX_STREAM_DIR" ]; then
+        echo "-> dx_stream 서브모듈이 없어 공식 저장소를 클론합니다..."
+        sudo -u "$ACTUAL_USER" git clone https://github.com/DEEPX-AI/dx_stream.git "$DX_STREAM_DIR" || {
+            echo "❌ [dx_stream] 저장소 클론에 실패했습니다."
+            exit 1
+        }
+    fi
+
+    if [ ! -f "$DX_STREAM_DIR/install.sh" ] || [ ! -f "$DX_STREAM_DIR/build.sh" ]; then
+        echo "❌ [dx_stream] install.sh/build.sh를 찾을 수 없습니다: $DX_STREAM_DIR"
+        exit 1
+    fi
+
+    echo "-> dx_stream 의존 패키지를 설치합니다..."
+    (cd "$DX_STREAM_DIR" && bash ./install.sh) || {
+        echo "❌ [dx_stream] 의존 패키지 설치에 실패했습니다."
+        exit 1
+    }
+
+    echo "-> dx_stream 플러그인을 빌드/설치합니다..."
+    if [ "$(id -u)" -eq 0 ]; then
+        (cd "$DX_STREAM_DIR" && ./build.sh --clean) || {
+            echo "❌ [dx_stream] 빌드에 실패했습니다."
+            exit 1
+        }
+    else
+        (cd "$DX_STREAM_DIR" && sudo -E ./build.sh --clean) || {
+            echo "❌ [dx_stream] 빌드에 실패했습니다."
+            exit 1
+        }
+    fi
+
+    sudo chown -R "$ACTUAL_USER:$(id -gn "$ACTUAL_USER")" "$DX_STREAM_DIR" 2>/dev/null || true
+    sudo rm -rf "$USER_HOME/.cache/gstreamer-1.0" 2>/dev/null || true
+    sudo -u "$ACTUAL_USER" mkdir -p "$USER_HOME/.cache" 2>/dev/null || true
+
+    export GST_PLUGIN_PATH="/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0:${GST_PLUGIN_PATH:-}"
+    export LD_LIBRARY_PATH="/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/local/share/gstdxstream/lib:${LD_LIBRARY_PATH:-}"
+
+    if gst-inspect-1.0 dxstream >/dev/null 2>&1; then
+        echo "✅ [dx_stream] gst-inspect-1.0 dxstream 검증 성공"
+        DX_STREAM_SERVICE_ENV='Environment=GST_PLUGIN_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0
+Environment=LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0:/usr/local/share/gstdxstream/lib'
+    else
+        echo "❌ [dx_stream] GStreamer 플러그인 검증에 실패했습니다."
+        exit 1
+    fi
+else
+    echo "-> dx_stream 설치를 건너뜁니다. 필요 시 INSTALL_DX_STREAM=true 또는 --dx-stream 옵션을 사용하세요."
+fi
+
+echo "-----------------------------------------------------"
+echo " 9. 모델 파일 다운로드 및 확인"
 echo "-----------------------------------------------------"
 MODEL_FILES_READY=true
 if [ -f "$MODEL_DOWNLOAD_SCRIPT" ]; then
@@ -330,7 +414,7 @@ then
 fi
 
 echo "-----------------------------------------------------"
-echo " 9. Systemd 백그라운드 서비스 등록"
+echo " 10. Systemd 백그라운드 서비스 등록"
 echo "-----------------------------------------------------"
 sudo bash -c "cat > $SERVICE_PATH" << EOL
 [Unit]
@@ -348,6 +432,7 @@ ExecStartPre=/bin/sleep 20
 ExecStart=/bin/bash -c 'yes n | python3 -u multi_event.py'
 Restart=always
 RestartSec=15
+$DX_STREAM_SERVICE_ENV
 StandardOutput=journal
 StandardError=journal
 
