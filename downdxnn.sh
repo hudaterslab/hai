@@ -8,3 +8,8 @@ wget -O hanjin_cctv.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/m
 wget -O signalman.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/signalman.dxnn
 wget -O license_plate_detector.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector.dxnn
 wget -O license_plate_detector_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector_ppu.dxnn
+wget -O libpostprocess_hai_ppu.so https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/libpostprocess_hai_ppu.so
+wget -O postprocess_hai_main_ppu.json https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/postprocess_hai_main_ppu.json
+wget -O postprocess_hai_helmet_ppu.json https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/postprocess_hai_helmet_ppu.json
+wget -O postprocess_hai_face_ppu.json https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/postprocess_hai_face_ppu.json
+wget -O postprocess_hai_plate_ppu.json https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/postprocess_hai_plate_ppu.json

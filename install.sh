@@ -10,6 +10,12 @@ for arg in "$@"; do
         -h|--help)
             echo "Usage: $0 [--dx-stream]"
             echo "  --dx-stream    Build and install DEEPX dx_stream GStreamer plugins"
+            echo ""
+            echo "Optional dx_stream HAI_PPU artifact:"
+            echo "  HAI_DXSTREAM_POSTPROCESS_SO=/path/to/libpostprocess_hai_ppu.so $0 --dx-stream"
+            echo "  Default artifact path: ./libpostprocess_hai_ppu.so"
+            echo "  Default config path: ./postprocess_hai_*_ppu.json"
+            echo "  Install target: /usr/local/share/gstdxstream/lib/libpostprocess_hai_ppu.so"
             exit 0
             ;;
         *)
@@ -37,6 +43,12 @@ MODEL_DOWNLOAD_SCRIPT="$PROJECT_DIR/downdxnn.sh"
 DX_DIR="$USER_HOME/dx-runtime"
 DX_STREAM_DIR="$DX_DIR/dx_stream"
 DX_STREAM_SERVICE_ENV=""
+HAI_DXSTREAM_POSTPROCESS_SO_NAME="libpostprocess_hai_ppu.so"
+HAI_DXSTREAM_POSTPROCESS_SO=${HAI_DXSTREAM_POSTPROCESS_SO:-"$PROJECT_DIR/$HAI_DXSTREAM_POSTPROCESS_SO_NAME"}
+HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR=${HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR:-"/usr/local/share/gstdxstream/lib"}
+HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR=${HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR:-"/usr/local/share/gstdxstream/configs/HAI_PPU"}
+HAI_DXSTREAM_POSTPROCESS_CONFIG_SOURCE_DIR=${HAI_DXSTREAM_POSTPROCESS_CONFIG_SOURCE_DIR:-"$PROJECT_DIR"}
+MODEL_DOWNLOAD_DONE=false
 
 sudo apt install ssh -y
 
@@ -48,6 +60,112 @@ if [ ! -f "$TARGET_SCRIPT" ]; then
     echo "❌ [설치 중단] 현재 폴더에 'multi_event.py' 파일이 존재하지 않습니다."
     exit 1
 fi
+
+run_model_downloads_once() {
+    if [ "$MODEL_DOWNLOAD_DONE" = "true" ]; then
+        echo "-> 모델/부가 artifact 다운로드는 이미 실행되어 건너뜁니다."
+        return 0
+    fi
+
+    MODEL_DOWNLOAD_DONE=true
+    if [ -f "$MODEL_DOWNLOAD_SCRIPT" ]; then
+        echo "-> downdxnn.sh를 실행하여 모델 및 부가 artifact를 확인/다운로드합니다..."
+        (cd "$PROJECT_DIR" && bash "$MODEL_DOWNLOAD_SCRIPT")
+    else
+        echo "⚠️ downdxnn.sh 파일이 없어 모델 다운로드를 건너뜁니다: $MODEL_DOWNLOAD_SCRIPT"
+    fi
+}
+
+write_hai_dxstream_postprocess_config() {
+    local config_path="$1"
+    local function_name="$2"
+    local library_path="$3"
+    sudo tee "$config_path" >/dev/null << EOL
+{
+    "inference_id": 1,
+    "library_file_path": "$library_path",
+    "function_name": "$function_name"
+}
+EOL
+}
+
+normalize_hai_dxstream_postprocess_config() {
+    local config_path="$1"
+    local library_path="$2"
+    python3 - "$config_path" "$library_path" << 'PY'
+import json
+import sys
+
+path, library_path = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+cfg["library_file_path"] = library_path
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=4)
+    f.write("\n")
+PY
+}
+
+install_hai_dxstream_postprocess_artifact() {
+    local source_so="$HAI_DXSTREAM_POSTPROCESS_SO"
+    if [ ! -f "$source_so" ] && [ -f "$PROJECT_DIR/$HAI_DXSTREAM_POSTPROCESS_SO_NAME" ]; then
+        source_so="$PROJECT_DIR/$HAI_DXSTREAM_POSTPROCESS_SO_NAME"
+    fi
+
+    if [ ! -f "$source_so" ]; then
+        echo "-> HAI_PPU custom postprocess .so가 없어 설치를 건너뜁니다."
+        echo "   기본 위치: $HAI_DXSTREAM_POSTPROCESS_SO"
+        echo "   직접 지정: HAI_DXSTREAM_POSTPROCESS_SO=/path/$HAI_DXSTREAM_POSTPROCESS_SO_NAME bash install.sh --dx-stream"
+        echo "   설치 위치: $HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR/$HAI_DXSTREAM_POSTPROCESS_SO_NAME"
+        return 0
+    fi
+
+    local target_so="$HAI_DXSTREAM_POSTPROCESS_INSTALL_DIR/$HAI_DXSTREAM_POSTPROCESS_SO_NAME"
+    echo "-> HAI_PPU custom postprocess .so를 설치합니다."
+    echo "   source: $source_so"
+    echo "   target: $target_so"
+    sudo install -D -m 755 "$source_so" "$target_so"
+    sudo mkdir -p "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR"
+
+    local config_source_dir="$HAI_DXSTREAM_POSTPROCESS_CONFIG_SOURCE_DIR"
+    local config_names=(
+        "postprocess_hai_main_ppu.json"
+        "postprocess_hai_helmet_ppu.json"
+        "postprocess_hai_face_ppu.json"
+        "postprocess_hai_plate_ppu.json"
+    )
+    local all_configs_ready=true
+    for config_name in "${config_names[@]}"; do
+        if [ ! -f "$config_source_dir/$config_name" ]; then
+            all_configs_ready=false
+            break
+        fi
+    done
+
+    if [ "$all_configs_ready" = "true" ]; then
+        echo "-> 다운로드된 HAI_PPU postprocess json을 설치합니다: $config_source_dir"
+        for config_name in "${config_names[@]}"; do
+            sudo cp -f "$config_source_dir/$config_name" "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/$config_name"
+            sudo chown "$ACTUAL_USER:$(id -gn "$ACTUAL_USER")" "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/$config_name" 2>/dev/null || true
+            normalize_hai_dxstream_postprocess_config "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/$config_name" "$target_so"
+            sudo chown root:root "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/$config_name" 2>/dev/null || true
+        done
+    else
+        echo "-> HAI_PPU postprocess json이 없어 기본 json을 생성합니다."
+        write_hai_dxstream_postprocess_config "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/postprocess_hai_main_ppu.json" "HAI_MAIN_PPU" "$target_so"
+        write_hai_dxstream_postprocess_config "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/postprocess_hai_helmet_ppu.json" "HAI_HELMET_PPU" "$target_so"
+        write_hai_dxstream_postprocess_config "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/postprocess_hai_face_ppu.json" "HAI_FACE_PPU" "$target_so"
+        write_hai_dxstream_postprocess_config "$HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR/postprocess_hai_plate_ppu.json" "HAI_PLATE_PPU" "$target_so"
+    fi
+
+    if command -v nm >/dev/null 2>&1; then
+        for fn in HAI_MAIN_PPU HAI_HELMET_PPU HAI_FACE_PPU HAI_PLATE_PPU; do
+            nm -D "$target_so" 2>/dev/null | grep -q " $fn$" || \
+                echo "⚠️ [dx_stream] $fn symbol을 $target_so 에서 확인하지 못했습니다."
+        done
+    fi
+    echo "✅ [dx_stream] HAI_PPU 설치/config 준비 완료: $HAI_DXSTREAM_POSTPROCESS_CONFIG_DIR"
+}
 
 # 2. system_config.json 부재 시 자동 생성
 if [ ! -f "$SYS_CONFIG_FILE" ]; then
@@ -352,6 +470,9 @@ if [ "$INSTALL_DX_STREAM" = "true" ]; then
         }
     fi
 
+    run_model_downloads_once
+    install_hai_dxstream_postprocess_artifact
+
     sudo chown -R "$ACTUAL_USER:$(id -gn "$ACTUAL_USER")" "$DX_STREAM_DIR" 2>/dev/null || true
     sudo rm -rf "$USER_HOME/.cache/gstreamer-1.0" 2>/dev/null || true
     sudo -u "$ACTUAL_USER" mkdir -p "$USER_HOME/.cache" 2>/dev/null || true
@@ -375,12 +496,7 @@ echo "-----------------------------------------------------"
 echo " 9. 모델 파일 다운로드 및 확인"
 echo "-----------------------------------------------------"
 MODEL_FILES_READY=true
-if [ -f "$MODEL_DOWNLOAD_SCRIPT" ]; then
-    echo "-> downdxnn.sh를 실행하여 모델 파일을 확인/다운로드합니다..."
-    (cd "$PROJECT_DIR" && bash "$MODEL_DOWNLOAD_SCRIPT")
-else
-    echo "⚠️ downdxnn.sh 파일이 없어 모델 다운로드를 건너뜁니다: $MODEL_DOWNLOAD_SCRIPT"
-fi
+run_model_downloads_once
 
 if ! python3 - "$SYS_CONFIG_FILE" "$PROJECT_DIR" << 'PY'
 import json
