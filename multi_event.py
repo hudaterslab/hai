@@ -159,6 +159,7 @@ def load_system_config():
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
         "LOOP_FPS": 15,
+        "PERF_LOG_INTERVAL_SEC": 10.0,
         "REC_PRE_SEC": 10,
         "REC_POST_SEC": 10,
         "EVENT_FRAME_SAVE_DELAY_SEC": 10.0,
@@ -4001,11 +4002,11 @@ class Camera:
                 cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         # 좌측 상단 카메라 ID 및 FPS
-        cv2.rectangle(fr, (0, 0), (100, 40), (0, 0, 0), -1)
+        cv2.rectangle(fr, (0, 0), (115, 40), (0, 0, 0), -1)
         cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
         fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
-        cv2.putText(fr, f"FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
+        cv2.putText(fr, f"AI FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
 
         active_alarms = set(alarms.values())
 
@@ -4318,6 +4319,10 @@ def main():
     last_fps_time = time.time()
     cpu_usage = 0.0
     dynamic_delay = 1.0 / target_fps
+    perf_log_interval_sec = float(SYS_CFG.get("PERF_LOG_INTERVAL_SEC", 10.0))
+    perf_last_log_time = time.time()
+    perf_totals = defaultdict(float)
+    perf_samples = 0
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
@@ -4384,6 +4389,16 @@ def main():
 
         while True:
             start_time = time.time()
+            loop_perf_start = time.perf_counter()
+            timing_read_ms = 0.0
+            timing_submit_ms = 0.0
+            timing_infer_wait_ms = 0.0
+            timing_logic_ms = 0.0
+            timing_meta_ms = 0.0
+            timing_recorder_ms = 0.0
+            timing_draw_ms = 0.0
+            timing_imshow_ms = 0.0
+            timing_event_ms = 0.0
 
             if output_cleanup_interval_sec > 0 and (start_time - last_output_cleanup_time) >= output_cleanup_interval_sec:
                 run_output_retention_cleanup(output_retention_days)
@@ -4435,14 +4450,19 @@ def main():
                 if mem_usage > 80 or q_size > 20:
                     logger.warning(f"⚠️ [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
 
+            t_stage = time.perf_counter()
             raw_data = [c.process_frame() for c in cams]
+            timing_read_ms = (time.perf_counter() - t_stage) * 1000.0
+
             final_imgs = []
+            t_stage = time.perf_counter()
             inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
             for idx, res in enumerate(raw_data):
                 fr, _, connected = res
                 if connected and fr is not None and cams[idx].events:
                     inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
+            timing_submit_ms = (time.perf_counter() - t_stage) * 1000.0
 
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
@@ -4457,13 +4477,19 @@ def main():
 
                 if not cams[idx].events:
                     if connected and fr is not None:
+                        t_stage = time.perf_counter()
                         final_imgs.append(cams[idx].draw(fr, [], [], [], {}, True))
+                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     else:
+                        t_stage = time.perf_counter()
                         final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
+                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     continue
 
                 if not connected or fr is None:
+                    t_stage = time.perf_counter()
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
+                    timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     continue
 
                 # ---------------------------------------------------------
@@ -4471,31 +4497,45 @@ def main():
                 # ---------------------------------------------------------
                 future = inference_futures.get(idx)
                 if future is None:
+                    t_stage = time.perf_counter()
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
+                    timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                     continue
 
+                t_stage = time.perf_counter()
                 t_main_input, d_helmet_res, d_signalman_res = future.result()
+                timing_infer_wait_ms += (time.perf_counter() - t_stage) * 1000.0
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
+                t_stage = time.perf_counter()
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                timing_logic_ms += (time.perf_counter() - t_stage) * 1000.0
+                t_stage = time.perf_counter()
                 infer_meta = cams[idx].build_inference_log(
                     fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events,
                     d_signalman_res=d_signalman_res
                 )
+                timing_meta_ms += (time.perf_counter() - t_stage) * 1000.0
 
                 # -----------------------------------------------------------
                 # [수정] 녹화기는 원본 프레임을 저장하고, GUI에만 오버레이를 표시합니다.
                 # -----------------------------------------------------------
                 if connected and fr is not None:
                     # 원본 프레임과 같은 시점의 추론 로그를 버퍼 및 녹화 큐에 업데이트합니다.
+                    t_stage = time.perf_counter()
                     cams[idx].recorder.update(fr, infer_meta)
+                    timing_recorder_ms += (time.perf_counter() - t_stage) * 1000.0
 
                     if is_gui_mode:
+                        t_stage = time.perf_counter()
                         display_fr = cams[idx].draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
                         final_imgs.append(display_fr)
+                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                 else:
                     if is_gui_mode:
+                        t_stage = time.perf_counter()
                         final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
+                        timing_draw_ms += (time.perf_counter() - t_stage) * 1000.0
                 # -----------------------------------------------------------
 
                 if new_events:
@@ -4579,10 +4619,51 @@ def main():
                     last_event_times[ip] = 0.0
 
             if is_gui_mode:
+                t_stage = time.perf_counter()
                 if final_imgs:
                     cv2.imshow("Monitor", create_mosaic_image(final_imgs))
-                if cv2.waitKey(1) == ord('q'):
+                key = cv2.waitKey(1)
+                timing_imshow_ms += (time.perf_counter() - t_stage) * 1000.0
+                if key == ord('q'):
                     break
+
+            timing_loop_total_ms = (time.perf_counter() - loop_perf_start) * 1000.0
+            perf_samples += 1
+            perf_totals["read_ms"] += timing_read_ms
+            perf_totals["submit_ms"] += timing_submit_ms
+            perf_totals["infer_wait_ms"] += timing_infer_wait_ms
+            perf_totals["logic_ms"] += timing_logic_ms
+            perf_totals["meta_ms"] += timing_meta_ms
+            perf_totals["recorder_ms"] += timing_recorder_ms
+            perf_totals["draw_ms"] += timing_draw_ms
+            perf_totals["imshow_ms"] += timing_imshow_ms
+            perf_totals["event_ms"] += timing_event_ms
+            perf_totals["loop_total_ms"] += timing_loop_total_ms
+
+            now_for_perf = time.time()
+            perf_elapsed = now_for_perf - perf_last_log_time
+            if perf_elapsed >= perf_log_interval_sec and perf_samples > 0:
+                loop_fps = perf_samples / max(0.001, perf_elapsed)
+                cam_ai_fps = ",".join(f"{c.cam_id}:{c.current_fps:.1f}" for c in cams)
+                logger.info(
+                    "[LOOP TIMING] "
+                    f"samples={perf_samples} loop_fps={loop_fps:.2f} "
+                    f"read={perf_totals['read_ms'] / perf_samples:.1f}ms "
+                    f"submit={perf_totals['submit_ms'] / perf_samples:.1f}ms "
+                    f"infer_wait={perf_totals['infer_wait_ms'] / perf_samples:.1f}ms "
+                    f"logic={perf_totals['logic_ms'] / perf_samples:.1f}ms "
+                    f"meta={perf_totals['meta_ms'] / perf_samples:.1f}ms "
+                    f"recorder={perf_totals['recorder_ms'] / perf_samples:.1f}ms "
+                    f"draw={perf_totals['draw_ms'] / perf_samples:.1f}ms "
+                    f"imshow={perf_totals['imshow_ms'] / perf_samples:.1f}ms "
+                    f"event={perf_totals['event_ms'] / perf_samples:.1f}ms "
+                    f"total={perf_totals['loop_total_ms'] / perf_samples:.1f}ms "
+                    f"target={target_fps:.1f} cpu={cpu_usage:.1f}% "
+                    f"cam_ai_fps={cam_ai_fps}"
+                )
+                perf_totals.clear()
+                perf_samples = 0
+                perf_last_log_time = now_for_perf
 
             sleep_time = dynamic_delay - (time.time() - start_time)
             if sleep_time > 0:
