@@ -5483,6 +5483,8 @@ def main():
     except Exception:
         current_fps_log_interval_sec = 10.0
     current_fps_last_print = {}
+    last_processed_fids = {c.ip: -1 for c in cams}
+    duplicate_fid_skips = defaultdict(int)
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
@@ -5611,16 +5613,27 @@ def main():
             final_imgs = []
             inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
+            new_frame_flags = {}
             for idx, res in enumerate(raw_data):
-                fr, _, connected, main_dets, helmet_dets = res
-                if connected and fr is not None and cams[idx].events:
+                fr, fid, connected, main_dets, helmet_dets = res
+                cam = cams[idx]
+                is_new_frame = (
+                    connected
+                    and fr is not None
+                    and cam.events
+                    and int(fid) > int(last_processed_fids.get(cam.ip, -1))
+                )
+                new_frame_flags[idx] = is_new_frame
+                if is_new_frame:
                     inference_futures[idx] = inference_executor.submit(
                         run_camera_inference,
-                        cams[idx],
+                        cam,
                         fr,
                         main_dets,
                         helmet_dets
                     )
+                elif connected and fr is not None and cam.events:
+                    duplicate_fid_skips[cam.ip] += 1
 
             for idx, res in enumerate(raw_data):
                 fr, fid, connected, main_dets, helmet_dets = res
@@ -5644,6 +5657,11 @@ def main():
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                     continue
 
+                if not new_frame_flags.get(idx, False):
+                    if is_gui_mode:
+                        final_imgs.append(cams[idx].draw(fr, [], [], [], {}, True))
+                    continue
+
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
@@ -5656,6 +5674,7 @@ def main():
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                last_processed_fids[cams[idx].ip] = int(fid)
                 now_fps_log = time.time()
                 cam_ip = cams[idx].ip
                 if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
@@ -5665,10 +5684,12 @@ def main():
                         f"current_fps={cams[idx].current_fps:.1f} fid={fid} "
                         f"main_meta={'reader' if main_dets is not None else 'detector'} "
                         f"helmet_meta={helmet_meta_source} "
+                        f"duplicate_fid_skips={duplicate_fid_skips.get(cam_ip, 0)} "
                         f"connected={connected} events={','.join(cams[idx].events) or '-'}",
                         flush=True
                     )
                     current_fps_last_print[cam_ip] = now_fps_log
+                    duplicate_fid_skips[cam_ip] = 0
                 infer_meta = cams[idx].build_inference_log(
                     fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events,
                     d_signalman_res=d_signalman_res
