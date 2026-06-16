@@ -154,6 +154,7 @@ def load_system_config():
             "python_paths": [],
             "gst_plugin_paths": ["/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0"],
             "appsink_timeout_sec": 2.0,
+            "end_to_end_main": True,
             "preprocess": {
                 "resize_width": 640,
                 "resize_height": 640,
@@ -1070,6 +1071,30 @@ DX_STREAM_POSTPROCESS_MIN_CONF = {
     "PLATE": 0.10,
 }
 
+def dx_stream_objects_to_detections(meta, conf_threshold, width, height):
+    if meta is None:
+        return np.empty((0, 6))
+
+    rows = []
+    for obj in getattr(meta, "object_meta_list", []) or []:
+        try:
+            score = float(getattr(obj, "confidence"))
+            cls_id = int(getattr(obj, "label"))
+            box = [float(v) for v in getattr(obj, "box")]
+            if len(box) < 4 or score < conf_threshold:
+                continue
+            x1 = np.clip(box[0], 0, width)
+            y1 = np.clip(box[1], 0, height)
+            x2 = np.clip(box[2], 0, width)
+            y2 = np.clip(box[3], 0, height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            rows.append([x1, y1, x2, y2, score, cls_id])
+        except Exception:
+            continue
+
+    return detection_array(rows)
+
 class DxStreamDeepX:
     _runtime_lock = threading.Lock()
     _runtime = None
@@ -1331,28 +1356,7 @@ class DxStreamDeepX:
         return appsink.emit("try-pull-sample", self.appsink_timeout_ns)
 
     def _objects_to_detections(self, meta, conf_threshold, width, height):
-        if meta is None:
-            return np.empty((0, 6))
-
-        rows = []
-        for obj in getattr(meta, "object_meta_list", []) or []:
-            try:
-                score = float(getattr(obj, "confidence"))
-                cls_id = int(getattr(obj, "label"))
-                box = [float(v) for v in getattr(obj, "box")]
-                if len(box) < 4 or score < conf_threshold:
-                    continue
-                x1 = np.clip(box[0], 0, width)
-                y1 = np.clip(box[1], 0, height)
-                x2 = np.clip(box[2], 0, width)
-                y2 = np.clip(box[3], 0, height)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                rows.append([x1, y1, x2, y2, score, cls_id])
-            except Exception:
-                continue
-
-        return detection_array(rows)
+        return dx_stream_objects_to_detections(meta, conf_threshold, width, height)
 
     def infer(self, img, conf_override=None):
         if img is None:
@@ -3200,10 +3204,24 @@ class AnchorTrackingROIAligner:
         return True
 
 class FrameReader:
-    def __init__(self, url, ip):
+    def __init__(
+        self,
+        url,
+        ip,
+        main_model_path=None,
+        helmet_model_path=None,
+        enable_dxstream_main=False,
+        enable_dxstream_helmet=False
+    ):
         self.url = sanitize_camera_url(url)
         self.ip = ip
+        self.main_model_path = os.path.abspath(main_model_path) if main_model_path else None
+        self.helmet_model_path = os.path.abspath(helmet_model_path) if helmet_model_path else None
+        self.enable_dxstream_main = bool(enable_dxstream_main)
+        self.enable_dxstream_helmet = bool(enable_dxstream_helmet)
         self.frame = None
+        self.main_dets = None
+        self.helmet_dets = None
         self.fid = 0
         self.running = True
         self.connected = False
@@ -3221,6 +3239,8 @@ class FrameReader:
         self._decode_window_bytes = 0
         self._decode_window_start = time.time()
         self._gst_check_logged = False
+        self._dxstream_check_logged = False
+        self._dxstream_main_warned = False
 
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -3242,11 +3262,22 @@ class FrameReader:
         self._gst_check_logged = True
         self._emit_decode_log(message, level=level)
 
+    def _emit_dxstream_check_once(self, message, level="info"):
+        if self._dxstream_check_logged:
+            return
+        self._dxstream_check_logged = True
+        self._emit_decode_log(message, level=level)
+
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
 
     def _cmd_text(self, cmd):
+        if isinstance(cmd, str):
+            return self._mask_pipeline_text(cmd)
         return self._mask_pipeline_text(" ".join(str(part) for part in cmd))
+
+    def _pipeline_text(self, text):
+        return self._mask_pipeline_text(str(text))
 
     def _set_decode_pipeline(self, mode, shape="-", pid="-", cmd=None, extra=""):
         self._decode_mode = mode
@@ -3372,6 +3403,63 @@ class FrameReader:
         )
         return True
 
+    def _should_use_dxstream_main_pipe(self):
+        if not self.enable_dxstream_main:
+            return False
+
+        dx_cfg = SYS_CFG.get("dx_stream", {}) or {}
+        if get_inference_backend() != "dx_stream" or not bool(dx_cfg.get("enabled", False)):
+            return False
+        if not bool(dx_cfg.get("end_to_end_main", True)):
+            self._emit_dxstream_check_once(
+                f"[DXSTREAM CHECK] CAM:{self.ip} skip reason=end_to_end_main_disabled"
+            )
+            return False
+        if not sys.platform.startswith("linux"):
+            self._emit_dxstream_check_once(
+                f"[DXSTREAM CHECK] CAM:{self.ip} skip reason=non_linux platform={sys.platform}"
+            )
+            return False
+        if not self.main_model_path or not os.path.exists(self.main_model_path):
+            self._emit_dxstream_check_once(
+                f"[DXSTREAM CHECK] CAM:{self.ip} skip reason=missing_main_model path={self.main_model_path or '-'}",
+                level="warning"
+            )
+            return False
+        if not shutil.which("gst-inspect-1.0") or not shutil.which("ffprobe"):
+            self._emit_dxstream_check_once(
+                f"[DXSTREAM CHECK] CAM:{self.ip} skip reason=missing_tools "
+                f"gst-inspect={shutil.which('gst-inspect-1.0') or '-'} ffprobe={shutil.which('ffprobe') or '-'}",
+                level="warning"
+            )
+            return False
+
+        DxStreamDeepX._configure_gst_plugin_path(dx_cfg)
+        missing_elements = [
+            name for name in ("dxpreprocess", "dxinfer", "dxpostprocess")
+            if not self._gst_element_exists(name)
+        ]
+        if missing_elements:
+            self._emit_dxstream_check_once(
+                f"[DXSTREAM CHECK] CAM:{self.ip} skip reason=missing_elements elements={','.join(missing_elements)}",
+                level="warning"
+            )
+            return False
+
+        try:
+            DxStreamDeepX._load_runtime()
+        except Exception as e:
+            self._emit_dxstream_check_once(
+                f"[DXSTREAM CHECK] CAM:{self.ip} skip reason=runtime_import_failed error={e}",
+                level="warning"
+            )
+            return False
+
+        self._emit_dxstream_check_once(
+            f"[DXSTREAM CHECK] CAM:{self.ip} enabled model={os.path.basename(self.main_model_path)}"
+        )
+        return True
+
     def _probe_stream_info(self):
         cmd = ["ffprobe", "-v", "error"]
         if self.url.lower().startswith("rtsp://"):
@@ -3451,6 +3539,73 @@ class FrameReader:
         fraction = Fraction(float(fps_limit)).limit_denominator(1000)
         return f"{fraction.numerator}/{fraction.denominator}"
 
+    def _gst_quote(self, value):
+        return str(value).replace("\\", "/").replace('"', '\\"')
+
+    def _resolve_dxstream_runtime_config_dir(self):
+        dx_cfg = SYS_CFG.get("dx_stream", {}) or {}
+        path = str(dx_cfg.get("runtime_config_dir", "./.dxstream_runtime") or "./.dxstream_runtime")
+        if not os.path.isabs(path):
+            path = os.path.join(PROJECT_ROOT, path)
+        return path
+
+    def _write_json_if_changed(self, path, payload):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        text = json.dumps(payload, ensure_ascii=False, indent=4) + "\n"
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    if f.read() == text:
+                        return
+        except Exception:
+            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _dxstream_model_specs(self):
+        specs = [("MAIN", self.main_model_path, 1)]
+        if self.enable_dxstream_helmet and self.helmet_model_path:
+            specs.append(("HELMET", self.helmet_model_path, 2))
+        return specs
+
+    def _write_dxstream_model_configs(self, model_key, model_path, inference_id):
+        dx_cfg = SYS_CFG.get("dx_stream", {}) or {}
+        config_dir = self._resolve_dxstream_runtime_config_dir()
+        postprocess_dir = dx_cfg.get("postprocess_config_dir", "/usr/local/share/gstdxstream/configs/HAI_PPU")
+        source_postprocess_path = os.path.join(postprocess_dir, DX_STREAM_POSTPROCESS_FILES[model_key])
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"dx_stream {model_key} model not found: {model_path}")
+        if not os.path.exists(source_postprocess_path):
+            raise FileNotFoundError(f"dx_stream {model_key} postprocess config not found: {source_postprocess_path}")
+
+        preprocess_source = dx_cfg.get("preprocess", {}) or {}
+        preprocess_cfg = {
+            "preprocess_id": int(inference_id),
+            "resize_width": int(preprocess_source.get("resize_width", 640)),
+            "resize_height": int(preprocess_source.get("resize_height", 640)),
+            "keep_ratio": bool(preprocess_source.get("keep_ratio", True)),
+            "pad_value": int(preprocess_source.get("pad_value", 114)),
+            "interval": int(preprocess_source.get("interval", 0)),
+        }
+        inference_cfg = {
+            "preprocess_id": int(inference_id),
+            "inference_id": int(inference_id),
+            "model_path": model_path,
+            "use-ort": bool(dx_cfg.get("use_ort", False)),
+        }
+        with open(source_postprocess_path, "r", encoding="utf-8") as f:
+            postprocess_cfg = json.load(f)
+        postprocess_cfg["inference_id"] = int(inference_id)
+
+        key = model_key.lower()
+        preprocess_path = os.path.join(config_dir, f"preprocess_{key}_reader.json")
+        inference_path = os.path.join(config_dir, f"inference_{key}_reader.json")
+        postprocess_path = os.path.join(config_dir, f"postprocess_{key}_reader.json")
+        self._write_json_if_changed(preprocess_path, preprocess_cfg)
+        self._write_json_if_changed(inference_path, inference_cfg)
+        self._write_json_if_changed(postprocess_path, postprocess_cfg)
+        return preprocess_path, inference_path, postprocess_path
+
     def _select_gstreamer_decoder(self, codec):
         codec = str(codec or "").strip().lower()
         mode = str(self.decode_cfg.get("hw_acceleration", "auto")).strip().lower()
@@ -3478,6 +3633,222 @@ class FrameReader:
             return None
 
         return depay, parser, decoder, decoder_kind
+
+    def _pull_dxstream_sample(self, appsink, timeout_ns):
+        if hasattr(appsink, "try_pull_sample"):
+            return appsink.try_pull_sample(timeout_ns)
+        return appsink.emit("try-pull-sample", timeout_ns)
+
+    def _log_dxstream_bus_messages(self, Gst, pipeline):
+        if pipeline is None:
+            return
+        bus = pipeline.get_bus()
+        while True:
+            msg = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.WARNING)
+            if msg is None:
+                break
+            if msg.type == Gst.MessageType.ERROR:
+                err, debug = msg.parse_error()
+                self._emit_decode_log(f"[DXSTREAM PIPELINE] CAM:{self.ip} error={err} debug={debug}", level="error")
+            elif msg.type == Gst.MessageType.WARNING:
+                warn, debug = msg.parse_warning()
+                self._emit_decode_log(f"[DXSTREAM PIPELINE] CAM:{self.ip} warning={warn} debug={debug}", level="warning")
+
+    def _sample_to_bgr_frame(self, Gst, sample):
+        caps = sample.get_caps()
+        if caps is None or caps.get_size() < 1:
+            return None, None, None
+        structure = caps.get_structure(0)
+        width = int(structure.get_value("width") or 0)
+        height = int(structure.get_value("height") or 0)
+        fmt = str(structure.get_value("format") or "RGB").upper()
+        if width <= 0 or height <= 0:
+            return None, None, None
+
+        channels = 4 if fmt in ("RGBA", "BGRA", "BGRX", "RGBX") else 3
+        expected = width * height * channels
+        buffer = sample.get_buffer()
+        ok, map_info = buffer.map(Gst.MapFlags.READ)
+        if not ok:
+            return None, None, None
+        try:
+            arr = np.frombuffer(map_info.data, dtype=np.uint8)
+            if arr.size < expected:
+                return None, None, None
+            arr = arr[:expected].reshape((height, width, channels))
+            if fmt == "RGB":
+                frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            elif fmt == "RGBA":
+                frame = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            elif fmt == "BGR":
+                frame = arr.copy()
+            elif fmt == "BGRA":
+                frame = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            elif fmt == "RGBX":
+                frame = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            elif fmt == "BGRX":
+                frame = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            else:
+                return None, None, None
+            return np.ascontiguousarray(frame), width, height
+        finally:
+            buffer.unmap(map_info)
+
+    def _run_dxstream_main_pipe(self):
+        info = self._probe_stream_info()
+        if info is None:
+            return False
+
+        in_w, in_h, codec = info
+        out_w, out_h = self._scaled_output_shape(in_w, in_h)
+        fps_limit = self._decode_fps_limit()
+        decoder_info = self._select_gstreamer_decoder(codec)
+        if decoder_info is None:
+            self._note_decode_failure(f"dxstream_unsupported_codec_{codec or 'unknown'}")
+            return False
+
+        try:
+            Gst, pydxs = DxStreamDeepX._load_runtime()
+            model_specs = self._dxstream_model_specs()
+            model_configs = []
+            for model_key, model_path, inference_id in model_specs:
+                model_configs.append((
+                    model_key,
+                    self._write_dxstream_model_configs(model_key, model_path, inference_id)
+                ))
+        except Exception as e:
+            self._note_decode_failure(f"dxstream_config_failed_{e}", level="error")
+            return False
+
+        depay, parser, decoder, decoder_kind = decoder_info
+        latency_ms = int(self.decode_cfg.get("gstreamer_latency_ms", 50) or 50)
+        protocols = str(self.decode_cfg.get("gstreamer_protocols", "tcp") or "tcp").strip().lower()
+        framerate_caps = self._gst_framerate_caps(fps_limit)
+        caps_parts = ["video/x-raw", "format=RGB", f"width={out_w}", f"height={out_h}"]
+        if framerate_caps:
+            caps_parts.append(f"framerate={framerate_caps}")
+        caps = ",".join(caps_parts)
+
+        rate_stage = "videorate ! " if framerate_caps else ""
+        branches = []
+        for model_key, (preprocess_path, inference_path, postprocess_path) in model_configs:
+            sink_name = f"{model_key.lower()}_sink"
+            branches.append(
+                f't. ! queue leaky=downstream max-size-buffers=1 ! '
+                f'dxpreprocess config-file-path="{self._gst_quote(preprocess_path)}" ! '
+                f'dxinfer config-file-path="{self._gst_quote(inference_path)}" ! '
+                f'dxpostprocess config-file-path="{self._gst_quote(postprocess_path)}" ! '
+                f'appsink name={sink_name} emit-signals=false sync=false max-buffers=1 drop=true wait-on-eos=false'
+            )
+
+        desc = (
+            f'rtspsrc location="{self._gst_quote(self.url)}" protocols={protocols} '
+            f'latency={latency_ms} drop-on-latency=true tcp-timeout=3000000 ! '
+            f'{depay} ! {parser} ! {decoder} ! '
+            f'videoconvert ! videoscale ! {rate_stage}{caps} ! '
+            f'tee name=t '
+            + " ".join(branches)
+        )
+
+        pipeline = None
+        try:
+            pipeline = Gst.parse_launch(desc)
+            appsinks = {}
+            for model_key, _ in model_configs:
+                sink_name = f"{model_key.lower()}_sink"
+                appsink = pipeline.get_by_name(sink_name)
+                if appsink is None:
+                    raise RuntimeError(f"{sink_name} not found")
+                appsinks[model_key] = appsink
+
+            ret = pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("pipeline failed to enter PLAYING state")
+
+            self.connected = True
+            self._set_decode_pipeline(
+                "dx_stream_rtsp",
+                shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
+                pid="inproc",
+                cmd=self._pipeline_text(desc),
+                extra=(
+                    f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
+                    f"latency_ms={latency_ms} protocols={protocols} fps_limit={fps_limit or '-'} "
+                    f"models={','.join(model_key for model_key, _ in model_configs)}"
+                )
+            )
+            self._decode_mode_logged = True
+            self.last_t = time.time()
+            first_frame_logged = False
+            timeout_ns = int(float((SYS_CFG.get("dx_stream", {}) or {}).get("appsink_timeout_sec", 2.0)) * 1_000_000_000)
+
+            while self.running:
+                samples = {}
+                for model_key, appsink in appsinks.items():
+                    sample = self._pull_dxstream_sample(appsink, timeout_ns)
+                    if sample is None:
+                        self._log_dxstream_bus_messages(Gst, pipeline)
+                        if time.time() - self.last_t > WATCHDOG_TIMEOUT:
+                            self._note_decode_failure(
+                                f"dxstream_{model_key.lower()}_timeout_{WATCHDOG_TIMEOUT:.0f}s",
+                                level="error"
+                            )
+                            return True
+                        break
+                    samples[model_key] = sample
+                if len(samples) != len(appsinks):
+                    continue
+
+                main_sample = samples.get("MAIN")
+                frame, width, height = self._sample_to_bgr_frame(Gst, main_sample)
+                if frame is None:
+                    self._note_decode_failure("dxstream_sample_map_failed", level="error")
+                    break
+
+                dets_by_model = {}
+                for model_key, sample in samples.items():
+                    out_buffer = sample.get_buffer()
+                    meta = pydxs.dx_get_frame_meta(hash(out_buffer))
+                    if model_key == "MAIN":
+                        det_width, det_height = width, height
+                    else:
+                        caps = sample.get_caps()
+                        structure = caps.get_structure(0) if caps is not None and caps.get_size() > 0 else None
+                        det_width = int(structure.get_value("width") or width) if structure is not None else width
+                        det_height = int(structure.get_value("height") or height) if structure is not None else height
+                    dets_by_model[model_key] = dx_stream_objects_to_detections(meta, 0.0, det_width, det_height)
+
+                with self.lock:
+                    self.frame = frame
+                    self.main_dets = dets_by_model.get("MAIN")
+                    self.helmet_dets = dets_by_model.get("HELMET")
+                    self.fid += 1
+                    self.last_t = time.time()
+                self._note_decode_frame(frame.nbytes, f"{width}x{height}")
+
+                if not first_frame_logged:
+                    self._emit_decode_log(
+                        f"[DXSTREAM READY] CAM:{self.ip} first_frame shape={width}x{height} "
+                        f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
+                        f"models={','.join(appsinks.keys())}"
+                    )
+                    first_frame_logged = True
+
+            return True
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] dx_stream RTSP pipe failed: {e}")
+            self._log_dxstream_bus_messages(Gst, pipeline) if pipeline is not None else None
+            return False
+        finally:
+            self.connected = False
+            with self.lock:
+                self.main_dets = None
+                self.helmet_dets = None
+            if pipeline is not None:
+                try:
+                    pipeline.set_state(Gst.State.NULL)
+                except Exception:
+                    pass
 
     def _run_gstreamer_pipe(self):
         info = self._probe_stream_info()
@@ -3561,6 +3932,8 @@ class FrameReader:
                 fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
                 with self.lock:
                     self.frame = fr
+                    self.main_dets = None
+                    self.helmet_dets = None
                     self.fid += 1
                     self.last_t = time.time()
                 self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
@@ -3648,6 +4021,8 @@ class FrameReader:
                 fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
                 with self.lock:
                     self.frame = fr
+                    self.main_dets = None
+                    self.helmet_dets = None
                     self.fid += 1
                     self.last_t = time.time()
                 self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
@@ -3670,6 +4045,15 @@ class FrameReader:
 
     def _run(self):
         while self.running:
+            if self._should_use_dxstream_main_pipe():
+                used_dxstream_pipe = self._run_dxstream_main_pipe()
+                if used_dxstream_pipe:
+                    continue
+                if not self.decode_cfg.get("fallback_to_cpu", True):
+                    time.sleep(5)
+                    continue
+                logger.warning(f"[CAM:{self.ip}] dx_stream RTSP pipe unavailable; trying GStreamer/FFmpeg fallback")
+
             if self._should_use_gstreamer_pipe():
                 used_gstreamer_pipe = self._run_gstreamer_pipe()
                 if used_gstreamer_pipe:
@@ -3716,6 +4100,8 @@ class FrameReader:
                         fr = cv2.resize(fr, (720, int(fr.shape[0] * ratio)), interpolation=cv2.INTER_NEAREST)
                     with self.lock:
                         self.frame = fr
+                        self.main_dets = None
+                        self.helmet_dets = None
                         self.fid += 1
                         self.last_t = time.time()
                     self._note_decode_frame(fr.nbytes, f"{fr.shape[1]}x{fr.shape[0]}")
@@ -3727,7 +4113,7 @@ class FrameReader:
 
     def read(self):
         with self.lock:
-            return self.frame, self.fid, self.connected
+            return self.frame, self.fid, self.connected, self.main_dets, self.helmet_dets
 
 class Camera:
     def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, det_plate, cam_id, event_inference_mode="separate"):
@@ -3747,7 +4133,14 @@ class Camera:
         self.trk_helmet = SimpleTracker()
         self.trk_signalman = SimpleTracker()
 
-        self.reader = FrameReader(conf.get('url', ''), ip)
+        self.reader = FrameReader(
+            conf.get('url', ''),
+            ip,
+            main_model_path=getattr(det_main, "engine_path", None),
+            helmet_model_path=getattr(det_helmet, "engine_path", None),
+            enable_dxstream_main=bool(self.events),
+            enable_dxstream_helmet=("no_helmet" in self.events)
+        )
         self.recorder = VideoRecorder(ip, cam_id=self.cam_id)
         self.motion_det = MotionDetector()
 
@@ -4101,9 +4494,9 @@ class Camera:
         print(f"[CCTV_Aligner] CAM {self.cam_id} {self.align_status_text}")
         logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
     def process_frame(self):
-        fr, fid, connected = self.reader.read()
+        fr, fid, connected, main_dets, helmet_dets = self.reader.read()
         # [수정] 원본 영상을 바로 Recorder에 밀어넣지 않습니다. (run_logic에서 렌더링 후 삽입)
-        return fr, fid, connected
+        return fr, fid, connected, main_dets, helmet_dets
 
     def apply_face_blur(self, frame, person_boxes, return_meta=False):
         if frame is None or self.det_face is None:
@@ -5031,9 +5424,12 @@ def main():
     logger.info(f"[Retention] 산출물 보관 정책: {output_retention_days:g}일 보관, {output_cleanup_interval_sec / 3600.0:.1f}시간마다 정리")
     run_output_retention_cleanup(output_retention_days)
 
-    def run_camera_inference(cam, fr):
+    def run_camera_inference(cam, fr, main_dets=None, helmet_dets=None):
         base_conf = min(main_conf, person_conf, signalman_conf)
-        raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
+        if main_dets is None:
+            raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
+        else:
+            raw_dets = main_dets
         t_main_input, _, d_signalman_res = split_unified_event_detections(
             raw_dets,
             cam.events,
@@ -5045,7 +5441,10 @@ def main():
 
         d_helmet_res = np.empty((0, 6))
         if "no_helmet" in cam.events:
-            d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
+            if helmet_dets is None:
+                d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
+            else:
+                d_helmet_res = helmet_dets
 
         return t_main_input, d_helmet_res, d_signalman_res
 
@@ -5111,12 +5510,18 @@ def main():
             inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
             for idx, res in enumerate(raw_data):
-                fr, _, connected = res
+                fr, _, connected, main_dets, helmet_dets = res
                 if connected and fr is not None and cams[idx].events:
-                    inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
+                    inference_futures[idx] = inference_executor.submit(
+                        run_camera_inference,
+                        cams[idx],
+                        fr,
+                        main_dets,
+                        helmet_dets
+                    )
 
             for idx, res in enumerate(raw_data):
-                fr, fid, connected = res
+                fr, fid, connected, main_dets, helmet_dets = res
 
                 if connected and fr is not None and loop_count % 100 == 0:
                     try:
@@ -5152,9 +5557,12 @@ def main():
                 now_fps_log = time.time()
                 cam_ip = cams[idx].ip
                 if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
+                    helmet_meta_source = "reader" if helmet_dets is not None else ("detector" if "no_helmet" in cams[idx].events else "-")
                     print(
                         f"[POST INFER FPS] CAM:{cams[idx].cam_id}({cam_ip}) "
                         f"current_fps={cams[idx].current_fps:.1f} fid={fid} "
+                        f"main_meta={'reader' if main_dets is not None else 'detector'} "
+                        f"helmet_meta={helmet_meta_source} "
                         f"connected={connected} events={','.join(cams[idx].events) or '-'}",
                         flush=True
                     )
