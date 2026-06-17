@@ -1,8 +1,10 @@
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/yolov8m-face_ppu.dxnn
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/helmet_3cls_v8_ppu.dxnn
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/hanjin_cctv_ppu.dxnn
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/yolov8m-face.dxnn
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/helmet_3cls_v8.dxnn
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/hanjin_cctv.dxnn
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/signalman.dxnn
-wget https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector.dxnn
+wget -O yolov8m-face_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/yolov8m-face_ppu.dxnn
+wget -O helmet_3cls_v8_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/helmet_3cls_v8_ppu.dxnn
+wget -O hanjin_cctv_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/hanjin_cctv_ppu.dxnn
+wget -O hanjin_cctv_v2.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/hanjin_cctv_v2.dxnn
+wget -O yolov8m-face.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/yolov8m-face.dxnn
+wget -O helmet_3cls_v8.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/helmet_3cls_v8.dxnn
+wget -O hanjin_cctv.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/hanjin_cctv.dxnn
+wget -O signalman.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/signalman.dxnn
+wget -O license_plate_detector.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector.dxnn
+wget -O license_plate_detector_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector_ppu.dxnn

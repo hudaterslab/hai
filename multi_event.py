@@ -3,6 +3,8 @@ import sys
 import gc
 import json
 import csv
+import shutil
+import subprocess
 import cv2
 import math
 import numpy as np
@@ -19,6 +21,7 @@ import concurrent.futures
 import re
 import requests
 import pytz
+from fractions import Fraction
 from urllib.parse import urlsplit, unquote
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
 import argparse
@@ -39,7 +42,7 @@ SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 WATCHDOG_TIMEOUT = 30.0
 
-# YOLOv8 클래스 ID 정의 (hanjin_cctv.dxnn 기준)
+# YOLOv8 클래스 ID 정의 (hanjin_cctv_v2.dxnn 기준)
 ID_H_HELMET = 0
 ID_H_NO_HELMET = 1
 ID_G_PERSON = 2
@@ -55,22 +58,42 @@ DEBUG_MODE = False
 # ROI 보정(Aligner) 튜닝 파라미터
 # ------------------------------------------------------------
 ALIGN_INTERVAL_SEC = 300.0
-ORB_FEATURES = 1500
-MIN_GOOD_MATCHES = 20
-MIN_INLIERS = 12
-MIN_INLIER_RATIO = 0.25
+ORB_FEATURES = 800
+MIN_HOMOGRAPHY_ATTEMPT_MATCHES = 30
+MIN_GOOD_MATCHES = 180
+MIN_INLIERS = 140
+MIN_INLIER_RATIO = 0.75
 RANSAC_REPROJ_THRESH = 5.0
 TRACKING_UPDATE_MIN_INTERVAL_SEC = 2.0
 TRACKING_UPDATE_MIN_INLIERS = 25
 TRACKING_UPDATE_MIN_INLIER_RATIO = 0.35
 ANCHOR_DIRECT_CHECK_INTERVAL_SEC = 15.0
-ANCHOR_DIRECT_MIN_INLIERS = 30
-ANCHOR_DIRECT_MIN_INLIER_RATIO = 0.35
-MAX_CORNER_SHIFT_RATIO = 0.45
 MAX_SCALE_CHANGE = 0.45
 MAX_PERSPECTIVE_ABS = 0.003
 HOMOGRAPHY_IDENTITY_ATOL = 1e-3
 ROI_APPLY_MIN_SHIFT_PX = 5.0
+ROI_DRIFT_THRESHOLD_PX = 15.0
+ROI_DRIFT_CONFIRM_COUNT = 3
+ALIGN_UNKNOWN_CONFIRM_COUNT = 3
+ANCHOR_REFRESH_UNKNOWN_COUNT = 3
+FEATURE_MASK_PADDING_RATIO = 0.08
+IR_SAT_MEAN_THRESHOLD = 25.0
+IR_CHANNEL_DIFF_THRESHOLD = 12.0
+IR_COLORFULNESS_THRESHOLD = 18.0
+ANCHOR_BASE = "base"
+ANCHOR_UPDATED = "updated"
+ANCHOR_SLOT_NAMES = (ANCHOR_BASE, ANCHOR_UPDATED)
+ROI_ALIGN_CSV_LOG_FILE = os.path.join(PROJECT_ROOT, "logs", "roi_align", "roi_align_decisions.csv")
+ROI_ALIGN_CAMERA_LOG_DIR = os.path.join(PROJECT_ROOT, "logs", "roi_align", "by_camera")
+ROI_ALIGN_LEARNING_DEFAULTS = {
+    "threshold_px": ROI_DRIFT_THRESHOLD_PX,
+    "confirm_count_required": ROI_DRIFT_CONFIRM_COUNT,
+    "min_inliers": MIN_INLIERS,
+    "min_inlier_ratio": MIN_INLIER_RATIO,
+    "alignment_unknown_confirm_count": ALIGN_UNKNOWN_CONFIRM_COUNT,
+    "anchor_refresh_unknown_count": ANCHOR_REFRESH_UNKNOWN_COUNT,
+    "stable_low_quality_min_inlier_ratio": 0.8,
+}
 
 MIN_APPLY_TRANSLATION_PX = 5.0
 MIN_APPLY_ROTATION_DEG = 0.5
@@ -118,12 +141,10 @@ def load_system_config():
             }
         },
         "models": {
-            "UNIFIED": "signalman.dxnn",
-            "MAIN": "hanjin_cctv.dxnn",
-            "FACE": "yolov8m-face.dxnn",
-            "HELMET": "helmet_3cls_v8.dxnn",
-            "SIGNALMAN": "signalman.dxnn",
-            "PLATE": "license_plate_detector.dxnn"
+            "MAIN": "hanjin_cctv_v2.dxnn",
+            "FACE": "yolov8m-face_ppu.dxnn",
+            "HELMET": "helmet_3cls_v8_ppu.dxnn",
+            "PLATE": "license_plate_detector_ppu.dxnn"
         },
         "model_confidences": {
             "MAIN": 0.6,
@@ -133,10 +154,35 @@ def load_system_config():
             "SIGNALMAN": 0.5,
             "PLATE": 0.1
         },
-        "INFERENCE_MODE": "auto",  # auto: 통합 모델 파일이 있으면 단일 모델, 없으면 기존 별도 모델
+        "model_output_formats": {
+            "MAIN": "ppu",
+            "FACE": "auto",
+            "HELMET": "auto",
+            "PLATE": "auto"
+        },
+        "model_engine_pool_sizes": {
+            "MAIN": 3,
+            "FACE": 1,
+            "HELMET": 1,
+            "PLATE": 1
+        },
+        "video_decode": {
+            "backend": "gstreamer",
+            "hw_acceleration": "auto",
+            "hw_device": "/dev/dri/renderD128",
+            "vaapi_driver": "iHD",
+            "fallback_to_cpu": True,
+            "fps_limit": 15.0,
+            "gstreamer_latency_ms": 50,
+            "gstreamer_protocols": "tcp",
+            "log_interval_sec": 10.0,
+            "print_pipeline_logs": True
+        },
+        "INFERENCE_MODE": "auto",  # compatibility setting; event inference uses MAIN model detections
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
         "LOOP_FPS": 15,
+        "PERF_LOG_INTERVAL_SEC": 10.0,
         "REC_PRE_SEC": 10,
         "REC_POST_SEC": 10,
         "EVENT_FRAME_SAVE_DELAY_SEC": 10.0,
@@ -169,6 +215,29 @@ def resolve_model_path(model_path):
     if os.path.isabs(model_path):
         return model_path
     return os.path.join(PROJECT_ROOT, model_path)
+
+def get_model_output_format(model_key):
+    formats = SYS_CFG.get("model_output_formats", {})
+    return str(formats.get(model_key, "auto")).strip().lower()
+
+def get_main_model_output_format(model_path):
+    fmt = get_model_output_format("MAIN")
+    model_name = os.path.basename(str(model_path or "")).lower()
+    if model_name == "hanjin_cctv_v2.dxnn":
+        if fmt != "ppu":
+            logger.warning(
+                f"[DeepX] MAIN model {model_name} requires PPU decode. "
+                f"Ignoring configured output_format={fmt}."
+            )
+        return "ppu"
+    return fmt
+
+def get_model_engine_pool_size(model_key, default=1):
+    sizes = SYS_CFG.get("model_engine_pool_sizes", {})
+    try:
+        return max(1, int(sizes.get(model_key, default)))
+    except Exception:
+        return max(1, int(default))
 
 def detection_array(rows):
     """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
@@ -208,6 +277,60 @@ def split_unified_event_detections(raw_dets, events, main_conf, person_conf, hel
         detection_array(d_signalman_res_list),
     )
 
+def create_roi_snapshot(cam, frame):
+    """현재 카메라 프레임에 ROI와 설정된 이벤트 명만 그립니다."""
+    if frame is None: return None
+    img = frame.copy()
+
+    # 1. ROI Polygon 그리기
+    if cam.roi_poly and len(cam.roi_poly) > 2:
+        cv2.polylines(img, [np.array(cam.roi_poly, np.int32)], True, (0, 255, 255), 2)
+
+    # 2. ROI Line 그리기
+    if cam.roi_lines:
+        for i in range(0, len(cam.roi_lines), 2):
+            if i + 1 < len(cam.roi_lines):
+                cv2.line(img, tuple(cam.roi_lines[i]), tuple(cam.roi_lines[i+1]), (0, 0, 255), 2)
+
+    # 3. 설정된 이벤트 명 좌측 상단에 표시
+    y_pos = 30
+    for evt in cam.events:
+        display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
+        cv2.putText(img, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        y_pos += 30
+
+    return img
+
+def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
+    """관제 서버로 1시간 주기 ROI 스냅샷을 백그라운드에서 전송합니다."""
+    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
+    try:
+        # 이미지를 메모리 상에서 JPEG 바이너리로 인코딩
+        _, img_encoded = cv2.imencode('.jpg', img)
+
+        data = {
+            "terminalId": str(terminal_id),
+            "cctvId": int(cam_id),
+            "imageWidth": int(w),
+            "imageHeight": int(h),
+            "cctvServerId": "1",
+            "isReqRoiSetup": "false",
+            "roiInfo": roi_info_str
+        }
+
+        files = {
+            "image": (f"snapshot_cam{cam_id}.jpg", img_encoded.tobytes(), "image/jpeg")
+        }
+
+        resp = requests.post(url, data=data, files=files, verify=False, timeout=15)
+
+        if resp.status_code == 200:
+            logger.info(f"?? [ROI Snapshot] CAM:{cam_id} 1시간 주기 스냅샷 전송 성공")
+        else:
+            logger.error(f"?? [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        logger.error(f"?? [ROI Snapshot] CAM:{cam_id} 전송 실패: {e}")
+
 # ==========================================
 # [2] 로깅 시스템 초기화
 # ==========================================
@@ -244,7 +367,7 @@ def graceful_shutdown():
             LOG_LISTENER.stop()
         except Exception:
             pass
-    print("🔄 [SYSTEM] 백그라운드 I/O 작업을 안전하게 마무리하고 종료합니다...")
+    print("?? [SYSTEM] 백그라운드 I/O 작업을 안전하게 마무리하고 종료합니다...")
     try:
         IMAGE_SAVER_POOL.shutdown(wait=True)
     except Exception:
@@ -322,7 +445,7 @@ try:
     from dx_engine import InferenceEngine, InferenceOption
     HAS_DX_ENGINE = True
 except ImportError:
-    logger.warning("💡 [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
+    logger.warning("?? [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
 
 # ==========================================
 # [4] 공통 유틸리티 함수
@@ -535,13 +658,13 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
             response = requests.post(url, data=data, files=files, verify=False, timeout=10)
 
             if response.status_code == 200:
-                logger.info(f"🌐 [API 전송 성공] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name}")
+                logger.info(f"?? [API 전송 성공] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name}")
             else:
-                logger.error(f"⚠️ [API 전송 실패] 상태코드: {response.status_code} | 메시지: {response.text}")
+                logger.error(f"?? [API 전송 실패] 상태코드: {response.status_code} | 메시지: {response.text}")
     except requests.exceptions.RequestException as e:
-        logger.error(f"⚠️ [API 네트워크 예외 발생]: {e}")
+        logger.error(f"?? [API 네트워크 예외 발생]: {e}")
     except Exception as e:
-        logger.error(f"⚠️ [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
+        logger.error(f"?? [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
 def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_tokens=None):
     """Create an API-only image with event boxes drawn on top."""
@@ -575,16 +698,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
 
         label = str(event_type)
-        # [수정] Confidence(Score) 표출 제거 및 Class ID 표출 적용
-        # if class_id is not None:
-            # label = f"{label_name}(ID:{class_id})"
-            # label = f"{label_name}"
-        # else:
-        #     label = label_name
-
-        # if obj_tid is not None:
-        #     label = f"{label} #{obj_tid}"
-        # 고객사 요청으로  Image Label은 이벤트 명만 표시
+        # 고객사 요청으로 API 전송 이미지 라벨은 이벤트 명만 표시합니다.
         text_y = max(20, y1 - 8)
         cv2.putText(api_img, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         drawn = True
@@ -604,7 +718,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         overlay = api_img.copy()
         cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
-        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(api_img, "Signalman Auth [EVIDENCE]", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if not auth_tokens:
             cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -685,9 +799,11 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         if objects_meta:
             ai_detected_bboxes = []
             for o in objects_meta:
+                if event_type == "conveyor_crossing" and str(o.get('label', '')).lower() == 'low_body':
+                    continue
                 item = {
                     "box": [int(b) for b in o['box']],
-                    "label": str(event_type),
+                    "label": str(o['label']),
                     "score": round(float(o.get('score', 0.95)), 2)
                 }
                 if o.get('tid') is not None:
@@ -722,21 +838,93 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
 # [6] DeepX NPU 모델 추론 (YOLOv8 버그 픽스 반영)
 # ==========================================
 class YoLoDeepX:
-    def __init__(self, engine_path):
-        # [수정] 객체 생성 시점에 NPU 환경인지 체크하여 안전하게 방어
+    def __init__(self, engine_path, output_format="auto", pool_size=1):
         if not HAS_DX_ENGINE:
-            raise RuntimeError("dx_engine이 설치되지 않은 서버/PC 환경에서는 YoLoDeepX(NPU) 객체를 생성할 수 없습니다.")
+            raise RuntimeError("dx_engine is not installed; YoLoDeepX can only run on a DeepX/NPU runtime.")
 
         self.engine_path = engine_path
+        self.output_format = self._resolve_output_format(output_format)
+        self.pool_size = max(1, int(pool_size or 1))
+        self.engine_pool = queue.Queue(maxsize=self.pool_size)
+        self.engines_ref = []
+        self.input_height = 640
+        self.input_width = 640
+        self.input_layout = "hwc"
+        self.input_has_batch = False
+
         try:
             io = InferenceOption()
-            self.engine = InferenceEngine(self.engine_path, io)
-            logger.info(f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)}")
+            for _ in range(self.pool_size):
+                engine = InferenceEngine(self.engine_path, io)
+                self.engine_pool.put(engine)
+                self.engines_ref.append(engine)
+
+            self._load_input_shape(self.engines_ref[0])
+            logger.info(
+                f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)} "
+                f"(output={self.output_format}, pool={self.pool_size}, "
+                f"input={self.input_width}x{self.input_height}, layout={self.input_layout})"
+            )
         except Exception as e:
             logger.error(f"[DeepX Load Fail] 엔진 초기화 실패 ({engine_path}): {e}")
             raise e
 
-    def letter_box(self, img, new_shape=(640,640)):
+    def __del__(self):
+        self.release()
+
+    def release(self):
+        while hasattr(self, "engine_pool") and not self.engine_pool.empty():
+            try:
+                self.engine_pool.get_nowait()
+            except Exception:
+                break
+        for engine in getattr(self, "engines_ref", []):
+            try:
+                del engine
+            except Exception:
+                pass
+        self.engines_ref = []
+
+    def _resolve_output_format(self, output_format):
+        fmt = str(output_format or "auto").strip().lower()
+        if fmt in ["", "auto"]:
+            model_name = os.path.basename(str(self.engine_path or "")).lower()
+            return "ppu" if "_ppu" in model_name or "-ppu" in model_name else "yolo"
+        if fmt in ["ppu", "deepx_ppu", "yolov8_ppu"]:
+            return "ppu"
+        if fmt in ["yolo", "yolov8", "raw", "standard", "raw_yolo"]:
+            return "yolo"
+        logger.warning(f"[DeepX] 알 수 없는 모델 출력 포맷({output_format})입니다. yolo 후처리로 동작합니다.")
+        return "yolo"
+
+    def _load_input_shape(self, engine):
+        try:
+            input_info = engine.get_input_tensors_info()
+            shape = list(input_info[0].get("shape", []))
+        except Exception as e:
+            logger.warning(f"[DeepX] 입력 텐서 shape 확인 실패. 640x640 기본값을 사용합니다: {e}")
+            return
+
+        if len(shape) == 4:
+            self.input_has_batch = True
+            if shape[-1] in [1, 3, 4]:
+                self.input_layout = "nhwc"
+                self.input_height, self.input_width = int(shape[1]), int(shape[2])
+            elif shape[1] in [1, 3, 4]:
+                self.input_layout = "nchw"
+                self.input_height, self.input_width = int(shape[2]), int(shape[3])
+        elif len(shape) == 3:
+            self.input_has_batch = False
+            if shape[-1] in [1, 3, 4]:
+                self.input_layout = "hwc"
+                self.input_height, self.input_width = int(shape[0]), int(shape[1])
+            elif shape[0] in [1, 3, 4]:
+                self.input_layout = "chw"
+                self.input_height, self.input_width = int(shape[1]), int(shape[2])
+
+    def letter_box(self, img, new_shape=None):
+        if new_shape is None:
+            new_shape = (self.input_height, self.input_width)
         h, w = img.shape[:2]
         scale = min(new_shape[0]/h, new_shape[1]/w)
         nw, nh = int(w*scale), int(h*scale)
@@ -748,6 +936,19 @@ class YoLoDeepX:
         canvas[dh:dh+nh, dw:dw+nw] = resized
 
         return canvas, scale, (dw, dh)
+
+    def _prepare_input_tensor(self, npu_input):
+        input_tensor = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+
+        # Keep the historical HWC path for standard YOLO models. PPU models are
+        # stricter about matching the SDK-reported input shape.
+        if self.output_format == "ppu":
+            if self.input_layout in ["nchw", "chw"]:
+                input_tensor = np.transpose(input_tensor, (2, 0, 1))
+            if self.input_has_batch:
+                input_tensor = np.expand_dims(input_tensor, axis=0)
+
+        return np.ascontiguousarray(input_tensor, dtype=np.uint8)
 
     def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
         try:
@@ -797,19 +998,79 @@ class YoLoDeepX:
             logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
             return []
 
+    def postprocess_ppu(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+        try:
+            raw_data = output_tensor[0]
+            if isinstance(raw_data, bytes):
+                flat = np.frombuffer(raw_data, dtype=np.uint8).copy()
+            else:
+                flat = np.ascontiguousarray(raw_data).view(np.uint8).ravel().copy()
+
+            if len(flat) == 0:
+                return []
+
+            stride = 32
+            if len(flat) % stride != 0:
+                logger.error(f"[DeepX PPU] 출력 버퍼 길이({len(flat)})가 {stride}의 배수가 아닙니다.")
+                return []
+
+            flat_stride = flat.reshape(len(flat) // stride, stride)
+            boxes_raw = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(-1, 4)
+            scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
+            labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+
+            mask = scores >= conf_thres
+            if not np.any(mask):
+                return []
+
+            boxes_raw = boxes_raw[mask]
+            scores = scores[mask]
+            labels = labels[mask]
+
+            cx = boxes_raw[:, 0]
+            cy = boxes_raw[:, 1]
+            bw = boxes_raw[:, 2]
+            bh = boxes_raw[:, 3]
+
+            x1 = cx - bw * 0.5
+            y1 = cy - bh * 0.5
+            x2 = cx + bw * 0.5
+            y2 = cy + bh * 0.5
+
+            max_wh = 7680
+            class_offset = labels.astype(np.float32) * max_wh
+            boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, bw, bh])
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+            if indices is None or len(indices) == 0:
+                return []
+
+            results = []
+            for i in np.array(indices).reshape(-1):
+                results.append([[x1[i], y1[i], x2[i], y2[i]], scores[i], labels[i]])
+
+            return results
+        except Exception as e:
+            logger.error(f"NPU PPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
+
     def infer(self, img, conf_override=None):
         if img is None:
             return np.empty((0,6))
 
         h_orig, w_orig = img.shape[:2]
         npu_input, scale, offset = self.letter_box(img)
-        npu_input_rgb = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+        input_tensor = self._prepare_input_tensor(npu_input)
+        engine = self.engine_pool.get()
 
         try:
-            output_tensor = self.engine.run([npu_input_rgb])
+            output_tensor = engine.run([input_tensor])
 
             thres = conf_override if conf_override is not None else 0.40
-            raw_dets = self.postprocess(output_tensor, conf_thres=thres)
+            if self.output_format == "ppu":
+                raw_dets = self.postprocess_ppu(output_tensor, conf_thres=thres)
+            else:
+                raw_dets = self.postprocess(output_tensor, conf_thres=thres)
 
             if not raw_dets:
                 return np.empty((0,6))
@@ -825,10 +1086,12 @@ class YoLoDeepX:
 
                 res.append([x1, y1, x2, y2, score, cls_id])
 
-            return np.array(res)
+            return np.array(res, dtype=float)
         except Exception as e:
             logger.error(f"NPU Inference Error: {e}")
             return np.empty((0,6))
+        finally:
+            self.engine_pool.put(engine)
 
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
@@ -895,16 +1158,24 @@ class SimpleTracker:
         return np.array(res_tracks)
 
 class VideoRecorder:
-    def __init__(self, ip):
+    def __init__(self, ip, cam_id=None):
         self.ip = ip
+        self.cam_id = cam_id if cam_id is not None else "-"
         self.fps = SYS_CFG.get("REC_FPS", 3)
-        self.buffer = deque(maxlen=self.fps * SYS_CFG.get("REC_PRE_SEC", 10))
+        self.pre_sec = SYS_CFG.get("REC_PRE_SEC", 10)
+        self.buffer = deque(maxlen=max(1, int(self.fps * self.pre_sec)))
         self.write_queue = queue.Queue()
 
         self.recording = False
         self.record_end_time = 0
         self.current_event = "unknown"
         self.running = True
+        logger.info(
+            f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:init | "
+            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:0.0 | "
+            f"Frames -> recorder pre-buffer max={self.buffer.maxlen} "
+            f"(REC_FPS={self.fps}, REC_PRE_SEC={self.pre_sec})"
+        )
 
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
@@ -922,18 +1193,18 @@ class VideoRecorder:
             if time.time() > self.record_end_time:
                 self.recording = False
                 self.write_queue.put(None)
-                logger.info(f"🎬 [녹화종료] {self.ip} - {self.current_event}")
+                logger.info(f"?? [녹화종료] {self.ip} - {self.current_event}")
             else:
                 self.write_queue.put(frame_item)
 
-    def trigger(self, event_name, objects_meta=None, event_meta=None): # [수정] objects_meta 매개변수 추가
+    def trigger(self, event_name, objects_meta=None, event_meta=None, current_fps=0.0): # [수정] objects_meta 매개변수 추가
         now = time.time()
         post_sec = SYS_CFG.get("REC_POST_SEC", 10)
 
         if self.recording:
             self.record_end_time = now + post_sec
         else:
-            logger.info(f"🎥 [녹화시작] {self.ip} - {event_name}")
+            logger.info(f"? [녹화시작] {self.ip} - {event_name}")
             self.recording = True
             self.record_end_time = now + post_sec
             self.current_event = event_name
@@ -942,6 +1213,18 @@ class VideoRecorder:
             self.current_meta = event_meta if event_meta is not None else objects_meta
 
             temp_buffer = list(self.buffer)
+            tids = []
+            if objects_meta:
+                for obj in objects_meta:
+                    obj_tid = obj.get("tid")
+                    if obj_tid is not None:
+                        tids.append(str(obj_tid))
+            tid_text = ",".join(tids) if tids else "-"
+            logger.info(
+                f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:{event_name} | "
+                f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid_text} | FPS:{current_fps:.1f} | "
+                f"Frames -> recorder pre-buffer kept={len(temp_buffer)}/{self.buffer.maxlen}"
+            )
             for item in temp_buffer:
                 self.write_queue.put(item)
 
@@ -999,9 +1282,9 @@ class VideoRecorder:
                     try:
                         with open(meta_path, 'w', encoding='utf-8') as f_meta:
                             json.dump(to_json_safe(self.current_meta), f_meta, indent=4, ensure_ascii=False)
-                        logger.info(f"📝 [BBox 데이터 저장 완료] 경로: {meta_path}")
+                        logger.info(f"?? [BBox 데이터 저장 완료] 경로: {meta_path}")
                     except Exception as e:
-                        logger.error(f"⚠️ BBox JSON 메타데이터 저장 실패: {e}")
+                        logger.error(f"?? BBox JSON 메타데이터 저장 실패: {e}")
                 # -----------------------------------------------------------
 
                 h, w = frame.shape[:2]
@@ -2224,10 +2507,196 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
 # [10] 카메라 제어 (FrameReader / Camera)
 # ==========================================
 
+class ROIAlignLearningStore:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = {"cameras": {}}
+        self.roi_setup_reported = self._load_reported_from_csv()
+
+    def _load_reported_from_csv(self, path=ROI_ALIGN_CSV_LOG_FILE):
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    requested = str(row.get("healthcheck_requested", "")).strip().lower()
+                    if requested in ("true", "1", "yes", "y"):
+                        return True
+        except Exception as e:
+            logger.warning(f"[ROI DRIFT] CSV state load failed: {e}")
+        return False
+
+    def append_csv_log(self, row, path=ROI_ALIGN_CSV_LOG_FILE):
+        fieldnames = [
+            "timestamp", "camera_key", "decision", "current_threshold_px", "expected_move_px",
+            "match_status", "good_matches", "inliers", "inlier_ratio",
+            "masked_objects",
+            "light_mode", "anchor_light_mode", "light_mode_changed", "light_mode_source",
+            "sat_mean", "channel_diff_mean", "colorfulness",
+            "anchor_update", "over_count", "alignment_unknown_count", "confirmed", "healthcheck_requested", "reason"
+        ]
+
+        def write_one_csv(target_path):
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
+            if exists:
+                try:
+                    with open(target_path, "r", newline="", encoding="utf-8") as f:
+                        current_header = (f.readline() or "").strip().split(",")
+                    if current_header != fieldnames:
+                        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        os.replace(target_path, f"{target_path}.bak_header_{stamp}")
+                        exists = False
+                except Exception as e:
+                    logger.warning(f"[ROI DRIFT] CSV header check failed: {e}")
+            with open(target_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not exists:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+        try:
+            write_one_csv(path)
+
+            camera_key = str(row.get("camera_key", "") or "unknown_cam")
+            safe_camera_key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", camera_key).strip("_") or "unknown_cam"
+            camera_path = os.path.join(ROI_ALIGN_CAMERA_LOG_DIR, f"{safe_camera_key}.csv")
+            write_one_csv(camera_path)
+        except Exception as e:
+            logger.warning(f"[ROI DRIFT] CSV log append failed: {e}")
+
+    def _now_iso(self):
+        kst = pytz.timezone("Asia/Seoul")
+        return datetime.datetime.now(kst).replace(microsecond=0).isoformat()
+
+    def _camera_params(self, camera_key, camera_conf):
+        params = dict(ROI_ALIGN_LEARNING_DEFAULTS)
+        sys_cfg = SYS_CFG.get("roi_align_learning", {}) or {}
+        params.update(sys_cfg.get("defaults", {}) or {})
+        params.update((sys_cfg.get("cameras", {}) or {}).get(camera_key, {}) or {})
+        params.update((camera_conf or {}).get("roi_align_learning", {}) or {})
+        return params
+
+    def _ensure_camera_locked(self, camera_key, camera_conf):
+        state = self.data.setdefault("cameras", {}).setdefault(camera_key, {})
+        params = self._camera_params(camera_key, camera_conf)
+        params["confirm_count_required"] = int(params.get("confirm_count_required", ROI_DRIFT_CONFIRM_COUNT))
+        state.setdefault("pending_outliers", [])
+        state.setdefault("consecutive_over_threshold", 0)
+        state.setdefault("consecutive_alignment_unknown", 0)
+        state["params"] = params
+        return state, params
+
+    def record_check(self, camera_key, camera_conf, shift_px, ok, debug):
+        with self.lock:
+            state, params = self._ensure_camera_locked(camera_key, camera_conf)
+            now_iso = self._now_iso()
+            state["last_checked_at"] = now_iso
+
+            threshold = float(params.get("threshold_px", ROI_DRIFT_THRESHOLD_PX))
+            inliers = int((debug or {}).get("inliers", 0) or 0)
+            ratio = float((debug or {}).get("inlier_ratio", 0.0) or 0.0)
+            quality_ok = bool(ok and inliers >= int(params.get("min_inliers", 30)) and ratio >= float(params.get("min_inlier_ratio", 0.35)))
+            status = str((debug or {}).get("status", ""))
+            alignment_unknown = status.startswith("alignment_unknown")
+            shift_px = float(shift_px or 0.0)
+            stable_low_quality = bool(
+                shift_px <= threshold
+                and ratio >= float(params.get("stable_low_quality_min_inlier_ratio", 0.80))
+            )
+
+            def _result(decision, confirmed=False, over_count=None, alignment_unknown_count=None):
+                return {
+                    "decision": decision,
+                    "threshold": threshold,
+                    "confirmed": bool(confirmed),
+                    "over_count": int(
+                        state.get("consecutive_over_threshold", 0)
+                        if over_count is None
+                        else over_count
+                    ),
+                    "alignment_unknown_count": int(
+                        state.get("consecutive_alignment_unknown", 0)
+                        if alignment_unknown_count is None
+                        else alignment_unknown_count
+                    ),
+                    "confirm_count_required": int(params.get("confirm_count_required", ROI_DRIFT_CONFIRM_COUNT)),
+                    "pending_outlier_count": int(len(state.get("pending_outliers", []) or []))
+                }
+
+            if not quality_ok:
+                if stable_low_quality:
+                    state["pending_outliers"] = []
+                    state["consecutive_over_threshold"] = 0
+                    state["consecutive_alignment_unknown"] = 0
+                    state["last_decision"] = "normal"
+                    state["last_shift_px"] = shift_px
+                    state["last_debug"] = debug or {}
+                    if isinstance(debug, dict):
+                        debug["quality_override"] = "stable_low_quality_small_shift"
+                    return _result("normal", confirmed=False, over_count=0)
+
+                state["pending_outliers"] = []
+                state["consecutive_over_threshold"] = 0
+                state["consecutive_alignment_unknown"] = int(state.get("consecutive_alignment_unknown", 0)) + 1
+
+                unknown_count = int(state["consecutive_alignment_unknown"])
+                unknown_required = int(params.get("alignment_unknown_confirm_count", ALIGN_UNKNOWN_CONFIRM_COUNT))
+
+                confirmed_unknown = unknown_count >= unknown_required
+                decision = "alignment_unknown" if confirmed_unknown else "hold_low_quality"
+
+                state["last_decision"] = decision
+                state["last_shift_px"] = shift_px
+                state["last_debug"] = debug or {}
+
+                return _result(
+                    decision,
+                    confirmed=confirmed_unknown,
+                    over_count=0,
+                    alignment_unknown_count=unknown_count
+                )
+
+            if shift_px > threshold:
+                state["consecutive_alignment_unknown"] = 0
+                state["consecutive_over_threshold"] = int(state.get("consecutive_over_threshold", 0)) + 1
+                pending = state.setdefault("pending_outliers", [])
+                pending.append({"at": now_iso, "shift_px": shift_px, "threshold_px": threshold})
+                state["pending_outliers"] = pending[-int(params.get("confirm_count_required", ROI_DRIFT_CONFIRM_COUNT)):]
+                confirmed = state["consecutive_over_threshold"] >= int(params.get("confirm_count_required", ROI_DRIFT_CONFIRM_COUNT))
+                state["last_decision"] = "confirmed_movement" if confirmed else "candidate"
+                state["last_shift_px"] = shift_px
+                state["last_debug"] = debug or {}
+                return _result(state["last_decision"], confirmed=confirmed, over_count=state["consecutive_over_threshold"])
+
+            state["pending_outliers"] = []
+            state["consecutive_over_threshold"] = 0
+            state["consecutive_alignment_unknown"] = 0
+            state["last_decision"] = "normal"
+            state["last_shift_px"] = shift_px
+            state["last_debug"] = debug or {}
+            return _result("normal", confirmed=False, over_count=0)
+
+    def was_roi_setup_reported(self):
+        with self.lock:
+            return bool(self.roi_setup_reported)
+
+    def mark_roi_setup_reported(self):
+        with self.lock:
+            self.roi_setup_reported = True
+
+ROI_ALIGN_LEARNING_STORE = ROIAlignLearningStore()
+
 class AnchorTrackingROIAligner:
     def __init__(self):
         self.orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self.anchor_slots = {}
+        self.anchor_candidates = {}
+        self.selected_anchor_slot = ""
+        self.alignment_unknown_count = 0
+        self.pending_update_anchor = None
+        self.last_anchor_update_action = ""
 
         self.anchor_gray = None
         self.anchor_kp = None
@@ -2259,22 +2728,312 @@ class AnchorTrackingROIAligner:
             "dy": 0.0,
             "angle_deg": 0.0,
             "scale": 1.0,
+            "perspective": 0.0,
+            "selected_anchor": "",
+            "anchors_tested": len(self.anchor_slots),
         }
 
-    def _gray(self, frame):
+    def _gray_plain(self, frame):
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    def _features(self, gray):
-        kp, des = self.orb.detectAndCompute(gray, None)
+    def _gray(self, frame):
+        return self._gray_plain(frame)
+
+    def _build_feature_mask(self, frame_shape, exclude_boxes=None):
+        if frame_shape is None:
+            return None, 0
+
+        h, w = frame_shape[:2]
+        if h <= 0 or w <= 0:
+            return None, 0
+
+        mask = np.full((h, w), 255, dtype=np.uint8)
+        excluded = 0
+
+        for box in exclude_boxes or []:
+            try:
+                x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            except Exception:
+                continue
+
+            bw = max(1.0, x2 - x1)
+            bh = max(1.0, y2 - y1)
+            pad = max(bw, bh) * FEATURE_MASK_PADDING_RATIO
+
+            ix1 = max(0, int(math.floor(x1 - pad)))
+            iy1 = max(0, int(math.floor(y1 - pad)))
+            ix2 = min(w, int(math.ceil(x2 + pad)))
+            iy2 = min(h, int(math.ceil(y2 + pad)))
+
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+
+            mask[iy1:iy2, ix1:ix2] = 0
+            excluded += 1
+
+        return mask, excluded
+
+    def _detect_light_mode(self, frame, exclude_boxes=None):
+        if frame is None:
+            return "unknown", {
+                "sat_mean": 0.0,
+                "channel_diff_mean": 0.0,
+                "colorfulness": 0.0,
+            }
+
+        h, w = frame.shape[:2]
+        feature_mask, _ = self._build_feature_mask((h, w), exclude_boxes)
+        valid_mask = feature_mask > 0 if feature_mask is not None else np.ones((h, w), dtype=bool)
+
+        if int(np.count_nonzero(valid_mask)) < max(100, int(h * w * 0.05)):
+            valid_mask = np.ones((h, w), dtype=bool)
+
+        b, g, r = cv2.split(frame)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        sat = hsv[:, :, 1][valid_mask]
+        rv = r[valid_mask].astype(np.float32)
+        gv = g[valid_mask].astype(np.float32)
+        bv = b[valid_mask].astype(np.float32)
+
+        if sat.size == 0 or rv.size == 0:
+            return "unknown", {
+                "sat_mean": 0.0,
+                "channel_diff_mean": 0.0,
+                "colorfulness": 0.0,
+            }
+
+        sat_mean = float(np.mean(sat))
+        channel_diff_mean = float(np.mean((np.abs(rv - gv) + np.abs(gv - bv) + np.abs(rv - bv)) / 3.0))
+
+        rg = rv - gv
+        yb = 0.5 * (rv + gv) - bv
+        colorfulness = float(
+            np.sqrt(np.std(rg) ** 2 + np.std(yb) ** 2)
+            + 0.3 * np.sqrt(np.mean(rg) ** 2 + np.mean(yb) ** 2)
+        )
+
+        mode = "ir" if (
+            sat_mean < IR_SAT_MEAN_THRESHOLD
+            and channel_diff_mean < IR_CHANNEL_DIFF_THRESHOLD
+            and colorfulness < IR_COLORFULNESS_THRESHOLD
+        ) else "day"
+
+        return mode, {
+            "sat_mean": sat_mean,
+            "channel_diff_mean": channel_diff_mean,
+            "colorfulness": colorfulness,
+        }
+
+    def _features(self, gray, mask=None):
+        kp, des = self.orb.detectAndCompute(gray, mask)
         return kp, des
 
-    def set_anchor(self, frame):
+    def _frame_feature_variants(self, frame, exclude_boxes=None):
+        feature_mask, excluded_count = self._build_feature_mask(frame.shape[:2], exclude_boxes)
+        image = self._gray_plain(frame)
+        kp, des = self._features(image, feature_mask)
+        return [{
+            "name": "gray",
+            "gray": image,
+            "kp": kp,
+            "des": des,
+            "features": 0 if kp is None else len(kp),
+            "masked_objects": excluded_count,
+        }]
+
+    def _best_feature_variant(self, variants):
+        valid = [v for v in variants if v.get("des") is not None and v.get("kp") is not None]
+        if not valid:
+            return variants[0] if variants else {"name": "none", "gray": None, "kp": None, "des": None, "features": 0}
+        return max(valid, key=lambda v: int(v.get("features", 0) or 0))
+
+    def _image_stats(self, gray):
+        if gray is None:
+            return {"brightness_mean": 0.0, "brightness_std": 0.0}
+        try:
+            return {
+                "brightness_mean": float(np.mean(gray)),
+                "brightness_std": float(np.std(gray)),
+            }
+        except Exception:
+            return {"brightness_mean": 0.0, "brightness_std": 0.0}
+
+    def _empty_debug(self, status, method="none", good=0):
+        return {
+            "status": status,
+            "method": method,
+            "raw_matches": 0,
+            "good_matches": int(good or 0),
+            "inliers": 0,
+            "inlier_ratio": 0.0,
+            "dx": 0.0,
+            "dy": 0.0,
+            "angle_deg": 0.0,
+            "scale": 1.0,
+            "perspective": 0.0,
+            "corner_mean_shift_px": 0.0,
+            "corner_max_shift_px": 0.0,
+            "selected_anchor": self.selected_anchor_slot,
+            "anchors_tested": len(self.anchor_slots),
+            "anchor_update": self.last_anchor_update_action,
+            "masked_objects": 0,
+            "light_mode": "unknown",
+            "anchor_light_mode": "unknown",
+            "light_mode_changed": False,
+            "light_mode_source": "unknown",
+            "sat_mean": 0.0,
+            "channel_diff_mean": 0.0,
+            "colorfulness": 0.0,
+        }
+
+    def _store_anchor_slot(self, slot, gray, kp, des, frame_shape, variants=None):
+        now_iso = ROI_ALIGN_LEARNING_STORE._now_iso()
+        variant_map = {}
+        for v in variants or []:
+            if v.get("des") is not None and v.get("kp") is not None:
+                variant_map[v.get("name", "gray")] = {
+                    "gray": v.get("gray"),
+                    "kp": v.get("kp"),
+                    "des": v.get("des"),
+                    "features": int(v.get("features", 0) or 0),
+                }
+        if not variant_map:
+            variant_map["gray"] = {"gray": gray, "kp": kp, "des": des, "features": 0 if kp is None else len(kp)}
+        self.anchor_slots[slot] = {
+            "gray": gray,
+            "kp": kp,
+            "des": des,
+            "shape": frame_shape,
+            "features": 0 if kp is None else len(kp),
+            "variants": variant_map,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        self.selected_anchor_slot = slot
+
+        # Keep legacy fields populated for older fallback paths.
+        self.anchor_gray = gray
+        self.anchor_kp = kp
+        self.anchor_des = des
+        self.anchor_shape = frame_shape
+        self.last_anchor_update_action = f"stored:{slot}"
+
+    def _capture_anchor_data(self, frame, exclude_boxes=None):
+        variants = self._frame_feature_variants(frame, exclude_boxes=exclude_boxes)
+        best_variant = self._best_feature_variant(variants)
+        gray = best_variant.get("gray")
+        kp = best_variant.get("kp")
+        des = best_variant.get("des")
+        return {
+            "gray": gray,
+            "kp": kp,
+            "des": des,
+            "shape": frame.shape[:2],
+            "variants": variants,
+            "best_name": best_variant.get("name", "gray"),
+            "features": 0 if kp is None else len(kp),
+            "masked_objects": int(best_variant.get("masked_objects", 0) or 0),
+        }
+
+    def _accept_light_transition_after_match_fail(self, frame, current_data, anchor, base_debug, exclude_boxes=None):
+        anchor_light_mode = anchor.get("light_mode", "unknown") if anchor else "unknown"
+        current_light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes)
+        light_mode_changed = bool(
+            anchor_light_mode not in ("", "unknown")
+            and current_light_mode not in ("", "unknown")
+            and anchor_light_mode != current_light_mode
+        )
+
+        base_debug["light_mode"] = current_light_mode
+        base_debug["anchor_light_mode"] = anchor_light_mode
+        base_debug["light_mode_changed"] = light_mode_changed
+        base_debug["light_mode_source"] = "detected_after_match_fail"
+        base_debug["sat_mean"] = float(light_stats.get("sat_mean", 0.0) or 0.0)
+        base_debug["channel_diff_mean"] = float(light_stats.get("channel_diff_mean", 0.0) or 0.0)
+        base_debug["colorfulness"] = float(light_stats.get("colorfulness", 0.0) or 0.0)
+
+        if not light_mode_changed:
+            return False, base_debug
+
+        current_data["light_mode"] = current_light_mode
+        current_data["light_stats"] = light_stats
+        self.pending_update_anchor = current_data
+        self.fail_count = 0
+        self.alignment_unknown_count = 0
+
+        base_debug["status"] = "ir_onoff_transition_accepted_after_low_quality"
+        base_debug["good_matches"] = max(int(base_debug.get("good_matches", 0) or 0), MIN_INLIERS)
+        base_debug["inliers"] = max(int(base_debug.get("inliers", 0) or 0), MIN_INLIERS)
+        base_debug["inlier_ratio"] = max(float(base_debug.get("inlier_ratio", 0.0) or 0.0), 1.0)
+        base_debug["corner_mean_shift_px"] = 0.0
+        base_debug["corner_max_shift_px"] = 0.0
+        base_debug["dx"] = 0.0
+        base_debug["dy"] = 0.0
+        base_debug["angle_deg"] = 0.0
+        base_debug["scale"] = 1.0
+        base_debug["perspective"] = 0.0
+        base_debug["anchor_update"] = "pending_ir_onoff_update"
+        return True, base_debug
+
+    def commit_pending_update_anchor(self, allow_scheduled=True):
+        data = self.pending_update_anchor
+        if not data:
+            self.last_anchor_update_action = "skip_no_pending"
+            return ""
+        kp = data.get("kp")
+        des = data.get("des")
+        if kp is None or des is None or len(kp) < MIN_GOOD_MATCHES:
+            self.last_anchor_update_action = f"skip_pending_features:{0 if kp is None else len(kp)}"
+            return ""
+
+        prev_anchor = self.anchor_slots.get(ANCHOR_UPDATED, {})
+        prev_light_mode = prev_anchor.get("light_mode", "unknown") if prev_anchor else "unknown"
+        prev_light_stats = prev_anchor.get("light_stats", {}) if prev_anchor else {}
+
+        self._store_anchor_slot(
+            ANCHOR_UPDATED,
+            data.get("gray"),
+            kp,
+            des,
+            data.get("shape"),
+            variants=data.get("variants"),
+        )
+        if data.get("light_mode") not in (None, "", "unknown"):
+            self.anchor_slots[ANCHOR_UPDATED]["light_mode"] = data.get("light_mode", "unknown")
+            self.anchor_slots[ANCHOR_UPDATED]["light_stats"] = data.get("light_stats", {})
+        else:
+            self.anchor_slots[ANCHOR_UPDATED]["light_mode"] = prev_light_mode
+            self.anchor_slots[ANCHOR_UPDATED]["light_stats"] = prev_light_stats
+        actions = [ANCHOR_UPDATED]
+
+        self.last_anchor_update_action = "updated:" + "+".join(actions)
+        return self.last_anchor_update_action
+
+    def _best_debug(self, debugs):
+        if not debugs:
+            return self._empty_debug("no_anchor_debug", method="multi_anchor")
+        return max(
+            debugs,
+            key=lambda d: (
+                int(d.get("inliers", 0) or 0),
+                float(d.get("inlier_ratio", 0.0) or 0.0),
+                int(d.get("good_matches", 0) or 0),
+            ),
+        )
+
+    def set_anchor(self, frame, exclude_boxes=None):
         if frame is None:
             self.last_debug["status"] = "set_anchor_failed_no_frame"
             return False
 
-        gray = self._gray(frame)
-        kp, des = self._features(gray)
+        light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes)
+        variants = self._frame_feature_variants(frame, exclude_boxes=exclude_boxes)
+        best_variant = self._best_feature_variant(variants)
+        gray = best_variant.get("gray")
+        kp = best_variant.get("kp")
+        des = best_variant.get("des")
+        masked_objects = int(best_variant.get("masked_objects", 0) or 0)
 
         if des is None or kp is None or len(kp) < MIN_GOOD_MATCHES:
             n = 0 if kp is None else len(kp)
@@ -2289,15 +3048,19 @@ class AnchorTrackingROIAligner:
                 "dy": 0.0,
                 "angle_deg": 0.0,
                 "scale": 1.0,
+                "masked_objects": masked_objects,
             }
             if DEBUG_ALIGN:
                 print(f"[CCTV_Aligner] anchor 특징점 부족: {n}")
             return False
 
-        self.anchor_gray = gray
-        self.anchor_kp = kp
-        self.anchor_des = des
-        self.anchor_shape = frame.shape[:2]
+        self._store_anchor_slot(ANCHOR_BASE, gray, kp, des, frame.shape[:2], variants=variants)
+        self._store_anchor_slot(ANCHOR_UPDATED, gray, kp, des, frame.shape[:2], variants=variants)
+        self.anchor_slots[ANCHOR_BASE]["light_mode"] = light_mode
+        self.anchor_slots[ANCHOR_BASE]["light_stats"] = light_stats
+        self.anchor_slots[ANCHOR_UPDATED]["light_mode"] = light_mode
+        self.anchor_slots[ANCHOR_UPDATED]["light_stats"] = light_stats
+        self.last_anchor_update_action = "init:base+updated"
 
         self.tracking_gray = gray
         self.tracking_kp = kp
@@ -2325,6 +3088,7 @@ class AnchorTrackingROIAligner:
             "dy": 0.0,
             "angle_deg": 0.0,
             "scale": 1.0,
+            "masked_objects": masked_objects,
         }
 
         if DEBUG_ALIGN:
@@ -2379,9 +3143,26 @@ class AnchorTrackingROIAligner:
         debug["perspective"] = float(m["perspective"])
         return debug
 
+    def _add_corner_shift_debug(self, debug, H, frame_shape):
+        debug["corner_mean_shift_px"] = 0.0
+        debug["corner_max_shift_px"] = 0.0
+        if H is None or frame_shape is None:
+            return debug
+        try:
+            h, w = frame_shape[:2]
+            corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+            warped = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+            if np.isfinite(warped).all():
+                dist = np.linalg.norm(warped - corners.reshape(-1, 2), axis=1)
+                debug["corner_mean_shift_px"] = float(np.mean(dist))
+                debug["corner_max_shift_px"] = float(np.max(dist))
+        except Exception:
+            pass
+        return debug
+
     def _match_and_homography(self, src_kp, src_des, dst_kp, dst_des, dst_shape, method_name):
         if src_des is None or dst_des is None:
-            return None, {"status": "descriptor_missing", "method": method_name, "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+            return None, {"status": "descriptor_missing", "method": method_name, "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0, "corner_mean_shift_px": 0.0, "corner_max_shift_px": 0.0}
 
         raw = self.matcher.knnMatch(src_des, dst_des, k=2)
 
@@ -2393,9 +3174,9 @@ class AnchorTrackingROIAligner:
             if m.distance < 0.75 * n.distance:
                 good.append(m)
 
-        debug = {"status": "matching", "method": method_name, "raw_matches": len(raw), "good_matches": len(good), "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0}
+        debug = {"status": "matching", "method": method_name, "raw_matches": len(raw), "good_matches": len(good), "inliers": 0, "inlier_ratio": 0.0, "reproj_mean": 0.0, "reproj_median": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0, "corner_mean_shift_px": 0.0, "corner_max_shift_px": 0.0}
 
-        if len(good) < MIN_GOOD_MATCHES:
+        if len(good) < MIN_HOMOGRAPHY_ATTEMPT_MATCHES:
             debug["status"] = f"not_enough_good_matches:{len(good)}"
             return None, debug
 
@@ -2412,7 +3193,22 @@ class AnchorTrackingROIAligner:
 
         debug["inliers"] = inliers
         debug["inlier_ratio"] = float(inlier_ratio)
+        try:
+            projected = cv2.perspectiveTransform(src_pts, H)
+            errors = np.linalg.norm(projected.reshape(-1, 2) - dst_pts.reshape(-1, 2), axis=1)
+            inlier_mask = mask.reshape(-1).astype(bool)
+            inlier_errors = errors[inlier_mask] if np.any(inlier_mask) else errors
+            debug["reproj_mean"] = float(np.mean(inlier_errors)) if len(inlier_errors) else 0.0
+            debug["reproj_median"] = float(np.median(inlier_errors)) if len(inlier_errors) else 0.0
+        except Exception:
+            debug["reproj_mean"] = 0.0
+            debug["reproj_median"] = 0.0
         debug = self._add_motion_debug(debug, H)
+        debug = self._add_corner_shift_debug(debug, H, dst_shape)
+
+        if len(good) < MIN_GOOD_MATCHES:
+            debug["status"] = f"not_enough_good_matches:{len(good)}"
+            return None, debug
 
         if inliers < MIN_INLIERS:
             debug["status"] = f"not_enough_inliers:{inliers}"
@@ -2445,11 +3241,6 @@ class AnchorTrackingROIAligner:
 
         orig = corners.reshape(-1, 2)
         shift = np.linalg.norm(warped - orig, axis=1)
-        mean_shift = float(np.mean(shift))
-        max_allowed_shift = max(w, h) * MAX_CORNER_SHIFT_RATIO
-
-        if mean_shift > max_allowed_shift: return False, f"rejected_large_shift:{mean_shift:.1f}"
-
         orig_top = np.linalg.norm(orig[1] - orig[0])
         orig_bottom = np.linalg.norm(orig[2] - orig[3])
         warped_top = np.linalg.norm(warped[1] - warped[0])
@@ -2562,12 +3353,116 @@ class AnchorTrackingROIAligner:
             return self.H_last_good.copy(), False
         return np.eye(3, dtype=np.float32), False
 
+    def estimate_anchor_direct_to_current(self, frame, exclude_boxes=None):
+        if not self.anchor_slots:
+            self.last_debug["status"] = "not_initialized"
+            return np.eye(3, dtype=np.float32), False
+
+        if frame is None:
+            self.last_debug["status"] = "no_current_frame"
+            return np.eye(3, dtype=np.float32), False
+
+        current_data = self._capture_anchor_data(frame, exclude_boxes=exclude_boxes)
+        current_variants = current_data.get("variants") or []
+        best_current_variant = self._best_feature_variant(current_variants)
+        gray = current_data.get("gray")
+        kp = current_data.get("kp")
+        des = current_data.get("des")
+        self.pending_update_anchor = current_data
+        self.last_anchor_update_action = "pending_current"
+        anchor = self.anchor_slots.get(ANCHOR_UPDATED) or self.anchor_slots.get(ANCHOR_BASE)
+        if not anchor:
+            self.last_debug["status"] = "updated_anchor_missing"
+            return np.eye(3, dtype=np.float32), False
+
+        if kp is None or des is None or len(kp) < MIN_GOOD_MATCHES:
+            n = 0 if kp is None else len(kp)
+            dbg = self._empty_debug(
+                f"current_not_enough_features:{n}",
+                method="multi_anchor_to_current",
+                good=n,
+            )
+            dbg["selected_anchor"] = ANCHOR_UPDATED if ANCHOR_UPDATED in self.anchor_slots else ANCHOR_BASE
+            dbg["anchor_slot"] = dbg["selected_anchor"]
+            dbg["preprocess"] = "gray"
+            dbg["current_features"] = n
+            dbg["anchor_features"] = int(anchor.get("features", 0) or 0)
+            dbg["masked_objects"] = int(current_data.get("masked_objects", 0) or 0)
+            dbg["anchors_tested"] = 1
+            dbg["anchor_update"] = self.last_anchor_update_action
+            dbg["anchor_light_mode"] = anchor.get("light_mode", "unknown")
+
+            accepted, dbg = self._accept_light_transition_after_match_fail(frame, current_data, anchor, dbg, exclude_boxes=exclude_boxes)
+            if accepted:
+                self.last_debug = dbg
+                return np.eye(3, dtype=np.float32), True
+
+            self.fail_count += 1
+            self.alignment_unknown_count += 1
+            dbg["status"] = (
+                f"alignment_unknown_low_quality:{dbg.get('status', 'unknown')}"
+                if self.alignment_unknown_count >= ALIGN_UNKNOWN_CONFIRM_COUNT
+                else f"low_quality:{dbg.get('status', 'unknown')}"
+            )
+            dbg["alignment_unknown_count"] = self.alignment_unknown_count
+            self.last_debug = dbg
+            return np.eye(3, dtype=np.float32), False
+
+        H_direct, dbg = self._match_and_homography(
+            anchor.get("kp"),
+            anchor.get("des"),
+            kp,
+            des,
+            frame.shape[:2],
+            method_name="updated_anchor_to_current:gray",
+        )
+        dbg["selected_anchor"] = ANCHOR_UPDATED if ANCHOR_UPDATED in self.anchor_slots else ANCHOR_BASE
+        dbg["anchor_slot"] = dbg["selected_anchor"]
+        dbg["preprocess"] = "gray"
+        dbg["current_features"] = int(best_current_variant.get("features", 0) or 0)
+        dbg["anchor_features"] = int(anchor.get("features", 0) or 0)
+        dbg["masked_objects"] = int(current_data.get("masked_objects", 0) or 0)
+        dbg["anchors_tested"] = 1
+        dbg["anchor_update"] = self.last_anchor_update_action
+        anchor_light_mode = anchor.get("light_mode", "unknown")
+        dbg["anchor_light_mode"] = anchor_light_mode
+        if dbg.get("light_mode", "unknown") in (None, "", "unknown") and anchor_light_mode not in (None, "", "unknown"):
+            dbg["light_mode"] = anchor_light_mode
+            dbg["light_mode_source"] = "same_as_anchor_match_ok"
+
+        if H_direct is None:
+            accepted, dbg = self._accept_light_transition_after_match_fail(frame, current_data, anchor, dbg, exclude_boxes=exclude_boxes)
+            if accepted:
+                self.last_debug = dbg
+                return np.eye(3, dtype=np.float32), True
+
+            self.fail_count += 1
+            self.alignment_unknown_count += 1
+            dbg["status"] = (
+                f"alignment_unknown_low_quality:{dbg.get('status', 'unknown')}"
+                if self.alignment_unknown_count >= ALIGN_UNKNOWN_CONFIRM_COUNT
+                else f"low_quality:{dbg.get('status', 'unknown')}"
+            )
+            dbg["alignment_unknown_count"] = self.alignment_unknown_count
+            self.last_debug = dbg
+            return np.eye(3, dtype=np.float32), False
+
+        self.success_count += 1
+        self.fail_count = 0
+        self.alignment_unknown_count = 0
+        self.selected_anchor_slot = dbg["selected_anchor"]
+        self.H_last_good = H_direct.astype(np.float32)
+        self.last_debug = self._add_motion_debug(dbg, H_direct)
+        self.last_debug["status"] = "ok_updated_anchor:gray"
+        self.last_debug["selected_anchor"] = dbg["selected_anchor"]
+        self.last_debug["anchors_tested"] = 1
+        self.last_debug["anchor_update"] = self.last_anchor_update_action
+        return self.H_last_good.copy(), True
+
     def _try_anchor_direct_correction(self, frame, kp, des):
         H_direct, dbg = self._match_and_homography(self.anchor_kp, self.anchor_des, kp, des, frame.shape[:2], method_name="anchor_direct_drift_check")
 
         if H_direct is None: return False
-        if dbg.get("inliers", 0) < ANCHOR_DIRECT_MIN_INLIERS: return False
-        if dbg.get("inlier_ratio", 0.0) < ANCHOR_DIRECT_MIN_INLIER_RATIO: return False
 
         dbg = self._add_motion_debug(dbg, H_direct)
 
@@ -2592,31 +3487,505 @@ class FrameReader:
         self.connected = False
         self.last_t = time.time()
         self.lock = threading.Lock()
+        self.decode_cfg = SYS_CFG.get("video_decode", {})
+        self._decode_mode_logged = False
+        self._decode_mode = "init"
+        self._decode_pid = "-"
+        self._decode_shape = "-"
+        self._decode_restarts = 0
+        self._decode_read_failures = 0
+        self._decode_frame_count = 0
+        self._decode_window_frames = 0
+        self._decode_window_bytes = 0
+        self._decode_window_start = time.time()
+        self._gst_check_logged = False
 
         threading.Thread(target=self._run, daemon=True).start()
 
+    def _decode_log_interval(self):
+        try:
+            return max(1.0, float(self.decode_cfg.get("log_interval_sec", 10.0)))
+        except Exception:
+            return 10.0
+
+    def _emit_decode_log(self, message, level="info"):
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(message)
+        if bool(self.decode_cfg.get("print_pipeline_logs", True)):
+            print(message, flush=True)
+
+    def _emit_gst_check_once(self, message, level="info"):
+        if self._gst_check_logged:
+            return
+        self._gst_check_logged = True
+        self._emit_decode_log(message, level=level)
+
+    def _mask_pipeline_text(self, text):
+        return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
+
+    def _cmd_text(self, cmd):
+        return self._mask_pipeline_text(" ".join(str(part) for part in cmd))
+
+    def _set_decode_pipeline(self, mode, shape="-", pid="-", cmd=None, extra=""):
+        self._decode_mode = mode
+        self._decode_pid = str(pid)
+        self._decode_shape = shape
+        self._decode_restarts += 1
+        self._decode_frame_count = 0
+        self._decode_window_frames = 0
+        self._decode_window_bytes = 0
+        self._decode_window_start = time.time()
+
+        detail = f" extra={extra}" if extra else ""
+        self._emit_decode_log(
+            f"[DECODE PIPELINE] CAM:{self.ip} restart={self._decode_restarts} "
+            f"mode={mode} pid={self._decode_pid} shape={shape}{detail}"
+        )
+        if cmd:
+            self._emit_decode_log(f"[DECODE PIPELINE] CAM:{self.ip} cmd={self._cmd_text(cmd)}")
+
+    def _note_decode_frame(self, frame_bytes, shape):
+        self._decode_frame_count += 1
+        self._decode_window_frames += 1
+        self._decode_window_bytes += int(frame_bytes or 0)
+        self._decode_shape = shape
+
+        now = time.time()
+        elapsed = now - self._decode_window_start
+        if elapsed < self._decode_log_interval():
+            return
+
+        fps = self._decode_window_frames / max(0.001, elapsed)
+        mbps = (self._decode_window_bytes * 8.0) / max(0.001, elapsed) / 1_000_000.0
+        self._emit_decode_log(
+            f"[DECODE FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
+            f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
+            f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
+            f"restarts={self._decode_restarts} connected={self.connected}"
+        )
+        self._decode_window_frames = 0
+        self._decode_window_bytes = 0
+        self._decode_window_start = now
+
+    def _note_decode_failure(self, reason, level="warning"):
+        self._decode_read_failures += 1
+        self._emit_decode_log(
+            f"[DECODE FAIL] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
+            f"reason={reason} failures={self._decode_read_failures} "
+            f"frames={self._decode_frame_count} restarts={self._decode_restarts}",
+            level=level
+        )
+
+    def _open_capture(self):
+        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        if cap.isOpened():
+            src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            shape = f"{src_w}x{src_h}" if src_w > 0 and src_h > 0 else "unknown"
+            self._set_decode_pipeline(
+                "opencv_ffmpeg_cpu",
+                shape=shape,
+                extra=f"backend=CAP_FFMPEG source_fps={src_fps:.2f}"
+            )
+            self._decode_mode_logged = True
+        return cap
+
+    def _should_use_ffmpeg_vaapi_pipe(self):
+        backend = str(self.decode_cfg.get("backend", "auto")).strip().lower()
+        if backend in ("opencv", "cv2", "ffmpeg_opencv", "gstreamer", "gst", "gst_vaapi"):
+            return False
+
+        mode = str(self.decode_cfg.get("hw_acceleration", "auto")).strip().lower()
+        if mode in ("", "none", "off", "cpu", "false", "0"):
+            return False
+
+        if not sys.platform.startswith("linux"):
+            return False
+
+        hw_device = str(self.decode_cfg.get("hw_device", "/dev/dri/renderD128")).strip()
+        if mode not in ("auto", "vaapi") or not hw_device or not os.path.exists(hw_device):
+            return False
+
+        return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+    def _should_use_gstreamer_pipe(self):
+        backend = str(self.decode_cfg.get("backend", "auto")).strip().lower()
+        if backend in ("opencv", "cv2", "ffmpeg_opencv", "ffmpeg", "ffmpeg_vaapi", "vaapi"):
+            return False
+
+        if backend not in ("auto", "gstreamer", "gst", "gst_vaapi"):
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=unsupported_backend backend={backend}"
+            )
+            return False
+
+        if not sys.platform.startswith("linux"):
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=non_linux platform={sys.platform} backend={backend}"
+            )
+            return False
+
+        gst_launch = shutil.which("gst-launch-1.0")
+        gst_inspect = shutil.which("gst-inspect-1.0")
+        if not gst_launch or not gst_inspect:
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=missing_gstreamer_tools "
+                f"backend={backend} gst-launch={gst_launch or '-'} gst-inspect={gst_inspect or '-'}",
+                level="warning"
+            )
+            return False
+
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffprobe_path:
+            self._emit_gst_check_once(
+                f"[GSTREAMER CHECK] CAM:{self.ip} skip reason=missing_ffprobe backend={backend}",
+                level="warning"
+            )
+            return False
+
+        self._emit_gst_check_once(
+            f"[GSTREAMER CHECK] CAM:{self.ip} enabled backend={backend} "
+            f"gst-launch={gst_launch} gst-inspect={gst_inspect} ffprobe={ffprobe_path}"
+        )
+        return True
+
+    def _probe_stream_info(self):
+        cmd = ["ffprobe", "-v", "error"]
+        if self.url.lower().startswith("rtsp://"):
+            cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000"])
+        cmd.extend([
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,codec_name",
+            "-of", "json",
+            self.url,
+        ])
+
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=8, text=True).strip()
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] ffprobe stream info failed: {e}")
+            return None
+
+        try:
+            data = json.loads(out)
+            streams = data.get("streams", [])
+            if not streams:
+                raise ValueError("no video stream")
+            stream = streams[0]
+            width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+            codec = str(stream.get("codec_name") or "").strip().lower()
+            if width > 0 and height > 0:
+                return width, height, codec
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] ffprobe stream info parse failed: {e}")
+
+        logger.warning(f"[CAM:{self.ip}] ffprobe returned no usable video info: {out}")
+        return None
+
+    def _probe_stream_shape(self):
+        info = self._probe_stream_info()
+        if info is None:
+            return None
+        width, height, _ = info
+        return width, height
+
+    def _scaled_output_shape(self, width, height):
+        if width <= 720:
+            return width, height
+        ratio = 720.0 / float(width)
+        out_height = max(2, int(round((height * ratio) / 2.0) * 2))
+        return 720, out_height
+
+    def _decode_fps_limit(self):
+        try:
+            fps_limit = float(self.decode_cfg.get("fps_limit", 15.0) or 0.0)
+        except Exception:
+            fps_limit = 15.0
+        return fps_limit if fps_limit > 0 else None
+
+    def _gst_element_exists(self, element_name):
+        try:
+            subprocess.run(
+                ["gst-inspect-1.0", element_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=True
+            )
+            return True
+        except Exception:
+            return False
+
+    def _first_gst_element(self, candidates):
+        for element_name in candidates:
+            if self._gst_element_exists(element_name):
+                return element_name
+        return None
+
+    def _gst_framerate_caps(self, fps_limit):
+        if fps_limit is None:
+            return None
+        fraction = Fraction(float(fps_limit)).limit_denominator(1000)
+        return f"{fraction.numerator}/{fraction.denominator}"
+
+    def _select_gstreamer_decoder(self, codec):
+        codec = str(codec or "").strip().lower()
+        mode = str(self.decode_cfg.get("hw_acceleration", "auto")).strip().lower()
+        allow_hw = mode not in ("", "none", "off", "cpu", "false", "0")
+
+        if codec in ("h264", "avc1"):
+            depay, parser = "rtph264depay", "h264parse"
+            hw_candidates = ["vaapih264dec", "vah264dec"]
+            cpu_candidates = ["avdec_h264", "openh264dec"]
+        elif codec in ("hevc", "h265"):
+            depay, parser = "rtph265depay", "h265parse"
+            hw_candidates = ["vaapih265dec", "vah265dec"]
+            cpu_candidates = ["avdec_h265"]
+        else:
+            return None
+
+        decoder = None
+        decoder_kind = "cpu"
+        if allow_hw:
+            decoder = self._first_gst_element(hw_candidates)
+            decoder_kind = "vaapi" if decoder else "cpu"
+        if decoder is None:
+            decoder = self._first_gst_element(cpu_candidates)
+        if decoder is None:
+            return None
+
+        return depay, parser, decoder, decoder_kind
+
+    def _run_gstreamer_pipe(self):
+        info = self._probe_stream_info()
+        if info is None:
+            return False
+
+        in_w, in_h, codec = info
+        out_w, out_h = self._scaled_output_shape(in_w, in_h)
+        frame_size = out_w * out_h * 3
+        fps_limit = self._decode_fps_limit()
+        decoder_info = self._select_gstreamer_decoder(codec)
+        if decoder_info is None:
+            self._note_decode_failure(f"gstreamer_unsupported_codec_{codec or 'unknown'}")
+            return False
+
+        depay, parser, decoder, decoder_kind = decoder_info
+        latency_ms = int(self.decode_cfg.get("gstreamer_latency_ms", 50) or 50)
+        protocols = str(self.decode_cfg.get("gstreamer_protocols", "tcp") or "tcp").strip().lower()
+        self._emit_decode_log(
+            f"[GSTREAMER SELECT] CAM:{self.ip} codec={codec or '-'} "
+            f"decoder={decoder} decoder_kind={decoder_kind} fps_limit={fps_limit or '-'}"
+        )
+
+        caps_parts = ["video/x-raw", "format=BGR", f"width={out_w}", f"height={out_h}"]
+        framerate_caps = self._gst_framerate_caps(fps_limit)
+        if framerate_caps:
+            caps_parts.append(f"framerate={framerate_caps}")
+        caps = ",".join(caps_parts)
+
+        cmd = [
+            "gst-launch-1.0", "-q",
+            "rtspsrc", f"location={self.url}", f"protocols={protocols}",
+            f"latency={latency_ms}", "drop-on-latency=true", "tcp-timeout=3000000",
+            "!", depay,
+            "!", parser,
+            "!", decoder,
+            "!", "videoconvert",
+            "!", "videoscale",
+            "!", "videorate",
+            "!", caps,
+            "!", "fdsink", "fd=1", "sync=false"
+        ]
+
+        env = os.environ.copy()
+        vaapi_driver = str(self.decode_cfg.get("vaapi_driver", "")).strip()
+        if vaapi_driver:
+            env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
+
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            if proc.stdout is None:
+                return False
+
+            self.connected = True
+            self._set_decode_pipeline(
+                "gstreamer_pipe",
+                shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
+                pid=proc.pid,
+                cmd=cmd,
+                extra=(
+                    f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
+                    f"latency_ms={latency_ms} protocols={protocols} fps_limit={fps_limit or '-'} "
+                    f"frame_bytes={frame_size}"
+                )
+            )
+            self._decode_mode_logged = True
+            self.last_t = time.time()
+            first_frame_logged = False
+
+            while self.running:
+                if time.time() - self.last_t > WATCHDOG_TIMEOUT:
+                    self._note_decode_failure(f"gstreamer_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
+                    break
+
+                raw = proc.stdout.read(frame_size)
+                if len(raw) != frame_size:
+                    self._note_decode_failure(f"gstreamer_short_read_{len(raw)}_of_{frame_size}", level="error")
+                    break
+
+                fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
+                with self.lock:
+                    self.frame = fr
+                    self.fid += 1
+                    self.last_t = time.time()
+                self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
+                if not first_frame_logged:
+                    self._emit_decode_log(
+                        f"[GSTREAMER READY] CAM:{self.ip} first_frame shape={out_w}x{out_h} "
+                        f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind}"
+                    )
+                    first_frame_logged = True
+
+            return True
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] GStreamer pipe failed: {e}")
+            return False
+        finally:
+            self.connected = False
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+    def _run_ffmpeg_vaapi_pipe(self):
+        shape = self._probe_stream_shape()
+        if shape is None:
+            return False
+
+        in_w, in_h = shape
+        out_w, out_h = self._scaled_output_shape(in_w, in_h)
+        frame_size = out_w * out_h * 3
+        hw_device = str(self.decode_cfg.get("hw_device", "/dev/dri/renderD128")).strip()
+        fps_limit = self._decode_fps_limit()
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        if self.url.lower().startswith("rtsp://"):
+            cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000", "-fflags", "nobuffer", "-flags", "low_delay"])
+        cmd.extend(["-hwaccel", "vaapi", "-hwaccel_device", hw_device, "-i", self.url, "-an"])
+
+        vf_chain = []
+        if (out_w, out_h) != (in_w, in_h):
+            vf_chain.append(f"scale={out_w}:{out_h}")
+        if fps_limit is not None:
+            vf_chain.append(f"fps={fps_limit:g}")
+        if vf_chain:
+            cmd.extend(["-vf", ",".join(vf_chain)])
+
+        cmd.extend(["-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"])
+
+        env = os.environ.copy()
+        vaapi_driver = str(self.decode_cfg.get("vaapi_driver", "")).strip()
+        if vaapi_driver:
+            env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
+
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            if proc.stdout is None:
+                return False
+
+            self.connected = True
+            self._set_decode_pipeline(
+                "ffmpeg_vaapi_pipe",
+                shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
+                pid=proc.pid,
+                cmd=cmd,
+                extra=f"device={hw_device} driver={vaapi_driver or '-'} fps_limit={fps_limit or '-'} frame_bytes={frame_size}"
+            )
+            self._decode_mode_logged = True
+            self.last_t = time.time()
+
+            while self.running:
+                if time.time() - self.last_t > WATCHDOG_TIMEOUT:
+                    self._note_decode_failure(f"vaapi_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
+                    break
+
+                raw = proc.stdout.read(frame_size)
+                if len(raw) != frame_size:
+                    self._note_decode_failure(f"vaapi_short_read_{len(raw)}_of_{frame_size}", level="error")
+                    break
+
+                fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
+                with self.lock:
+                    self.frame = fr
+                    self.fid += 1
+                    self.last_t = time.time()
+                self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
+
+            return True
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] FFmpeg VAAPI pipe failed: {e}")
+            return False
+        finally:
+            self.connected = False
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
     def _run(self):
         while self.running:
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            if self._should_use_gstreamer_pipe():
+                used_gstreamer_pipe = self._run_gstreamer_pipe()
+                if used_gstreamer_pipe:
+                    continue
+                if not self.decode_cfg.get("fallback_to_cpu", True):
+                    time.sleep(5)
+                    continue
+                logger.warning(f"[CAM:{self.ip}] GStreamer pipe unavailable; trying FFmpeg/OpenCV fallback")
+
+            if self._should_use_ffmpeg_vaapi_pipe():
+                used_vaapi_pipe = self._run_ffmpeg_vaapi_pipe()
+                if used_vaapi_pipe:
+                    continue
+                if not self.decode_cfg.get("fallback_to_cpu", True):
+                    time.sleep(5)
+                    continue
+                logger.warning(f"[CAM:{self.ip}] VAAPI pipe unavailable; trying OpenCV FFmpeg reader")
+
+            cap = self._open_capture()
             if not cap.isOpened():
-                # 💡 [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
-                logger.error(f"🚨 [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
+                # ?? [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
+                logger.error(f"?? [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
                 time.sleep(5)
                 continue
 
             self.connected = True
-            logger.info(f"✅ [CAM:{self.ip}] 카메라 스트림 연결 성공.")
+            logger.info(f"? [CAM:{self.ip}] 카메라 스트림 연결 성공.")
             self.last_t = time.time()
 
             while self.running and cap.isOpened():
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
-                    # 💡 [수정] 타임아웃 로깅 레벨 격상
-                    logger.error(f"🚨 [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
+                    # ?? [수정] 타임아웃 로깅 레벨 격상
+                    logger.error(f"?? [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
                     break
 
                 ret, fr = cap.read()
                 if not ret:
-                    logger.error(f"🚨 [CAM:{self.ip}] 프레임 읽기 실패(EOF 또는 스트림 끊김).")
+                    self._note_decode_failure("opencv_read_failed", level="error")
                     break
 
                 if fr is not None:
@@ -2627,6 +3996,7 @@ class FrameReader:
                         self.frame = fr
                         self.fid += 1
                         self.last_t = time.time()
+                    self._note_decode_frame(fr.nbytes, f"{fr.shape[1]}x{fr.shape[0]}")
                 time.sleep(0.005)
 
             self.connected = False
@@ -2640,6 +4010,7 @@ class FrameReader:
 class Camera:
     def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, det_plate, cam_id, event_inference_mode="separate"):
         self.ip = ip
+        self.camera_key = ip
         self.conf = conf
         self.cam_id = cam_id
         self.event_inference_mode = event_inference_mode
@@ -2656,7 +4027,7 @@ class Camera:
         self.trk_signalman = SimpleTracker()
 
         self.reader = FrameReader(conf.get('url', ''), ip)
-        self.recorder = VideoRecorder(ip)
+        self.recorder = VideoRecorder(ip, cam_id=self.cam_id)
         self.motion_det = MotionDetector()
 
         self.alerted = defaultdict(set)
@@ -2678,7 +4049,7 @@ class Camera:
 
         self.roi_frame_shape = None # 해상도 변경 감지용
         self.status_history = deque(maxlen=10)
-        #self._reset_alignment_state("ALIGN INIT")
+        self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
 
     def _reset_alignment_state(self, status_text="ALIGN RESET"):
@@ -2720,7 +4091,7 @@ class Camera:
         self.roi_lines = []
         self.roi_frame_shape = None
 
-        #self._reset_alignment_state("ALIGN RESET")
+        self._reset_alignment_state("ALIGN RESET")
         self._rebuild_handlers()
 
         try:
@@ -2729,7 +4100,7 @@ class Camera:
             pass
 
         logger.info(
-            f"🔄 [CAM:{self.ip}] 무중단 설정 리로드 완료: "
+            f"?? [CAM:{self.ip}] 무중단 설정 리로드 완료: "
             f"{old_events} -> {self.events} | ROI aligner reset"
         )
         print(f"[CCTV_Aligner] CAM {self.cam_id} 설정 변경으로 aligner reset 완료")
@@ -2796,7 +4167,20 @@ class Camera:
             return pts
         return out.reshape(-1, 2).astype(np.int32).tolist()
 
-    def _update_alignment(self, frame):
+    def _detections_to_exclude_boxes(self, *detections_list):
+        boxes = []
+        for detections in detections_list:
+            if detections is None:
+                continue
+            try:
+                for det in detections:
+                    if len(det) >= 4:
+                        boxes.append([float(det[0]), float(det[1]), float(det[2]), float(det[3])])
+            except Exception:
+                continue
+        return boxes
+
+    def _update_alignment(self, frame, exclude_boxes=None):
         if frame is None:
             return
 
@@ -2808,27 +4192,9 @@ class Camera:
             self.align_status_text = "NO ROI"
             self._inject_roi_to_handlers([], [])
 
-            if not hasattr(self, "_no_roi_last_log_time"):
-                self._no_roi_last_log_time = 0.0
-
-            now_no_roi = time.time()
-            if now_no_roi - self._no_roi_last_log_time > 60.0:
-                msg = (
-                    f"[CCTV_Aligner] CAM {self.cam_id} NO ROI | "
-                    f"events={self.events} | ip={self.ip}"
-                )
-                print(msg)
-                logger.warning(
-                    f"[CAM:{self.cam_id}] ROI align skipped | reason=NO_ROI | "
-                    f"events={self.events} | ip={self.ip}"
-                )
-                self._no_roi_last_log_time = now_no_roi
-
-            return
-
         # 최초 anchor 등록
         if not self.anchor_set:
-            ok = self.aligner.set_anchor(frame)
+            ok = self.aligner.set_anchor(frame, exclude_boxes=exclude_boxes)
 
             if ok:
                 self.anchor_set = True
@@ -2879,7 +4245,7 @@ class Camera:
         old_roi_poly = list(self.aligned_roi_poly or [])
         old_roi_lines = list(self.aligned_roi_lines or [])
 
-        H, ok = self.aligner.estimate_anchor_to_current(frame)
+        H, ok = self.aligner.estimate_anchor_direct_to_current(frame, exclude_boxes=exclude_boxes)
         dbg = getattr(self.aligner, "last_debug", {}) or {}
 
         status = dbg.get("status", "unknown")
@@ -2893,121 +4259,148 @@ class Camera:
         angle = float(dbg.get("angle_deg", 0.0) or 0.0)
         scale = float(dbg.get("scale", 1.0) or 1.0)
         perspective = float(dbg.get("perspective", 0.0) or 0.0)
+        masked_objects = int(dbg.get("masked_objects", 0) or 0)
+        light_mode = str(dbg.get("light_mode", "unknown") or "unknown")
+        anchor_light_mode = str(dbg.get("anchor_light_mode", "unknown") or "unknown")
+        light_mode_changed = bool(dbg.get("light_mode_changed", False))
+        light_mode_source = str(dbg.get("light_mode_source", "unknown") or "unknown")
+        sat_mean = float(dbg.get("sat_mean", 0.0) or 0.0)
+        channel_diff_mean = float(dbg.get("channel_diff_mean", 0.0) or 0.0)
+        colorfulness = float(dbg.get("colorfulness", 0.0) or 0.0)
 
         identity_H = np.eye(3, dtype=np.float32)
         h_shifted = not np.allclose(H, identity_H, atol=HOMOGRAPHY_IDENTITY_ATOL)
 
         self.align_ok = ok
 
-        # H를 base ROI에 적용해서 이번 주기 ROI 후보 생성
-        new_roi_poly = self._transform_points(self.base_roi_poly, H)
-        new_roi_lines = self._transform_points(self.base_roi_lines, H)
+        corner_mean_shift = float(dbg.get("corner_mean_shift_px", 0.0) or 0.0)
+        corner_max_shift = float(dbg.get("corner_max_shift_px", 0.0) or 0.0)
+        if ok and H is not None and frame is not None and corner_max_shift <= 0.0:
+            try:
+                h_frame, w_frame = frame.shape[:2]
+                corners = np.array([[0, 0], [w_frame, 0], [w_frame, h_frame], [0, h_frame]], dtype=np.float32).reshape(-1, 1, 2)
+                warped_corners = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+                corner_dist = np.linalg.norm(warped_corners - corners.reshape(-1, 2), axis=1)
+                corner_mean_shift = float(np.mean(corner_dist))
+                corner_max_shift = float(np.max(corner_dist))
+            except Exception as e:
+                logger.warning(f"[CAM:{self.cam_id}] frame corner shift calc failed: {e}")
 
-        # ROI 변화량 계산
-        def _mean_point_shift(before, after):
-            if not before or not after or len(before) != len(after):
-                return 0.0, 0.0
+        camera_shift = corner_max_shift
+        expected_move_px_for_log = round(float(camera_shift), 3) if ok else -1
 
-            before_np = np.array(before, dtype=np.float32)
-            after_np = np.array(after, dtype=np.float32)
+        decision = ROI_ALIGN_LEARNING_STORE.record_check(self.camera_key, self.conf, camera_shift, ok, dbg)
+        threshold = float(decision.get("threshold", ROI_DRIFT_THRESHOLD_PX) or ROI_DRIFT_THRESHOLD_PX)
+        self.align_shifted = bool(decision.get("confirmed", False))
+        healthcheck_requested = False
+        healthcheck_reason = ""
 
-            if before_np.shape != after_np.shape:
-                return 0.0, 0.0
+        self.aligned_roi_poly = list(self.base_roi_poly)
+        self.aligned_roi_lines = list(self.base_roi_lines)
+        self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
 
-            dist = np.linalg.norm(after_np - before_np, axis=1)
-            return float(np.mean(dist)), float(np.max(dist))
+        decision_name = str(decision.get("decision", ""))
+        stable_low_quality_override = (
+            dbg.get("quality_override") == "stable_low_quality_small_shift"
+        )
 
-        poly_mean_shift, poly_max_shift = _mean_point_shift(old_roi_poly, new_roi_poly)
-        line_mean_shift, line_max_shift = _mean_point_shift(old_roi_lines, new_roi_lines)
+        if decision_name == "normal" and camera_shift <= threshold and (ok or stable_low_quality_override):
+            anchor_update_action = self.aligner.commit_pending_update_anchor(allow_scheduled=False)
+            dbg["anchor_update"] = anchor_update_action
+        else:
+            dbg["anchor_update"] = dbg.get("anchor_update", "hold_current_anchor")
 
-        roi_mean_shift = max(poly_mean_shift, line_mean_shift)
-        roi_max_shift = max(poly_max_shift, line_max_shift)
 
-        roi_shifted = roi_max_shift >= ROI_APPLY_MIN_SHIFT_PX
-        self.align_shifted = roi_shifted
-
-        # 1) aligner가 직접 작은 jitter라고 판단한 경우
-        if status == "skip_small_jitter_keep_identity":
-            # 기존 aligned ROI 유지. 없으면 base ROI 주입.
-            if not self.aligned_roi_poly and not self.aligned_roi_lines:
-                self.aligned_roi_poly = list(self.base_roi_poly)
-                self.aligned_roi_lines = list(self.base_roi_lines)
-
-            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
-
+        if decision.get("confirmed", False):
+            if decision_name == "alignment_unknown":
+                reason = (
+                    f"alignment_unknown camera={self.camera_key} cam_id={self.cam_id} "
+                    f"status={status} best_anchor={dbg.get('selected_anchor', '')} "
+                    f"anchors_tested={dbg.get('anchors_tested', 0)} "
+                    f"best_good={good} best_inliers={inliers} best_ratio={ratio:.2f} "
+                    f"over={decision.get('over_count', 0)}"
+                )
+            else:
+                reason = (
+                    f"camera={self.camera_key} cam_id={self.cam_id} "
+                    f"shift={camera_shift:.1f}px threshold={threshold:.1f}px "
+                    f"over={decision.get('over_count', 0)}"
+                )
+            healthcheck_requested = request_terminal_roi_setup_required(reason=reason)
+            healthcheck_reason = reason
             self.align_status_text = (
-                f"JITTER IGNORED {method} "
-                f"status={status} g={good} i={inliers} r={ratio:.2f} "
-                f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
-                f"scale={scale:.3f} persp={perspective:.5f} | "
-                f"roi_shift max={roi_max_shift:.1f}px mean={roi_mean_shift:.1f}px | "
-                f"threshold={ROI_APPLY_MIN_SHIFT_PX:.1f}px | action=roi_kept"
-            )
-
-        # 2) 매칭 성공 + 실제 ROI 좌표가 충분히 움직인 경우
-        elif ok and roi_shifted:
-            self.aligned_roi_poly = new_roi_poly
-            self.aligned_roi_lines = new_roi_lines
-            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
-
-            self.align_status_text = (
-                f"ALIGN APPLIED {method} "
-                f"status={status} g={good} i={inliers} r={ratio:.2f} "
+                f"ROI SETUP REQUIRED {method} "
+                f"status={status} decision={decision.get('decision')} "
+                f"anchor={dbg.get('selected_anchor', '')}/{dbg.get('anchors_tested', 0)} "
+                f"g={good} i={inliers} r={ratio:.2f} "
+                f"mask_obj={masked_objects} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
                 f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
                 f"scale={scale:.3f} persp={perspective:.5f} | "
                 f"h_shifted={h_shifted} | "
-                f"roi_shift max={roi_max_shift:.1f}px mean={roi_mean_shift:.1f}px | "
-                f"poly_shift mean={poly_mean_shift:.1f}px max={poly_max_shift:.1f}px | "
-                f"line_shift mean={line_mean_shift:.1f}px max={line_max_shift:.1f}px | "
-                f"threshold={ROI_APPLY_MIN_SHIFT_PX:.1f}px | action=roi_updated"
+                f"camera_shift max={camera_shift:.1f}px mean={corner_mean_shift:.1f}px | "
+                f"threshold={threshold:.1f}px | action=healthcheck_true_persistent_base_roi_kept"
             )
-
-        # 3) 매칭은 성공했지만 실제 ROI 좌표 변화가 너무 작아서 유지
-        elif ok and not roi_shifted:
-            if not self.aligned_roi_poly and not self.aligned_roi_lines:
-                self.aligned_roi_poly = list(self.base_roi_poly)
-                self.aligned_roi_lines = list(self.base_roi_lines)
-
-            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
-
-            self.align_status_text = (
-                f"JITTER IGNORED {method} "
-                f"status={status} g={good} i={inliers} r={ratio:.2f} "
-                f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
-                f"scale={scale:.3f} persp={perspective:.5f} | "
-                f"h_shifted={h_shifted} but roi_shift max={roi_max_shift:.1f}px "
-                f"mean={roi_mean_shift:.1f}px < threshold={ROI_APPLY_MIN_SHIFT_PX:.1f}px | "
-                f"action=roi_kept"
-            )
-
-        # 4) 매칭 실패 또는 homography가 위험하다고 판단된 경우
         else:
-            if KEEP_LAST_GOOD_ROI_ON_FAILURE:
-                if not self.aligned_roi_poly and not self.aligned_roi_lines:
-                    self.aligned_roi_poly = list(self.base_roi_poly)
-                    self.aligned_roi_lines = list(self.base_roi_lines)
-
-                self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
-                hold_action = "last_good_roi_kept"
-            else:
-                self.aligned_roi_poly = list(self.base_roi_poly)
-                self.aligned_roi_lines = list(self.base_roi_lines)
-                self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
-                hold_action = "base_roi_restored"
-
             self.align_status_text = (
-                f"ALIGN HOLD {method} "
-                f"status={status} g={good} i={inliers} r={ratio:.2f} "
+                f"ROI DRIFT {method} "
+                f"status={status} decision={decision.get('decision')} "
+                f"anchor={dbg.get('selected_anchor', '')}/{dbg.get('anchors_tested', 0)} "
+                f"g={good} i={inliers} r={ratio:.2f} "
+                f"mask_obj={masked_objects} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
                 f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
                 f"scale={scale:.3f} persp={perspective:.5f} | "
-                f"reason={status} | action={hold_action}"
+                f"h_shifted={h_shifted} | "
+                f"camera_shift max={camera_shift:.1f}px mean={corner_mean_shift:.1f}px | "
+                f"threshold={threshold:.1f}px over={decision.get('over_count', 0)} | "
+                f"action=base_roi_kept"
             )
+
+        terminal_status_text = (
+            f"[ROI DRIFT] cam={self.camera_key} "
+            f"threshold={threshold:.1f}px "
+            f"expected_move={camera_shift:.1f}px "
+            f"dx={dx:.1f}px dy={dy:.1f}px rotate={angle:.2f}deg "
+            f"decision={decision.get('decision')} "
+            f"status={status} anchor={dbg.get('selected_anchor', '')}/{dbg.get('anchors_tested', 0)} "
+            f"mask_obj={masked_objects} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
+            f"anchor_update={dbg.get('anchor_update', '')}"
+        )
+        csv_row = {
+            "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
+            "camera_key": self.camera_key,
+            "decision": decision.get("decision"),
+            "current_threshold_px": round(float(threshold), 3),
+            "expected_move_px": expected_move_px_for_log,
+            "match_status": status,
+            "good_matches": good,
+            "inliers": inliers,
+            "inlier_ratio": round(float(ratio), 6),
+            "masked_objects": masked_objects,
+            "light_mode": light_mode,
+            "anchor_light_mode": anchor_light_mode,
+            "light_mode_changed": light_mode_changed,
+            "light_mode_source": light_mode_source,
+            "sat_mean": round(float(sat_mean), 6),
+            "channel_diff_mean": round(float(channel_diff_mean), 6),
+            "colorfulness": round(float(colorfulness), 6),
+            "anchor_update": dbg.get("anchor_update", ""),
+            "over_count": decision.get("over_count", 0),
+            "alignment_unknown_count": decision.get("alignment_unknown_count", 0),
+            "confirmed": bool(decision.get("confirmed", False)),
+            "healthcheck_requested": healthcheck_requested,
+            "reason": healthcheck_reason
+        }
+        ROI_ALIGN_LEARNING_STORE.append_csv_log(csv_row)
 
         self.status_history.append(self.align_status_text)
         self.last_align_time = now
 
-        print(f"[CCTV_Aligner] CAM {self.cam_id} {self.align_status_text}")
-        logger.info(f"[CAM:{self.cam_id}] ROI align status | {self.align_status_text}")
+        print(terminal_status_text)
+        logger.info(terminal_status_text)
+        logger.debug(f"[CAM:{self.cam_id}] ROI align detail | {self.align_status_text}")
+        return
+
+
     def process_frame(self):
         fr, fid, connected = self.reader.read()
         # [수정] 원본 영상을 바로 Recorder에 밀어넣지 않습니다. (run_logic에서 렌더링 후 삽입)
@@ -3302,9 +4695,14 @@ class Camera:
             time_diff = self.fps_queue[-1] - self.fps_queue[0]
             self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
 
-        self._initialize_base_roi_if_needed(fr)
-        #self._update_alignment(fr)
-        motion_mask = self.motion_det.apply(fr)
+        if d_signalman_res is None:
+            d_signalman_res = np.empty((0, 6))
+
+        align_exclude_boxes = self._detections_to_exclude_boxes(d_main_res, d_helmet_res, d_signalman_res)
+        self._update_alignment(fr, exclude_boxes=align_exclude_boxes)
+        motion_mask = None
+        if "signal_vehicle" in self.handlers:
+            motion_mask = self.motion_det.apply(fr)
 
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
@@ -3312,9 +4710,6 @@ class Camera:
         # d_helmet_filtered = [d for d in d_helmet_res if int(d[5]) == ID_H_NO_HELMET]
         # t_helmet = self.trk_helmet.update(d_helmet_filtered)
         t_helmet = self.trk_helmet.update(d_helmet_res)
-
-        if d_signalman_res is None:
-            d_signalman_res = np.empty((0, 6))
 
         t_signalman = self.trk_signalman.update(d_signalman_res)
 
@@ -3324,7 +4719,9 @@ class Camera:
         score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
         newly_triggered_events = []
 
-        record_fr = fr.copy()
+        # Recording currently uses the original frame in the main loop.
+        # record_fr = fr.copy()
+        record_fr = None
 
         for ename, handler in self.handlers.items():
             if ename == "no_helmet":
@@ -3337,7 +4734,7 @@ class Camera:
             try:
                 triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
             except Exception as e:
-                logger.error(f"🚨 [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
+                logger.error(f"?? [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
 
             for ev in triggered:
@@ -3359,7 +4756,7 @@ class Camera:
                     objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
 
                     log_msg = (
-                        f"🔥 [EVENT TRIGGERED] CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
+                        f"?? [EVENT TRIGGERED] CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
                         f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FPS:{self.current_fps:.1f} | "
                         f"Objects -> {objs_log_str}"
                     )
@@ -3407,7 +4804,12 @@ class Camera:
                         auth_tokens=auth_tokens
                     )
 
-                    self.recorder.trigger(ename, objects_meta=objects_meta, event_meta=event_meta)
+                    self.recorder.trigger(
+                        ename,
+                        objects_meta=objects_meta,
+                        event_meta=event_meta,
+                        current_fps=self.current_fps
+                    )
                     self.alerted[tid].add(ename)
                     self.last_evt_t[ename] = now
 
@@ -3536,11 +4938,11 @@ class Camera:
                 cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         # 좌측 상단 카메라 ID 및 FPS
-        cv2.rectangle(fr, (0, 0), (100, 40), (0, 0, 0), -1)
+        cv2.rectangle(fr, (0, 0), (115, 40), (0, 0, 0), -1)
         cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
         fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
-        cv2.putText(fr, f"FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
+        cv2.putText(fr, f"AI FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
 
         active_alarms = set(alarms.values())
 
@@ -3680,10 +5082,51 @@ class HealthCheckDaemon:
         self.running = True
         self.url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
 
+        self._roi_setup_required_pending = False
+        self._roi_setup_required_reason = ""
+        self._roi_setup_required_lock = threading.Lock()
+
         # 데몬 스레드로 실행하여 메인 프로세스 종료 시 강제 종료되도록 허용
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        logger.info(f"🩺 [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
+        logger.info(f"? [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
+
+
+
+
+    def request_roi_setup_required(self, reason=""):
+        with self._roi_setup_required_lock:
+            if self._roi_setup_required_pending:
+                return False
+
+            self._roi_setup_required_pending = True
+            self._roi_setup_required_true_sent_count = 0
+            self._roi_setup_required_reason = str(reason or "")
+
+        logger.warning(
+            f"[Health Check] ROI setup required flagged | "
+            f"terminalId={self.terminal_id} reason={reason or 'unspecified'}"
+        )
+        return True
+
+    def _should_send_roi_setup_required(self):
+        with self._roi_setup_required_lock:
+            return bool(self._roi_setup_required_pending)
+
+    def _mark_roi_setup_required_sent(self):
+        with self._roi_setup_required_lock:
+            if not self._roi_setup_required_pending:
+                return
+
+            self._roi_setup_required_true_sent_count += 1
+            sent_count = self._roi_setup_required_true_sent_count
+            reason = self._roi_setup_required_reason
+
+        logger.warning(
+            f"[Health Check] ROI setup required true sent (persistent) | "
+            f"terminalId={self.terminal_id} count={sent_count} "
+            f"reason={reason or 'unspecified'}"
+        )
 
     def _run(self):
         while self.running:
@@ -3696,6 +5139,7 @@ class HealthCheckDaemon:
                 # ISO 8601 포맷
                 kst = pytz.timezone('Asia/Seoul')
                 reported_at = datetime.datetime.now(kst).strftime('%Y-%m-%dT%H:%M:%S')
+                is_roi_setup_required = self._should_send_roi_setup_required()
 
                 data = {
                     "terminalId": str(self.terminal_id),
@@ -3703,7 +5147,8 @@ class HealthCheckDaemon:
                     "cpuUsage": round(cpu, 1),
                     "memoryUsage": round(mem, 1),
                     "temperature": round(temp, 1),
-                    "softwareVersion": self.version
+                    "softwareVersion": self.version,
+                    "isRoiSetupRequired": is_roi_setup_required
                 }
 
                 # requests 모듈은 딕셔너리를 data= 에 넘기면 자동으로 application/x-www-form-urlencoded 로 처리합니다.
@@ -3712,12 +5157,22 @@ class HealthCheckDaemon:
                 response = requests.post(self.url, headers=headers, data=data, timeout=10, verify=False)
 
                 if response.status_code == 200:
-                    logger.debug(f"🩺 [Health Check] 전송 성공 (CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%)")
+                    if is_roi_setup_required:
+                        self._mark_roi_setup_required_sent()
+
+                    logger.debug(
+                        f"?? [Health Check] 전송 성공 "
+                        f"(CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%, "
+                        f"ROI_SETUP: {data['isRoiSetupRequired']})"
+                    )
                 else:
-                    logger.error(f"⚠️ [Health Check] API 응답 에러 (상태코드: {response.status_code}) - {response.text}")
+                    logger.error(
+                        f"?? [Health Check] API 응답 에러 "
+                        f"(상태코드: {response.status_code}) - {response.text}"
+                    )
 
             except Exception as e:
-                logger.error(f"⚠️ [Health Check] 네트워크 연결 예외 발생: {e}")
+                logger.error(f"?? [Health Check] 네트워크 연결 예외 발생: {e}")
 
             # interval(300초)을 통으로 sleep하지 않고, 1초마다 running 상태를 체크하여 빠른 셧다운을 지원
             for _ in range(self.interval):
@@ -3729,6 +5184,14 @@ class HealthCheckDaemon:
         self.running = False
         if self.thread.is_alive():
             self.thread.join(timeout=2.0)
+
+HEALTH_DAEMON = None
+
+def request_terminal_roi_setup_required(reason=""):
+    if HEALTH_DAEMON is None:
+        logger.warning(f"[Health Check] ROI setup required could not be flagged because daemon is not ready | reason={reason or 'unspecified'}")
+        return False
+    return HEALTH_DAEMON.request_roi_setup_required(reason=reason)
 
 def main():
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
@@ -3759,7 +5222,7 @@ def main():
     if DEBUG_MODE:
         _log_level_str = SYS_CFG.get("logging", {}).get("level", "INFO").upper()
         logger.setLevel(getattr(logging, _log_level_str, logging.INFO))
-        logger.debug("🛠️ 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
+        logger.debug("??? 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
 
     if os.path.exists(config_file):
         try:
@@ -3787,34 +5250,43 @@ def main():
 
     models_cfg = SYS_CFG.get("models", {})
     inference_mode = str(SYS_CFG.get("INFERENCE_MODE", "auto")).strip().lower()
-    use_unified_event_model = inference_mode in ["auto", "unified", "single"]
-    unified_model_path = resolve_model_path(models_cfg.get("UNIFIED", "signalman.dxnn"))
+    event_inference_mode = "main"
+    main_model_path = resolve_model_path(models_cfg.get("MAIN", "hanjin_cctv_v2.dxnn"))
 
-    if use_unified_event_model and not os.path.exists(unified_model_path):
-        logger.warning(
-            f"통합 이벤트 모델을 찾을 수 없어 기존 별도 모델 구조로 동작합니다: {unified_model_path}"
-        )
-        use_unified_event_model = False
-
-    event_inference_mode = "unified" if use_unified_event_model else "separate"
+    if not os.path.exists(main_model_path):
+        logger.error(f"MAIN model file not found: {main_model_path}")
+        return
+    if inference_mode not in ["auto", "unified", "single", "main"]:
+        logger.info(f"INFERENCE_MODE={inference_mode} is handled with MAIN model inference.")
 
     try:
         logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
 
-        if use_unified_event_model:
-            # 이벤트 판단용 기본 객체와 신호수는 통합 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
-            # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
-            d_main = YoLoDeepX(unified_model_path)
-            d_helmet = YoLoDeepX(resolve_model_path(models_cfg["HELMET"]))
-            d_signalman = None
-        else:
-            d_main = YoLoDeepX(resolve_model_path(models_cfg["MAIN"]))
-            d_helmet = YoLoDeepX(resolve_model_path(models_cfg["HELMET"]))
-            d_signalman = YoLoDeepX(resolve_model_path(models_cfg["SIGNALMAN"]))
+        # 이벤트 판단용 기본 객체와 신호수는 MAIN 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
+        # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
+        d_main = YoLoDeepX(
+            main_model_path,
+            output_format=get_main_model_output_format(main_model_path),
+            pool_size=max(3, get_model_engine_pool_size("MAIN"))
+        )
+        d_helmet = YoLoDeepX(
+            resolve_model_path(models_cfg["HELMET"]),
+            output_format=get_model_output_format("HELMET"),
+            pool_size=get_model_engine_pool_size("HELMET")
+        )
+        d_signalman = None
 
         # 개인정보 블러는 이벤트 판단 모델과 목적이 달라 별도 모델을 유지합니다.
-        d_face = YoLoDeepX(resolve_model_path(models_cfg["FACE"]))
-        d_plate = YoLoDeepX(resolve_model_path(models_cfg["PLATE"]))
+        d_face = YoLoDeepX(
+            resolve_model_path(models_cfg["FACE"]),
+            output_format=get_model_output_format("FACE"),
+            pool_size=get_model_engine_pool_size("FACE")
+        )
+        d_plate = YoLoDeepX(
+            resolve_model_path(models_cfg["PLATE"]),
+            output_format=get_model_output_format("PLATE"),
+            pool_size=get_model_engine_pool_size("PLATE")
+        )
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
@@ -3844,10 +5316,23 @@ def main():
     last_fps_time = time.time()
     cpu_usage = 0.0
     dynamic_delay = 1.0 / target_fps
+    try:
+        current_fps_log_interval_sec = max(
+            1.0,
+            float(SYS_CFG.get(
+                "CURRENT_FPS_LOG_INTERVAL_SEC",
+                SYS_CFG.get("video_decode", {}).get("log_interval_sec", 10.0)
+            ))
+        )
+    except Exception:
+        current_fps_log_interval_sec = 10.0
+    current_fps_last_print = {}
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
+    global HEALTH_DAEMON
     health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=60)
+    HEALTH_DAEMON = health_daemon
 
     last_config_mtime = 0
     if os.path.exists(config_file):
@@ -3863,21 +5348,50 @@ def main():
     # 이렇게 하면 "이벤트 직전/직후 상황"을 사람이 다시 보면서 재현하기 쉽습니다.
     event_frame_save_delay_sec = float(SYS_CFG.get("EVENT_FRAME_SAVE_DELAY_SEC", 10.0))
     configured_event_frame_save_max_count = int(SYS_CFG.get("EVENT_FRAME_SAVE_MAX_COUNT", 0) or 0)
+    event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
     if configured_event_frame_save_max_count > 0:
         # 현장 상황을 알고 있다면 system_config.json에서 최대 저장 장수를 직접 지정할 수 있습니다.
         event_frame_save_max_count = configured_event_frame_save_max_count
     else:
         # 별도 지정이 없으면 녹화 FPS와 저장 시간을 기준으로 자동 계산합니다.
         # 예: 10초, REC_FPS 3이면 약 45장까지 보관합니다. 실제 저장 장수는 들어온 프레임 수만큼입니다.
-        event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
-    event_frame_save_max_count = max(1, int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5)))
+        event_frame_save_max_count = int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5))
+    event_frame_save_max_count = max(1, int(event_frame_save_max_count))
     event_save_queues = {c.ip: deque(maxlen=event_frame_save_max_count) for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
+    for c in cams:
+        logger.info(
+            f"[EVENT FRAME BUFFER] CAM:{c.cam_id}({c.ip}) | Event:init | "
+            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:{c.current_fps:.1f} | "
+            f"Frames -> event-frame buffer max={event_save_queues[c.ip].maxlen} "
+            f"(window={event_frame_save_delay_sec:.1f}s, fps_basis={event_frame_save_fps:.1f})"
+        )
     output_retention_days = float(SYS_CFG.get("OUTPUT_RETENTION_DAYS", 14))
     output_cleanup_interval_sec = float(SYS_CFG.get("OUTPUT_CLEANUP_INTERVAL_SEC", 86400))
     last_output_cleanup_time = time.time()
     logger.info(f"[Retention] 산출물 보관 정책: {output_retention_days:g}일 보관, {output_cleanup_interval_sec / 3600.0:.1f}시간마다 정리")
     run_output_retention_cleanup(output_retention_days)
+
+    def run_camera_inference(cam, fr):
+        base_conf = min(main_conf, person_conf, signalman_conf)
+        raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
+        t_main_input, _, d_signalman_res = split_unified_event_detections(
+            raw_dets,
+            cam.events,
+            main_conf=main_conf,
+            person_conf=person_conf,
+            helmet_conf=helmet_conf,
+            signalman_conf=signalman_conf
+        )
+
+        d_helmet_res = np.empty((0, 6))
+        if "no_helmet" in cam.events:
+            d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
+
+        return t_main_input, d_helmet_res, d_signalman_res
+
+    last_roi_snapshot_time = time.time() - 3590.0  # 시작 후 10초 뒤 첫 전송
+    ROI_SNAPSHOT_INTERVAL_SEC = 3600.0  # 1시간 주기
 
     try:
         psutil.cpu_percent(interval=None)
@@ -3892,7 +5406,7 @@ def main():
             if loop_count > 0 and loop_count % 45 == 0 and os.path.exists(config_file):
                 current_mtime = os.path.getmtime(config_file)
                 if current_mtime > last_config_mtime:
-                    logger.info("🛠️ [System] cameras.json 변경 감지. 카메라 설정을 무중단 핫 리로드합니다.")
+                    logger.info("??? [System] cameras.json 변경 감지. 카메라 설정을 무중단 핫 리로드합니다.")
                     try:
                         with open(config_file, 'r', encoding='utf-8') as f:
                             new_configs = json.load(f)
@@ -3923,7 +5437,7 @@ def main():
                 dynamic_delay = 1.0 / target_fps
 
                 if DEBUG_MODE:
-                    logger.debug(f"⏱️ [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
+                    logger.debug(f"?? [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
 
                 last_fps_time = current_time
 
@@ -3933,10 +5447,35 @@ def main():
                 q_size = IMAGE_SAVER_POOL._work_queue.qsize() if hasattr(IMAGE_SAVER_POOL, '_work_queue') else 0
 
                 if mem_usage > 80 or q_size > 20:
-                    logger.warning(f"⚠️ [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
+                    logger.warning(f"?? [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
 
             raw_data = [c.process_frame() for c in cams]
+
             final_imgs = []
+
+            now_time = time.time()
+            if (now_time - last_roi_snapshot_time) >= ROI_SNAPSHOT_INTERVAL_SEC:
+                for idx, c in enumerate(cams):
+                    fr, fid, connected = raw_data[idx]
+                    if connected and fr is not None:
+                        snap_img = create_roi_snapshot(c, fr)
+                        h, w = snap_img.shape[:2]
+                        roi_info = {
+                            "roi_poly_norm": c.roi_poly_norm,
+                            "roi_lines_norm": c.roi_lines_norm
+                        }
+                        IMAGE_SAVER_POOL.submit(
+                            _send_roi_snapshot_task,
+                            c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h
+                        )
+                last_roi_snapshot_time = now_time
+
+            inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+            inference_futures = {}
+            for idx, res in enumerate(raw_data):
+                fr, _, connected = res
+                if connected and fr is not None and cams[idx].events:
+                    inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
 
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
@@ -3956,61 +5495,32 @@ def main():
                         final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                     continue
 
-                if not connected:
+                if not connected or fr is None:
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                     continue
 
                 # ---------------------------------------------------------
                 # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
                 # ---------------------------------------------------------
-                if use_unified_event_model:
-                    # 헬멧 미착용은 아래 전용 모델에서 따로 추론하므로 통합 모델 기준에는 helmet_conf를 섞지 않습니다.
-                    base_conf = min(main_conf, person_conf, signalman_conf)
-                    raw_dets = cams[idx].det_main.infer(fr, conf_override=base_conf)
-                    t_main_input, _, d_signalman_res = split_unified_event_detections(
-                        raw_dets,
-                        cams[idx].events,
-                        main_conf=main_conf,
-                        person_conf=person_conf,
-                        helmet_conf=helmet_conf,
-                        signalman_conf=signalman_conf
-                    )
+                future = inference_futures.get(idx)
+                if future is None:
+                    final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
+                    continue
 
-                    d_helmet_res = np.empty((0, 6))
-                    if "no_helmet" in cams[idx].events:
-                        # 통합 signalman 모델의 헬멧 클래스는 쓰지 않고, 기존 helmet_3cls_v8 전용 모델 결과를 사용합니다.
-                        d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
-                else:
-                    # 기존 하드코딩 대신 변수(person_conf)를 적용합니다.
-                    base_conf = min(main_conf, person_conf)
-                    d_main_res = cams[idx].det_main.infer(fr, conf_override=base_conf)
-
-                    d_main_res_list = []
-                    for d in d_main_res:
-                        cls_id = int(d[5])
-                        conf = float(d[4])
-
-                        # ID_G_PERSON(2), ID_PERSON_LOW(4), ID_REFLECTIVE_VEST(5)인 경우 JSON에서 로드한 person_conf 적용
-                        if cls_id in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]:
-                            if conf >= person_conf:
-                                d_main_res_list.append(d)
-                        else:
-                            # 차량 등 나머지 객체는 JSON에서 로드한 main_conf 유지
-                            if conf >= main_conf:
-                                d_main_res_list.append(d)
-
-                    t_main_input = detection_array(d_main_res_list)
-
-                    d_helmet_res = np.empty((0, 6))
-                    if "no_helmet" in cams[idx].events:
-                        d_helmet_res = cams[idx].det_helmet.infer(fr, conf_override=helmet_conf)
-
-                    d_signalman_res = np.empty((0, 6))
-                    if "signal_vehicle" in cams[idx].events:
-                        d_signalman_res = cams[idx].det_signalman.infer(fr, conf_override=signalman_conf)
+                t_main_input, d_helmet_res, d_signalman_res = future.result()
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                now_fps_log = time.time()
+                cam_ip = cams[idx].ip
+                if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
+                    print(
+                        f"[POST INFER FPS] CAM:{cams[idx].cam_id}({cam_ip}) "
+                        f"current_fps={cams[idx].current_fps:.1f} fid={fid} "
+                        f"connected={connected} events={','.join(cams[idx].events) or '-'}",
+                        flush=True
+                    )
+                    current_fps_last_print[cam_ip] = now_fps_log
                 infer_meta = cams[idx].build_inference_log(
                     fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events,
                     d_signalman_res=d_signalman_res
@@ -4034,7 +5544,25 @@ def main():
                 if new_events:
                     # [수정] 디스크에 바로 쓰지 않고, 큐에 스택(Stacking)하며 이벤트 시간 갱신
                     # 메인 루프 참조 문제 방지를 위해 fr.copy() 사용
-                    last_event_times[cams[idx].ip] = time.time()
+                    cam_ip = cams[idx].ip
+                    last_event_times[cam_ip] = time.time()
+                    event_queue = event_save_queues.get(cam_ip)
+                    if event_queue is not None:
+                        event_names = ",".join(str(ev.get("event_name", "unknown")) for ev in new_events)
+                        event_tids = []
+                        for ev in new_events:
+                            for obj in ev.get("objects", []):
+                                obj_tid = obj.get("tid")
+                                if obj_tid is not None:
+                                    event_tids.append(str(obj_tid))
+                        event_tid_text = ",".join(event_tids) if event_tids else "-"
+                        logger.info(
+                            f"[EVENT FRAME BUFFER] CAM:{cams[idx].cam_id}({cam_ip}) | Event:{event_names} | "
+                            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{event_tid_text} | "
+                            f"FPS:{cams[idx].current_fps:.1f} | "
+                            f"Frames -> start keeping frames {len(event_queue)}/{event_queue.maxlen} "
+                            f"(window={event_frame_save_delay_sec:.1f}s)"
+                        )
 
                     for ev_data in new_events:
                         api_payload = []
@@ -4057,6 +5585,8 @@ def main():
                     event_infer_meta["privacy_blur"] = privacy_blur_meta
                     event_save_queues[cams[idx].ip].append((fid, event_frame, event_infer_meta))
 
+            inference_executor.shutdown(wait=True)
+
             # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
             for c in cams:
@@ -4070,7 +5600,12 @@ def main():
                     # 각 줄에는 저장된 이미지 경로(image_path)와 그 이미지의 AI 판단 결과가 같이 들어갑니다.
                     infer_log_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{batch_ts}.infer.jsonl")
                     infer_records = []
-                    logger.debug(f"[{ip}] {event_frame_save_delay_sec:.1f}초 저장 구간 완료. 쌓인 큐({len(q)}장)를 비동기 저장합니다.")
+                    logger.info(
+                        f"[EVENT FRAME BUFFER] CAM:{c.cam_id}({ip}) | Event:flush | "
+                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:{c.current_fps:.1f} | "
+                        f"Frames -> flush kept={len(q)}/{q.maxlen} "
+                        f"(window={event_frame_save_delay_sec:.1f}s)"
+                    )
                     for item_fid, item_fr, item_meta in list(q):
                         event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{item_fid}.jpg")
                         # 디스크 쓰기 병목 방지를 위해 스레드 풀에 작업 위임 (Off-loading)
@@ -4089,7 +5624,8 @@ def main():
             if is_gui_mode:
                 if final_imgs:
                     cv2.imshow("Monitor", create_mosaic_image(final_imgs))
-                if cv2.waitKey(1) == ord('q'):
+                key = cv2.waitKey(1)
+                if key == ord('q'):
                     break
 
             sleep_time = dynamic_delay - (time.time() - start_time)
@@ -4102,12 +5638,26 @@ def main():
         logger.error(f"[치명적 오류] {e}\n{traceback.format_exc()}")
     finally:
         if 'health_daemon' in locals():
-            logger.info("🩺 [Health Check] 데몬 스레드를 안전하게 종료합니다.")
+            logger.info("?? [Health Check] 데몬 스레드를 안전하게 종료합니다.")
             health_daemon.stop()
 
         for c in cams:
             c.reader.running = False
             c.recorder.running = False
+
+        for model_name in ["d_main", "d_helmet", "d_signalman", "d_face", "d_plate"]:
+            model = locals().get(model_name)
+            if model is not None and hasattr(model, "release"):
+                try:
+                    model.release()
+                except Exception:
+                    pass
+
+        if 'inference_executor' in locals():
+            try:
+                inference_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                inference_executor.shutdown(wait=False)
 
         if is_gui_mode:
             cv2.destroyAllWindows()
