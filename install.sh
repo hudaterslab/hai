@@ -59,7 +59,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "HELMET": "helmet_3cls_v8_ppu.dxnn",
         "PLATE": "license_plate_detector_ppu.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "print_pipeline_logs": true},
@@ -98,7 +98,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
         "HELMET": "helmet_3cls_v8_ppu.dxnn",
         "PLATE": "license_plate_detector_ppu.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.35, "SIGNALMAN": 0.5, "PLATE": 0.1},
+    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},
     "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "auto"},
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "print_pipeline_logs": true},
