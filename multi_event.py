@@ -697,18 +697,8 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         thickness = 3 if is_target else 2
         cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
 
-        label_name = str(obj.get('label', event_type))
-        class_id = obj.get('class_id')
-
-        # [수정] Confidence(Score) 표출 제거 및 Class ID 표출 적용
-        if class_id is not None:
-            label = f"{label_name}(ID:{class_id})"
-        else:
-            label = label_name
-
-        if obj_tid is not None:
-            label = f"{label} #{obj_tid}"
-
+        label = str(event_type)
+        # 고객사 요청으로 API 전송 이미지 라벨은 이벤트 명만 표시합니다.
         text_y = max(20, y1 - 8)
         cv2.putText(api_img, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         drawn = True
