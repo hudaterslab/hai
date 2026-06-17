@@ -799,6 +799,8 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         if objects_meta:
             ai_detected_bboxes = []
             for o in objects_meta:
+                if event_type == "conveyor_crossing" and str(o.get('label', '')).lower() == 'low_body':
+                    continue
                 item = {
                     "box": [int(b) for b in o['box']],
                     "label": str(o['label']),
