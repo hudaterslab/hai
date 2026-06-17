@@ -7,6 +7,17 @@ echo "=========================================="
 echo " 1. 바탕화면 자동 로그인 (GDM3) 자동 설정"
 echo "=========================================="
 sudo cp /etc/gdm3/custom.conf /etc/gdm3/custom.conf.bak 2>/dev/null || true
+sudo touch /etc/gdm3/custom.conf
+
+if ! grep -q "^\[daemon\]" /etc/gdm3/custom.conf; then
+    echo "[daemon]" | sudo tee -a /etc/gdm3/custom.conf > /dev/null
+fi
+
+if grep -iq "WaylandEnable" /etc/gdm3/custom.conf; then
+    sudo sed -i -E 's/^#?\s*WaylandEnable\s*=.*/WaylandEnable=false/i' /etc/gdm3/custom.conf
+else
+    sudo sed -i "/\[daemon\]/a WaylandEnable=false" /etc/gdm3/custom.conf
+fi
 
 if grep -iq "AutomaticLoginEnable" /etc/gdm3/custom.conf; then
     sudo sed -i -E 's/^#?\s*AutomaticLoginEnable\s*=\s*.*/AutomaticLoginEnable=True/i' /etc/gdm3/custom.conf
@@ -71,6 +82,7 @@ VNC_USER="${VNC_USER:-$ACTUAL_USER}"
 VNC_PORT="${VNC_PORT:-5900}"
 VNC_DISPLAY="${VNC_DISPLAY:-:0}"
 VNC_LISTEN="${VNC_LISTEN:-auto}"
+VNC_LOGIN_SCREEN_ACCESS="${VNC_LOGIN_SCREEN_ACCESS:-true}"
 VNC_HOME="$(getent passwd "$VNC_USER" | cut -d: -f6)"
 VNC_GROUP="$(id -gn "$VNC_USER")"
 VNC_AUTH="${VNC_AUTH:-$VNC_HOME/.Xauthority}"
@@ -105,6 +117,19 @@ if [ ! -e "$VNC_AUTH" ]; then
     VNC_AUTH="guess"
 fi
 
+if [ "$VNC_LOGIN_SCREEN_ACCESS" = "true" ]; then
+    VNC_SERVICE_USER="root"
+    VNC_SERVICE_GROUP="root"
+    VNC_SERVICE_DISPLAY="WAIT:0"
+    VNC_SERVICE_AUTH="guess"
+    echo "VNC login-screen access enabled. x11vnc will attach before desktop login."
+else
+    VNC_SERVICE_USER="$VNC_USER"
+    VNC_SERVICE_GROUP="$VNC_GROUP"
+    VNC_SERVICE_DISPLAY="$VNC_DISPLAY"
+    VNC_SERVICE_AUTH="$VNC_AUTH"
+fi
+
 sudo install -d -m 700 -o "$VNC_USER" -g "$VNC_GROUP" "$VNC_HOME/.vnc"
 
 if [ -n "${VNC_PASSWORD:-}" ]; then
@@ -126,12 +151,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$VNC_USER
-Group=$VNC_GROUP
-Environment=DISPLAY=$VNC_DISPLAY
-Environment=XAUTHORITY=$VNC_AUTH
+User=$VNC_SERVICE_USER
+Group=$VNC_SERVICE_GROUP
+Environment=DISPLAY=$VNC_SERVICE_DISPLAY
+Environment=XAUTHORITY=$VNC_SERVICE_AUTH
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 90); do test -S /tmp/.X11-unix/X0 && exit 0; sleep 2; done; exit 1'
-ExecStart=$X11VNC_BIN -display $VNC_DISPLAY -auth $VNC_AUTH -rfbauth $VNC_PASSWD -rfbport $VNC_PORT -listen $VNC_LISTEN_ADDR -forever -shared -repeat -noxdamage -o $VNC_LOG
+ExecStart=$X11VNC_BIN -display $VNC_SERVICE_DISPLAY -auth $VNC_SERVICE_AUTH -rfbauth $VNC_PASSWD -rfbport $VNC_PORT -listen $VNC_LISTEN_ADDR -forever -shared -repeat -noxdamage -o $VNC_LOG
 Restart=always
 RestartSec=3
 
