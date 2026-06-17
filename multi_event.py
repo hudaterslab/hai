@@ -5309,7 +5309,7 @@ def main():
     target_fps = SYS_CFG.get("REC_FPS", 15)
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
-    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35)  # [추가] 설정값 로드
+    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.5)  # [추가] 설정값 로드
     signalman_conf = SYS_CFG.get("model_confidences", {}).get("SIGNALMAN", person_conf)
     loop_count = 0
     fps_calc_interval = 30
@@ -5416,7 +5416,7 @@ def main():
                         last_config_mtime = current_mtime
 
                         # [추가] 만약 system_config.json 도 함께 체크하거나 리로드 구조가 있다면
-                        # 여기에서 person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35) 를 갱신할 수 있습니다.
+                        # 여기에서 person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.5) 를 갱신할 수 있습니다.
                     except Exception as e:
                         logger.error(f"핫 리로드 중 예외 발생: {e}")
 
