@@ -29,6 +29,10 @@ import argparse
 warnings = requests.packages.urllib3.exceptions.InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(warnings)
 
+API_SEND_STATE = {"consecutive_failures": 0, "last_failure_at": None}
+API_SEND_STATE_LOCK = threading.Lock()
+EVENT_AUDIT_LOCK = threading.Lock()
+
 # ==========================================
 # [1] 시스템 기본 설정 및 상수
 # ==========================================
@@ -116,7 +120,16 @@ def deep_merge_dict(base, override):
 def load_system_config():
     default_config = {
         "terminal_id": "99999",
-        "logging": {"dir": "./logs", "level": "INFO", "retention_days": 14},
+        "logging": {
+            "dir": "./logs",
+            "level": "INFO",
+            "file_level": "INFO",
+            "console_level": "INFO",
+            "debug_file_level": "DEBUG",
+            "retention_days": 14,
+            "event_audit_enabled": True,
+            "disk_free_warn_gb": 5.0
+        },
         "event_config": {
             "intrusion": {"enabled": False, "cooldown_sec": 600},
             "illegal_parking": {"enabled": False, "cooldown_sec": 600, "trigger_sec": 5.0, "move_threshold_ratio": 0.1, "blur_plate": True},
@@ -175,8 +188,7 @@ def load_system_config():
             "fps_limit": 15.0,
             "gstreamer_latency_ms": 50,
             "gstreamer_protocols": "tcp",
-            "log_interval_sec": 10.0,
-            "print_pipeline_logs": True
+            "log_interval_sec": 10.0
         },
         "INFERENCE_MODE": "auto",  # compatibility setting; event inference uses MAIN model detections
         "BATCH_SIZE": 9,
@@ -338,8 +350,16 @@ LOG_DIR = SYS_CFG.get("logging", {}).get("dir", "./logs")
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR, exist_ok=True)
 
+def _parse_log_level(value, default=logging.INFO):
+    return getattr(logging, str(value or "").upper(), default)
+
+_log_cfg = SYS_CFG.get("logging", {})
+_file_log_level = _parse_log_level(_log_cfg.get("file_level", _log_cfg.get("level", "INFO")), logging.INFO)
+_console_log_level = _parse_log_level(_log_cfg.get("console_level", "INFO"), logging.INFO)
+_logger_floor_level = min(_file_log_level, _console_log_level)
+
 logger = logging.getLogger("CCTV_SYSTEM")
-logger.setLevel(logging.INFO)
+logger.setLevel(_logger_floor_level)
 formatter = logging.Formatter('%(asctime)s | %(levelname)-7s | [%(funcName)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 log_filename = datetime.datetime.now().strftime("cctv_%Y%m%d.log")
@@ -347,14 +367,17 @@ log_filepath = os.path.join(LOG_DIR, log_filename)
 
 log_retention_days = max(1, int(SYS_CFG.get("logging", {}).get("retention_days", 14)))
 file_handler = TimedRotatingFileHandler(log_filepath, when="H", interval=1, backupCount=24 * log_retention_days, encoding='utf-8')
+file_handler.setLevel(_file_log_level)
 file_handler.setFormatter(formatter)
 
 stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(_console_log_level)
 stream_handler.setFormatter(formatter)
 
 # 비동기 로깅을 위한 큐(Queue) 설정
 log_queue = queue.Queue(-1)
 queue_handler = QueueHandler(log_queue)
+queue_handler.setLevel(_logger_floor_level)
 logger.addHandler(queue_handler)
 
 LOG_LISTENER = QueueListener(log_queue, file_handler, stream_handler, respect_handler_level=True)
@@ -362,16 +385,16 @@ LOG_LISTENER.start()
 
 def graceful_shutdown():
     """시스템 종료 시 스레드 풀과 로거를 안전하게 정리합니다."""
+    logger.info("[SYSTEM] Waiting for background I/O tasks to finish.")
+    try:
+        IMAGE_SAVER_POOL.shutdown(wait=True)
+    except Exception:
+        pass
     if LOG_LISTENER is not None:
         try:
             LOG_LISTENER.stop()
         except Exception:
             pass
-    print("?? [SYSTEM] 백그라운드 I/O 작업을 안전하게 마무리하고 종료합니다...")
-    try:
-        IMAGE_SAVER_POOL.shutdown(wait=True)
-    except Exception:
-        pass
 
 atexit.register(graceful_shutdown)
 
@@ -562,6 +585,116 @@ def int_box(box):
 def int_point(pt):
     return [int(round(float(pt[0]))), int(round(float(pt[1])))]
 
+def now_kst():
+    return datetime.datetime.now(pytz.timezone('Asia/Seoul'))
+
+def safe_id_part(value):
+    text = str(value if value is not None else "-")
+    text = re.sub(r"[^0-9A-Za-z_.-]+", "_", text).strip("_")
+    return text or "-"
+
+def make_event_id(cam_id, ip, event_name, tid, fid, ts=None):
+    ts = ts or now_kst()
+    stamp = ts.strftime('%Y%m%dT%H%M%S%f')[:-3]
+    return (
+        f"{stamp}_cam{safe_id_part(cam_id)}_{safe_id_part(ip)}_"
+        f"{safe_id_part(event_name)}_tid{safe_id_part(tid)}_fid{safe_id_part(fid)}"
+    )
+
+def append_event_audit_record(record, stage="event", status="ok", extra=None):
+    if not SYS_CFG.get("logging", {}).get("event_audit_enabled", True):
+        return
+    try:
+        audit_record = dict(record or {})
+        if extra:
+            audit_record.update(extra)
+        audit_record.setdefault("ts", now_kst().isoformat())
+        audit_record["audit_stage"] = stage
+        audit_record["artifact_status"] = status
+        ts_text = str(audit_record.get("ts", ""))
+        day = ts_text[:10].replace("-", "") if len(ts_text) >= 10 else now_kst().strftime('%Y%m%d')
+        audit_path = os.path.join(EVENT_ROOT_DIR, "logs", f"event_{day}.jsonl")
+        with EVENT_AUDIT_LOCK:
+            _write_jsonl_records(audit_path, [audit_record])
+    except Exception as e:
+        logger.error(f"[EVENT AUDIT] write failed | event_id={(record or {}).get('event_id', '-')} | {e}")
+
+def log_disk_health(paths, threshold_gb=None):
+    try:
+        threshold_gb = float(
+            threshold_gb
+            if threshold_gb is not None
+            else SYS_CFG.get("logging", {}).get("disk_free_warn_gb", 5.0)
+        )
+    except Exception:
+        threshold_gb = 5.0
+
+    seen_roots = set()
+    for label, path in paths:
+        target = os.path.abspath(path or PROJECT_ROOT)
+        while not os.path.exists(target):
+            parent = os.path.dirname(target)
+            if parent == target:
+                target = PROJECT_ROOT
+                break
+            target = parent
+        if target in seen_roots:
+            continue
+        seen_roots.add(target)
+        try:
+            usage = shutil.disk_usage(target)
+            free_gb = usage.free / (1024 ** 3)
+            total_gb = usage.total / (1024 ** 3)
+            if free_gb < threshold_gb:
+                logger.warning(
+                    f"[DISK HEALTH] label={label} path={target} free_gb={free_gb:.2f} "
+                    f"total_gb={total_gb:.2f} threshold_gb={threshold_gb:.2f}"
+                )
+            else:
+                logger.debug(
+                    f"[DISK HEALTH] label={label} path={target} free_gb={free_gb:.2f} "
+                    f"total_gb={total_gb:.2f}"
+                )
+        except Exception as e:
+            logger.warning(f"[DISK HEALTH] check failed | label={label} path={path} | {e}")
+
+def record_api_send_state(ok, event_id="-"):
+    with API_SEND_STATE_LOCK:
+        failures = int(API_SEND_STATE.get("consecutive_failures", 0) or 0)
+        if ok:
+            if failures > 0:
+                logger.info(f"[API SEND RECOVERED] event_id={event_id or '-'} previous_failures={failures}")
+            API_SEND_STATE["consecutive_failures"] = 0
+            API_SEND_STATE["last_failure_at"] = None
+            return
+
+        failures += 1
+        API_SEND_STATE["consecutive_failures"] = failures
+        API_SEND_STATE["last_failure_at"] = now_kst().isoformat()
+        if failures in (1, 3, 10) or failures % 10 == 0:
+            logger.warning(f"[API SEND DEGRADED] event_id={event_id or '-'} consecutive_failures={failures}")
+
+def get_git_metadata():
+    meta = {"commit": "-", "branch": "-"}
+    try:
+        meta["commit"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=PROJECT_ROOT,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2
+        ).strip()
+        meta["branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=PROJECT_ROOT,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2
+        ).strip()
+    except Exception:
+        pass
+    return meta
+
 def ccw(p1, p2, p3):
     """세 점의 방향성을 판별합니다. (선분 교차 알고리즘용)"""
     val = (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
@@ -611,9 +744,20 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
 # ==========================================
 # [5] API 통신 및 이미지 저장 (NAS 연동 제외)
 # ==========================================
-def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, bboxes, img_width=None, img_height=None):
+def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, bboxes, img_width=None, img_height=None, event_id=None):
     """수신 서버(Receiver API)로 이벤트 이미지를 POST 전송합니다."""
+    event_id = event_id or "-"
+    api_audit = {
+        "event_id": event_id,
+        "event_name": event_name,
+        "terminal_id": str(terminal_id),
+        "cctv_id": int(cctv_id),
+        "image_path": image_path,
+        "bbox_count": len(bboxes or [])
+    }
     if(terminal_id == "99999"):
+        logger.debug(f"[API SKIP] event_id={event_id} reason=default_terminal image={image_path}")
+        append_event_audit_record(api_audit, stage="api_send", status="skipped", extra={"reason": "default_terminal"})
         logger.debug(f"[API 스킵] 기본 단말 ID(99999) 사용 중: {image_path}")
         return
 
@@ -627,12 +771,13 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
     }
 
     if event_name not in event_type_mapping:
+        logger.debug(f"[API SKIP] event_id={event_id} reason=unknown_event event={event_name}")
+        append_event_audit_record(api_audit, stage="api_send", status="skipped", extra={"reason": "unknown_event"})
         logger.debug(f"[API 스킵] 정의되지 않은 이벤트 타입: {event_name}")
         return
 
     api_event_type = event_type_mapping[event_name]
-    kst = pytz.timezone('Asia/Seoul')
-    collected_at = datetime.datetime.now(kst).strftime('%Y-%m-%dT%H:%M:%S')
+    collected_at = now_kst().strftime('%Y-%m-%dT%H:%M:%S')
 
     # [검증 완료] bboxes 배열(리스트 내 딕셔너리)을 JSON 문자열로 안전하게 직렬화
     detected_objects_json = json.dumps(bboxes) if bboxes else "[]"
@@ -649,21 +794,58 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
     if img_height: data["imageHeight"] = int(img_height)
 
     if not os.path.exists(image_path):
+        logger.error(f"[API ERROR] event_id={event_id} image_missing={image_path}")
+        record_api_send_state(False, event_id)
+        append_event_audit_record(api_audit, stage="api_send", status="failed", extra={"reason": "image_missing"})
         logger.error(f"[API 에러] 파일을 찾을 수 없습니다: {image_path}")
         return
 
     try:
+        started_at = time.monotonic()
         with open(image_path, 'rb') as f:
             files = {"image": (os.path.basename(image_path), f, "image/jpeg")}
             response = requests.post(url, data=data, files=files, verify=False, timeout=10)
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            bbox_count = len(bboxes or [])
 
             if response.status_code == 200:
+                logger.info(
+                    f"[API SEND OK] event_id={event_id} terminal={terminal_id} cam={cctv_id} "
+                    f"event={event_name} status={response.status_code} elapsed_ms={elapsed_ms} "
+                    f"bbox_count={bbox_count} image={os.path.basename(image_path)}"
+                )
+                record_api_send_state(True, event_id)
+                append_event_audit_record(
+                    api_audit,
+                    stage="api_send",
+                    status="ok",
+                    extra={"status_code": response.status_code, "elapsed_ms": elapsed_ms}
+                )
                 logger.info(f"?? [API 전송 성공] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name}")
             else:
                 logger.error(f"?? [API 전송 실패] 상태코드: {response.status_code} | 메시지: {response.text}")
+            if response.status_code != 200:
+                logger.error(
+                    f"[API SEND FAIL] event_id={event_id} terminal={terminal_id} cam={cctv_id} "
+                    f"event={event_name} status={response.status_code} elapsed_ms={elapsed_ms} "
+                    f"bbox_count={bbox_count} body={response.text}"
+                )
+                record_api_send_state(False, event_id)
+                append_event_audit_record(
+                    api_audit,
+                    stage="api_send",
+                    status="failed",
+                    extra={"status_code": response.status_code, "elapsed_ms": elapsed_ms}
+                )
     except requests.exceptions.RequestException as e:
+        logger.error(f"[API NETWORK ERROR] event_id={event_id} image={image_path} | {e}")
+        record_api_send_state(False, event_id)
+        append_event_audit_record(api_audit, stage="api_send", status="failed", extra={"reason": "network_error"})
         logger.error(f"?? [API 네트워크 예외 발생]: {e}")
     except Exception as e:
+        logger.error(f"[API UNEXPECTED ERROR] event_id={event_id} image={image_path} | {e}\n{traceback.format_exc()}")
+        record_api_send_state(False, event_id)
+        append_event_audit_record(api_audit, stage="api_send", status="failed", extra={"reason": "unexpected_error"})
         logger.error(f"?? [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
 def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_tokens=None):
@@ -732,17 +914,46 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
 
     return api_img
 
+def _write_image_file(path, image, label="image", event_id="-"):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ok = cv2.imwrite(path, image)
+        if not ok:
+            logger.error(f"[EVIDENCE SAVE FAIL] event_id={event_id or '-'} label={label} path={path} reason=cv2.imwrite_false")
+            return False
+        logger.debug(f"[EVIDENCE SAVE OK] event_id={event_id or '-'} label={label} path={path}")
+        return True
+    except Exception as e:
+        logger.error(f"[EVIDENCE SAVE FAIL] event_id={event_id or '-'} label={label} path={path} | {e}")
+        return False
+
 def _save_and_send_task(img, img_path, api_img, api_img_path, api_params):
+    event_id = api_params.get('event_id', '-')
+    audit_base = {
+        "event_id": event_id,
+        "ts": api_params.get('event_ts', now_kst().isoformat()),
+        "event_name": api_params.get('event_name', '-'),
+        "terminal_id": api_params.get('terminal_id', '-'),
+        "cctv_id": api_params.get('cctv_id', '-'),
+        "ip": api_params.get('ip', '-'),
+        "image_path": img_path,
+        "api_img_path": api_img_path
+    }
     """비동기 스레드에서 파일 쓰기 및 API 전송을 처리합니다."""
     try:
-        cv2.imwrite(img_path, img)
+        if not _write_image_file(img_path, img, label="event_image", event_id=event_id):
+            append_event_audit_record(audit_base, stage="event_image_saved", status="failed", extra={"failed_path": img_path})
+            return
+        append_event_audit_record(audit_base, stage="event_image_saved", status="ok", extra={"saved_path": img_path})
     except Exception as e:
         logger.error(f"[이미지 저장 실패] 경로: {img_path} | 예외: {e}")
         return
 
     try:
-        os.makedirs(os.path.dirname(api_img_path), exist_ok=True)
-        cv2.imwrite(api_img_path, api_img)
+        if not _write_image_file(api_img_path, api_img, label="api_image", event_id=event_id):
+            append_event_audit_record(audit_base, stage="api_image_saved", status="failed", extra={"failed_path": api_img_path})
+            return
+        append_event_audit_record(audit_base, stage="api_image_saved", status="ok", extra={"saved_path": api_img_path})
     except Exception as e:
         logger.error(f"[API image save failed] path: {api_img_path} | error: {e}")
         return
@@ -755,7 +966,8 @@ def _save_and_send_task(img, img_path, api_img, api_img_path, api_params):
             cctv_id=api_params['cctv_id'],
             bboxes=api_params['bboxes'],
             img_width=api_params['img_width'],
-            img_height=api_params['img_height']
+            img_height=api_params['img_height'],
+            event_id=event_id
         )
     except Exception as e:
         logger.error(f"[Task 내부 API 호출 에러] {e}")
@@ -771,7 +983,7 @@ def _write_jsonl_records(path, records):
     except Exception as e:
         logger.error(f"[InferLog] JSONL write failed: {path} | {e}")
 
-def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None, auth_tokens=None):
+def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None, auth_tokens=None, event_id=None, event_ts=None):
     """원본 프레임 이미지를 로컬에 저장하고 탐지 메타데이터를 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
@@ -781,6 +993,8 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         img = frame.copy()
         x1, y1, x2, y2 = map(int, bbox)
         now = datetime.datetime.now()
+        event_ts = event_ts or now_kst().isoformat()
+        event_id = event_id or make_event_id(cctv_id, ip, event_type, tid, "unknown", now_kst())
 
         dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images", str(event_type))
         api_dpath = os.path.join(EVENT_ROOT_DIR, "events", ip, "images_api", str(event_type))
@@ -790,6 +1004,13 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         fname = f"{now.strftime('%Y%m%d_%H%M%S')}_{ip}_{event_type}_{tid}.jpg"
         img_path = os.path.join(dpath, fname)
         api_img_path = os.path.join(api_dpath, fname)
+        evidence_paths = {
+            "event_id": event_id,
+            "ts": event_ts,
+            "image_path": img_path,
+            "api_img_path": api_img_path,
+            "image_basename": fname
+        }
         
         # [수정] auth_tokens 데이터를 _draw_event_api_image 로 전달
         api_img = _draw_event_api_image(img, event_type, [x1, y1, x2, y2], tid, objects_meta, auth_tokens)
@@ -821,6 +1042,8 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
 
         api_params = {
             'ip': ip,
+            'event_id': event_id,
+            'event_ts': event_ts,
             'event_name': event_type,
             'terminal_id': str(terminal_id),
             'cctv_id': int(cctv_id),
@@ -830,9 +1053,32 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         }
 
         IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, api_img, api_img_path, api_params)
+        append_event_audit_record(
+            {
+                "event_id": event_id,
+                "ts": event_ts,
+                "event_name": event_type,
+                "terminal_id": str(terminal_id),
+                "cctv_id": int(cctv_id),
+                "ip": ip,
+                "tid": int(tid),
+                "bbox": [x1, y1, x2, y2],
+                "image_path": img_path,
+                "api_img_path": api_img_path,
+                "image_basename": fname
+            },
+            stage="evidence_queued",
+            status="queued"
+        )
+        logger.info(
+            f"[EVIDENCE QUEUED] event_id={event_id} cam={cctv_id} event={event_type} "
+            f"tid={tid} image={img_path} api_image={api_img_path}"
+        )
+        return evidence_paths
 
     except Exception as e:
         logger.error(f"[EventLogic Error] 이미지 마킹 중 예외 발생: {e}")
+        return None
 
 # ==========================================
 # [6] DeepX NPU 모델 추론 (YOLOv8 버그 픽스 반영)
@@ -1169,6 +1415,11 @@ class VideoRecorder:
         self.recording = False
         self.record_end_time = 0
         self.current_event = "unknown"
+        self.current_meta = None
+        self.current_video_path = None
+        self.current_infer_log_path = None
+        self.current_meta_path = None
+        self.current_record_started_at = None
         self.running = True
         logger.info(
             f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:init | "
@@ -1211,6 +1462,7 @@ class VideoRecorder:
             # MP4 옆 JSON에는 BBox뿐 아니라 이벤트 판단 근거(decision_trace)까지 함께 남깁니다.
             # event_meta가 없는 예전 호출은 objects_meta만 저장해 기존 동작을 유지합니다.
             self.current_meta = event_meta if event_meta is not None else objects_meta
+            self.current_record_started_at = now
 
             temp_buffer = list(self.buffer)
             tids = []
@@ -1221,7 +1473,8 @@ class VideoRecorder:
                         tids.append(str(obj_tid))
             tid_text = ",".join(tids) if tids else "-"
             logger.info(
-                f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:{event_name} | "
+                f"[FRAME BUFFER] event_id={event_meta.get('event_id', '-') if isinstance(event_meta, dict) else '-'} "
+                f"CAM:{self.cam_id}({self.ip}) | Event:{event_name} | "
                 f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid_text} | FPS:{current_fps:.1f} | "
                 f"Frames -> recorder pre-buffer kept={len(temp_buffer)}/{self.buffer.maxlen}"
             )
@@ -1230,6 +1483,8 @@ class VideoRecorder:
 
     def _writer_loop(self):
         writer = None
+        fpath = None
+        meta_path = None
         # infer_log_file은 녹화 영상과 같은 이름의 ".infer.jsonl" 파일입니다.
         # 예: 20260521_120000_192.168.0.10_no_helmet.mp4
         #     20260521_120000_192.168.0.10_no_helmet.infer.jsonl
@@ -1245,13 +1500,45 @@ class VideoRecorder:
                 continue
 
             if item is None:
+                duration_sec = 0.0
                 if writer:
                     writer.release()
+                    if self.current_record_started_at:
+                        duration_sec = max(0.0, time.time() - self.current_record_started_at)
+                    event_id = "-"
+                    if isinstance(self.current_meta, dict):
+                        event_id = self.current_meta.get("event_id", "-")
+                    logger.info(
+                        f"[RECORDING CLOSED] event_id={event_id} cam={self.cam_id} ip={self.ip} "
+                        f"event={self.current_event} video={fpath or '-'} infer_log={infer_log_path or '-'} "
+                        f"frames={video_frame_index} duration_sec={duration_sec:.1f}"
+                    )
                     writer = None
                 if infer_log_file:
                     infer_log_file.close()
                     infer_log_file = None
+                if isinstance(self.current_meta, dict):
+                    self.current_meta.update({
+                        "video_path": fpath,
+                        "infer_log_path": infer_log_path,
+                        "meta_path": meta_path,
+                        "recording_frames": int(video_frame_index),
+                        "recording_duration_sec": round(float(duration_sec), 3)
+                    })
+                    append_event_audit_record(self.current_meta, stage="recording_closed", status="ok")
+                    logger.info(
+                        f"[EVENT AUDIT] event_id={self.current_meta.get('event_id', '-')} "
+                        f"stage=recording_closed meta={meta_path or '-'} video={fpath or '-'} "
+                        f"infer_log={infer_log_path or '-'}"
+                    )
                 infer_log_path = None
+                fpath = None
+                meta_path = None
+                self.current_video_path = None
+                self.current_infer_log_path = None
+                self.current_meta_path = None
+                self.current_record_started_at = None
+                self.current_meta = None
                 video_frame_index = 0
                 continue
 
@@ -1272,6 +1559,8 @@ class VideoRecorder:
                 # 영상 파일 옆에 같은 이름의 infer 로그 파일을 만듭니다.
                 # 영상은 원본 그대로 두고, AI가 본 박스/클래스/이벤트 정보는 이 파일에 저장합니다.
                 infer_log_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.infer.jsonl")
+                self.current_video_path = fpath
+                self.current_infer_log_path = infer_log_path
 
                 # -----------------------------------------------------------
                 # [추가] 영상 생성 시점에 BBox 상세 수치 데이터(JSON)를 동시 저장
@@ -1279,9 +1568,22 @@ class VideoRecorder:
                 if hasattr(self, 'current_meta') and self.current_meta:
                     meta_fname = f"{time_str}_{self.ip}_{self.current_event}.json"
                     meta_path = os.path.join(dpath, meta_fname)
+                    self.current_meta_path = meta_path
+                    if isinstance(self.current_meta, dict):
+                        self.current_meta.update({
+                            "video_path": fpath,
+                            "infer_log_path": infer_log_path,
+                            "meta_path": meta_path
+                        })
                     try:
                         with open(meta_path, 'w', encoding='utf-8') as f_meta:
                             json.dump(to_json_safe(self.current_meta), f_meta, indent=4, ensure_ascii=False)
+                        if isinstance(self.current_meta, dict):
+                            append_event_audit_record(self.current_meta, stage="recording_metadata_written", status="open")
+                            logger.info(
+                                f"[EVENT AUDIT] event_id={self.current_meta.get('event_id', '-')} stage=recording_metadata_written "
+                                f"meta={meta_path} video={fpath} infer_log={infer_log_path}"
+                            )
                         logger.info(f"?? [BBox 데이터 저장 완료] 경로: {meta_path}")
                     except Exception as e:
                         logger.error(f"?? BBox JSON 메타데이터 저장 실패: {e}")
@@ -1635,7 +1937,7 @@ class CrossingDetector(BaseEventDetector):
                         del self.candidates[p_tid]
                     else:
                         if p_tid in self.candidates:
-                            print(f"[프레임 {fid}] ID {p_tid} 침투 깊이: {perp_dist:.2f} | 교차 후 실이동: {post_cross_dist:.2f} / 요구거리: {dynamic_threshold:.2f}")
+                            logger.debug(f"[CROSSING CANDIDATE] fid={fid} tid={p_tid} perp_dist={perp_dist:.2f} post_cross_dist={post_cross_dist:.2f} threshold={dynamic_threshold:.2f}")
 
                 elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec:
                     del self.candidates[p_tid]
@@ -3051,7 +3353,7 @@ class AnchorTrackingROIAligner:
                 "masked_objects": masked_objects,
             }
             if DEBUG_ALIGN:
-                print(f"[CCTV_Aligner] anchor 특징점 부족: {n}")
+                logger.debug(f"[CCTV_Aligner] anchor features insufficient: {n}")
             return False
 
         self._store_anchor_slot(ANCHOR_BASE, gray, kp, des, frame.shape[:2], variants=variants)
@@ -3092,7 +3394,7 @@ class AnchorTrackingROIAligner:
         }
 
         if DEBUG_ALIGN:
-            print(f"[CCTV_Aligner] anchor 기준 프레임 등록 완료: features={len(kp)}")
+            logger.debug(f"[CCTV_Aligner] anchor registered: features={len(kp)}")
         return True
 
     def _normalize_H(self, H):
@@ -3511,8 +3813,6 @@ class FrameReader:
     def _emit_decode_log(self, message, level="info"):
         log_fn = getattr(logger, level, logger.info)
         log_fn(message)
-        if bool(self.decode_cfg.get("print_pipeline_logs", True)):
-            print(message, flush=True)
 
     def _emit_gst_check_once(self, message, level="info"):
         if self._gst_check_logged:
@@ -4103,7 +4403,7 @@ class Camera:
             f"?? [CAM:{self.ip}] 무중단 설정 리로드 완료: "
             f"{old_events} -> {self.events} | ROI aligner reset"
         )
-        print(f"[CCTV_Aligner] CAM {self.cam_id} 설정 변경으로 aligner reset 완료")
+        logger.debug(f"[CCTV_Aligner] CAM {self.cam_id} aligner reset after config reload")
 
     def _initialize_base_roi_if_needed(self, frame):
         if frame is None:
@@ -4209,7 +4509,7 @@ class Camera:
                     f"base_poly={len(self.base_roi_poly)} pts | "
                     f"base_lines={len(self.base_roi_lines)} pts"
                 )
-                print(msg)
+                logger.debug(msg)
                 logger.info(
                     f"[CAM:{self.cam_id}] ROI anchor set | ip={self.ip} | "
                     f"base_poly={len(self.base_roi_poly)} | "
@@ -4228,7 +4528,7 @@ class Camera:
                     f"[CCTV_Aligner] CAM {self.cam_id} ANCHOR FAIL | "
                     f"reason={status} | good={good} | ip={self.ip}"
                 )
-                print(msg)
+                logger.debug(msg)
                 logger.warning(
                     f"[CAM:{self.cam_id}] ROI anchor failed | "
                     f"reason={status} | good={good} | ip={self.ip}"
@@ -4395,7 +4695,6 @@ class Camera:
         self.status_history.append(self.align_status_text)
         self.last_align_time = now
 
-        print(terminal_status_text)
         logger.info(terminal_status_text)
         logger.debug(f"[CAM:{self.cam_id}] ROI align detail | {self.align_status_text}")
         return
@@ -4676,6 +4975,8 @@ class Camera:
             "alarms": {str(int(tid)): evt for tid, evt in (alarms or {}).items()},
             "new_events": [
                 {
+                    "event_id": str(ev.get("event_id", "")),
+                    "ts": str(ev.get("ts", "")),
                     "event_name": str(ev.get("event_name", "")),
                     "objects": self._serialize_event_objects(ev.get("objects", [])),
                     "privacy_blur": to_json_safe(ev.get("privacy_blur", {})),
@@ -4753,11 +5054,16 @@ class Camera:
                 }))
 
                 if ename not in self.alerted[tid] and (now - self.last_evt_t.get(ename, 0) >= cooldown):
+                    event_ts_dt = now_kst()
+                    event_ts = event_ts_dt.isoformat()
+                    event_fid = int(ev.get('fid', fid))
+                    event_id = make_event_id(self.cam_id, self.ip, ename, tid, event_fid, event_ts_dt)
                     objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
 
                     log_msg = (
-                        f"?? [EVENT TRIGGERED] CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
-                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FPS:{self.current_fps:.1f} | "
+                        f"?? [EVENT TRIGGERED] event_id={event_id} CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
+                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FID:{event_fid} | FPS:{self.current_fps:.1f} | "
+                        f"Reason:{decision_trace.get('reason', '-')} | "
                         f"Objects -> {objs_log_str}"
                     )
                     logger.warning(log_msg)
@@ -4772,6 +5078,13 @@ class Camera:
                     )
                     privacy_blur_meta["scope"] = "event_snapshot"
                     privacy_blur_meta["reference_tracks"] = "event_objects" if event_privacy_tracks else "current_tracks"
+                    logger.info(
+                        f"[PRIVACY BLUR] event_id={event_id} cam={self.cam_id} event={ename} "
+                        f"face_enabled={blur_face_option} plate_enabled={blur_plate_option} "
+                        f"face_count={len(privacy_blur_meta.get('face', []))} "
+                        f"plate_count={len(privacy_blur_meta.get('plate', []))} "
+                        f"reference_tracks={privacy_blur_meta.get('reference_tracks', '-')}"
+                    )
 
                     event_trajectories = {}
                     for obj in objects_meta:
@@ -4783,13 +5096,15 @@ class Camera:
 
                     auth_tokens = ev.get('auth_tokens', None)
                     event_meta = {
+                        'event_id': event_id,
+                        'ts': event_ts,
                         'event_name': ename,
                         'terminal_id': str(SYS_CFG.get("terminal_id", "99999")),
                         'cctv_id': int(self.cam_id),
                         'ip': str(self.ip),
                         'tid': int(tid),
                         'bbox': int_box(bbox),
-                        'fid': int(ev.get('fid', fid)),
+                        'fid': event_fid,
                         'objects': self._serialize_event_objects(objects_meta),
                         'trajectories': to_json_safe(event_trajectories),
                         'auth_tokens': to_json_safe(auth_tokens or []),
@@ -4797,12 +5112,16 @@ class Camera:
                         'decision_trace': decision_trace
                     }
 
-                    save_event_image_with_mark(
+                    evidence_paths = save_event_image_with_mark(
                         frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid,
                         terminal_id=SYS_CFG.get("terminal_id", "99999"), cctv_id=self.cam_id,
                         objects_meta=objects_meta, trajectories=event_trajectories,
-                        auth_tokens=auth_tokens
+                        auth_tokens=auth_tokens,
+                        event_id=event_id,
+                        event_ts=event_ts
                     )
+                    if evidence_paths:
+                        event_meta.update(evidence_paths)
 
                     self.recorder.trigger(
                         ename,
@@ -4814,11 +5133,21 @@ class Camera:
                     self.last_evt_t[ename] = now
 
                     newly_triggered_events.append({
+                        'event_id': event_id,
+                        'ts': event_ts,
                         'event_name': ename,
                         'objects': objects_meta,
                         'privacy_blur': privacy_blur_meta,
                         'decision_trace': decision_trace
                     })
+
+                else:
+                    cooldown_remaining = max(0.0, cooldown - (now - self.last_evt_t.get(ename, 0)))
+                    logger.debug(
+                        f"[EVENT SUPPRESSED] cam={self.cam_id} ip={self.ip} event={ename} tid={tid} "
+                        f"fid={int(ev.get('fid', fid))} alerted={ename in self.alerted[tid]} "
+                        f"cooldown_remaining={cooldown_remaining:.1f}s"
+                    )
 
                 current_alarms[tid] = ename
 
@@ -5085,6 +5414,7 @@ class HealthCheckDaemon:
         self._roi_setup_required_pending = False
         self._roi_setup_required_reason = ""
         self._roi_setup_required_lock = threading.Lock()
+        self._consecutive_failures = 0
 
         # 데몬 스레드로 실행하여 메인 프로세스 종료 시 강제 종료되도록 허용
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -5157,6 +5487,11 @@ class HealthCheckDaemon:
                 response = requests.post(self.url, headers=headers, data=data, timeout=10, verify=False)
 
                 if response.status_code == 200:
+                    if self._consecutive_failures > 0:
+                        logger.info(
+                            f"[Health Check] recovered after {self._consecutive_failures} consecutive failures"
+                        )
+                    self._consecutive_failures = 0
                     if is_roi_setup_required:
                         self._mark_roi_setup_required_sent()
 
@@ -5166,13 +5501,15 @@ class HealthCheckDaemon:
                         f"ROI_SETUP: {data['isRoiSetupRequired']})"
                     )
                 else:
+                    self._consecutive_failures += 1
                     logger.error(
                         f"?? [Health Check] API 응답 에러 "
-                        f"(상태코드: {response.status_code}) - {response.text}"
+                        f"(상태코드: {response.status_code}, consecutive_failures={self._consecutive_failures}) - {response.text}"
                     )
 
             except Exception as e:
-                logger.error(f"?? [Health Check] 네트워크 연결 예외 발생: {e}")
+                self._consecutive_failures += 1
+                logger.error(f"?? [Health Check] 네트워크 연결 예외 발생 (consecutive_failures={self._consecutive_failures}): {e}")
 
             # interval(300초)을 통으로 sleep하지 않고, 1초마다 running 상태를 체크하여 빠른 셧다운을 지원
             for _ in range(self.interval):
@@ -5220,8 +5557,17 @@ def main():
     debug_ans = guarded_input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
     DEBUG_MODE = True if debug_ans == 'y' else False
     if DEBUG_MODE:
-        _log_level_str = SYS_CFG.get("logging", {}).get("level", "INFO").upper()
-        logger.setLevel(getattr(logging, _log_level_str, logging.INFO))
+        _runtime_log_cfg = SYS_CFG.get("logging", {})
+        _debug_file_level = _parse_log_level(_runtime_log_cfg.get("debug_file_level", "DEBUG"), logging.DEBUG)
+        _debug_console_level = _parse_log_level(
+            _runtime_log_cfg.get("debug_console_level", _runtime_log_cfg.get("console_level", "INFO")),
+            logging.INFO
+        )
+        _debug_floor_level = min(_debug_file_level, _debug_console_level)
+        logger.setLevel(_debug_floor_level)
+        queue_handler.setLevel(_debug_floor_level)
+        file_handler.setLevel(_debug_file_level)
+        stream_handler.setLevel(_debug_console_level)
         logger.debug("??? 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
 
     if os.path.exists(config_file):
@@ -5296,14 +5642,27 @@ def main():
         ip = extract_ip(rtsp)
         conf = camera_configs.get(ip)
 
-        if not conf or not conf.get('events'): continue
+        if not conf:
+            logger.warning(f"[CAMERA SKIP] cam_index={i+1} ip={ip} reason=missing_camera_config")
+            continue
+        if not conf.get('events'):
+            logger.warning(f"[CAMERA SKIP] cam_index={i+1} ip={ip} reason=no_enabled_events")
+            continue
         conf['url'] = rtsp
         cams.append(Camera(
             ip, conf, d_main, d_helmet, d_face, d_signalman, d_plate,
             cam_id=i+1,
             event_inference_mode=event_inference_mode
         ))
-        logger.info(f"Loaded [CAM {i+1}]: {ip}")
+        logger.info(
+            f"[CAMERA LOADED] cam={i+1} ip={ip} events={','.join(conf.get('events', [])) or '-'} "
+            f"roi_poly_points={len(conf.get('roi_poly_norm', []) or [])} "
+            f"roi_line_points={len(conf.get('roi_lines_norm', []) or [])}"
+        )
+
+    if not cams:
+        logger.error("[SYSTEM STARTUP] no active cameras loaded; check cameras.csv and cameras.json events.")
+        return
 
     # 환경 변수 스로틀링 기준
     target_fps = SYS_CFG.get("REC_FPS", 15)
@@ -5330,6 +5689,23 @@ def main():
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
+    git_meta = get_git_metadata()
+    logger.info(
+        f"[SYSTEM STARTUP] version={software_version} git_branch={git_meta.get('branch', '-')} "
+        f"git_commit={git_meta.get('commit', '-')} terminal_id={terminal_id} "
+        f"project_root={PROJECT_ROOT} config={CONFIG_COMMON_FILE} cameras_config={config_file} "
+        f"python={sys.version.split()[0]} opencv={cv2.__version__}"
+    )
+    logger.info(
+        f"[SYSTEM CONFIG] active_cameras={len(cams)} batch_size={BATCH_SIZE} rec_fps={SYS_CFG.get('REC_FPS')} "
+        f"loop_fps={SYS_CFG.get('LOOP_FPS')} confidences={json.dumps(SYS_CFG.get('model_confidences', {}), ensure_ascii=False)} "
+        f"decode={json.dumps(SYS_CFG.get('video_decode', {}), ensure_ascii=False)}"
+    )
+    logger.info(
+        f"[MODEL CONFIG] main={main_model_path} helmet={resolve_model_path(models_cfg.get('HELMET', '-'))} "
+        f"face={resolve_model_path(models_cfg.get('FACE', '-'))} plate={resolve_model_path(models_cfg.get('PLATE', '-'))}"
+    )
+    log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
     global HEALTH_DAEMON
     health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=60)
     HEALTH_DAEMON = health_daemon
@@ -5445,6 +5821,7 @@ def main():
                 gc.collect()
                 mem_usage = psutil.virtual_memory().percent
                 q_size = IMAGE_SAVER_POOL._work_queue.qsize() if hasattr(IMAGE_SAVER_POOL, '_work_queue') else 0
+                log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
 
                 if mem_usage > 80 or q_size > 20:
                     logger.warning(f"?? [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
@@ -5507,18 +5884,26 @@ def main():
                     final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
                     continue
 
-                t_main_input, d_helmet_res, d_signalman_res = future.result()
+                try:
+                    t_main_input, d_helmet_res, d_signalman_res = future.result()
+                except Exception as e:
+                    logger.error(
+                        f"[INFERENCE ERROR] cam={cams[idx].cam_id} ip={cams[idx].ip} fid={fid} "
+                        f"events={','.join(cams[idx].events) or '-'} | {e}\n{traceback.format_exc()}"
+                    )
+                    if is_gui_mode:
+                        final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
+                    continue
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
                 t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
                 now_fps_log = time.time()
                 cam_ip = cams[idx].ip
                 if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
-                    print(
+                    logger.debug(
                         f"[POST INFER FPS] CAM:{cams[idx].cam_id}({cam_ip}) "
                         f"current_fps={cams[idx].current_fps:.1f} fid={fid} "
-                        f"connected={connected} events={','.join(cams[idx].events) or '-'}",
-                        flush=True
+                        f"connected={connected} events={','.join(cams[idx].events) or '-'}"
                     )
                     current_fps_last_print[cam_ip] = now_fps_log
                 infer_meta = cams[idx].build_inference_log(
@@ -5572,7 +5957,10 @@ def main():
                                 "label": ev_data['event_name'],
                                 "score": obj['score']
                             })
-                        logger.info(f"[{cams[idx].ip}] 알람 API 페이로드 덤프 ({ev_data['event_name']}): {json.dumps(api_payload)}")
+                        logger.debug(
+                            f"[API PAYLOAD DEBUG] event_id={ev_data.get('event_id', '-')} "
+                            f"cam={cams[idx].ip} event={ev_data['event_name']} payload={json.dumps(api_payload)}"
+                        )
 
                 # 이벤트가 발생한 뒤 설정된 시간 동안 privacy blur가 적용된 프레임과 AI 판단 로그를 계속 모읍니다.
                 # 녹화 MP4는 원본으로 두고, 별도 이벤트 프레임 이미지에는 개인정보 보호 처리를 적용합니다.
@@ -5609,7 +5997,18 @@ def main():
                     for item_fid, item_fr, item_meta in list(q):
                         event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{item_fid}.jpg")
                         # 디스크 쓰기 병목 방지를 위해 스레드 풀에 작업 위임 (Off-loading)
-                        IMAGE_SAVER_POOL.submit(cv2.imwrite, event_img_path, item_fr)
+                        window_event_id = "-"
+                        if item_meta:
+                            new_events = item_meta.get("new_events", [])
+                            if new_events:
+                                window_event_id = new_events[0].get("event_id", "-")
+                        IMAGE_SAVER_POOL.submit(
+                            _write_image_file,
+                            event_img_path,
+                            item_fr,
+                            "event_frame_window",
+                            window_event_id
+                        )
                         if item_meta is not None:
                             record = dict(item_meta)
                             # 이 image_path가 실제 저장된 원본 이미지와 AI 판단 로그를 이어주는 연결고리입니다.
