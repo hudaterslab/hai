@@ -30,7 +30,7 @@ echo "✅ 사용자 [$ACTUAL_USER] 바탕화면 자동 로그인 세팅 완료!"
 echo "=========================================="
 echo " 2. 필수 패키지 설치 (Tailscale & xrdp)"
 echo "=========================================="
-sudo apt update && sudo apt install -y curl gpg xrdp x11vnc xauth
+sudo apt update && sudo apt install -y curl gpg xrdp x11vnc xauth net-tools
 
 # Tailscale 설치
 curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale.gpg > /dev/null
@@ -86,6 +86,7 @@ VNC_LOGIN_SCREEN_ACCESS="${VNC_LOGIN_SCREEN_ACCESS:-true}"
 VNC_HOME="$(getent passwd "$VNC_USER" | cut -d: -f6)"
 VNC_GROUP="$(id -gn "$VNC_USER")"
 VNC_AUTH="${VNC_AUTH:-$VNC_HOME/.Xauthority}"
+VNC_AUTH_CANDIDATES="${VNC_AUTH_CANDIDATES:-/var/run/sddm/* /run/sddm/* /run/user/*/gdm/Xauthority /run/gdm3/auth-for-*/database}"
 VNC_PASSWD="$VNC_HOME/.vnc/passwd"
 VNC_LOG="$VNC_HOME/.vnc/x11vnc.log"
 VNC_SERVICE="/etc/systemd/system/remote-x11vnc.service"
@@ -120,14 +121,16 @@ fi
 if [ "$VNC_LOGIN_SCREEN_ACCESS" = "true" ]; then
     VNC_SERVICE_USER="root"
     VNC_SERVICE_GROUP="root"
-    VNC_SERVICE_DISPLAY="WAIT:0"
-    VNC_SERVICE_AUTH="guess"
-    echo "VNC login-screen access enabled. x11vnc will attach before desktop login."
+    VNC_SERVICE_DISPLAY="$VNC_DISPLAY"
+    VNC_SERVICE_AUTH=""
+    VNC_SERVICE_EXEC_START="/bin/sh -c 'AUTH_FILE=\"\"; for f in $VNC_AUTH_CANDIDATES; do if [ -r \"\$f\" ]; then AUTH_FILE=\"\$f\"; break; fi; done; if [ -z \"\$AUTH_FILE\" ]; then echo \"No display-manager Xauthority file found in: $VNC_AUTH_CANDIDATES\" >&2; exit 1; fi; exec $X11VNC_BIN -display $VNC_SERVICE_DISPLAY -auth \"\$AUTH_FILE\" -rfbauth $VNC_PASSWD -rfbport $VNC_PORT -listen $VNC_LISTEN_ADDR -forever -shared -repeat -noxdamage -o $VNC_LOG'"
+    echo "VNC login-screen access enabled. x11vnc will use display-manager Xauthority files."
 else
     VNC_SERVICE_USER="$VNC_USER"
     VNC_SERVICE_GROUP="$VNC_GROUP"
     VNC_SERVICE_DISPLAY="$VNC_DISPLAY"
     VNC_SERVICE_AUTH="$VNC_AUTH"
+    VNC_SERVICE_EXEC_START="$X11VNC_BIN -display $VNC_SERVICE_DISPLAY -auth $VNC_SERVICE_AUTH -rfbauth $VNC_PASSWD -rfbport $VNC_PORT -listen $VNC_LISTEN_ADDR -forever -shared -repeat -noxdamage -o $VNC_LOG"
 fi
 
 sudo install -d -m 700 -o "$VNC_USER" -g "$VNC_GROUP" "$VNC_HOME/.vnc"
@@ -156,7 +159,7 @@ Group=$VNC_SERVICE_GROUP
 Environment=DISPLAY=$VNC_SERVICE_DISPLAY
 Environment=XAUTHORITY=$VNC_SERVICE_AUTH
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 90); do test -S /tmp/.X11-unix/X0 && exit 0; sleep 2; done; exit 1'
-ExecStart=$X11VNC_BIN -display $VNC_SERVICE_DISPLAY -auth $VNC_SERVICE_AUTH -rfbauth $VNC_PASSWD -rfbport $VNC_PORT -listen $VNC_LISTEN_ADDR -forever -shared -repeat -noxdamage -o $VNC_LOG
+ExecStart=$VNC_SERVICE_EXEC_START
 Restart=always
 RestartSec=3
 
