@@ -62,7 +62,7 @@ DEBUG_MODE = False
 # ROI 보정(Aligner) 튜닝 파라미터
 # ------------------------------------------------------------
 ALIGN_INTERVAL_SEC = 300.0
-ORB_FEATURES = 800
+ORB_FEATURES = 1000
 MIN_HOMOGRAPHY_ATTEMPT_MATCHES = 30
 MIN_GOOD_MATCHES = 180
 MIN_INLIERS = 140
@@ -81,9 +81,9 @@ ROI_DRIFT_CONFIRM_COUNT = 3
 ALIGN_UNKNOWN_CONFIRM_COUNT = 3
 ANCHOR_REFRESH_UNKNOWN_COUNT = 3
 FEATURE_MASK_PADDING_RATIO = 0.08
-IR_SAT_MEAN_THRESHOLD = 25.0
-IR_CHANNEL_DIFF_THRESHOLD = 12.0
-IR_COLORFULNESS_THRESHOLD = 18.0
+IR_SAT_MEAN_THRESHOLD = 18.0
+IR_CHANNEL_DIFF_THRESHOLD = 8.0
+IR_COLORFULNESS_THRESHOLD = 12.0
 ANCHOR_BASE = "base"
 ANCHOR_UPDATED = "updated"
 ANCHOR_SLOT_NAMES = (ANCHOR_BASE, ANCHOR_UPDATED)
@@ -2830,12 +2830,11 @@ class ROIAlignLearningStore:
 
     def append_csv_log(self, row, path=ROI_ALIGN_CSV_LOG_FILE):
         fieldnames = [
-            "timestamp", "camera_key", "decision", "current_threshold_px", "expected_move_px",
+            "timestamp", "camera_key", "decision", "expected_move_px",
             "match_status", "good_matches", "inliers", "inlier_ratio",
-            "masked_objects",
             "light_mode", "anchor_light_mode", "light_mode_changed", "light_mode_source",
             "sat_mean", "channel_diff_mean", "colorfulness",
-            "anchor_update", "over_count", "alignment_unknown_count", "confirmed", "healthcheck_requested", "reason"
+            "anchor_update", "over_count", "alignment_unknown_count", "healthcheck_requested", "reason"
         ]
 
         def write_one_csv(target_path):
@@ -2860,10 +2859,6 @@ class ROIAlignLearningStore:
         try:
             write_one_csv(path)
 
-            camera_key = str(row.get("camera_key", "") or "unknown_cam")
-            safe_camera_key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", camera_key).strip("_") or "unknown_cam"
-            camera_path = os.path.join(ROI_ALIGN_CAMERA_LOG_DIR, f"{safe_camera_key}.csv")
-            write_one_csv(camera_path)
         except Exception as e:
             logger.warning(f"[ROI DRIFT] CSV log append failed: {e}")
 
@@ -3667,7 +3662,6 @@ class AnchorTrackingROIAligner:
         current_data = self._capture_anchor_data(frame, exclude_boxes=exclude_boxes)
         current_variants = current_data.get("variants") or []
         best_current_variant = self._best_feature_variant(current_variants)
-        gray = current_data.get("gray")
         kp = current_data.get("kp")
         des = current_data.get("des")
         self.pending_update_anchor = current_data
@@ -3727,10 +3721,27 @@ class AnchorTrackingROIAligner:
         dbg["anchors_tested"] = 1
         dbg["anchor_update"] = self.last_anchor_update_action
         anchor_light_mode = anchor.get("light_mode", "unknown")
+        current_light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes)
+
+        light_mode_changed = bool(
+            anchor_light_mode not in ("", "unknown")
+            and current_light_mode not in ("", "unknown")
+            and anchor_light_mode != current_light_mode
+        )
+
         dbg["anchor_light_mode"] = anchor_light_mode
-        if dbg.get("light_mode", "unknown") in (None, "", "unknown") and anchor_light_mode not in (None, "", "unknown"):
-            dbg["light_mode"] = anchor_light_mode
-            dbg["light_mode_source"] = "same_as_anchor_match_ok"
+        dbg["light_mode"] = current_light_mode
+        dbg["light_mode_changed"] = light_mode_changed
+        dbg["light_mode_source"] = "detected_always"
+        dbg["sat_mean"] = float(light_stats.get("sat_mean", 0.0) or 0.0)
+        dbg["channel_diff_mean"] = float(light_stats.get("channel_diff_mean", 0.0) or 0.0)
+        dbg["colorfulness"] = float(light_stats.get("colorfulness", 0.0) or 0.0)
+
+        if light_mode_changed:
+            current_data["light_mode"] = current_light_mode
+            current_data["light_stats"] = light_stats
+            self.pending_update_anchor = current_data
+            dbg["anchor_update"] = "pending_light_mode_update"
 
         if H_direct is None:
             accepted, dbg = self._accept_light_transition_after_match_fail(frame, current_data, anchor, dbg, exclude_boxes=exclude_boxes)
@@ -3758,7 +3769,7 @@ class AnchorTrackingROIAligner:
         self.last_debug["status"] = "ok_updated_anchor:gray"
         self.last_debug["selected_anchor"] = dbg["selected_anchor"]
         self.last_debug["anchors_tested"] = 1
-        self.last_debug["anchor_update"] = self.last_anchor_update_action
+        self.last_debug["anchor_update"] = dbg.get("anchor_update", self.last_anchor_update_action)
         return self.H_last_good.copy(), True
 
     def _try_anchor_direct_correction(self, frame, kp, des):
@@ -4618,7 +4629,7 @@ class Camera:
                     f"status={status} best_anchor={dbg.get('selected_anchor', '')} "
                     f"anchors_tested={dbg.get('anchors_tested', 0)} "
                     f"best_good={good} best_inliers={inliers} best_ratio={ratio:.2f} "
-                    f"over={decision.get('over_count', 0)}"
+                    f"unknown={decision.get('alignment_unknown_count', 0)}"
                 )
             else:
                 reason = (
@@ -4626,7 +4637,9 @@ class Camera:
                     f"shift={camera_shift:.1f}px threshold={threshold:.1f}px "
                     f"over={decision.get('over_count', 0)}"
                 )
-            healthcheck_requested = request_terminal_roi_setup_required(reason=reason)
+
+            request_terminal_roi_setup_required(reason=reason)
+            healthcheck_requested = True
             healthcheck_reason = reason
             self.align_status_text = (
                 f"ROI SETUP REQUIRED {method} "
@@ -4655,6 +4668,7 @@ class Camera:
                 f"action=base_roi_kept"
             )
 
+       
         terminal_status_text = (
             f"[ROI DRIFT] cam={self.camera_key} "
             f"threshold={threshold:.1f}px "
@@ -4669,13 +4683,11 @@ class Camera:
             "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
             "camera_key": self.camera_key,
             "decision": decision.get("decision"),
-            "current_threshold_px": round(float(threshold), 3),
             "expected_move_px": expected_move_px_for_log,
             "match_status": status,
             "good_matches": good,
             "inliers": inliers,
             "inlier_ratio": round(float(ratio), 6),
-            "masked_objects": masked_objects,
             "light_mode": light_mode,
             "anchor_light_mode": anchor_light_mode,
             "light_mode_changed": light_mode_changed,
@@ -4686,7 +4698,6 @@ class Camera:
             "anchor_update": dbg.get("anchor_update", ""),
             "over_count": decision.get("over_count", 0),
             "alignment_unknown_count": decision.get("alignment_unknown_count", 0),
-            "confirmed": bool(decision.get("confirmed", False)),
             "healthcheck_requested": healthcheck_requested,
             "reason": healthcheck_reason
         }
@@ -5529,6 +5540,14 @@ def request_terminal_roi_setup_required(reason=""):
         logger.warning(f"[Health Check] ROI setup required could not be flagged because daemon is not ready | reason={reason or 'unspecified'}")
         return False
     return HEALTH_DAEMON.request_roi_setup_required(reason=reason)
+
+def is_terminal_roi_setup_required_pending():
+    if HEALTH_DAEMON is None:
+        return False
+    try:
+        return HEALTH_DAEMON._should_send_roi_setup_required()
+    except Exception:
+        return False
 
 def main():
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
