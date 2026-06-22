@@ -4668,7 +4668,7 @@ class Camera:
                 f"action=base_roi_kept"
             )
 
-       
+
         terminal_status_text = (
             f"[ROI DRIFT] cam={self.camera_key} "
             f"threshold={threshold:.1f}px "
