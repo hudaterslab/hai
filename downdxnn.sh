@@ -8,3 +8,4 @@ wget -O hanjin_cctv.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/m
 wget -O signalman.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/signalman.dxnn
 wget -O license_plate_detector.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector.dxnn
 wget -O license_plate_detector_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector_ppu.dxnn
+wget -O license_plate_detector_v2.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/license_plate_detector_v2.dxnn

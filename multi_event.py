@@ -157,7 +157,7 @@ def load_system_config():
             "MAIN": "hanjin_cctv_v2.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
             "HELMET": "helmet_3cls_v8_ppu.dxnn",
-            "PLATE": "license_plate_detector_ppu.dxnn"
+            "PLATE": "license_plate_detector_v2.dxnn"
         },
         "model_confidences": {
             "MAIN": 0.6,
@@ -171,7 +171,7 @@ def load_system_config():
             "MAIN": "ppu",
             "FACE": "auto",
             "HELMET": "auto",
-            "PLATE": "auto"
+            "PLATE": "yolo"
         },
         "model_engine_pool_sizes": {
             "MAIN": 3,
@@ -1206,9 +1206,14 @@ class YoLoDeepX:
             if pred.ndim == 3:
                 pred = pred[0]
 
-            # Class-Id 및 Score 추출
-            scores = np.max(pred[:, 4:], axis=1)
-            class_ids = np.argmax(pred[:, 4:], axis=1)
+            class_scores = pred[:, 4:]
+            if class_scores.shape[1] == 1:
+                # Single-class YOLO heads expose one score column after xywh.
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
+            else:
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
 
             # Confidence 필터링
             mask = scores > conf_thres
