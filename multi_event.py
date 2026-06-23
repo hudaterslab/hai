@@ -5626,7 +5626,7 @@ class HealthCheckDaemon:
             logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
             return []
 
-        handled_cctv_ids = []
+        changed_cctv_ids = []
         changed = False
         runtime_updates = []
 
@@ -5689,14 +5689,14 @@ class HealthCheckDaemon:
                         new_conf[key] = value
                         item_changed = True
 
-                handled_cctv_ids.append(str(cam.cam_id))
                 if item_changed:
+                    changed_cctv_ids.append(str(cam.cam_id))
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     changed = True
                 else:
                     logger.info(
-                        f"[Health Check] ROI settings already up to date: "
+                        f"[Health Check] ROI settings unchanged; setup request remains pending if active: "
                         f"cctvId={item.get('cctvId')!r} keys={','.join(sorted(roi_updates.keys()))}"
                     )
 
@@ -5722,7 +5722,7 @@ class HealthCheckDaemon:
             except Exception as e:
                 logger.error(f"[Health Check] runtime ROI update failed: cctvId={cam.cam_id} error={e}")
 
-        return handled_cctv_ids
+        return changed_cctv_ids
 
     def _run(self):
         while self.running:
@@ -5767,11 +5767,11 @@ class HealthCheckDaemon:
                         response_payload = {}
                         logger.warning(f"[Health Check] failed to parse response JSON: {e}")
 
-                    applied_roi_cctv_ids = self._apply_roi_settings_from_response(response_payload)
-                    if applied_roi_cctv_ids:
+                    changed_roi_cctv_ids = self._apply_roi_settings_from_response(response_payload)
+                    if changed_roi_cctv_ids:
                         self.clear_roi_setup_required(reason="roi_settings_applied_from_health_response")
                         self.request_roi_snapshot_refresh(
-                            cctv_ids=applied_roi_cctv_ids,
+                            cctv_ids=changed_roi_cctv_ids,
                             reason="roi_settings_applied_from_health_response"
                         )
 
