@@ -326,7 +326,7 @@ def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
             "imageWidth": int(w),
             "imageHeight": int(h),
             "cctvServerId": "1",
-            "isReqRoiSetup": "false",
+            "isReqRoiSetup": False,
             "roiInfo": roi_info_str
         }
 
@@ -4394,6 +4394,7 @@ class Camera:
         """웹 UI 등 외부에서 cameras.json이 변경되었을 때, 무중단으로 설정을 핫 리로드합니다."""
         old_events = self.events.copy()
 
+        self.conf = new_conf
         self.events = new_conf.get('events', [])
         self.roi_poly_norm = new_conf.get('roi_poly_norm', [])
         self.roi_lines_norm = new_conf.get('roi_lines_norm', [])
@@ -5415,16 +5416,22 @@ def get_system_temperature():
     return 0.0 # 센서가 없는 PC 환경 등의 폴백(Fallback)
 
 class HealthCheckDaemon:
-    def __init__(self, terminal_id, version="v1.1.0", interval_sec=60):
+    def __init__(self, terminal_id, version="v1.1.0", interval_sec=60, cams=None, config_file=CONFIG_CAMERAS_FILE):
         self.terminal_id = terminal_id
         self.version = version
         self.interval = interval_sec
         self.running = True
         self.url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
+        self.cams = list(cams or [])
+        self.config_file = config_file
+        self._config_lock = threading.Lock()
 
         self._roi_setup_required_pending = False
         self._roi_setup_required_reason = ""
+        self._roi_setup_required_true_sent_count = 0
         self._roi_setup_required_lock = threading.Lock()
+        self._roi_snapshot_refresh_cctv_ids = set()
+        self._roi_snapshot_refresh_lock = threading.Lock()
         self._consecutive_failures = 0
 
         # 데몬 스레드로 실행하여 메인 프로세스 종료 시 강제 종료되도록 허용
@@ -5469,6 +5476,254 @@ class HealthCheckDaemon:
             f"reason={reason or 'unspecified'}"
         )
 
+    def clear_roi_setup_required(self, reason=""):
+        with self._roi_setup_required_lock:
+            if not self._roi_setup_required_pending:
+                return False
+
+            self._roi_setup_required_pending = False
+            self._roi_setup_required_true_sent_count = 0
+            old_reason = self._roi_setup_required_reason
+            self._roi_setup_required_reason = ""
+
+        logger.info(
+            f"[Health Check] ROI setup required cleared | "
+            f"terminalId={self.terminal_id} reason={reason or old_reason or 'unspecified'}"
+        )
+        return True
+
+    def request_roi_snapshot_refresh(self, cctv_ids=None, reason=""):
+        ids = {
+            str(cctv_id).strip()
+            for cctv_id in (cctv_ids or [])
+            if str(cctv_id or "").strip()
+        }
+        if not ids:
+            return False
+
+        with self._roi_snapshot_refresh_lock:
+            before = set(self._roi_snapshot_refresh_cctv_ids)
+            self._roi_snapshot_refresh_cctv_ids.update(ids)
+            pending = set(self._roi_snapshot_refresh_cctv_ids)
+
+        logger.info(
+            f"[Health Check] ROI snapshot refresh requested | "
+            f"terminalId={self.terminal_id} cctvIds={','.join(sorted(ids))} "
+            f"pending={','.join(sorted(pending))} reason={reason or 'unspecified'}"
+        )
+        return pending != before
+
+    def get_roi_snapshot_refresh_cctv_ids(self):
+        with self._roi_snapshot_refresh_lock:
+            return set(self._roi_snapshot_refresh_cctv_ids)
+
+    def clear_roi_snapshot_refresh(self, cctv_ids=None, reason=""):
+        ids = {
+            str(cctv_id).strip()
+            for cctv_id in (cctv_ids or [])
+            if str(cctv_id or "").strip()
+        }
+        if not ids:
+            return False
+
+        with self._roi_snapshot_refresh_lock:
+            before = set(self._roi_snapshot_refresh_cctv_ids)
+            self._roi_snapshot_refresh_cctv_ids.difference_update(ids)
+            cleared = before - set(self._roi_snapshot_refresh_cctv_ids)
+            pending = set(self._roi_snapshot_refresh_cctv_ids)
+
+        if cleared:
+            logger.info(
+                f"[Health Check] ROI snapshot refresh cleared | "
+                f"terminalId={self.terminal_id} cctvIds={','.join(sorted(cleared))} "
+                f"pending={','.join(sorted(pending)) or '-'} reason={reason or 'unspecified'}"
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _decode_jsonish(value):
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            return json.loads(text)
+        return value
+
+    @staticmethod
+    def _coerce_roi_norm_points(value):
+        value = HealthCheckDaemon._decode_jsonish(value)
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(f"ROI norm value must be a list, got {type(value).__name__}")
+
+        points = []
+        for point in value:
+            if isinstance(point, dict):
+                x = point.get("x")
+                y = point.get("y")
+            elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                x, y = point[0], point[1]
+            else:
+                raise ValueError(f"Invalid ROI point: {point!r}")
+            points.append([round(float(x), 6), round(float(y), 6)])
+        return points
+
+    @classmethod
+    def _extract_roi_norm_updates(cls, roi_json):
+        payload = cls._decode_jsonish(roi_json)
+        if not isinstance(payload, dict):
+            return None
+
+        candidates = [payload]
+        for nested_key in ("roiInfo", "roi_info"):
+            if nested_key not in payload:
+                continue
+            nested = cls._decode_jsonish(payload.get(nested_key))
+            if isinstance(nested, dict):
+                candidates.append(nested)
+
+        for candidate in candidates:
+            updates = {}
+            if "roi_poly_norm" in candidate:
+                updates["roi_poly_norm"] = cls._coerce_roi_norm_points(candidate.get("roi_poly_norm"))
+            if "roi_lines_norm" in candidate:
+                updates["roi_lines_norm"] = cls._coerce_roi_norm_points(candidate.get("roi_lines_norm"))
+            if updates:
+                return updates
+        return None
+
+    def _find_camera_by_cctv_id(self, cctv_id):
+        cctv_text = str(cctv_id or "").strip()
+        if not cctv_text:
+            return None
+
+        for cam in self.cams:
+            if cctv_text == str(getattr(cam, "cam_id", "")):
+                return cam
+            if cctv_text == str(getattr(cam, "ip", "")):
+                return cam
+            if cctv_text == str(getattr(cam, "camera_key", "")):
+                return cam
+        return None
+
+    def _apply_roi_settings_from_response(self, response_payload):
+        if not isinstance(response_payload, dict):
+            return []
+
+        data = response_payload.get("data")
+        if not isinstance(data, dict):
+            return []
+
+        roi_settings = data.get("roiSettings")
+        if not roi_settings:
+            logger.debug("[Health Check] roiSettings empty; no ROI update")
+            return []
+        if not isinstance(roi_settings, list):
+            logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
+            return []
+
+        changed_cctv_ids = []
+        changed = False
+        runtime_updates = []
+
+        with self._config_lock:
+            try:
+                if os.path.exists(self.config_file):
+                    with open(self.config_file, "r", encoding="utf-8") as f:
+                        camera_configs = json.load(f)
+                else:
+                    camera_configs = {}
+            except Exception as e:
+                logger.error(f"[Health Check] failed to load cameras config for ROI update: {e}")
+                return []
+
+            if not isinstance(camera_configs, dict):
+                logger.error("[Health Check] cameras config is not an object; ROI update skipped")
+                return []
+
+            for item in roi_settings:
+                if not isinstance(item, dict):
+                    logger.warning(f"[Health Check] invalid roiSettings item ignored: {item!r}")
+                    continue
+
+                cam = self._find_camera_by_cctv_id(item.get("cctvId"))
+                if cam is None:
+                    logger.warning(f"[Health Check] ROI settings camera not found: cctvId={item.get('cctvId')!r}")
+                    continue
+
+                try:
+                    roi_updates = self._extract_roi_norm_updates(item.get("roiJson"))
+                except Exception as e:
+                    logger.warning(
+                        f"[Health Check] ROI settings parse failed: "
+                        f"cctvId={item.get('cctvId')!r} error={e}"
+                    )
+                    continue
+
+                if not roi_updates:
+                    logger.info(
+                        f"[Health Check] ROI settings has no norm keys; treated as initial setup: "
+                        f"cctvId={item.get('cctvId')!r}"
+                    )
+                    continue
+
+                disk_conf = camera_configs.get(cam.ip)
+                new_conf = dict(getattr(cam, "conf", {}) or {})
+                if isinstance(disk_conf, dict):
+                    new_conf.update(disk_conf)
+
+                item_changed = False
+                for key, value in roi_updates.items():
+                    key_was_present = key in new_conf
+                    old_value = new_conf.get(key)
+                    try:
+                        old_norm = self._coerce_roi_norm_points(old_value) if key_was_present else None
+                    except Exception:
+                        old_norm = old_value
+
+                    if (not key_was_present) or old_norm != value:
+                        new_conf[key] = value
+                        item_changed = True
+
+                if item_changed:
+                    changed_cctv_ids.append(str(cam.cam_id))
+                    camera_configs[cam.ip] = new_conf
+                    runtime_updates.append((cam, new_conf, roi_updates))
+                    changed = True
+                else:
+                    logger.info(
+                        f"[Health Check] ROI settings unchanged; setup request remains pending if active: "
+                        f"cctvId={item.get('cctvId')!r} keys={','.join(sorted(roi_updates.keys()))}"
+                    )
+
+            if changed:
+                try:
+                    temp_path = f"{self.config_file}.tmp"
+                    with open(temp_path, "w", encoding="utf-8") as f:
+                        json.dump(camera_configs, f, indent=4, ensure_ascii=False)
+                    os.replace(temp_path, self.config_file)
+                except Exception as e:
+                    logger.error(f"[Health Check] failed to write cameras config for ROI update: {e}")
+                    return []
+
+        for cam, new_conf, roi_updates in runtime_updates:
+            try:
+                cam.update_config(new_conf)
+                logger.info(
+                    f"[Health Check] ROI settings applied: "
+                    f"cctvId={cam.cam_id} camera={cam.ip} keys={','.join(sorted(roi_updates.keys()))} "
+                    f"poly={len(new_conf.get('roi_poly_norm', []) or [])} "
+                    f"lines={len(new_conf.get('roi_lines_norm', []) or [])}"
+                )
+            except Exception as e:
+                logger.error(f"[Health Check] runtime ROI update failed: cctvId={cam.cam_id} error={e}")
+
+        return changed_cctv_ids
+
     def _run(self):
         while self.running:
             try:
@@ -5505,6 +5760,20 @@ class HealthCheckDaemon:
                     self._consecutive_failures = 0
                     if is_roi_setup_required:
                         self._mark_roi_setup_required_sent()
+
+                    try:
+                        response_payload = response.json()
+                    except Exception as e:
+                        response_payload = {}
+                        logger.warning(f"[Health Check] failed to parse response JSON: {e}")
+
+                    changed_roi_cctv_ids = self._apply_roi_settings_from_response(response_payload)
+                    if changed_roi_cctv_ids:
+                        self.clear_roi_setup_required(reason="roi_settings_applied_from_health_response")
+                        self.request_roi_snapshot_refresh(
+                            cctv_ids=changed_roi_cctv_ids,
+                            reason="roi_settings_applied_from_health_response"
+                        )
 
                     logger.debug(
                         f"?? [Health Check] 전송 성공 "
@@ -5546,6 +5815,22 @@ def is_terminal_roi_setup_required_pending():
         return False
     try:
         return HEALTH_DAEMON._should_send_roi_setup_required()
+    except Exception:
+        return False
+
+def get_terminal_roi_snapshot_refresh_cctv_ids():
+    if HEALTH_DAEMON is None:
+        return set()
+    try:
+        return HEALTH_DAEMON.get_roi_snapshot_refresh_cctv_ids()
+    except Exception:
+        return set()
+
+def clear_terminal_roi_snapshot_refresh(cctv_ids=None, reason=""):
+    if HEALTH_DAEMON is None:
+        return False
+    try:
+        return HEALTH_DAEMON.clear_roi_snapshot_refresh(cctv_ids=cctv_ids, reason=reason)
     except Exception:
         return False
 
@@ -5726,7 +6011,13 @@ def main():
     )
     log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
     global HEALTH_DAEMON
-    health_daemon = HealthCheckDaemon(terminal_id=terminal_id, version=software_version, interval_sec=60)
+    health_daemon = HealthCheckDaemon(
+        terminal_id=terminal_id,
+        version=software_version,
+        interval_sec=60,
+        cams=cams,
+        config_file=config_file
+    )
     HEALTH_DAEMON = health_daemon
 
     last_config_mtime = 0
@@ -5850,11 +6141,22 @@ def main():
             final_imgs = []
 
             now_time = time.time()
-            if (now_time - last_roi_snapshot_time) >= ROI_SNAPSHOT_INTERVAL_SEC:
+            roi_snapshot_refresh_cctv_ids = get_terminal_roi_snapshot_refresh_cctv_ids()
+            periodic_roi_snapshot_due = (now_time - last_roi_snapshot_time) >= ROI_SNAPSHOT_INTERVAL_SEC
+            if periodic_roi_snapshot_due or roi_snapshot_refresh_cctv_ids:
+                roi_snapshot_queued = False
+                refreshed_cctv_ids = set()
                 for idx, c in enumerate(cams):
+                    cctv_id_text = str(c.cam_id)
+                    force_camera_snapshot = cctv_id_text in roi_snapshot_refresh_cctv_ids
+                    if not periodic_roi_snapshot_due and not force_camera_snapshot:
+                        continue
+
                     fr, fid, connected = raw_data[idx]
                     if connected and fr is not None:
                         snap_img = create_roi_snapshot(c, fr)
+                        if snap_img is None:
+                            continue
                         h, w = snap_img.shape[:2]
                         roi_info = {
                             "roi_poly_norm": c.roi_poly_norm,
@@ -5864,7 +6166,16 @@ def main():
                             _send_roi_snapshot_task,
                             c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h
                         )
-                last_roi_snapshot_time = now_time
+                        roi_snapshot_queued = True
+                        if force_camera_snapshot:
+                            refreshed_cctv_ids.add(cctv_id_text)
+                if roi_snapshot_queued and periodic_roi_snapshot_due:
+                    last_roi_snapshot_time = now_time
+                if refreshed_cctv_ids:
+                    clear_terminal_roi_snapshot_refresh(
+                        cctv_ids=refreshed_cctv_ids,
+                        reason="roi_snapshot_sent"
+                    )
 
             inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
