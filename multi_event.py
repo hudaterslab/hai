@@ -62,11 +62,19 @@ DEBUG_MODE = False
 # ROI 보정(Aligner) 튜닝 파라미터
 # ------------------------------------------------------------
 ALIGN_INTERVAL_SEC = 300.0
+ROI_CHANGE_EVENT = "roi_change"
+ROI_CHANGE_FIELD = "roi_change_poly_norm"
 ORB_FEATURES = 1000
-MIN_HOMOGRAPHY_ATTEMPT_MATCHES = 30
-MIN_GOOD_MATCHES = 180
-MIN_INLIERS = 140
-MIN_INLIER_RATIO = 0.75
+# roi_change는 사용자가 지정한 ROI 안에서만 ORB를 계산하므로
+# 전체 화면 기준보다 낮은 전역 기준을 사용한다.
+MIN_HOMOGRAPHY_ATTEMPT_MATCHES = 15
+MIN_GOOD_MATCHES = 30
+MIN_INLIERS = 20
+MIN_INLIER_RATIO = 0.50
+ANCHOR_RETRY_INTERVAL_SEC = 30.0
+# RTSP/GStreamer 연결 직후 1~3초 동안 회색/무효 프레임이 들어오는 현장을 피하기 위해
+# ROI_CHANGE anchor는 첫 roi_change 프레임 확인 후 이 시간만큼 안정화 대기한다.
+ANCHOR_STARTUP_DELAY_SEC = 10.0
 RANSAC_REPROJ_THRESH = 5.0
 TRACKING_UPDATE_MIN_INTERVAL_SEC = 2.0
 TRACKING_UPDATE_MIN_INLIERS = 25
@@ -80,6 +88,14 @@ ROI_DRIFT_THRESHOLD_PX = 15.0
 ROI_DRIFT_CONFIRM_COUNT = 3
 ALIGN_UNKNOWN_CONFIRM_COUNT = 3
 ANCHOR_REFRESH_UNKNOWN_COUNT = 3
+# 수정1+2. alignment_unknown(측정 불가)은 즉시 헬스체크하지 않고 보류(hold)한다.
+#   여명/황혼 전환기나 저조도로 매칭이 잠깐 깨지는 것은 '카메라 이동'이 아니라 '측정 불가'이며
+#   대부분 전환이 끝나면 phaseCorrelate가 스스로 재락(re-lock)해 복구된다.
+#   - 측정 불가가 아주 오래(아래 카운트) 지속될 때만 '진짜 고장' 의심으로 헬스체크 escalate
+#   - phaseCorrelate가 '확신 있는 큰 이동'을 보이면 측정 불가여도 실제 이동 의심 → 즉시 escalate
+#   - 모든 헬스체크는 카메라별 쿨다운으로 스팸을 억제
+ALIGN_UNKNOWN_HEALTHCHECK_COUNT = 36       # 5분 주기 × 36 ≈ 3시간 연속 측정불가 시에만 알람
+ROI_HEALTHCHECK_COOLDOWN_SEC = 21600.0     # 카메라별 헬스체크 최소 간격(6시간)
 FEATURE_MASK_PADDING_RATIO = 0.08
 IR_SAT_MEAN_THRESHOLD = 18.0
 IR_CHANNEL_DIFF_THRESHOLD = 8.0
@@ -97,6 +113,8 @@ ROI_ALIGN_LEARNING_DEFAULTS = {
     "alignment_unknown_confirm_count": ALIGN_UNKNOWN_CONFIRM_COUNT,
     "anchor_refresh_unknown_count": ANCHOR_REFRESH_UNKNOWN_COUNT,
     "stable_low_quality_min_inlier_ratio": 0.8,
+    "alignment_unknown_healthcheck_count": ALIGN_UNKNOWN_HEALTHCHECK_COUNT,
+    "healthcheck_cooldown_sec": ROI_HEALTHCHECK_COOLDOWN_SEC,
 }
 
 MIN_APPLY_TRANSLATION_PX = 5.0
@@ -105,6 +123,29 @@ MIN_APPLY_SCALE_CHANGE = 0.02
 MIN_APPLY_PERSPECTIVE = 0.0005
 KEEP_LAST_GOOD_ROI_ON_FAILURE = True
 DEBUG_ALIGN = True
+
+# B. 8-DOF 호모그래피 대신 부분 affine(회전+균일스케일+평행이동, 4-DOF) 추정 사용.
+#    적은/반복 매칭에서 허위 원근·회전을 만들어 ROI 꼭짓점 이동량을 과장하는 문제를 줄인다.
+USE_PARTIAL_AFFINE = True
+
+# C. ORB 매칭 전에 phaseCorrelate로 ROI 평행이동을 빠르게 추정하는 사전 검사.
+#    조명/노출 변화에 강하고 평행이동을 subpixel로 바로 주므로, '카메라가 거의 안 움직인'
+#    흔한 경우를 안정적으로 걸러 무거운 특징매칭을 생략한다.
+PHASE_CORR_ENABLED = True
+PHASE_CORR_NO_MOVE_PX = 3.0          # 이 이하 평행이동 + 충분한 신뢰도면 '이동 없음'으로 보고 매칭 생략
+PHASE_CORR_MIN_RESPONSE = 0.20       # phaseCorrelate 응답(신뢰도) 하한
+PHASE_CORR_MIN_ROI_SIZE = 32         # ROI bbox 한 변이 이보다 작으면 건너뜀
+
+# D. roi_change 모드는 사용자가 지정한 좁은 ROI 안에서만 ORB를 계산해 특징점이 적게 잡힌다.
+#    전역 기준(MIN_GOOD_MATCHES=30 등)을 그대로 요구하면 텍스처가 적은 ROI가 영구적으로
+#    실패해 '카메라 이동'이 아니라 '특징점 부족'인데도 alignment_unknown/헬스체크로 오인식된다.
+#    가용(앵커) 특징점 수에 비례해 임계값을 동적으로 낮춘다.
+ROI_CHANGE_DYNAMIC_THRESHOLDS = True
+ROI_CHANGE_GOOD_MATCH_FRAC = 0.30
+ROI_CHANGE_GOOD_MATCH_FLOOR = 12
+ROI_CHANGE_INLIER_FRAC = 0.20
+ROI_CHANGE_INLIER_FLOOR = 8
+ROI_CHANGE_ANCHOR_FEAT_FLOOR = 12
 
 def deep_merge_dict(base, override):
     """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
@@ -303,6 +344,12 @@ def create_roi_snapshot(cam, frame):
         for i in range(0, len(cam.roi_lines), 2):
             if i + 1 < len(cam.roi_lines):
                 cv2.line(img, tuple(cam.roi_lines[i]), tuple(cam.roi_lines[i+1]), (0, 0, 255), 2)
+
+    if getattr(cam, "roi_change_poly", None) and len(cam.roi_change_poly) > 2:
+        pts = np.array(cam.roi_change_poly, np.int32)
+        cv2.polylines(img, [pts], True, (0, 255, 0), 2)
+        x, y = cam.roi_change_poly[0]
+        cv2.putText(img, "ROI_CHANGE", (int(x), max(15, int(y) - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
     # 3. 설정된 이벤트 명 좌측 상단에 표시
     y_pos = 30
@@ -2832,6 +2879,7 @@ class ROIAlignLearningStore:
         fieldnames = [
             "timestamp", "camera_key", "decision", "expected_move_px",
             "match_status", "good_matches", "inliers", "inlier_ratio",
+            "phase_response", "phase_shift_px",
             "light_mode", "anchor_light_mode", "light_mode_changed", "light_mode_source",
             "sat_mean", "channel_diff_mean", "colorfulness",
             "anchor_update", "over_count", "alignment_unknown_count", "healthcheck_requested", "reason"
@@ -2893,7 +2941,13 @@ class ROIAlignLearningStore:
             threshold = float(params.get("threshold_px", ROI_DRIFT_THRESHOLD_PX))
             inliers = int((debug or {}).get("inliers", 0) or 0)
             ratio = float((debug or {}).get("inlier_ratio", 0.0) or 0.0)
-            quality_ok = bool(ok and inliers >= int(params.get("min_inliers", 30)) and ratio >= float(params.get("min_inlier_ratio", 0.35)))
+            # D. _match_and_homography가 roi_change 가용 특징점에 맞춰 낮춘 동적 임계값을
+            #    debug에 실어 보내면 그것을 우선 사용한다(없으면 카메라 설정값으로 폴백).
+            dbg_min_inliers = (debug or {}).get("min_inliers")
+            dbg_min_ratio = (debug or {}).get("min_inlier_ratio")
+            min_inliers_req = int(dbg_min_inliers) if dbg_min_inliers else int(params.get("min_inliers", MIN_INLIERS))
+            min_ratio_req = float(dbg_min_ratio) if dbg_min_ratio else float(params.get("min_inlier_ratio", MIN_INLIER_RATIO))
+            quality_ok = bool(ok and inliers >= min_inliers_req and ratio >= min_ratio_req)
             status = str((debug or {}).get("status", ""))
             alignment_unknown = status.startswith("alignment_unknown")
             shift_px = float(shift_px or 0.0)
@@ -2902,11 +2956,32 @@ class ROIAlignLearningStore:
                 and ratio >= float(params.get("stable_low_quality_min_inlier_ratio", 0.80))
             )
 
-            def _result(decision, confirmed=False, over_count=None, alignment_unknown_count=None):
+            def _result(decision, confirmed=False, over_count=None, alignment_unknown_count=None, healthcheck_intent=False):
+                # 수정2. 헬스체크(ROI 재설정 요청)는 카메라별 쿨다운으로 스팸을 막는다.
+                healthcheck = False
+                if healthcheck_intent:
+                    cooldown = float(params.get("healthcheck_cooldown_sec", ROI_HEALTHCHECK_COOLDOWN_SEC) or 0.0)
+                    last_hc = state.get("last_healthcheck_at")
+                    allow = True
+                    if last_hc and cooldown > 0:
+                        try:
+                            elapsed = (
+                                datetime.datetime.fromisoformat(now_iso)
+                                - datetime.datetime.fromisoformat(last_hc)
+                            ).total_seconds()
+                            if elapsed < cooldown:
+                                allow = False
+                        except Exception:
+                            allow = True
+                    if allow:
+                        healthcheck = True
+                        state["last_healthcheck_at"] = now_iso
                 return {
                     "decision": decision,
                     "threshold": threshold,
                     "confirmed": bool(confirmed),
+                    "healthcheck": bool(healthcheck),
+                    "healthcheck_intent": bool(healthcheck_intent),
                     "over_count": int(
                         state.get("consecutive_over_threshold", 0)
                         if over_count is None
@@ -2943,6 +3018,18 @@ class ROIAlignLearningStore:
                 confirmed_unknown = unknown_count >= unknown_required
                 decision = "alignment_unknown" if confirmed_unknown else "hold_low_quality"
 
+                # 수정1. 측정 불가는 기본적으로 '보류'다(헬스체크 X). 다음 두 경우에만 escalate:
+                #   (a) phaseCorrelate가 '확신 있는 큰 이동'을 보고했다 → 실제 카메라 이동 의심
+                #   (b) 측정 불가가 매우 오래 지속됐다 → 진짜 고장/완전 가림 의심
+                healthcheck_count = int(params.get("alignment_unknown_healthcheck_count", ALIGN_UNKNOWN_HEALTHCHECK_COUNT))
+                phase_confident = bool((debug or {}).get("phase_confident", False))
+                phase_shift = float((debug or {}).get("phase_shift_px", 0.0) or 0.0)
+                phase_move_suspected = phase_confident and phase_shift > threshold
+                hc_intent = bool(
+                    confirmed_unknown
+                    and (phase_move_suspected or unknown_count >= healthcheck_count)
+                )
+
                 state["last_decision"] = decision
                 state["last_shift_px"] = shift_px
                 state["last_debug"] = debug or {}
@@ -2951,7 +3038,8 @@ class ROIAlignLearningStore:
                     decision,
                     confirmed=confirmed_unknown,
                     over_count=0,
-                    alignment_unknown_count=unknown_count
+                    alignment_unknown_count=unknown_count,
+                    healthcheck_intent=hc_intent,
                 )
 
             if shift_px > threshold:
@@ -2964,7 +3052,13 @@ class ROIAlignLearningStore:
                 state["last_decision"] = "confirmed_movement" if confirmed else "candidate"
                 state["last_shift_px"] = shift_px
                 state["last_debug"] = debug or {}
-                return _result(state["last_decision"], confirmed=confirmed, over_count=state["consecutive_over_threshold"])
+                # 실제 측정된 이동(confirmed_movement)은 헬스체크 대상(쿨다운 적용)
+                return _result(
+                    state["last_decision"],
+                    confirmed=confirmed,
+                    over_count=state["consecutive_over_threshold"],
+                    healthcheck_intent=confirmed,
+                )
 
             state["pending_outliers"] = []
             state["consecutive_over_threshold"] = 0
@@ -3026,6 +3120,20 @@ class AnchorTrackingROIAligner:
             "angle_deg": 0.0,
             "scale": 1.0,
             "perspective": 0.0,
+            "inlier_shift_mean_px": 0.0,
+            "inlier_shift_median_px": 0.0,
+            "inlier_shift_p90_px": 0.0,
+            "inlier_shift_max_px": 0.0,
+            "inlier_dx_median_px": 0.0,
+            "inlier_dy_median_px": 0.0,
+            "good_shift_mean_px": 0.0,
+            "good_shift_median_px": 0.0,
+            "good_shift_p90_px": 0.0,
+            "good_shift_max_px": 0.0,
+            "good_dx_median_px": 0.0,
+            "good_dy_median_px": 0.0,
+            "good_shift_calculated": False,
+            "inlier_shift_calculated": False,
             "selected_anchor": "",
             "anchors_tested": len(self.anchor_slots),
         }
@@ -3036,7 +3144,7 @@ class AnchorTrackingROIAligner:
     def _gray(self, frame):
         return self._gray_plain(frame)
 
-    def _build_feature_mask(self, frame_shape, exclude_boxes=None):
+    def _build_feature_mask(self, frame_shape, exclude_boxes=None, include_poly=None):
         if frame_shape is None:
             return None, 0
 
@@ -3044,7 +3152,14 @@ class AnchorTrackingROIAligner:
         if h <= 0 or w <= 0:
             return None, 0
 
-        mask = np.full((h, w), 255, dtype=np.uint8)
+        if include_poly and len(include_poly) >= 3:
+            mask = np.zeros((h, w), dtype=np.uint8)
+            pts = np.array(include_poly, dtype=np.int32)
+            pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+            pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+            cv2.fillPoly(mask, [pts], 255)
+        else:
+            mask = np.full((h, w), 255, dtype=np.uint8)
         excluded = 0
 
         for box in exclude_boxes or []:
@@ -3070,7 +3185,7 @@ class AnchorTrackingROIAligner:
 
         return mask, excluded
 
-    def _detect_light_mode(self, frame, exclude_boxes=None):
+    def _detect_light_mode(self, frame, exclude_boxes=None, include_poly=None):
         if frame is None:
             return "unknown", {
                 "sat_mean": 0.0,
@@ -3079,7 +3194,7 @@ class AnchorTrackingROIAligner:
             }
 
         h, w = frame.shape[:2]
-        feature_mask, _ = self._build_feature_mask((h, w), exclude_boxes)
+        feature_mask, _ = self._build_feature_mask((h, w), exclude_boxes, include_poly=include_poly)
         valid_mask = feature_mask > 0 if feature_mask is not None else np.ones((h, w), dtype=bool)
 
         if int(np.count_nonzero(valid_mask)) < max(100, int(h * w * 0.05)):
@@ -3126,8 +3241,12 @@ class AnchorTrackingROIAligner:
         kp, des = self.orb.detectAndCompute(gray, mask)
         return kp, des
 
-    def _frame_feature_variants(self, frame, exclude_boxes=None):
-        feature_mask, excluded_count = self._build_feature_mask(frame.shape[:2], exclude_boxes)
+    def _frame_feature_variants(self, frame, exclude_boxes=None, include_poly=None):
+        feature_mask, excluded_count = self._build_feature_mask(
+            frame.shape[:2],
+            exclude_boxes,
+            include_poly=include_poly,
+        )
         image = self._gray_plain(frame)
         kp, des = self._features(image, feature_mask)
         return [{
@@ -3137,6 +3256,7 @@ class AnchorTrackingROIAligner:
             "des": des,
             "features": 0 if kp is None else len(kp),
             "masked_objects": excluded_count,
+            "feature_roi": "roi_change" if include_poly and len(include_poly) >= 3 else "full_frame",
         }]
 
     def _best_feature_variant(self, variants):
@@ -3144,6 +3264,29 @@ class AnchorTrackingROIAligner:
         if not valid:
             return variants[0] if variants else {"name": "none", "gray": None, "kp": None, "des": None, "features": 0}
         return max(valid, key=lambda v: int(v.get("features", 0) or 0))
+
+    def _is_roi_change_mode(self, include_poly=None, feature_roi=None):
+        if feature_roi == "roi_change":
+            return True
+        return bool(include_poly and len(include_poly) >= 3)
+
+    def _roi_match_thresholds(self, roi_change_mode=False, anchor_features=None):
+        min_anchor_features = MIN_GOOD_MATCHES
+        min_good_matches = MIN_GOOD_MATCHES
+        min_inliers = MIN_INLIERS
+        # D. roi_change ROI는 특징점이 적게 잡히므로 가용(앵커) 특징점 수에 비례해 임계값을 낮춘다.
+        if ROI_CHANGE_DYNAMIC_THRESHOLDS and roi_change_mode and anchor_features:
+            af = int(anchor_features)
+            min_good_matches = max(ROI_CHANGE_GOOD_MATCH_FLOOR, min(MIN_GOOD_MATCHES, int(af * ROI_CHANGE_GOOD_MATCH_FRAC)))
+            min_inliers = max(ROI_CHANGE_INLIER_FLOOR, min(MIN_INLIERS, int(af * ROI_CHANGE_INLIER_FRAC)))
+            min_anchor_features = ROI_CHANGE_ANCHOR_FEAT_FLOOR
+        return {
+            "min_anchor_features": min_anchor_features,
+            "min_homography_attempt_matches": MIN_HOMOGRAPHY_ATTEMPT_MATCHES,
+            "min_good_matches": min_good_matches,
+            "min_inliers": min_inliers,
+            "min_inlier_ratio": MIN_INLIER_RATIO,
+        }
 
     def _image_stats(self, gray):
         if gray is None:
@@ -3171,6 +3314,20 @@ class AnchorTrackingROIAligner:
             "perspective": 0.0,
             "corner_mean_shift_px": 0.0,
             "corner_max_shift_px": 0.0,
+            "inlier_shift_mean_px": 0.0,
+            "inlier_shift_median_px": 0.0,
+            "inlier_shift_p90_px": 0.0,
+            "inlier_shift_max_px": 0.0,
+            "inlier_dx_median_px": 0.0,
+            "inlier_dy_median_px": 0.0,
+            "good_shift_mean_px": 0.0,
+            "good_shift_median_px": 0.0,
+            "good_shift_p90_px": 0.0,
+            "good_shift_max_px": 0.0,
+            "good_dx_median_px": 0.0,
+            "good_dy_median_px": 0.0,
+            "good_shift_calculated": False,
+            "inlier_shift_calculated": False,
             "selected_anchor": self.selected_anchor_slot,
             "anchors_tested": len(self.anchor_slots),
             "anchor_update": self.last_anchor_update_action,
@@ -3216,8 +3373,8 @@ class AnchorTrackingROIAligner:
         self.anchor_shape = frame_shape
         self.last_anchor_update_action = f"stored:{slot}"
 
-    def _capture_anchor_data(self, frame, exclude_boxes=None):
-        variants = self._frame_feature_variants(frame, exclude_boxes=exclude_boxes)
+    def _capture_anchor_data(self, frame, exclude_boxes=None, include_poly=None):
+        variants = self._frame_feature_variants(frame, exclude_boxes=exclude_boxes, include_poly=include_poly)
         best_variant = self._best_feature_variant(variants)
         gray = best_variant.get("gray")
         kp = best_variant.get("kp")
@@ -3231,11 +3388,12 @@ class AnchorTrackingROIAligner:
             "best_name": best_variant.get("name", "gray"),
             "features": 0 if kp is None else len(kp),
             "masked_objects": int(best_variant.get("masked_objects", 0) or 0),
+            "feature_roi": best_variant.get("feature_roi", "full_frame"),
         }
 
-    def _accept_light_transition_after_match_fail(self, frame, current_data, anchor, base_debug, exclude_boxes=None):
+    def _accept_light_transition_after_match_fail(self, frame, current_data, anchor, base_debug, exclude_boxes=None, include_poly=None):
         anchor_light_mode = anchor.get("light_mode", "unknown") if anchor else "unknown"
-        current_light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes)
+        current_light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes, include_poly=include_poly)
         light_mode_changed = bool(
             anchor_light_mode not in ("", "unknown")
             and current_light_mode not in ("", "unknown")
@@ -3253,6 +3411,12 @@ class AnchorTrackingROIAligner:
         if not light_mode_changed:
             return False, base_debug
 
+        thresholds = self._roi_match_thresholds(
+            self._is_roi_change_mode(include_poly=include_poly, feature_roi=current_data.get("feature_roi")),
+            anchor_features=(anchor.get("features") if anchor else None),
+        )
+        min_inliers = int(thresholds["min_inliers"])
+
         current_data["light_mode"] = current_light_mode
         current_data["light_stats"] = light_stats
         self.pending_update_anchor = current_data
@@ -3260,11 +3424,19 @@ class AnchorTrackingROIAligner:
         self.alignment_unknown_count = 0
 
         base_debug["status"] = "ir_onoff_transition_accepted_after_low_quality"
-        base_debug["good_matches"] = max(int(base_debug.get("good_matches", 0) or 0), MIN_INLIERS)
-        base_debug["inliers"] = max(int(base_debug.get("inliers", 0) or 0), MIN_INLIERS)
+        base_debug["good_matches"] = max(int(base_debug.get("good_matches", 0) or 0), min_inliers)
+        base_debug["inliers"] = max(int(base_debug.get("inliers", 0) or 0), min_inliers)
         base_debug["inlier_ratio"] = max(float(base_debug.get("inlier_ratio", 0.0) or 0.0), 1.0)
         base_debug["corner_mean_shift_px"] = 0.0
         base_debug["corner_max_shift_px"] = 0.0
+        base_debug["inlier_shift_mean_px"] = 0.0
+        base_debug["inlier_shift_median_px"] = 0.0
+        base_debug["inlier_shift_p90_px"] = 0.0
+        base_debug["inlier_shift_max_px"] = 0.0
+        base_debug["inlier_dx_median_px"] = 0.0
+        base_debug["inlier_dy_median_px"] = 0.0
+        base_debug["good_shift_calculated"] = False
+        base_debug["inlier_shift_calculated"] = True
         base_debug["dx"] = 0.0
         base_debug["dy"] = 0.0
         base_debug["angle_deg"] = 0.0
@@ -3280,8 +3452,16 @@ class AnchorTrackingROIAligner:
             return ""
         kp = data.get("kp")
         des = data.get("des")
-        if kp is None or des is None or len(kp) < MIN_GOOD_MATCHES:
-            self.last_anchor_update_action = f"skip_pending_features:{0 if kp is None else len(kp)}"
+        thresholds = self._roi_match_thresholds(
+            self._is_roi_change_mode(feature_roi=data.get("feature_roi")),
+            anchor_features=data.get("features"),
+        )
+        min_anchor_features = int(thresholds["min_anchor_features"])
+        if kp is None or des is None or len(kp) < min_anchor_features:
+            self.last_anchor_update_action = (
+                f"skip_pending_features:{0 if kp is None else len(kp)}"
+                f"/min:{min_anchor_features}"
+            )
             return ""
 
         prev_anchor = self.anchor_slots.get(ANCHOR_UPDATED, {})
@@ -3319,23 +3499,27 @@ class AnchorTrackingROIAligner:
             ),
         )
 
-    def set_anchor(self, frame, exclude_boxes=None):
+    def set_anchor(self, frame, exclude_boxes=None, include_poly=None):
         if frame is None:
             self.last_debug["status"] = "set_anchor_failed_no_frame"
             return False
 
-        light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes)
-        variants = self._frame_feature_variants(frame, exclude_boxes=exclude_boxes)
+        light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes, include_poly=include_poly)
+        variants = self._frame_feature_variants(frame, exclude_boxes=exclude_boxes, include_poly=include_poly)
         best_variant = self._best_feature_variant(variants)
         gray = best_variant.get("gray")
         kp = best_variant.get("kp")
         des = best_variant.get("des")
         masked_objects = int(best_variant.get("masked_objects", 0) or 0)
+        feature_roi = best_variant.get("feature_roi", "full_frame")
+        roi_change_mode = self._is_roi_change_mode(include_poly=include_poly, feature_roi=feature_roi)
+        thresholds = self._roi_match_thresholds(roi_change_mode, anchor_features=(0 if kp is None else len(kp)))
+        min_anchor_features = int(thresholds["min_anchor_features"])
 
-        if des is None or kp is None or len(kp) < MIN_GOOD_MATCHES:
+        if des is None or kp is None or len(kp) < min_anchor_features:
             n = 0 if kp is None else len(kp)
             self.last_debug = {
-                "status": f"set_anchor_failed_not_enough_features:{n}",
+                "status": f"set_anchor_failed_not_enough_features:{n}/min:{min_anchor_features}",
                 "method": "anchor_init",
                 "raw_matches": 0,
                 "good_matches": 0,
@@ -3346,6 +3530,9 @@ class AnchorTrackingROIAligner:
                 "angle_deg": 0.0,
                 "scale": 1.0,
                 "masked_objects": masked_objects,
+                "feature_roi": feature_roi,
+                "roi_change_mode": roi_change_mode,
+                "min_anchor_features": min_anchor_features,
             }
             if DEBUG_ALIGN:
                 logger.debug(f"[CCTV_Aligner] anchor features insufficient: {n}")
@@ -3386,6 +3573,9 @@ class AnchorTrackingROIAligner:
             "angle_deg": 0.0,
             "scale": 1.0,
             "masked_objects": masked_objects,
+            "feature_roi": feature_roi,
+            "roi_change_mode": roi_change_mode,
+            "min_anchor_features": min_anchor_features,
         }
 
         if DEBUG_ALIGN:
@@ -3457,9 +3647,39 @@ class AnchorTrackingROIAligner:
             pass
         return debug
 
-    def _match_and_homography(self, src_kp, src_des, dst_kp, dst_des, dst_shape, method_name):
+    def _match_and_homography(self, src_kp, src_des, dst_kp, dst_des, dst_shape, method_name, roi_change_mode=False):
+        thresholds = self._roi_match_thresholds(roi_change_mode, anchor_features=(0 if src_kp is None else len(src_kp)))
+        min_attempt_matches = int(thresholds["min_homography_attempt_matches"])
+        min_good_matches = int(thresholds["min_good_matches"])
+        min_inliers = int(thresholds["min_inliers"])
+        min_inlier_ratio = float(thresholds["min_inlier_ratio"])
+
         if src_des is None or dst_des is None:
-            return None, {"status": "descriptor_missing", "method": method_name, "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0, "corner_mean_shift_px": 0.0, "corner_max_shift_px": 0.0}
+            return None, {
+                "status": "descriptor_missing", "method": method_name,
+                "raw_matches": 0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0,
+                "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0,
+                "corner_mean_shift_px": 0.0, "corner_max_shift_px": 0.0,
+                "inlier_shift_mean_px": 0.0,
+                "inlier_shift_median_px": 0.0,
+                "inlier_shift_p90_px": 0.0,
+                "inlier_shift_max_px": 0.0,
+                "inlier_dx_median_px": 0.0,
+                "inlier_dy_median_px": 0.0,
+                "good_shift_mean_px": 0.0,
+                "good_shift_median_px": 0.0,
+                "good_shift_p90_px": 0.0,
+                "good_shift_max_px": 0.0,
+                "good_dx_median_px": 0.0,
+                "good_dy_median_px": 0.0,
+                "good_shift_calculated": False,
+                "inlier_shift_calculated": False,
+                "roi_change_mode": roi_change_mode,
+                "min_homography_attempt_matches": min_attempt_matches,
+                "min_good_matches": min_good_matches,
+                "min_inliers": min_inliers,
+                "min_inlier_ratio": min_inlier_ratio,
+            }
 
         raw = self.matcher.knnMatch(src_des, dst_des, k=2)
 
@@ -3471,19 +3691,94 @@ class AnchorTrackingROIAligner:
             if m.distance < 0.75 * n.distance:
                 good.append(m)
 
-        debug = {"status": "matching", "method": method_name, "raw_matches": len(raw), "good_matches": len(good), "inliers": 0, "inlier_ratio": 0.0, "reproj_mean": 0.0, "reproj_median": 0.0, "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0, "corner_mean_shift_px": 0.0, "corner_max_shift_px": 0.0}
+        debug = {
+            "status": "matching", "method": method_name,
+            "raw_matches": len(raw), "good_matches": len(good),
+            "inliers": 0, "inlier_ratio": 0.0,
+            "reproj_mean": 0.0, "reproj_median": 0.0,
+            "dx": 0.0, "dy": 0.0, "angle_deg": 0.0, "scale": 1.0,
+            "corner_mean_shift_px": 0.0, "corner_max_shift_px": 0.0,
+            "inlier_shift_mean_px": 0.0,
+            "inlier_shift_median_px": 0.0,
+            "inlier_shift_p90_px": 0.0,
+            "inlier_shift_max_px": 0.0,
+            "inlier_dx_median_px": 0.0,
+            "inlier_dy_median_px": 0.0,
+            "good_shift_mean_px": 0.0,
+            "good_shift_median_px": 0.0,
+            "good_shift_p90_px": 0.0,
+            "good_shift_max_px": 0.0,
+            "good_dx_median_px": 0.0,
+            "good_dy_median_px": 0.0,
+            "good_shift_calculated": False,
+            "inlier_shift_calculated": False,
+            "homography_calculated": False,
+            "homography_matrix": None,
+            "roi_change_mode": roi_change_mode,
+            "min_homography_attempt_matches": min_attempt_matches,
+            "min_good_matches": min_good_matches,
+            "min_inliers": min_inliers,
+            "min_inlier_ratio": min_inlier_ratio,
+        }
 
-        if len(good) < MIN_HOMOGRAPHY_ATTEMPT_MATCHES:
-            debug["status"] = f"not_enough_good_matches:{len(good)}"
+        # Homography 품질 기준을 통과하지 못하거나 min_attempt에 못 미쳐도,
+        # good match 자체가 있으면 실제 매칭점 이동량은 로그에 남긴다.
+        # 0.0px도 정상 계산값이므로 calculated flag로 계산 여부를 별도 표시한다.
+        if good:
+            src_pts = np.float32([src_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([dst_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            try:
+                good_src_xy = src_pts.reshape(-1, 2)
+                good_dst_xy = dst_pts.reshape(-1, 2)
+                good_delta = good_dst_xy - good_src_xy
+                good_shift = np.linalg.norm(good_delta, axis=1)
+                if len(good_shift) > 0:
+                    debug["good_shift_mean_px"] = float(np.mean(good_shift))
+                    debug["good_shift_median_px"] = float(np.median(good_shift))
+                    debug["good_shift_p90_px"] = float(np.percentile(good_shift, 90))
+                    debug["good_shift_max_px"] = float(np.max(good_shift))
+                    debug["good_dx_median_px"] = float(np.median(good_delta[:, 0]))
+                    debug["good_dy_median_px"] = float(np.median(good_delta[:, 1]))
+                    debug["good_shift_calculated"] = True
+            except Exception:
+                pass
+        else:
+            src_pts = np.empty((0, 1, 2), dtype=np.float32)
+            dst_pts = np.empty((0, 1, 2), dtype=np.float32)
+
+        if len(good) < min_attempt_matches:
+            debug["status"] = f"not_enough_good_matches:{len(good)}/min_attempt:{min_attempt_matches}"
             return None, debug
 
-        src_pts = np.float32([src_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst_pts = np.float32([dst_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        if USE_PARTIAL_AFFINE:
+            # B. CCTV의 실제 화각 변화(pan/tilt/zoom)는 회전+균일스케일+평행이동(4-DOF)으로
+            #    충분하다. 8-DOF 호모그래피는 적은/반복 매칭에서 허위 원근·회전을 만들어
+            #    ROI 꼭짓점 이동량을 과장하므로 estimateAffinePartial2D로 추정한다.
+            M, mask = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=RANSAC_REPROJ_THRESH,
+            )
+            if M is None or mask is None:
+                debug["status"] = "affine_failed"
+                return None, debug
+            # 이후 로직은 3x3 행렬을 기대하므로 affine(2x3)을 마지막 행 [0,0,1]로 승격한다.
+            H = np.eye(3, dtype=np.float32)
+            H[:2, :] = M.astype(np.float32)
+        else:
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, RANSAC_REPROJ_THRESH)
+            if H is None or mask is None:
+                debug["status"] = "homography_failed"
+                return None, debug
 
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, RANSAC_REPROJ_THRESH)
-        if H is None or mask is None:
-            debug["status"] = "homography_failed"
-            return None, debug
+        try:
+            H_for_debug = self._normalize_H(H.astype(np.float32))
+            if H_for_debug is not None:
+                debug["homography_calculated"] = True
+                debug["homography_matrix"] = H_for_debug.tolist()
+        except Exception:
+            debug["homography_calculated"] = False
+            debug["homography_matrix"] = None
 
         inliers = int(mask.sum())
         inlier_ratio = inliers / max(1, len(good))
@@ -3497,22 +3792,40 @@ class AnchorTrackingROIAligner:
             inlier_errors = errors[inlier_mask] if np.any(inlier_mask) else errors
             debug["reproj_mean"] = float(np.mean(inlier_errors)) if len(inlier_errors) else 0.0
             debug["reproj_median"] = float(np.median(inlier_errors)) if len(inlier_errors) else 0.0
+
+            # roi_change 최종 이동량 판단에는 Homography로 ROI 꼭짓점을 warp한 값을 쓰지 않는다.
+            # Homography는 적은 매칭/반복 패턴에서 꼭짓점 이동량을 과장할 수 있으므로,
+            # RANSAC inlier로 살아남은 실제 매칭점들의 displacement를 별도로 기록한다.
+            src_xy = src_pts.reshape(-1, 2)
+            dst_xy = dst_pts.reshape(-1, 2)
+            inlier_src = src_xy[inlier_mask] if np.any(inlier_mask) else np.empty((0, 2), dtype=np.float32)
+            inlier_dst = dst_xy[inlier_mask] if np.any(inlier_mask) else np.empty((0, 2), dtype=np.float32)
+            if len(inlier_src) > 0:
+                delta = inlier_dst - inlier_src
+                shift = np.linalg.norm(delta, axis=1)
+                debug["inlier_shift_mean_px"] = float(np.mean(shift))
+                debug["inlier_shift_median_px"] = float(np.median(shift))
+                debug["inlier_shift_p90_px"] = float(np.percentile(shift, 90))
+                debug["inlier_shift_max_px"] = float(np.max(shift))
+                debug["inlier_dx_median_px"] = float(np.median(delta[:, 0]))
+                debug["inlier_dy_median_px"] = float(np.median(delta[:, 1]))
+                debug["inlier_shift_calculated"] = True
         except Exception:
             debug["reproj_mean"] = 0.0
             debug["reproj_median"] = 0.0
         debug = self._add_motion_debug(debug, H)
         debug = self._add_corner_shift_debug(debug, H, dst_shape)
 
-        if len(good) < MIN_GOOD_MATCHES:
-            debug["status"] = f"not_enough_good_matches:{len(good)}"
+        if len(good) < min_good_matches:
+            debug["status"] = f"not_enough_good_matches:{len(good)}/min:{min_good_matches}"
             return None, debug
 
-        if inliers < MIN_INLIERS:
-            debug["status"] = f"not_enough_inliers:{inliers}"
+        if inliers < min_inliers:
+            debug["status"] = f"not_enough_inliers:{inliers}/min:{min_inliers}"
             return None, debug
 
-        if inlier_ratio < MIN_INLIER_RATIO:
-            debug["status"] = f"low_inlier_ratio:{inlier_ratio:.2f}"
+        if inlier_ratio < min_inlier_ratio:
+            debug["status"] = f"low_inlier_ratio:{inlier_ratio:.2f}/min:{min_inlier_ratio:.2f}"
             return None, debug
 
         H = H.astype(np.float32)
@@ -3650,7 +3963,7 @@ class AnchorTrackingROIAligner:
             return self.H_last_good.copy(), False
         return np.eye(3, dtype=np.float32), False
 
-    def estimate_anchor_direct_to_current(self, frame, exclude_boxes=None):
+    def estimate_anchor_direct_to_current(self, frame, exclude_boxes=None, include_poly=None):
         if not self.anchor_slots:
             self.last_debug["status"] = "not_initialized"
             return np.eye(3, dtype=np.float32), False
@@ -3659,7 +3972,7 @@ class AnchorTrackingROIAligner:
             self.last_debug["status"] = "no_current_frame"
             return np.eye(3, dtype=np.float32), False
 
-        current_data = self._capture_anchor_data(frame, exclude_boxes=exclude_boxes)
+        current_data = self._capture_anchor_data(frame, exclude_boxes=exclude_boxes, include_poly=include_poly)
         current_variants = current_data.get("variants") or []
         best_current_variant = self._best_feature_variant(current_variants)
         kp = current_data.get("kp")
@@ -3671,10 +3984,15 @@ class AnchorTrackingROIAligner:
             self.last_debug["status"] = "updated_anchor_missing"
             return np.eye(3, dtype=np.float32), False
 
-        if kp is None or des is None or len(kp) < MIN_GOOD_MATCHES:
+        feature_roi = current_data.get("feature_roi", "full_frame")
+        roi_change_mode = self._is_roi_change_mode(include_poly=include_poly, feature_roi=feature_roi)
+        thresholds = self._roi_match_thresholds(roi_change_mode, anchor_features=anchor.get("features"))
+        min_anchor_features = int(thresholds["min_anchor_features"])
+
+        if kp is None or des is None or len(kp) < min_anchor_features:
             n = 0 if kp is None else len(kp)
             dbg = self._empty_debug(
-                f"current_not_enough_features:{n}",
+                f"current_not_enough_features:{n}/min:{min_anchor_features}",
                 method="multi_anchor_to_current",
                 good=n,
             )
@@ -3687,8 +4005,11 @@ class AnchorTrackingROIAligner:
             dbg["anchors_tested"] = 1
             dbg["anchor_update"] = self.last_anchor_update_action
             dbg["anchor_light_mode"] = anchor.get("light_mode", "unknown")
+            dbg["feature_roi"] = feature_roi
+            dbg["roi_change_mode"] = roi_change_mode
+            dbg["min_anchor_features"] = min_anchor_features
 
-            accepted, dbg = self._accept_light_transition_after_match_fail(frame, current_data, anchor, dbg, exclude_boxes=exclude_boxes)
+            accepted, dbg = self._accept_light_transition_after_match_fail(frame, current_data, anchor, dbg, exclude_boxes=exclude_boxes, include_poly=include_poly)
             if accepted:
                 self.last_debug = dbg
                 return np.eye(3, dtype=np.float32), True
@@ -3711,6 +4032,7 @@ class AnchorTrackingROIAligner:
             des,
             frame.shape[:2],
             method_name="updated_anchor_to_current:gray",
+            roi_change_mode=roi_change_mode,
         )
         dbg["selected_anchor"] = ANCHOR_UPDATED if ANCHOR_UPDATED in self.anchor_slots else ANCHOR_BASE
         dbg["anchor_slot"] = dbg["selected_anchor"]
@@ -3718,10 +4040,13 @@ class AnchorTrackingROIAligner:
         dbg["current_features"] = int(best_current_variant.get("features", 0) or 0)
         dbg["anchor_features"] = int(anchor.get("features", 0) or 0)
         dbg["masked_objects"] = int(current_data.get("masked_objects", 0) or 0)
+        dbg["feature_roi"] = feature_roi
+        dbg["roi_change_mode"] = roi_change_mode
+        dbg["min_anchor_features"] = min_anchor_features
         dbg["anchors_tested"] = 1
         dbg["anchor_update"] = self.last_anchor_update_action
         anchor_light_mode = anchor.get("light_mode", "unknown")
-        current_light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes)
+        current_light_mode, light_stats = self._detect_light_mode(frame, exclude_boxes=exclude_boxes, include_poly=include_poly)
 
         light_mode_changed = bool(
             anchor_light_mode not in ("", "unknown")
@@ -3744,7 +4069,7 @@ class AnchorTrackingROIAligner:
             dbg["anchor_update"] = "pending_light_mode_update"
 
         if H_direct is None:
-            accepted, dbg = self._accept_light_transition_after_match_fail(frame, current_data, anchor, dbg, exclude_boxes=exclude_boxes)
+            accepted, dbg = self._accept_light_transition_after_match_fail(frame, current_data, anchor, dbg, exclude_boxes=exclude_boxes, include_poly=include_poly)
             if accepted:
                 self.last_debug = dbg
                 return np.eye(3, dtype=np.float32), True
@@ -3789,6 +4114,86 @@ class AnchorTrackingROIAligner:
         self.last_debug = dbg
         self.last_debug["status"] = "anchor_direct_corrected_drift"
         return True
+
+    def _roi_bbox(self, poly, w, h):
+        pts = np.array(poly, dtype=np.float32).reshape(-1, 2)
+        x1 = int(max(0, math.floor(float(pts[:, 0].min()))))
+        y1 = int(max(0, math.floor(float(pts[:, 1].min()))))
+        x2 = int(min(w, math.ceil(float(pts[:, 0].max()))))
+        y2 = int(min(h, math.ceil(float(pts[:, 1].max()))))
+        return x1, y1, x2, y2
+
+    def phase_translation_precheck(self, frame, include_poly=None):
+        """C. ORB 매칭 전에 phaseCorrelate로 ROI 평행이동을 빠르게/강건하게 추정한다.
+        반환: dict(shift, dx, dy, response, confident) 또는 None(판단 불가 → 특징매칭으로 진행)."""
+        if not PHASE_CORR_ENABLED or frame is None:
+            return None
+        anchor = self.anchor_slots.get(ANCHOR_UPDATED) or self.anchor_slots.get(ANCHOR_BASE)
+        if not anchor:
+            return None
+        anchor_gray = anchor.get("gray")
+        if anchor_gray is None:
+            return None
+        h, w = frame.shape[:2]
+        if anchor_gray.shape[:2] != (h, w):
+            # 앵커와 현재 프레임 해상도가 다르면 phase 비교가 무의미 → 특징매칭으로 넘긴다.
+            return None
+        if include_poly and len(include_poly) >= 3:
+            x1, y1, x2, y2 = self._roi_bbox(include_poly, w, h)
+        else:
+            x1, y1, x2, y2 = 0, 0, w, h
+        if (x2 - x1) < PHASE_CORR_MIN_ROI_SIZE or (y2 - y1) < PHASE_CORR_MIN_ROI_SIZE:
+            return None
+        try:
+            cur_gray = self._gray_plain(frame)
+            a = anchor_gray[y1:y2, x1:x2].astype(np.float32)
+            b = cur_gray[y1:y2, x1:x2].astype(np.float32)
+            if a.shape != b.shape or a.size == 0:
+                return None
+            win = cv2.createHanningWindow((a.shape[1], a.shape[0]), cv2.CV_32F)
+            (dx, dy), response = cv2.phaseCorrelate(a, b, win)
+            shift = float(math.hypot(dx, dy))
+            return {
+                "shift": shift,
+                "dx": float(dx),
+                "dy": float(dy),
+                "response": float(response),
+                "confident": bool(response >= PHASE_CORR_MIN_RESPONSE),
+            }
+        except Exception as e:
+            logger.debug(f"[CCTV_Aligner] phaseCorrelate failed: {e}")
+            return None
+
+    def make_phase_skip_debug(self, phase, include_poly=None):
+        """phaseCorrelate가 '이동 없음'을 신뢰도 높게 판단했을 때, 특징매칭을 생략하고도
+        다운스트림(record_check/CSV 로깅)이 그대로 동작하도록 디버그 dict을 구성한다."""
+        roi_change_mode = self._is_roi_change_mode(include_poly=include_poly)
+        anchor = self.anchor_slots.get(ANCHOR_UPDATED) or self.anchor_slots.get(ANCHOR_BASE) or {}
+        thresholds = self._roi_match_thresholds(roi_change_mode, anchor_features=anchor.get("features"))
+        dbg = self._empty_debug("ok_phase_skip_no_move", method="phase_correlate", good=int(thresholds["min_good_matches"]))
+        dbg["selected_anchor"] = ANCHOR_UPDATED if ANCHOR_UPDATED in self.anchor_slots else ANCHOR_BASE
+        dbg["anchor_slot"] = dbg["selected_anchor"]
+        dbg["anchors_tested"] = 1
+        dbg["anchor_update"] = self.last_anchor_update_action
+        dbg["anchor_features"] = int(anchor.get("features", 0) or 0)
+        dbg["anchor_light_mode"] = anchor.get("light_mode", "unknown")
+        # phaseCorrelate가 충분히 작은 평행이동 + 높은 신뢰도를 보였으므로 품질 통과로 본다.
+        dbg["inliers"] = int(thresholds["min_inliers"])
+        dbg["inlier_ratio"] = 1.0
+        dbg["min_inliers"] = int(thresholds["min_inliers"])
+        dbg["min_inlier_ratio"] = float(thresholds["min_inlier_ratio"])
+        dbg["min_good_matches"] = int(thresholds["min_good_matches"])
+        dbg["roi_change_mode"] = roi_change_mode
+        dbg["inlier_dx_median_px"] = float(phase.get("dx", 0.0))
+        dbg["inlier_dy_median_px"] = float(phase.get("dy", 0.0))
+        dbg["inlier_shift_median_px"] = float(phase.get("shift", 0.0))
+        dbg["inlier_shift_mean_px"] = float(phase.get("shift", 0.0))
+        dbg["inlier_shift_calculated"] = True
+        dbg["homography_calculated"] = True
+        dbg["homography_matrix"] = np.eye(3, dtype=np.float32).tolist()
+        dbg["phase_response"] = float(phase.get("response", 0.0))
+        dbg["phase_shift_px"] = float(phase.get("shift", 0.0))
+        return dbg
 
 class FrameReader:
     def __init__(self, url, ip):
@@ -4350,11 +4755,14 @@ class Camera:
 
         self.roi_poly_norm = conf.get('roi_poly_norm', [])
         self.roi_lines_norm = conf.get('roi_lines_norm', [])
+        self.roi_change_poly_norm = conf.get(ROI_CHANGE_FIELD, [])
         self.roi_poly = []
         self.roi_lines = []
+        self.roi_change_poly = []
 
         self.base_roi_poly = []
         self.base_roi_lines = []
+        self.base_roi_change_poly = []
         self.aligned_roi_poly = []
         self.aligned_roi_lines = []
 
@@ -4370,10 +4778,13 @@ class Camera:
 
         self.base_roi_poly = []
         self.base_roi_lines = []
+        self.base_roi_change_poly = []
         self.aligned_roi_poly = []
         self.aligned_roi_lines = []
 
         self.last_align_time = 0.0
+        self.last_anchor_attempt_time = 0.0
+        self.anchor_startup_wait_started_at = 0.0
         self.align_status_text = status_text
         self.align_ok = False
         self.align_shifted = False
@@ -4398,9 +4809,11 @@ class Camera:
         self.events = new_conf.get('events', [])
         self.roi_poly_norm = new_conf.get('roi_poly_norm', [])
         self.roi_lines_norm = new_conf.get('roi_lines_norm', [])
+        self.roi_change_poly_norm = new_conf.get(ROI_CHANGE_FIELD, [])
 
         self.roi_poly = []
         self.roi_lines = []
+        self.roi_change_poly = []
         self.roi_frame_shape = None
 
         self._reset_alignment_state("ALIGN RESET")
@@ -4430,19 +4843,23 @@ class Camera:
             need_init = True
         if self.roi_lines_norm and not self.base_roi_lines:
             need_init = True
+        if self.roi_change_poly_norm and not self.base_roi_change_poly:
+            need_init = True
 
         if not need_init:
             return True
 
         self.base_roi_poly = denormalize_roi_points(self.roi_poly_norm, w, h) if self.roi_poly_norm else []
         self.base_roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h) if self.roi_lines_norm else []
+        self.base_roi_change_poly = denormalize_roi_points(self.roi_change_poly_norm, w, h) if self.roi_change_poly_norm else []
+        self.roi_change_poly = list(self.base_roi_change_poly)
 
         self.aligned_roi_poly = list(self.base_roi_poly)
         self.aligned_roi_lines = list(self.base_roi_lines)
         self.roi_frame_shape = frame.shape[:2]
 
         self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
-        logger.info(f"[CAM:{self.cam_id}] base ROI init | poly={len(self.base_roi_poly)} lines={len(self.base_roi_lines)} shape={frame.shape[:2]}")
+        logger.info(f"[CAM:{self.cam_id}] base ROI init | poly={len(self.base_roi_poly)} lines={len(self.base_roi_lines)} roi_change={len(self.base_roi_change_poly)} shape={frame.shape[:2]}")
         return True
 
     def _inject_roi_to_handlers(self, roi_poly, roi_lines):
@@ -4492,25 +4909,68 @@ class Camera:
                 continue
         return boxes
 
+    def _calculate_roi_change_shift(self, H):
+        if H is None or not self.base_roi_change_poly:
+            return 0.0, 0.0
+        try:
+            pts = np.array(self.base_roi_change_poly, dtype=np.float32).reshape(-1, 1, 2)
+            warped = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+            orig = pts.reshape(-1, 2)
+            dist = np.linalg.norm(warped - orig, axis=1)
+            return float(np.mean(dist)), float(np.max(dist))
+        except Exception as e:
+            logger.warning(f"[CAM:{self.cam_id}] roi_change shift calc failed: {e}")
+            return 0.0, 0.0
+
     def _update_alignment(self, frame, exclude_boxes=None):
         if frame is None:
             return
 
         # 현재 프레임 해상도 기준으로 base ROI 초기화 또는 갱신
+        if ROI_CHANGE_EVENT not in self.events:
+            self.align_status_text = "ROI CHANGE OFF"
+            return
+
         self._initialize_base_roi_if_needed(frame)
 
         # ROI가 아예 없는 경우
-        if not self.base_roi_poly and not self.base_roi_lines:
-            self.align_status_text = "NO ROI"
-            self._inject_roi_to_handlers([], [])
+        if not self.base_roi_change_poly:
+            self.align_status_text = "NO ROI_CHANGE ROI"
+            self.align_ok = False
+            self.align_shifted = False
+            return
 
-        # 최초 anchor 등록
+        # 최초 anchor 등록. 실패 시에도 매 프레임 재시도하지 않고 짧은 재시도 간격을 둔다.
         if not self.anchor_set:
-            ok = self.aligner.set_anchor(frame, exclude_boxes=exclude_boxes)
+            now = time.time()
+
+            # RTSP/GStreamer 연결 직후 회색/무효 프레임이 들어오는 경우가 있어
+            # 첫 roi_change 프레임을 본 뒤 일정 시간 동안 anchor 등록을 지연한다.
+            if getattr(self, "anchor_startup_wait_started_at", 0.0) <= 0.0:
+                self.anchor_startup_wait_started_at = now
+                self.align_status_text = "ANCHOR WAIT STABILIZE"
+                return
+
+            startup_elapsed = now - float(getattr(self, "anchor_startup_wait_started_at", now) or now)
+            if startup_elapsed < ANCHOR_STARTUP_DELAY_SEC:
+                self.align_status_text = f"ANCHOR WAIT {ANCHOR_STARTUP_DELAY_SEC - startup_elapsed:.1f}s"
+                self.align_ok = False
+                self.align_shifted = False
+                return
+
+            if now - getattr(self, "last_anchor_attempt_time", 0.0) < ANCHOR_RETRY_INTERVAL_SEC:
+                return
+            self.last_anchor_attempt_time = now
+
+            ok = self.aligner.set_anchor(
+                frame,
+                exclude_boxes=exclude_boxes,
+                include_poly=self.base_roi_change_poly,
+            )
 
             if ok:
                 self.anchor_set = True
-                self.last_align_time = time.time()
+                self.last_align_time = now
                 self.align_status_text = "ANCHOR SET"
                 self.align_ok = True
                 self.align_shifted = False
@@ -4557,8 +5017,48 @@ class Camera:
         old_roi_poly = list(self.aligned_roi_poly or [])
         old_roi_lines = list(self.aligned_roi_lines or [])
 
-        H, ok = self.aligner.estimate_anchor_direct_to_current(frame, exclude_boxes=exclude_boxes)
-        dbg = getattr(self.aligner, "last_debug", {}) or {}
+        # C. phaseCorrelate 사전 검사: 카메라가 거의 안 움직였다고 신뢰도 높게 판단되면
+        #    무거운 ORB 특징매칭을 생략하고 'normal' 경로로 처리한다(엣지 부하↓, 허위 이동↓).
+        phase = self.aligner.phase_translation_precheck(frame, include_poly=self.base_roi_change_poly)
+        phase_skip = bool(
+            phase is not None
+            and phase.get("confident")
+            and phase.get("shift", 1e9) <= PHASE_CORR_NO_MOVE_PX
+        )
+        if phase_skip:
+            H = np.eye(3, dtype=np.float32)
+            ok = True
+            dbg = self.aligner.make_phase_skip_debug(phase, include_poly=self.base_roi_change_poly)
+            dbg["phase_confident"] = True
+            # 수정3. phase_skip 행에도 밝기 텔레메트리를 남겨 여명/황혼 곡선을 추적할 수 있게 한다.
+            lm, lstats = self.aligner._detect_light_mode(
+                frame, exclude_boxes=exclude_boxes, include_poly=self.base_roi_change_poly
+            )
+            alm = dbg.get("anchor_light_mode", "unknown")
+            dbg["light_mode"] = lm
+            dbg["light_mode_source"] = "phase_skip_detected"
+            dbg["light_mode_changed"] = bool(
+                alm not in ("", "unknown") and lm not in ("", "unknown") and alm != lm
+            )
+            dbg["sat_mean"] = float(lstats.get("sat_mean", 0.0) or 0.0)
+            dbg["channel_diff_mean"] = float(lstats.get("channel_diff_mean", 0.0) or 0.0)
+            dbg["colorfulness"] = float(lstats.get("colorfulness", 0.0) or 0.0)
+            self.aligner.last_debug = dbg
+        else:
+            H, ok = self.aligner.estimate_anchor_direct_to_current(
+                frame,
+                exclude_boxes=exclude_boxes,
+                include_poly=self.base_roi_change_poly,
+            )
+            dbg = getattr(self.aligner, "last_debug", {}) or {}
+            # 수정1. phaseCorrelate 사전검사 결과를 판정에 전달한다.
+            #   (측정 불가 vs 실제 큰 이동을 구분: 확신 있는 큰 shift면 실제 이동 의심)
+            if phase is not None:
+                dbg["phase_response"] = float(phase.get("response", 0.0) or 0.0)
+                dbg["phase_shift_px"] = float(phase.get("shift", 0.0) or 0.0)
+                dbg["phase_confident"] = bool(phase.get("confident", False))
+            else:
+                dbg["phase_confident"] = False
 
         status = dbg.get("status", "unknown")
         method = dbg.get("method", "none")
@@ -4572,6 +5072,7 @@ class Camera:
         scale = float(dbg.get("scale", 1.0) or 1.0)
         perspective = float(dbg.get("perspective", 0.0) or 0.0)
         masked_objects = int(dbg.get("masked_objects", 0) or 0)
+        feature_roi = str(dbg.get("feature_roi", "full_frame") or "full_frame")
         light_mode = str(dbg.get("light_mode", "unknown") or "unknown")
         anchor_light_mode = str(dbg.get("anchor_light_mode", "unknown") or "unknown")
         light_mode_changed = bool(dbg.get("light_mode_changed", False))
@@ -4585,23 +5086,79 @@ class Camera:
 
         self.align_ok = ok
 
+        # expected_move_px는 "매칭점 displacement"가 아니라 실제 ROI 보정 로직이 쓰는
+        # Homography 기반 이동량이다. roi_change가 설정된 경우 기준 roi_change polygon을
+        # Homography로 warp했을 때의 최대 꼭짓점 이동량을 사용한다.
+        # Homography가 계산되지 않은 경우에만 -1로 기록한다.
         corner_mean_shift = float(dbg.get("corner_mean_shift_px", 0.0) or 0.0)
         corner_max_shift = float(dbg.get("corner_max_shift_px", 0.0) or 0.0)
-        if ok and H is not None and frame is not None and corner_max_shift <= 0.0:
+
+        H_for_shift = None
+        if H is not None and ok:
+            H_for_shift = H
+        else:
+            # _match_and_homography에서 Homography는 계산됐지만 품질 검사에서 rejected 된 경우도
+            # 디버깅/로그용 expected_move_px 산출을 위해 H 행렬을 debug에 보관한다.
             try:
-                h_frame, w_frame = frame.shape[:2]
-                corners = np.array([[0, 0], [w_frame, 0], [w_frame, h_frame], [0, h_frame]], dtype=np.float32).reshape(-1, 1, 2)
-                warped_corners = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
-                corner_dist = np.linalg.norm(warped_corners - corners.reshape(-1, 2), axis=1)
-                corner_mean_shift = float(np.mean(corner_dist))
-                corner_max_shift = float(np.max(corner_dist))
-            except Exception as e:
-                logger.warning(f"[CAM:{self.cam_id}] frame corner shift calc failed: {e}")
+                H_debug = dbg.get("homography_matrix")
+                if H_debug is not None:
+                    H_tmp = np.array(H_debug, dtype=np.float32)
+                    if H_tmp.shape == (3, 3) and np.isfinite(H_tmp).all():
+                        H_for_shift = H_tmp
+            except Exception:
+                H_for_shift = None
 
-        camera_shift = corner_max_shift
-        expected_move_px_for_log = round(float(camera_shift), 3) if ok else -1
+        roi_mean_shift = 0.0
+        roi_max_shift = 0.0
+        homography_shift_calculated = H_for_shift is not None and bool(dbg.get("homography_calculated", False))
+        if homography_shift_calculated and self.base_roi_change_poly and len(self.base_roi_change_poly) > 2:
+            # 로그용으로 ROI 꼭짓점 warp 이동량은 계속 기록한다(아래 dbg에 저장).
+            roi_mean_shift, roi_max_shift = self._calculate_roi_change_shift(H_for_shift)
 
-        decision = ROI_ALIGN_LEARNING_STORE.record_check(self.camera_key, self.conf, camera_shift, ok, dbg)
+        # A. 카메라 이동 판정에는 호모그래피로 warp한 ROI 꼭짓점 이동량(roi_max_shift)을 쓰지 않는다.
+        #    작은 회전/원근 성분이 ROI 중심에서 먼 꼭짓점에서 크게 증폭돼, 실제로 안 움직였는데
+        #    '이동'으로 오판하기 때문이다. 대신 RANSAC inlier로 살아남은 실제 매칭점들의
+        #    median 평행이동을 이동량으로 사용한다(꼭짓점 증폭 없음).
+        inlier_shift_calculated = bool(dbg.get("inlier_shift_calculated", False))
+        if inlier_shift_calculated:
+            camera_shift = float(math.hypot(
+                float(dbg.get("inlier_dx_median_px", 0.0) or 0.0),
+                float(dbg.get("inlier_dy_median_px", 0.0) or 0.0),
+            ))
+            shift_source = "inlier_median_translation"
+        elif homography_shift_calculated:
+            # inlier 통계가 없는 경우(예: 매칭 실패)에만 호모그래피 기반값으로 폴백한다.
+            if self.base_roi_change_poly and len(self.base_roi_change_poly) > 2:
+                camera_shift = roi_max_shift
+                shift_source = "homography_roi_change_max_fallback"
+            else:
+                camera_shift = corner_max_shift
+                shift_source = "homography_corner_max_fallback"
+        else:
+            camera_shift = -1.0
+            shift_source = "not_calculated"
+
+        inlier_shift_mean = float(dbg.get("inlier_shift_mean_px", 0.0) or 0.0)
+        inlier_shift_median = float(dbg.get("inlier_shift_median_px", 0.0) or 0.0)
+        inlier_shift_p90 = float(dbg.get("inlier_shift_p90_px", 0.0) or 0.0)
+        inlier_shift_max = float(dbg.get("inlier_shift_max_px", 0.0) or 0.0)
+        inlier_dx_median = float(dbg.get("inlier_dx_median_px", 0.0) or 0.0)
+        inlier_dy_median = float(dbg.get("inlier_dy_median_px", 0.0) or 0.0)
+        good_shift_mean = float(dbg.get("good_shift_mean_px", 0.0) or 0.0)
+        good_shift_median = float(dbg.get("good_shift_median_px", 0.0) or 0.0)
+        good_shift_p90 = float(dbg.get("good_shift_p90_px", 0.0) or 0.0)
+        good_shift_max = float(dbg.get("good_shift_max_px", 0.0) or 0.0)
+        good_dx_median = float(dbg.get("good_dx_median_px", 0.0) or 0.0)
+        good_dy_median = float(dbg.get("good_dy_median_px", 0.0) or 0.0)
+
+        dbg["roi_change_mean_shift_px"] = float(roi_mean_shift)
+        dbg["roi_change_max_shift_px"] = float(roi_max_shift)
+        dbg["camera_shift_source"] = shift_source
+
+        expected_move_px_for_log = round(float(camera_shift), 3)
+        decision_shift = max(0.0, float(camera_shift)) if camera_shift >= 0 else 0.0
+
+        decision = ROI_ALIGN_LEARNING_STORE.record_check(self.camera_key, self.conf, decision_shift, ok, dbg)
         threshold = float(decision.get("threshold", ROI_DRIFT_THRESHOLD_PX) or ROI_DRIFT_THRESHOLD_PX)
         self.align_shifted = bool(decision.get("confirmed", False))
         healthcheck_requested = False
@@ -4623,7 +5180,7 @@ class Camera:
             dbg["anchor_update"] = dbg.get("anchor_update", "hold_current_anchor")
 
 
-        if decision.get("confirmed", False):
+        if decision.get("healthcheck", False):
             if decision_name == "alignment_unknown":
                 reason = (
                     f"alignment_unknown camera={self.camera_key} cam_id={self.cam_id} "
@@ -4647,11 +5204,16 @@ class Camera:
                 f"status={status} decision={decision.get('decision')} "
                 f"anchor={dbg.get('selected_anchor', '')}/{dbg.get('anchors_tested', 0)} "
                 f"g={good} i={inliers} r={ratio:.2f} "
-                f"mask_obj={masked_objects} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
+                f"mask_obj={masked_objects} feature_roi={feature_roi} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
                 f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
                 f"scale={scale:.3f} persp={perspective:.5f} | "
                 f"h_shifted={h_shifted} | "
-                f"camera_shift max={camera_shift:.1f}px mean={corner_mean_shift:.1f}px | "
+                f"match_shift source={shift_source} median={camera_shift:.1f}px "
+                f"inlier_mean={inlier_shift_mean:.1f}px inlier_p90={inlier_shift_p90:.1f}px inlier_max={inlier_shift_max:.1f}px "
+                f"inlier_mdx={inlier_dx_median:.1f}px inlier_mdy={inlier_dy_median:.1f}px "
+                f"good_median={good_shift_median:.1f}px good_mean={good_shift_mean:.1f}px good_p90={good_shift_p90:.1f}px good_max={good_shift_max:.1f}px | "
+                f"homography_roi_shift max={roi_max_shift:.1f}px mean={roi_mean_shift:.1f}px | "
+                f"corner_shift max={corner_max_shift:.1f}px mean={corner_mean_shift:.1f}px | "
                 f"threshold={threshold:.1f}px | action=healthcheck_true_persistent_base_roi_kept"
             )
         else:
@@ -4660,11 +5222,16 @@ class Camera:
                 f"status={status} decision={decision.get('decision')} "
                 f"anchor={dbg.get('selected_anchor', '')}/{dbg.get('anchors_tested', 0)} "
                 f"g={good} i={inliers} r={ratio:.2f} "
-                f"mask_obj={masked_objects} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
+                f"mask_obj={masked_objects} feature_roi={feature_roi} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
                 f"dx={dx:.1f} dy={dy:.1f} angle={angle:.2f} "
                 f"scale={scale:.3f} persp={perspective:.5f} | "
                 f"h_shifted={h_shifted} | "
-                f"camera_shift max={camera_shift:.1f}px mean={corner_mean_shift:.1f}px | "
+                f"match_shift source={shift_source} median={camera_shift:.1f}px "
+                f"inlier_mean={inlier_shift_mean:.1f}px inlier_p90={inlier_shift_p90:.1f}px inlier_max={inlier_shift_max:.1f}px "
+                f"inlier_mdx={inlier_dx_median:.1f}px inlier_mdy={inlier_dy_median:.1f}px "
+                f"good_median={good_shift_median:.1f}px good_mean={good_shift_mean:.1f}px good_p90={good_shift_p90:.1f}px good_max={good_shift_max:.1f}px | "
+                f"homography_roi_shift max={roi_max_shift:.1f}px mean={roi_mean_shift:.1f}px | "
+                f"corner_shift max={corner_max_shift:.1f}px mean={corner_mean_shift:.1f}px | "
                 f"threshold={threshold:.1f}px over={decision.get('over_count', 0)} | "
                 f"action=base_roi_kept"
             )
@@ -4673,22 +5240,29 @@ class Camera:
         terminal_status_text = (
             f"[ROI DRIFT] cam={self.camera_key} "
             f"threshold={threshold:.1f}px "
-            f"expected_move={camera_shift:.1f}px "
+            f"expected_move={camera_shift:.1f}px source={shift_source} "
             f"dx={dx:.1f}px dy={dy:.1f}px rotate={angle:.2f}deg "
             f"decision={decision.get('decision')} "
             f"status={status} anchor={dbg.get('selected_anchor', '')}/{dbg.get('anchors_tested', 0)} "
-            f"mask_obj={masked_objects} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
+            f"mask_obj={masked_objects} feature_roi={feature_roi} light={anchor_light_mode}->{light_mode} source={light_mode_source} changed={light_mode_changed} "
             f"anchor_update={dbg.get('anchor_update', '')}"
         )
+        # 수정3. phase_skip 행의 good/inliers/ratio는 실제 측정값이 아니라 내부 임계값을 채운
+        #   합성값이라 혼동을 준다. phase_skip 행에선 비워두고, 대신 실제 phaseCorrelate
+        #   측정값(response/shift)을 별도 컬럼으로 남긴다.
+        phase_response_log = round(float(phase.get("response", 0.0)), 4) if phase else ""
+        phase_shift_log = round(float(phase.get("shift", 0.0)), 3) if phase else ""
         csv_row = {
             "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
             "camera_key": self.camera_key,
             "decision": decision.get("decision"),
             "expected_move_px": expected_move_px_for_log,
             "match_status": status,
-            "good_matches": good,
-            "inliers": inliers,
-            "inlier_ratio": round(float(ratio), 6),
+            "good_matches": "" if phase_skip else good,
+            "inliers": "" if phase_skip else inliers,
+            "inlier_ratio": "" if phase_skip else round(float(ratio), 6),
+            "phase_response": phase_response_log,
+            "phase_shift_px": phase_shift_log,
             "light_mode": light_mode,
             "anchor_light_mode": anchor_light_mode,
             "light_mode_changed": light_mode_changed,
@@ -5208,6 +5782,11 @@ class Camera:
             for i in range(0, len(self.roi_lines), 2):
                 if i + 1 < len(self.roi_lines):
                     cv2.line(fr, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0, 0, 255), 2)
+        if self.roi_change_poly and len(self.roi_change_poly) > 2:
+            pts = np.array(self.roi_change_poly, np.int32)
+            cv2.polylines(fr, [pts], True, (0, 255, 0), 2)
+            x, y = self.roi_change_poly[0]
+            cv2.putText(fr, "ROI_CHANGE", (int(x), max(15, int(y) - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         # -----------------------------------------------------------
         # [핵심] 카메라별 설정된 이벤트에 따라 화면에 그릴 클래스(ID) 동적 필터링
@@ -5626,7 +6205,7 @@ class HealthCheckDaemon:
             logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
             return []
 
-        changed_cctv_ids = []
+        handled_cctv_ids = []
         changed = False
         runtime_updates = []
 
@@ -5689,14 +6268,14 @@ class HealthCheckDaemon:
                         new_conf[key] = value
                         item_changed = True
 
+                handled_cctv_ids.append(str(cam.cam_id))
                 if item_changed:
-                    changed_cctv_ids.append(str(cam.cam_id))
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     changed = True
                 else:
                     logger.info(
-                        f"[Health Check] ROI settings unchanged; setup request remains pending if active: "
+                        f"[Health Check] ROI settings already up to date: "
                         f"cctvId={item.get('cctvId')!r} keys={','.join(sorted(roi_updates.keys()))}"
                     )
 
@@ -5722,7 +6301,7 @@ class HealthCheckDaemon:
             except Exception as e:
                 logger.error(f"[Health Check] runtime ROI update failed: cctvId={cam.cam_id} error={e}")
 
-        return changed_cctv_ids
+        return handled_cctv_ids
 
     def _run(self):
         while self.running:
@@ -5767,11 +6346,11 @@ class HealthCheckDaemon:
                         response_payload = {}
                         logger.warning(f"[Health Check] failed to parse response JSON: {e}")
 
-                    changed_roi_cctv_ids = self._apply_roi_settings_from_response(response_payload)
-                    if changed_roi_cctv_ids:
+                    applied_roi_cctv_ids = self._apply_roi_settings_from_response(response_payload)
+                    if applied_roi_cctv_ids:
                         self.clear_roi_setup_required(reason="roi_settings_applied_from_health_response")
                         self.request_roi_snapshot_refresh(
-                            cctv_ids=changed_roi_cctv_ids,
+                            cctv_ids=applied_roi_cctv_ids,
                             reason="roi_settings_applied_from_health_response"
                         )
 
@@ -6059,11 +6638,12 @@ def main():
     run_output_retention_cleanup(output_retention_days)
 
     def run_camera_inference(cam, fr):
+        active_detection_events = [evt for evt in cam.events if evt != ROI_CHANGE_EVENT]
         base_conf = min(main_conf, person_conf, signalman_conf)
         raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
         t_main_input, _, d_signalman_res = split_unified_event_detections(
             raw_dets,
-            cam.events,
+            active_detection_events,
             main_conf=main_conf,
             person_conf=person_conf,
             helmet_conf=helmet_conf,
@@ -6160,7 +6740,8 @@ def main():
                         h, w = snap_img.shape[:2]
                         roi_info = {
                             "roi_poly_norm": c.roi_poly_norm,
-                            "roi_lines_norm": c.roi_lines_norm
+                            "roi_lines_norm": c.roi_lines_norm,
+                            "roi_change_poly_norm": c.roi_change_poly_norm
                         }
                         IMAGE_SAVER_POOL.submit(
                             _send_roi_snapshot_task,

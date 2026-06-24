@@ -6,16 +6,21 @@ import time
 import math
 import numpy as np
 import subprocess
+from collections import deque, defaultdict
 
 # ==========================================
 # [1] multi_event.py 컴포넌트 임포트 (재사용)
 # ==========================================
 try:
+    import multi_event as me
     from multi_event import (
         SYS_CFG, EVENT_REGISTRY, SimpleTracker,
         denormalize_roi_points, extract_ip, run_wizard_batch_mode,
         ID_H_HELMET, ID_H_NO_HELMET, ID_G_PERSON, ID_PERSON_LOW,
-        ID_REFLECTIVE_VEST, TARGET_VEHICLES
+        ID_REFLECTIVE_VEST, TARGET_VEHICLES,
+        Camera, MotionDetector,
+        split_unified_event_detections, detection_array,
+        resolve_model_path, ROI_CHANGE_EVENT
     )
 except ImportError as e:
     print(f"[오류] multi_event.py 파일을 찾을 수 없거나 임포트 에러가 발생했습니다: {e}")
@@ -28,6 +33,12 @@ TEST_DIR = "./test_videos"
 TEST_RESULT_DIR = "./test_results"
 TEST_CONFIG_FILE = os.path.join(TEST_DIR, "test_cameras.json")
 TARGET_FPS = SYS_CFG.get("REC_FPS", 3.0)
+
+# 테스트 재현용에서는 실제 관제 API 전송을 막습니다.
+# 이벤트 판정/저장 로직은 multi_event.py 경로를 타되, 외부 POST만 차단합니다.
+def _test_no_api_send(*args, **kwargs):
+    return None
+me.send_event_image_to_receiver = _test_no_api_send
 
 # ==========================================
 # [3] 모의 프레임 리더 (단말 속도 모사)
@@ -71,7 +82,7 @@ class DualModelWrapper:
             self.ext = 'dxnn'
             self.model_path = f"{self.base_name}.dxnn"
             self.model = YoLoDeepX(self.model_path)
-            print(f"✅ [Model] DeepX NPU 로드 완료: {self.model_path}")
+            print(f"? [Model] DeepX NPU 로드 완료: {self.model_path}")
             return
         except ImportError:
             pass
@@ -81,13 +92,13 @@ class DualModelWrapper:
         try:
             from ultralytics import YOLO
             self.model = YOLO(self.model_path)
-            print(f"✅ [Model] 서버/PC 환경 감지 - PyTorch 로드 완료: {self.model_path}")
+            print(f"? [Model] 서버/PC 환경 감지 - PyTorch 로드 완료: {self.model_path}")
         except ImportError:
             raise ImportError("PyTorch(.pt) 모델을 사용하려면 'pip install ultralytics'가 필요합니다.")
 
     def infer(self, img, conf_override=0.40):
         if img is None:
-            return np.empty((0,6))
+            return np.empty((0, 6))
 
         if self.ext == 'pt':
             results = self.model(img, verbose=False, conf=conf_override)
@@ -99,9 +110,67 @@ class DualModelWrapper:
                     c = float(box.conf[0].cpu().numpy())
                     cls_id = int(box.cls[0].cpu().numpy())
                     res.append([x1, y1, x2, y2, c, cls_id])
-            return np.array(res) if res else np.empty((0,6))
+            return np.array(res) if res else np.empty((0, 6))
         else:
             return self.model.infer(img, conf_override)
+
+# ==========================================
+# [4-1] 테스트용 Camera 래퍼
+#      - RTSP FrameReader만 빼고, run_logic/draw/privacy_blur는 multi_event.py 그대로 사용
+# ==========================================
+class DummyRecorder:
+    def trigger(self, event_name, objects_meta=None, event_meta=None):
+        # test.py의 결과 영상 저장은 아래 VideoWriter가 담당합니다.
+        return None
+
+    def update(self, frame, infer_meta=None):
+        return None
+
+class ReplayCamera(Camera):
+    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_signalman, det_plate,
+                 cam_id, event_inference_mode="separate"):
+        # Camera.__init__을 호출하면 RTSP FrameReader 스레드가 뜨므로 호출하지 않습니다.
+        # 대신 multi_event.py의 Camera 필드 구조만 동일하게 구성합니다.
+        self.ip = ip
+        self.conf = conf
+        self.cam_id = cam_id
+        self.event_inference_mode = event_inference_mode
+        self.events = conf.get('events', [])
+
+        self.det_main = det_main
+        self.det_helmet = det_helmet
+        self.det_face = det_face
+        self.det_signalman = det_signalman
+        self.det_plate = det_plate
+
+        self.trk_main = SimpleTracker()
+        self.trk_helmet = SimpleTracker()
+        self.trk_signalman = SimpleTracker()
+
+        self.reader = None
+        self.recorder = DummyRecorder()
+        self.motion_det = MotionDetector()
+
+        self.alerted = defaultdict(set)
+        self.last_evt_t = {}
+        self.visual_alarms = {}
+
+        self.fps_queue = deque(maxlen=30)
+        self.current_fps = 0.0
+
+        self.roi_poly_norm = conf.get('roi_poly_norm', [])
+        self.roi_lines_norm = conf.get('roi_lines_norm', [])
+        self.roi_poly = []
+        self.roi_lines = []
+
+        self.base_roi_poly = []
+        self.base_roi_lines = []
+        self.aligned_roi_poly = []
+        self.aligned_roi_lines = []
+
+        self.roi_frame_shape = None
+        self.status_history = deque(maxlen=10)
+        self._rebuild_handlers()
 
 # ==========================================
 # [5] 설정 관리 및 실행
@@ -130,6 +199,13 @@ def load_or_run_wizard(video_files):
 
     return configs
 
+def _load_optional_model(model_name, label):
+    try:
+        return DualModelWrapper(model_name)
+    except Exception as e:
+        print(f"[Model Warning] {label} 모델 로드 실패. 해당 기능은 비활성화됩니다: {e}")
+        return None
+
 def main():
     if not os.path.exists(TEST_DIR):
         os.makedirs(TEST_DIR)
@@ -146,17 +222,35 @@ def main():
 
     configs = load_or_run_wizard(video_files)
 
+    # 실제 multi_event.py의 운영 추론 경로를 그대로 따릅니다.
+    # multi_event.py는 INFERENCE_MODE 값과 무관하게 항상 MAIN 모델 한 번의 추론 결과를
+    # split_unified_event_detections()로 클래스별로 나눠서 사용합니다(event_inference_mode="main").
+    # 따라서 test.py도 동일하게 MAIN 모델만 사용하고, 신호수는 MAIN 출력 split에서 가져옵니다.
     try:
-        model_main = DualModelWrapper(SYS_CFG["models"]["MAIN"])
-        model_helmet = DualModelWrapper(SYS_CFG["models"]["HELMET"])
+        models_cfg = SYS_CFG.get("models", {})
+        event_inference_mode = "main"
+
+        model_main = DualModelWrapper(models_cfg.get("MAIN", "hanjin_cctv.dxnn"))
+        model_signalman = None  # 신호수는 MAIN 모델 출력 split(d_signalman_res)에서 가져옵니다.
+
+        model_helmet = DualModelWrapper(models_cfg.get("HELMET", "helmet_3cls_v8.dxnn"))
+
+        # test.py 결과 영상에도 개인정보 블러를 적용하기 위해 FACE/PLATE 모델을 로드합니다.
+        # 모델이 없으면 테스트 자체는 계속 진행합니다.
+        model_face = _load_optional_model(models_cfg.get("FACE", "yolov8m-face.dxnn"), "FACE")
+        model_plate = _load_optional_model(models_cfg.get("PLATE", "license_plate_detector.dxnn"), "PLATE")
+
         main_conf = SYS_CFG["model_confidences"]["MAIN"]
         helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
+        person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.35)
+        signalman_conf = SYS_CFG.get("model_confidences", {}).get("SIGNALMAN", person_conf)
+
     except Exception as e:
         print(f"[Model Load Error] {e}")
         return
 
     print("\n=====================================")
-    print(f"🚀 테스트 분석 시작 (목표 프레임: {TARGET_FPS} FPS)")
+    print(f"?? 테스트 분석 시작 (목표 프레임: {TARGET_FPS} FPS / event inference: {event_inference_mode})")
     print(f"저장 경로: {os.path.abspath(TEST_RESULT_DIR)}")
     print("=====================================")
 
@@ -175,94 +269,89 @@ def main():
         print(f"\n▶ [{v_idx+1}/{len(video_files)}] 재생 및 녹화 중: {video_filename} | 적용 이벤트: {events}")
 
         reader = VideoMockReader(video_path, target_fps=TARGET_FPS)
-        trk_main = SimpleTracker()
-        trk_helmet = SimpleTracker()
-
-        roi_poly_norm = conf.get('roi_poly_norm', [])
-        roi_lines_norm = conf.get('roi_lines_norm', [])
-        roi_frame_shape = None
-        handlers = {}
-        alarms_display = {}
-
         video_writer = None
+
+        replay_cam = ReplayCamera(
+            ip=v_key,
+            conf=conf,
+            det_main=model_main,
+            det_helmet=model_helmet,
+            det_face=model_face,
+            det_signalman=model_signalman,
+            det_plate=model_plate,
+            cam_id=v_idx + 1,
+            event_inference_mode=event_inference_mode
+        )
 
         while True:
             ret, frame, fid = reader.read()
             if not ret:
                 break
 
-            # 해상도 변경 시 ROI 역정규화 및 이벤트 핸들러 초기화
-            if roi_frame_shape != frame.shape[:2]:
-                h, w = frame.shape[:2]
-                roi_poly = denormalize_roi_points(roi_poly_norm, w, h)
-                roi_lines = denormalize_roi_points(roi_lines_norm, w, h)
+            # ---------------------------------------------------------
+            # [실제 multi_event.py의 run_camera_inference()와 동일한 추론 입력 구성]
+            # - MAIN 모델 한 번 추론 후 split_unified_event_detections()로 클래스 분리
+            # - 신호수(signalman)는 MAIN 출력 split 결과(d_signalman_res) 사용
+            # - 헬멧은 "no_helmet" 이벤트일 때만 helmet 모델 추론
+            # ---------------------------------------------------------
+            active_detection_events = [evt for evt in replay_cam.events if evt != ROI_CHANGE_EVENT]
+            base_conf = min(main_conf, person_conf, signalman_conf)
+            raw_dets = replay_cam.det_main.infer(frame, conf_override=base_conf)
+            t_main_input, _, d_signalman_res = split_unified_event_detections(
+                raw_dets,
+                active_detection_events,
+                main_conf=main_conf,
+                person_conf=person_conf,
+                helmet_conf=helmet_conf,
+                signalman_conf=signalman_conf
+            )
 
-                for ename in events:
-                    if ename in EVENT_REGISTRY:
-                        event_cfg = SYS_CFG.get("event_config", {}).get(ename, {})
-                        handlers[ename] = EVENT_REGISTRY[ename](event_cfg, roi_poly, roi_lines)
-                roi_frame_shape = frame.shape[:2]
+            d_helmet_res = np.empty((0, 6))
+            if "no_helmet" in replay_cam.events:
+                d_helmet_res = replay_cam.det_helmet.infer(frame, conf_override=helmet_conf)
 
-            # 모델 추론
-            d_main_res = model_main.infer(frame, conf_override=main_conf)
-            d_helmet_res = model_helmet.infer(frame, conf_override=helmet_conf)
+            # ---------------------------------------------------------
+            # [핵심] 이벤트 재현은 multi_event.py의 Camera.run_logic() 그대로 사용
+            # - MotionDetector
+            # - SimpleTracker 3종(main/helmet/signalman)
+            # - 이벤트 핸들러 kwargs
+            # - cooldown / visual alarm / decision_trace
+            # ---------------------------------------------------------
+            t_main, t_helmet, t_signalman, alarms, new_events = replay_cam.run_logic(
+                frame,
+                fid,
+                t_main_input,
+                d_helmet_res,
+                d_signalman_res
+            )
 
-            # 트래킹
-            d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
-            t_main = trk_main.update(d_main_filtered)
+            for ev_data in new_events:
+                tids = []
+                for obj in ev_data.get('objects', []):
+                    if obj.get('tid') is not None:
+                        tids.append(str(obj.get('tid')))
+                tid_text = ",".join(tids) if tids else "-"
+                print(f"?? [{ev_data.get('event_name', '').upper()} 알람 발생!] FID:{fid} | TID:{tid_text}")
 
-            d_helmet_filtered = [d for d in d_helmet_res if int(d[5]) == ID_H_NO_HELMET]
-            t_helmet = trk_helmet.update(d_helmet_filtered)
+            # ---------------------------------------------------------
+            # [추가] test.py 결과 영상에도 얼굴/번호판 모자이크 적용
+            # - 실제 multi_event.py의 apply_privacy_blur() 재사용
+            # - 그 위에 draw()로 ROI/BBox/알람 UI 렌더링
+            # ---------------------------------------------------------
+            render_base = frame.copy()
+            if replay_cam.det_face is not None or replay_cam.det_plate is not None:
+                render_base, _privacy_meta = replay_cam.apply_privacy_blur(
+                    render_base,
+                    t_main,
+                    blur_face=True,
+                    blur_plate=True
+                )
 
-            track_map = {int(t[4]): int(t[6]) for t in t_main}
+            render_frame = replay_cam.draw(render_base, t_main, t_helmet, t_signalman, alarms, connected=True)
+            cv2.putText(render_frame, f"TEST MODE | {TARGET_FPS} FPS | FID: {fid}",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-            # 이벤트 판별 로직 수행
-            for ename, handler in handlers.items():
-                kwargs = {'helmet_tracks': t_helmet} if ename == "no_helmet" else {}
-                triggered = handler.process(t_main, track_map, None, frame, fid, **kwargs)
-
-                for ev in triggered:
-                    tid = ev['tid']
-                    print(f"🚨 [{ename.upper()} 알람 발생!] FID:{fid} | TID:{tid}")
-                    alarms_display[tid] = {'evt': ename, 'expire_fid': fid + int(TARGET_FPS * 5)}
-
-            # 만료된 알람 제거
-            for tid in list(alarms_display.keys()):
-                if fid > alarms_display[tid]['expire_fid']:
-                    del alarms_display[tid]
-
-            # 화면 렌더링
-            render_frame = frame.copy()
-
-            if roi_poly:
-                cv2.polylines(render_frame, [np.array(roi_poly, np.int32)], True, (0, 255, 255), 2)
-            if roi_lines:
-                for i in range(0, len(roi_lines), 2):
-                    if i + 1 < len(roi_lines):
-                        cv2.line(render_frame, tuple(roi_lines[i]), tuple(roi_lines[i+1]), (0, 0, 255), 2)
-
-            for t in t_main:
-                tid = int(t[4])
-                cls_id = int(t[6])
-                color = (0, 255, 0)
-
-                if cls_id == ID_G_PERSON: label = f"Person [{tid}]"
-                elif cls_id == ID_PERSON_LOW: label, color = f"LowBody [{tid}]", (0, 150, 0)
-                elif cls_id == ID_REFLECTIVE_VEST: label, color = f"Signalman [{tid}]", (0, 255, 255)
-                elif cls_id in TARGET_VEHICLES: label, color = f"Vehicle [{tid}]", (255, 100, 0)
-                else: label = f"OBJ [{tid}]"
-
-                if tid in alarms_display:
-                    color = (0, 0, 255)
-                    label = f"ALARM: {alarms_display[tid]['evt']}"
-                    cv2.rectangle(render_frame, (0, 0), (render_frame.shape[1], render_frame.shape[0]), (0, 0, 255), 10)
-
-                cv2.rectangle(render_frame, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, 2)
-                cv2.putText(render_frame, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-            cv2.putText(render_frame, f"TEST MODE | {TARGET_FPS} FPS | FID: {fid}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-            # [추가] 렌더링된 프레임을 영상 파일로 기록
+            # 렌더링된 프레임을 영상 파일로 기록
             if video_writer is None:
                 h_out, w_out = render_frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -280,7 +369,7 @@ def main():
         reader.release()
 
     cv2.destroyAllWindows()
-    print("\n✅ 모든 비디오 테스트 및 결과 저장이 완료되었습니다.")
+    print("\n? 모든 비디오 테스트 및 결과 저장이 완료되었습니다.")
 
 if __name__ == "__main__":
     main()
