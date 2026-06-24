@@ -3877,7 +3877,8 @@ class FrameReader:
             f"[DECODE FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
             f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
             f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
-            f"restarts={self._decode_restarts} connected={self.connected}"
+            f"restarts={self._decode_restarts} connected={self.connected}",
+            level="debug"
         )
         self._decode_window_frames = 0
         self._decode_window_bytes = 0
