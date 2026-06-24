@@ -2248,6 +2248,9 @@ class HelmetDetector(BaseEventDetector):
                     'objects': [
                         # [수정] 사람(Person) BBox를 페이로드에서 제외하고, 미착용 머리 객체만 전송
                         {'label': 'no_helmet', 'box': [int(x) for x in nh_track_match[:4]], 'score': float(nh_track_match[5]), 'tid': int(nh_track_match[4]), 'class_id': ID_H_NO_HELMET}
+                    ],
+                    'privacy_objects': [
+                        {'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid, 'class_id': ID_G_PERSON}
                     ]
                 })
 
@@ -2274,6 +2277,7 @@ class HelmetDetector(BaseEventDetector):
                 matched_session['frame'] = frame.copy() if frame is not None else None
                 matched_session['fid'] = fid
                 matched_session['objects'] = nh_p['objects']
+                matched_session['privacy_objects'] = nh_p.get('privacy_objects', [])
                 matched_session['decision_context'] = nh_p.get('decision_context', {})
 
                 if roi_crop is not None:
@@ -2295,6 +2299,7 @@ class HelmetDetector(BaseEventDetector):
                     'triggered': False,
                     'roi_buffer': new_buffer,
                     'objects': nh_p['objects'],
+                    'privacy_objects': nh_p.get('privacy_objects', []),
                     'decision_context': nh_p.get('decision_context', {})
                 })
 
@@ -2324,6 +2329,7 @@ class HelmetDetector(BaseEventDetector):
                         'frame': session['frame'],
                         'fid': session['fid'],
                         'objects': session['objects'],
+                        'privacy_objects': session.get('privacy_objects', []),
                         'decision_trace': {
                             'detector': 'HelmetDetector',
                             'reason': 'no_helmet_duration_exceeded',
@@ -5176,6 +5182,8 @@ class Camera:
         current_alarms = {}
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
         score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
+        track_map_helmet = {int(t[4]): int(t[6]) for t in t_helmet}
+        score_map_helmet = {int(t[4]): round(float(t[5]), 2) for t in t_helmet}
         newly_triggered_events = []
 
         # Recording currently uses the original frame in the main loop.
@@ -5185,13 +5193,22 @@ class Camera:
         for ename, handler in self.handlers.items():
             if ename == "no_helmet":
                 kwargs = {'helmet_tracks': t_helmet}
+                handler_tracks = t_helmet
+                handler_track_map = track_map_helmet
+                handler_score_map = score_map_helmet
             elif ename == "signal_vehicle":
                 kwargs = {'signalman_tracks': t_signalman}
+                handler_tracks = t_main
+                handler_track_map = track_map_main
+                handler_score_map = score_map_main
             else:
                 kwargs = {}
+                handler_tracks = t_main
+                handler_track_map = track_map_main
+                handler_score_map = score_map_main
 
             try:
-                triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
+                triggered = handler.process(handler_tracks, handler_track_map, motion_mask, fr, fid, **kwargs)
             except Exception as e:
                 logger.error(f"?? [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
@@ -5202,9 +5219,10 @@ class Camera:
                 ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
                 cooldown = SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 600)
 
-                actual_score = score_map_main.get(tid, 0.95)
+                actual_score = handler_score_map.get(tid, score_map_main.get(tid, 0.95))
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
-                event_privacy_tracks = self._privacy_tracks_from_event_objects(objects_meta)
+                privacy_source_objects = ev.get('privacy_objects', objects_meta)
+                event_privacy_tracks = self._privacy_tracks_from_event_objects(privacy_source_objects)
                 privacy_reference_tracks = event_privacy_tracks if event_privacy_tracks else t_main
                 decision_trace = to_json_safe(ev.get('decision_trace', {
                     'detector': handler.__class__.__name__,
@@ -5409,17 +5427,29 @@ class Camera:
         if "no_helmet" in self.events:
             for t in t_helmet:
                 tid = int(t[4])
-                cls_id = int(t[6]) # 0: Helmet, 1: No-Helmet
+                cls_id = int(t[6]) # Helmet model classes can include helmet/head/person.
 
                 # [수정] 헬멧 착용 여부에 따라 라벨과 색상을 명확히 분리
                 if cls_id == ID_H_HELMET:
                     color = (0, 255, 0) # 초록색
                     label = f"Helmet [{tid}]"
                     thickness = 2
-                else:
+                elif cls_id == ID_H_NO_HELMET:
                     color = (0, 0, 255) # 빨간색
                     label = f"Head [{tid}]"
                     thickness = 3 if tid in alarms else 2
+                elif cls_id == ID_G_PERSON:
+                    color = (0, 255, 0)
+                    label = f"Person(H) [{tid}]"
+                    thickness = 2
+                elif cls_id == ID_PERSON_LOW:
+                    color = (0, 150, 0)
+                    label = f"LowBody(H) [{tid}]"
+                    thickness = 2
+                else:
+                    color = (0, 165, 255)
+                    label = f"HelmetObj {cls_id} [{tid}]"
+                    thickness = 2
 
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
                 cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -6205,16 +6235,21 @@ def main():
     run_output_retention_cleanup(output_retention_days)
 
     def run_camera_inference(cam, fr):
-        base_conf = min(main_conf, person_conf, signalman_conf)
-        raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
-        t_main_input, _, d_signalman_res = split_unified_event_detections(
-            raw_dets,
-            cam.events,
-            main_conf=main_conf,
-            person_conf=person_conf,
-            helmet_conf=helmet_conf,
-            signalman_conf=signalman_conf
-        )
+        main_events = [event_name for event_name in cam.events if event_name != "no_helmet"]
+        t_main_input = np.empty((0, 6))
+        d_signalman_res = np.empty((0, 6))
+
+        if main_events:
+            base_conf = min(main_conf, person_conf, signalman_conf)
+            raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
+            t_main_input, _, d_signalman_res = split_unified_event_detections(
+                raw_dets,
+                main_events,
+                main_conf=main_conf,
+                person_conf=person_conf,
+                helmet_conf=helmet_conf,
+                signalman_conf=signalman_conf
+            )
 
         d_helmet_res = np.empty((0, 6))
         if "no_helmet" in cam.events:
