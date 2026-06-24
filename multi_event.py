@@ -188,7 +188,8 @@ def load_system_config():
             "fps_limit": 15.0,
             "gstreamer_latency_ms": 50,
             "gstreamer_protocols": "tcp",
-            "log_interval_sec": 10.0
+            "log_interval_sec": 10.0,
+            "verbose_logs": False
         },
         "INFERENCE_MODE": "auto",  # compatibility setting; event inference uses MAIN model detections
         "BATCH_SIZE": 9,
@@ -3972,8 +3973,17 @@ class FrameReader:
         except Exception:
             return 10.0
 
+    def _decode_verbose_logs(self):
+        value = self.decode_cfg.get("verbose_logs", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
     def _emit_decode_log(self, message, level="info"):
-        log_fn = getattr(logger, level, logger.info)
+        effective_level = level
+        if str(level).lower() == "info" and not self._decode_verbose_logs():
+            effective_level = "debug"
+        log_fn = getattr(logger, effective_level, logger.info)
         log_fn(message)
 
     def _emit_gst_check_once(self, message, level="info"):
