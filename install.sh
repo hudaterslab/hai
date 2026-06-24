@@ -56,7 +56,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "models": {
         "MAIN": "hanjin_cctv_v2.dxnn",
         "FACE": "yolov8m-face_ppu.dxnn",
-        "HELMET": "helmet_3cls_v8_ppu.dxnn",
+        "HELMET": "helmet_260622.dxnn",
         "PLATE": "license_plate_detector_v2.dxnn"
     },
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},
@@ -95,7 +95,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
     "models": {
         "MAIN": "hanjin_cctv_v2.dxnn",
         "FACE": "yolov8m-face_ppu.dxnn",
-        "HELMET": "helmet_3cls_v8_ppu.dxnn",
+        "HELMET": "helmet_260622.dxnn",
         "PLATE": "license_plate_detector_v2.dxnn"
     },
     "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},

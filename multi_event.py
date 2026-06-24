@@ -156,7 +156,7 @@ def load_system_config():
         "models": {
             "MAIN": "hanjin_cctv_v2.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
-            "HELMET": "helmet_3cls_v8_ppu.dxnn",
+            "HELMET": "helmet_260622.dxnn",
             "PLATE": "license_plate_detector_v2.dxnn"
         },
         "model_confidences": {
@@ -1089,7 +1089,8 @@ class YoLoDeepX:
             raise RuntimeError("dx_engine is not installed; YoLoDeepX can only run on a DeepX/NPU runtime.")
 
         self.engine_path = engine_path
-        self.output_format = self._resolve_output_format(output_format)
+        self.requested_output_format = str(output_format or "auto").strip().lower()
+        self.output_format = self._normalize_configured_output_format(output_format) or "yolo"
         self.pool_size = max(1, int(pool_size or 1))
         self.engine_pool = queue.Queue(maxsize=self.pool_size)
         self.engines_ref = []
@@ -1106,6 +1107,7 @@ class YoLoDeepX:
                 self.engines_ref.append(engine)
 
             self._load_input_shape(self.engines_ref[0])
+            self.output_format = self._resolve_output_format(output_format, self.engines_ref[0])
             logger.info(
                 f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)} "
                 f"(output={self.output_format}, pool={self.pool_size}, "
@@ -1131,17 +1133,155 @@ class YoLoDeepX:
                 pass
         self.engines_ref = []
 
-    def _resolve_output_format(self, output_format):
+    def _normalize_configured_output_format(self, output_format):
         fmt = str(output_format or "auto").strip().lower()
         if fmt in ["", "auto"]:
-            model_name = os.path.basename(str(self.engine_path or "")).lower()
-            return "ppu" if "_ppu" in model_name or "-ppu" in model_name else "yolo"
+            return None
         if fmt in ["ppu", "deepx_ppu", "yolov8_ppu"]:
             return "ppu"
         if fmt in ["yolo", "yolov8", "raw", "standard", "raw_yolo"]:
             return "yolo"
         logger.warning(f"[DeepX] 알 수 없는 모델 출력 포맷({output_format})입니다. yolo 후처리로 동작합니다.")
         return "yolo"
+
+    def _resolve_output_format(self, output_format, engine=None):
+        configured = self._normalize_configured_output_format(output_format)
+        if configured:
+            return configured
+
+        detected, detail = self._detect_output_format_from_engine(engine)
+        if detected:
+            logger.info(
+                f"[DeepX] output_format=auto detected {detected}: "
+                f"{os.path.basename(self.engine_path)} ({detail})"
+            )
+            return detected
+
+        fallback = self._detect_output_format_from_filename()
+        logger.warning(
+            f"[DeepX] output_format=auto could not inspect output tensors for "
+            f"{os.path.basename(self.engine_path)} ({detail or 'no metadata'}). "
+            f"Using filename fallback: {fallback}."
+        )
+        return fallback
+
+    def _detect_output_format_from_filename(self):
+        model_name = os.path.basename(str(self.engine_path or "")).lower()
+        return "ppu" if "_ppu" in model_name or "-ppu" in model_name else "yolo"
+
+    def _detect_output_format_from_engine(self, engine):
+        if engine is None:
+            return None, "engine unavailable"
+
+        info_reader = None
+        for method_name in ["get_output_tensors_info", "get_outputs_info", "get_output_tensor_info"]:
+            if hasattr(engine, method_name):
+                info_reader = getattr(engine, method_name)
+                break
+        if info_reader is None:
+            return None, "output tensor metadata API unavailable"
+
+        try:
+            output_info = info_reader()
+        except Exception as e:
+            return None, f"output tensor metadata read failed: {e}"
+
+        entries = self._tensor_info_entries(output_info)
+        if not entries:
+            return None, "empty output tensor metadata"
+
+        metadata_text = self._safe_json_text(entries).lower()
+        shapes = [shape for shape in (self._tensor_shape(entry) for entry in entries) if shape]
+        dtypes = [self._tensor_dtype(entry).lower() for entry in entries if self._tensor_dtype(entry)]
+        detail = f"shapes={shapes or '-'} dtypes={dtypes or '-'}"
+
+        if "ppu" in metadata_text or "postprocess" in metadata_text or "bbox" in metadata_text:
+            return "ppu", detail
+        if self._metadata_looks_raw_yolo(shapes, dtypes):
+            return "yolo", detail
+        if self._metadata_looks_ppu(shapes, dtypes):
+            return "ppu", detail
+
+        return None, detail
+
+    def _tensor_info_entries(self, value):
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            for key in ["outputs", "output", "tensors", "tensor_info"]:
+                nested = value.get(key)
+                if isinstance(nested, (list, tuple)):
+                    return list(nested)
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def _safe_json_text(self, value):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+
+    def _tensor_shape(self, entry):
+        shape = None
+        if isinstance(entry, dict):
+            for key in ["shape", "dims", "dimension", "tensor_shape"]:
+                if key in entry:
+                    shape = entry.get(key)
+                    break
+        else:
+            for key in ["shape", "dims", "dimension", "tensor_shape"]:
+                if hasattr(entry, key):
+                    shape = getattr(entry, key)
+                    break
+
+        if shape is None:
+            return []
+        try:
+            return [int(x) for x in list(shape)]
+        except Exception:
+            numbers = re.findall(r"-?\d+", str(shape))
+            return [int(x) for x in numbers]
+
+    def _tensor_dtype(self, entry):
+        if isinstance(entry, dict):
+            for key in ["dtype", "data_type", "type", "format"]:
+                if key in entry and entry.get(key) is not None:
+                    return str(entry.get(key))
+        else:
+            for key in ["dtype", "data_type", "type", "format"]:
+                if hasattr(entry, key):
+                    return str(getattr(entry, key))
+        return ""
+
+    def _shape_without_ones(self, shape):
+        return [int(x) for x in shape if int(x) > 1]
+
+    def _metadata_looks_raw_yolo(self, shapes, dtypes):
+        for shape in shapes:
+            dims = self._shape_without_ones(shape)
+            if len(dims) < 2:
+                continue
+            has_candidate_axis = max(dims) >= 1000
+            has_class_axis = any(5 <= dim <= 256 for dim in dims)
+            if has_candidate_axis and has_class_axis:
+                return True
+        return False
+
+    def _metadata_looks_ppu(self, shapes, dtypes):
+        has_byte_output = any(dtype in ["uint8", "byte", "bytes"] or "uint8" in dtype for dtype in dtypes)
+        if has_byte_output and any(self._shape_looks_ppu_rows(shape) for shape in shapes):
+            return True
+        return any(self._shape_looks_ppu_rows(shape) for shape in shapes) and not self._metadata_looks_raw_yolo(shapes, dtypes)
+
+    def _shape_looks_ppu_rows(self, shape):
+        dims = self._shape_without_ones(shape)
+        if not dims:
+            return False
+        if len(dims) == 1:
+            return dims[0] % 32 == 0 and dims[0] <= 65536
+        return dims[-1] in [6, 7, 8, 32] and max(dims) < 1000
 
     def _load_input_shape(self, engine):
         try:
@@ -5919,7 +6059,7 @@ def main():
         logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
 
         # 이벤트 판단용 기본 객체와 신호수는 MAIN 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
-        # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
+        # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 전용 HELMET 모델 결과를 사용합니다.
         d_main = YoLoDeepX(
             main_model_path,
             output_format=get_main_model_output_format(main_model_path),
