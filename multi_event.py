@@ -904,7 +904,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         overlay = api_img.copy()
         cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
-        cv2.putText(api_img, "Signalman Auth [EVIDENCE]", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if not auth_tokens:
             cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -1028,7 +1028,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
                     continue
                 item = {
                     "box": [int(b) for b in o['box']],
-                    "label": str(o['label']),
+                    "label": event_type,
                     "score": round(float(o.get('score', 0.95)), 2)
                 }
                 if o.get('tid') is not None:
@@ -6067,7 +6067,7 @@ class HealthCheckDaemon:
                             reason="roi_settings_applied_from_health_response"
                         )
 
-                    logger.debug(
+                    logger.info(
                         f"?? [Health Check] 전송 성공 "
                         f"(CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%, "
                         f"ROI_SETUP: {data['isRoiSetupRequired']})"
