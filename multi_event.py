@@ -188,6 +188,8 @@ def load_system_config():
             "fps_limit": 15.0,
             "gstreamer_latency_ms": 50,
             "gstreamer_protocols": "tcp",
+            "gstreamer_tcp_timeout_us": 3000000,
+            "gstreamer_drop_on_latency": True,
             "log_interval_sec": 10.0,
             "verbose_logs": False
         },
@@ -4312,6 +4314,17 @@ class FrameReader:
         depay, parser, decoder, decoder_kind = decoder_info
         latency_ms = int(self.decode_cfg.get("gstreamer_latency_ms", 50) or 50)
         protocols = str(self.decode_cfg.get("gstreamer_protocols", "tcp") or "tcp").strip().lower()
+        try:
+            tcp_timeout_us = int(self.decode_cfg.get("gstreamer_tcp_timeout_us", 3000000))
+        except Exception:
+            tcp_timeout_us = 3000000
+        tcp_timeout_us = max(0, tcp_timeout_us)
+        drop_on_latency = self.decode_cfg.get("gstreamer_drop_on_latency", True)
+        if isinstance(drop_on_latency, str):
+            drop_on_latency = drop_on_latency.strip().lower() not in ("0", "false", "no", "off")
+        else:
+            drop_on_latency = bool(drop_on_latency)
+        drop_on_latency_text = "true" if drop_on_latency else "false"
         self._emit_decode_log(
             f"[GSTREAMER SELECT] CAM:{self.ip} codec={codec or '-'} "
             f"decoder={decoder} decoder_kind={decoder_kind} fps_limit={fps_limit or '-'}"
@@ -4326,7 +4339,7 @@ class FrameReader:
         cmd = [
             "gst-launch-1.0", "-q",
             "rtspsrc", f"location={self.url}", f"protocols={protocols}",
-            f"latency={latency_ms}", "drop-on-latency=true", "tcp-timeout=3000000",
+            f"latency={latency_ms}", f"drop-on-latency={drop_on_latency_text}", f"tcp-timeout={tcp_timeout_us}",
             "!", depay,
             "!", parser,
             "!", decoder,
@@ -4367,7 +4380,8 @@ class FrameReader:
                 cmd=cmd,
                 extra=(
                     f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
-                    f"latency_ms={latency_ms} protocols={protocols} fps_limit={fps_limit or '-'} "
+                    f"latency_ms={latency_ms} protocols={protocols} tcp_timeout_us={tcp_timeout_us} "
+                    f"drop_on_latency={drop_on_latency_text} fps_limit={fps_limit or '-'} "
                     f"frame_bytes={frame_size}"
                 )
             )
