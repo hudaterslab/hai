@@ -202,6 +202,7 @@ def load_system_config():
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
         "OUTPUT_RETENTION_DAYS": 14,
         "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
+        "ROI_SETUP_REQUIRED_API_ENABLED": False,
         "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
         "VISUAL_ALARM_DURATION": 5.0
     }
@@ -4801,9 +4802,13 @@ class Camera:
                     f"over={decision.get('over_count', 0)}"
                 )
 
-            request_terminal_roi_setup_required(reason=reason)
-            healthcheck_requested = True
+            healthcheck_requested = request_terminal_roi_setup_required(reason=reason)
             healthcheck_reason = reason
+            healthcheck_action = (
+                "healthcheck_true_persistent_base_roi_kept"
+                if healthcheck_requested or is_terminal_roi_setup_required_pending()
+                else "healthcheck_suppressed_base_roi_kept"
+            )
             self.align_status_text = (
                 f"ROI SETUP REQUIRED {method} "
                 f"status={status} decision={decision.get('decision')} "
@@ -4814,7 +4819,7 @@ class Camera:
                 f"scale={scale:.3f} persp={perspective:.5f} | "
                 f"h_shifted={h_shifted} | "
                 f"camera_shift max={camera_shift:.1f}px mean={corner_mean_shift:.1f}px | "
-                f"threshold={threshold:.1f}px | action=healthcheck_true_persistent_base_roi_kept"
+                f"threshold={threshold:.1f}px | action={healthcheck_action}"
             )
         else:
             self.align_status_text = (
@@ -5644,6 +5649,8 @@ class HealthCheckDaemon:
         return True
 
     def _should_send_roi_setup_required(self):
+        if not bool(SYS_CFG.get("ROI_SETUP_REQUIRED_API_ENABLED", False)):
+            return False
         with self._roi_setup_required_lock:
             return bool(self._roi_setup_required_pending)
 
@@ -5991,6 +5998,12 @@ class HealthCheckDaemon:
 HEALTH_DAEMON = None
 
 def request_terminal_roi_setup_required(reason=""):
+    if not bool(SYS_CFG.get("ROI_SETUP_REQUIRED_API_ENABLED", False)):
+        logger.info(
+            f"[Health Check] ROI setup required flag suppressed by config | "
+            f"reason={reason or 'unspecified'}"
+        )
+        return False
     if HEALTH_DAEMON is None:
         logger.warning(f"[Health Check] ROI setup required could not be flagged because daemon is not ready | reason={reason or 'unspecified'}")
         return False

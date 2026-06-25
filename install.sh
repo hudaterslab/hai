@@ -64,6 +64,7 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "verbose_logs": false},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
+    "ROI_SETUP_REQUIRED_API_ENABLED": false,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
 }
@@ -103,6 +104,7 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "verbose_logs": false},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
+    "ROI_SETUP_REQUIRED_API_ENABLED": false,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
     "VISUAL_ALARM_DURATION": 5.0
 }
