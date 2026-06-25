@@ -3996,6 +3996,48 @@ class FrameReader:
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
 
+    def _short_external_output(self, text, limit=800):
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        text = self._mask_pipeline_text(str(text or "").strip())
+        text = re.sub(r"\s+", " ", text)
+        if len(text) > limit:
+            return text[:limit] + "..."
+        return text
+
+    def _ensure_clean_url(self, context):
+        clean_url = sanitize_camera_url(self.url)
+        if clean_url != self.url:
+            logger.warning(
+                f"[CAM:{self.ip}] {context} sanitized runtime stream URL: "
+                f"{self._mask_pipeline_text(repr(self.url))} -> "
+                f"{self._mask_pipeline_text(repr(clean_url))}"
+            )
+            self.url = clean_url
+        return self.url
+
+    def _drain_binary_log_pipe(self, pipe, line_buffer):
+        try:
+            for raw_line in iter(pipe.readline, b""):
+                line = self._short_external_output(raw_line)
+                if line:
+                    line_buffer.append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    def _emit_buffered_stderr(self, label, line_buffer):
+        if not line_buffer:
+            return
+        self._emit_decode_log(
+            f"[{label} STDERR] CAM:{self.ip} {' | '.join(line_buffer)}",
+            level="warning"
+        )
+
     def _cmd_text(self, cmd):
         return self._mask_pipeline_text(" ".join(str(part) for part in cmd))
 
@@ -4125,20 +4167,36 @@ class FrameReader:
         return True
 
     def _probe_stream_info(self):
+        probe_url = self._ensure_clean_url("ffprobe")
         cmd = ["ffprobe", "-v", "error"]
-        if self.url.lower().startswith("rtsp://"):
+        if probe_url.lower().startswith("rtsp://"):
             cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000"])
         cmd.extend([
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height,codec_name",
             "-of", "json",
-            self.url,
+            probe_url,
         ])
 
         try:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=8, text=True).strip()
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+                text=True
+            )
+            out = (result.stdout or "").strip()
+            err = (result.stderr or "").strip()
         except Exception as e:
             logger.warning(f"[CAM:{self.ip}] ffprobe stream info failed: {e}")
+            return None
+
+        if result.returncode != 0:
+            logger.warning(
+                f"[CAM:{self.ip}] ffprobe stream info failed: rc={result.returncode} "
+                f"stderr={self._short_external_output(err)} stdout={self._short_external_output(out)}"
+            )
             return None
 
         try:
@@ -4152,9 +4210,15 @@ class FrameReader:
             if width > 0 and height > 0:
                 return width, height, codec
         except Exception as e:
-            logger.warning(f"[CAM:{self.ip}] ffprobe stream info parse failed: {e}")
+            logger.warning(
+                f"[CAM:{self.ip}] ffprobe stream info parse failed: {e} "
+                f"stdout={self._short_external_output(out)} stderr={self._short_external_output(err)}"
+            )
 
-        logger.warning(f"[CAM:{self.ip}] ffprobe returned no usable video info: {out}")
+        logger.warning(
+            f"[CAM:{self.ip}] ffprobe returned no usable video info: "
+            f"stdout={self._short_external_output(out)} stderr={self._short_external_output(err)}"
+        )
         return None
 
     def _probe_stream_shape(self):
@@ -4279,9 +4343,20 @@ class FrameReader:
             env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
 
         proc = None
+        gst_failed = False
+        gst_stderr_lines = deque(maxlen=30)
+        gst_stderr_thread = None
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, bufsize=frame_size * 2)
+            if proc.stderr is not None:
+                gst_stderr_thread = threading.Thread(
+                    target=self._drain_binary_log_pipe,
+                    args=(proc.stderr, gst_stderr_lines),
+                    daemon=True
+                )
+                gst_stderr_thread.start()
             if proc.stdout is None:
+                gst_failed = True
                 return False
 
             self.connected = True
@@ -4303,11 +4378,13 @@ class FrameReader:
             while self.running:
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
                     self._note_decode_failure(f"gstreamer_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
+                    gst_failed = True
                     break
 
                 raw = proc.stdout.read(frame_size)
                 if len(raw) != frame_size:
                     self._note_decode_failure(f"gstreamer_short_read_{len(raw)}_of_{frame_size}", level="error")
+                    gst_failed = True
                     break
 
                 fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
@@ -4325,6 +4402,7 @@ class FrameReader:
 
             return True
         except Exception as e:
+            gst_failed = True
             logger.warning(f"[CAM:{self.ip}] GStreamer pipe failed: {e}")
             return False
         finally:
@@ -4338,6 +4416,13 @@ class FrameReader:
                         proc.kill()
                     except Exception:
                         pass
+            if gst_stderr_thread is not None:
+                try:
+                    gst_stderr_thread.join(timeout=0.2)
+                except Exception:
+                    pass
+            if gst_failed:
+                self._emit_buffered_stderr("GSTREAMER", gst_stderr_lines)
 
     def _run_ffmpeg_vaapi_pipe(self):
         shape = self._probe_stream_shape()
