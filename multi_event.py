@@ -6457,6 +6457,7 @@ def main():
 
                     fr, fid, connected = raw_data[idx]
                     if connected and fr is not None:
+                        c._initialize_base_roi_if_needed(fr)
                         snap_img = create_roi_snapshot(c, fr)
                         if snap_img is None:
                             continue
