@@ -269,6 +269,12 @@ STARTUP_MODEL_PROFILES = {
             "HELMET": "auto",
             "PLATE": "yolo",
         },
+        "model_engine_pool_sizes": {
+            "MAIN": 3,
+            "FACE": 1,
+            "HELMET": 1,
+            "PLATE": 1,
+        },
     },
     "normal": {
         "models": {
@@ -282,6 +288,12 @@ STARTUP_MODEL_PROFILES = {
             "FACE": "yolo",
             "HELMET": "auto",
             "PLATE": "yolo",
+        },
+        "model_engine_pool_sizes": {
+            "MAIN": 1,
+            "FACE": 1,
+            "HELMET": 1,
+            "PLATE": 1,
         },
     },
 }
@@ -385,8 +397,19 @@ def _apply_startup_model_profile(config, profile):
     profile_config = STARTUP_MODEL_PROFILES[profile]
     models = config.setdefault("models", {})
     formats = config.setdefault("model_output_formats", {})
+    pool_sizes = config.setdefault("model_engine_pool_sizes", {})
     models.update(profile_config["models"])
     formats.update(profile_config["model_output_formats"])
+    pool_sizes.update(profile_config["model_engine_pool_sizes"])
+
+def get_main_model_engine_pool_size(main_model_path):
+    model_name = os.path.basename(str(main_model_path or "")).lower()
+    if model_name == "hanjin_cctv.dxnn":
+        return 1
+    model_profile = _normalize_startup_model_profile(SYS_CFG)
+    if model_profile == "normal":
+        return 1
+    return get_model_engine_pool_size("MAIN", default=3)
 
 def ensure_startup_runtime_config(force=False):
     global SYS_CFG, BATCH_SIZE
@@ -6386,6 +6409,7 @@ def main():
     inference_mode = str(SYS_CFG.get("INFERENCE_MODE", "auto")).strip().lower()
     event_inference_mode = "main"
     main_model_path = resolve_model_path(models_cfg.get("MAIN", "hanjin_cctv_v2.dxnn"))
+    main_pool_size = get_main_model_engine_pool_size(main_model_path)
 
     if not os.path.exists(main_model_path):
         logger.error(f"MAIN model file not found: {main_model_path}")
@@ -6401,7 +6425,7 @@ def main():
         d_main = YoLoDeepX(
             main_model_path,
             output_format=get_main_model_output_format(main_model_path),
-            pool_size=max(3, get_model_engine_pool_size("MAIN"))
+            pool_size=main_pool_size
         )
         d_helmet = YoLoDeepX(
             resolve_model_path(models_cfg["HELMET"]),
@@ -6491,7 +6515,8 @@ def main():
     )
     logger.info(
         f"[MODEL CONFIG] main={main_model_path} helmet={resolve_model_path(models_cfg.get('HELMET', '-'))} "
-        f"face={resolve_model_path(models_cfg.get('FACE', '-'))} plate={resolve_model_path(models_cfg.get('PLATE', '-'))}"
+        f"face={resolve_model_path(models_cfg.get('FACE', '-'))} plate={resolve_model_path(models_cfg.get('PLATE', '-'))} "
+        f"pools={json.dumps(SYS_CFG.get('model_engine_pool_sizes', {}), ensure_ascii=False)} main_effective_pool={main_pool_size}"
     )
     log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
     global HEALTH_DAEMON
