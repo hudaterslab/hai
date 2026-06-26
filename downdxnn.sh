@@ -1,5 +1,6 @@
 wget -O yolov8m-face_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/yolov8m-face_ppu.dxnn
 wget -O helmet_260622.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/helmet_260622.dxnn
+wget -O helmet_3cls_v8.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/helmet_3cls_v8.dxnn
 wget -O hanjin_cctv_ppu.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/hanjin_cctv_ppu.dxnn
 wget -O hanjin_cctv_v2.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/hanjin_cctv_v2.dxnn
 wget -O yolov8m-face.dxnn https://huggingface.co/HudatersU/sample_3.2.0/resolve/main/yolov8m-face.dxnn

@@ -255,6 +255,188 @@ def get_model_engine_pool_size(model_key, default=1):
     except Exception:
         return max(1, int(default))
 
+STARTUP_MODEL_PROFILES = {
+    "ppu": {
+        "models": {
+            "MAIN": "hanjin_cctv_v2.dxnn",
+            "FACE": "yolov8m-face_ppu.dxnn",
+            "HELMET": "helmet_260622.dxnn",
+            "PLATE": "license_plate_detector_v2.dxnn",
+        },
+        "model_output_formats": {
+            "MAIN": "ppu",
+            "FACE": "ppu",
+            "HELMET": "auto",
+            "PLATE": "yolo",
+        },
+    },
+    "normal": {
+        "models": {
+            "MAIN": "hanjin_cctv.dxnn",
+            "FACE": "yolov8m-face.dxnn",
+            "HELMET": "helmet_3cls_v8.dxnn",
+            "PLATE": "license_plate_detector_v2.dxnn",
+        },
+        "model_output_formats": {
+            "MAIN": "yolo",
+            "FACE": "yolo",
+            "HELMET": "auto",
+            "PLATE": "yolo",
+        },
+    },
+}
+
+STARTUP_VIDEO_PIPELINE_CHOICES = [
+    {
+        "key": "gstreamer",
+        "label": "GStreamer",
+        "description": "Linux/GStreamer RTSP 파이프라인",
+        "aliases": ("1", "g", "gst", "gstreamer", "gxstreamer", "gxstremer"),
+    },
+    {
+        "key": "ffmpeg",
+        "label": "FFmpeg",
+        "description": "FFmpeg/OpenCV 파이프라인",
+        "aliases": ("2", "f", "ffmpeg", "opencv", "cv2"),
+    },
+]
+
+STARTUP_MODEL_PROFILE_CHOICES = [
+    {
+        "key": "ppu",
+        "label": "PPU",
+        "description": "PPU 출력 모델 우선 사용",
+        "aliases": ("1", "p", "ppu"),
+    },
+    {
+        "key": "normal",
+        "label": "Normal",
+        "description": "일반 YOLO 출력 모델 사용",
+        "aliases": ("2", "n", "normal", "nonppu", "non-ppu", "yolo"),
+    },
+]
+
+def _atomic_write_json(path, data):
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    filename = os.path.basename(path)
+    tmp_path = os.path.join(directory, f".{filename}.{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+def _normalize_startup_video_pipeline(value):
+    value = str(value or "").strip().lower()
+    if value in ("gstreamer", "gst", "gst_vaapi", "gxstreamer", "gxstremer"):
+        return "gstreamer"
+    if value in ("ffmpeg", "ffmpeg_vaapi", "vaapi", "opencv", "cv2", "ffmpeg_opencv"):
+        return "ffmpeg"
+    return "gstreamer"
+
+def _normalize_startup_model_profile(config):
+    model_name = os.path.basename(str(((config.get("models") or {}).get("MAIN")) or "")).lower()
+    output_format = str(((config.get("model_output_formats") or {}).get("MAIN")) or "").strip().lower()
+    if output_format == "ppu" or "ppu" in model_name or model_name == "hanjin_cctv_v2.dxnn":
+        return "ppu"
+    return "normal"
+
+def _prompt_startup_choice(title, choices, default_key):
+    choices_by_alias = {}
+    for index, choice in enumerate(choices, 1):
+        choices_by_alias[str(index)] = choice["key"]
+        choices_by_alias[choice["key"]] = choice["key"]
+        for alias in choice.get("aliases", ()):
+            choices_by_alias[str(alias).lower()] = choice["key"]
+
+    while True:
+        print("")
+        print(title)
+        for index, choice in enumerate(choices, 1):
+            default_mark = " (기본값)" if choice["key"] == default_key else ""
+            print(f"  {index}. {choice['label']} - {choice['description']}{default_mark}")
+        try:
+            raw = guarded_input(">> 선택: ").strip().lower()
+        except EOFError:
+            return default_key
+        if not raw:
+            return default_key
+        selected = choices_by_alias.get(raw)
+        if selected:
+            return selected
+        print("잘못된 선택입니다. 위 번호 또는 이름을 입력하세요.")
+
+def _apply_startup_video_pipeline(config, pipeline):
+    video_decode = config.setdefault("video_decode", {})
+    video_decode["backend"] = pipeline
+    video_decode.setdefault("hw_acceleration", "auto")
+    video_decode.setdefault("fallback_to_cpu", True)
+    video_decode.setdefault("fps_limit", 15.0)
+    video_decode.setdefault("log_interval_sec", 10.0)
+    video_decode.setdefault("verbose_logs", False)
+
+def _apply_startup_model_profile(config, profile):
+    profile_config = STARTUP_MODEL_PROFILES[profile]
+    models = config.setdefault("models", {})
+    formats = config.setdefault("model_output_formats", {})
+    models.update(profile_config["models"])
+    formats.update(profile_config["model_output_formats"])
+
+def ensure_startup_runtime_config(force=False):
+    global SYS_CFG, BATCH_SIZE
+
+    startup_profile = SYS_CFG.get("startup_profile", {}) if isinstance(SYS_CFG.get("startup_profile"), dict) else {}
+    already_configured = bool(startup_profile.get("configured"))
+    if not force and already_configured:
+        return False
+
+    if not force and (not sys.stdin or not sys.stdin.isatty()):
+        logger.info(
+            "[STARTUP CONFIG] startup_profile is not configured, "
+            "but stdin is not interactive; keeping current system_config.json."
+        )
+        return False
+
+    config = deep_merge_dict({}, SYS_CFG)
+    current_pipeline = _normalize_startup_video_pipeline((config.get("video_decode") or {}).get("backend"))
+    current_model_profile = _normalize_startup_model_profile(config)
+
+    reason = "--configure-startup" if force else "first startup setup"
+    logger.info(f"[STARTUP CONFIG] running {reason}; config={CONFIG_COMMON_FILE}")
+    selected_pipeline = _prompt_startup_choice(
+        "영상 파이프라인 선택",
+        STARTUP_VIDEO_PIPELINE_CHOICES,
+        current_pipeline,
+    )
+    selected_model_profile = _prompt_startup_choice(
+        "모델 프로필 선택",
+        STARTUP_MODEL_PROFILE_CHOICES,
+        current_model_profile,
+    )
+
+    _apply_startup_video_pipeline(config, selected_pipeline)
+    _apply_startup_model_profile(config, selected_model_profile)
+    config["startup_profile"] = {
+        "configured": True,
+        "video_pipeline": selected_pipeline,
+        "model_profile": selected_model_profile,
+        "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _atomic_write_json(CONFIG_COMMON_FILE, config)
+    SYS_CFG = load_system_config()
+    BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
+    logger.info(
+        f"[STARTUP CONFIG] saved video_pipeline={selected_pipeline} "
+        f"model_profile={selected_model_profile} config={CONFIG_COMMON_FILE}"
+    )
+    return True
+
 def detection_array(rows):
     """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
     if rows is None or len(rows) == 0:
@@ -6133,9 +6315,12 @@ def clear_terminal_roi_snapshot_refresh(cctv_ids=None, reason=""):
         return False
 
 def main():
+    global DEBUG_MODE, SYS_CFG, BATCH_SIZE
+
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
     parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
+    parser.add_argument('--configure-startup', action='store_true', help="시작 영상/모델 선택을 다시 실행하고 system_config.json에 저장합니다.")
     args = parser.parse_args()
 
     is_gui_mode = args.gui
@@ -6145,8 +6330,9 @@ def main():
     else:
         logger.info("[시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)")
 
-    global DEBUG_MODE
     logger.info("[System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료")
+
+    ensure_startup_runtime_config(force=args.configure_startup)
 
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
     if not rtsp_list:
