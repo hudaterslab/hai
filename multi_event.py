@@ -6426,7 +6426,7 @@ def main():
                 dynamic_delay = 1.0 / target_fps
 
                 if DEBUG_MODE:
-                    logger.debug(f"?? [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
+                    logger.info(f"?? [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
 
                 last_fps_time = current_time
 
