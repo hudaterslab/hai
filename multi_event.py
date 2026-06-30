@@ -209,7 +209,7 @@ def load_system_config():
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
         "OUTPUT_RETENTION_DAYS": 14,
         "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
-        "ROI_SETUP_REQUIRED_API_ENABLED": False,
+        "ROI_SETUP_REQUIRED_API_ENABLED": True,
         "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
         "VISUAL_ALARM_DURATION": 5.0
     }
