@@ -1859,12 +1859,6 @@ class ParkingDetector(BaseEventDetector):
                             'triggered': False
                         })
                     else:
-                        self.states[tid].update({
-                            'bbox': t[:4],
-                            'frame': frame.copy() if frame is not None else None,
-                            'fid': fid
-                        })
-
                         duration_sec = current_time - self.states[tid]['start_time']
 
                         if not self.states[tid].get('triggered', False) and duration_sec >= self.trigger_sec:
@@ -2278,7 +2272,6 @@ class HelmetDetector(BaseEventDetector):
                 matched_session['last_tid'] = nh_p['tid']
                 matched_session['last_person_bbox'] = nh_p['person_bbox']
                 matched_session['bbox'] = nh_p['head_bbox']
-                matched_session['frame'] = frame.copy() if frame is not None else None
                 matched_session['fid'] = fid
                 matched_session['objects'] = nh_p['objects']
                 matched_session['privacy_objects'] = nh_p.get('privacy_objects', [])
@@ -2298,7 +2291,6 @@ class HelmetDetector(BaseEventDetector):
                     'last_tid': nh_p['tid'],
                     'last_person_bbox': nh_p['person_bbox'],
                     'bbox': nh_p['head_bbox'],
-                    'frame': frame.copy() if frame is not None else None,
                     'fid': fid,
                     'triggered': False,
                     'roi_buffer': new_buffer,
@@ -2330,7 +2322,7 @@ class HelmetDetector(BaseEventDetector):
                     triggered.append({
                         'tid': session['last_tid'],
                         'bbox': session['bbox'],
-                        'frame': session['frame'],
+                        'frame': frame.copy() if frame is not None else None,
                         'fid': session['fid'],
                         'objects': session['objects'],
                         'privacy_objects': session.get('privacy_objects', []),
@@ -6381,6 +6373,7 @@ def main():
 
     last_roi_snapshot_time = time.time() - 3590.0  # 시작 후 10초 뒤 첫 전송
     ROI_SNAPSHOT_INTERVAL_SEC = 3600.0  # 1시간 주기
+    inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
 
     try:
         psutil.cpu_percent(interval=None)
@@ -6481,7 +6474,6 @@ def main():
                         reason="roi_snapshot_sent"
                     )
 
-            inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
             for idx, res in enumerate(raw_data):
                 fr, _, connected = res
@@ -6606,8 +6598,6 @@ def main():
                     event_infer_meta = dict(infer_meta)
                     event_infer_meta["privacy_blur"] = privacy_blur_meta
                     event_save_queues[cams[idx].ip].append((fid, event_frame, event_infer_meta))
-
-            inference_executor.shutdown(wait=True)
 
             # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
