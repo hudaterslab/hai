@@ -79,8 +79,9 @@ ROI_ALIGN_LEARNING_DEFAULTS = {
 # ============================================================
 # 전체 화면 3×3 격자 기반 화각 변경(틀어짐) 감지
 #   - 전체 프레임을 3×3로 나눠 각 칸의 평행이동 벡터를 phaseCorrelate로 측정.
-#   - 측정 가능한(텍스처 있는) 칸 중 'GRID_SHAKE_THRESHOLD_PX(10px) 이상 움직이고 + 같은 방향'인
-#     칸이 GRID_CONSISTENT_MIN개 이상이면 카메라 틀어짐으로 본다.
+#   - 측정 성공한 칸이 모두 GRID_SHAKE_THRESHOLD_PX(10px)를 초과해 움직였고,
+#     그중 같은 방향인 칸이 round(n_moving × GRID_QUORUM_FRACTION) 이상이면
+#     카메라 틀어짐으로 본다.
 #       * 객체 이동: 일부 칸만 움직임 → 같은 방향 칸 수 부족 → 틀어짐 아님(사물=차/사람/택배)
 #       * 조명 변화(주/야·IR): 밝기만 변하고 벡터(평행이동)는 없음 → 틀어짐 아님
 #   - 이벤트(cameras.json events에 "roi_change") 지정 카메라만 동작.
@@ -96,7 +97,6 @@ GRID_CELL_MIN_STD = 10.0             # 칸 픽셀 표준편차가 이 미만이�
 GRID_QUORUM_FRACTION = 0.6           # 텍스처 칸 중 이 비율이 측정돼야 판단 가능
 GRID_QUORUM_FLOOR = 3                # 정족수 하한(최소 이만큼은 측정돼야 판단)
 GRID_DIRECTION_COS_MIN = 0.6         # 움직인 칸 벡터와 대표(median) 방향의 코사인 유사도가 이 이상이면 '같은 방향'(0.6≈±53°)
-GRID_CONSISTENT_MIN = 4              # 같은 방향으로 이동한 칸이 이 개수 이상이면 틀어짐
 
 def _format_grid_cell_diag(c):
     """격자 칸 1개가 '얼마나 움직였는지'(px)만 적는다(CSV/로그 공용).
@@ -2837,8 +2837,11 @@ class ROIAlignLearningStore:
     # 3×3 격자 전용 CSV 스키마(단순화: decision은 normal/suspect/confirm 3종).
     #   decision        : normal(이동 없음) / suspect(이동 감지, 누적 중) / confirm(연속 N회 도달 → API)
     #   suspect_count   : 연속 suspect 횟수(normal이 나오면 0으로 리셋). confirm_count_required(기본 3) 도달 시 confirm
+    #   cells_measurable: std 게이트 통과(측정 가능)한 칸 수. cells_moving == cells_measurable 이면 '전부 움직임'(①)
     #   cells_moving    : >GRID_SHAKE_THRESHOLD_PX(10px) 로 움직인 칸 수
-    #   cells_consistent: 그중 같은 방향인 칸 수. 이 값 >= GRID_CONSISTENT_MIN(3) 이면 suspect(=틀어짐 후보)
+    #   cells_consistent: 움직인 칸 중 같은 방향인 칸 수
+    #   consistent_quorum: 같은 방향 정족수 = round(cells_moving × GRID_QUORUM_FRACTION). cells_consistent >= 이 값(②)
+    #     → ①(전부 움직임) & ②(방향 정족수 충족) 둘 다면 그 검사가 '틀어짐(moved)' = suspect 후보
     #   grid_cells      : 칸별 이동량(9칸 '|' 구분). 측정칸=이동 px, 제외칸="x"(텍스처 없음/측정 실패)
     #   grid_cells_std  : 칸별 std(텍스처, 9칸 '|'). >= GRID_CELL_MIN_STD(10) 이면 측정칸 → 어느 칸이 통과했는지 확인
     #   frame_std       : 전체 프레임 표준편차(텍스처/대비)
@@ -2847,7 +2850,7 @@ class ROIAlignLearningStore:
     def append_csv_log(self, row, path=ROI_ALIGN_CSV_LOG_FILE):
         fieldnames = [
             "timestamp", "camera_key", "decision",
-            "suspect_count", "cells_moving", "cells_consistent",
+            "suspect_count", "cells_measurable", "cells_moving", "cells_consistent", "consistent_quorum",
             "grid_cells", "grid_cells_std", "frame_std",
             "anchor_refreshed", "healthcheck", "reason",
         ]
@@ -2937,7 +2940,7 @@ class AnchorTrackingROIAligner:
     """전체 화면 3×3 격자 phaseCorrelate 기반 화각 흔들림 감지기.
     앵커 슬롯(BASE=원본 보존, UPDATED=주기 갱신)에 전체 프레임 gray만 보관한다."""
     def __init__(self):
-        self.anchor_slots = {}                 # {ANCHOR_BASE/UPDATED: {"gray", "shape", "features", ...}}
+        self.anchor_slots = {}                 # {ANCHOR_BASE/UPDATED: {"gray", "shape", "created_at", "updated_at"}}
         self.last_debug = {"status": "not_initialized", "method": "grid_phase"}
         self.last_grid_result = None           # 마지막 detect_grid_camera_motion 결과(칸별 진단 포함, 외부 조회용)
 
@@ -2985,15 +2988,15 @@ class AnchorTrackingROIAligner:
         n_tex = self._grid_textured_cell_count(gray)
         if n_tex < GRID_QUORUM_FLOOR:
             self.last_debug = {"status": f"grid_anchor_low_texture:{n_tex}/{GRID_ROWS*GRID_COLS}",
-                               "method": "grid_phase", "good_matches": n_tex}
+                               "method": "grid_phase"}
             return False
         now_iso = ROI_ALIGN_LEARNING_STORE._now_iso()
         for slot in (ANCHOR_BASE, ANCHOR_UPDATED):
             self.anchor_slots[slot] = {
-                "gray": gray, "shape": frame.shape[:2], "features": n_tex,
+                "gray": gray, "shape": frame.shape[:2],
                 "created_at": now_iso, "updated_at": now_iso,
             }
-        self.last_debug = {"status": "grid_anchor_set", "method": "grid_phase", "good_matches": n_tex}
+        self.last_debug = {"status": "grid_anchor_set", "method": "grid_phase"}
         return True
 
     def refresh_grid_anchor(self, frame):
@@ -3010,18 +3013,19 @@ class AnchorTrackingROIAligner:
             return f"skip_refresh_low_texture:{n_tex}"
         slot["gray"] = gray
         slot["shape"] = frame.shape[:2]
-        slot["features"] = n_tex
         slot["updated_at"] = ROI_ALIGN_LEARNING_STORE._now_iso()
         return "grid_refresh"
 
     def detect_grid_camera_motion(self, frame):
         """전체 화면 3×3 격자에서 각 칸의 평행이동을 측정해 '카메라 틀어짐'을 판정.
-        '10px(GRID_SHAKE_THRESHOLD_PX) 이상 움직이고 + 대표 방향과 코사인 유사도 >= GRID_DIRECTION_COS_MIN'인
-        칸이 GRID_CONSISTENT_MIN(=3)개 이상이면 moved=True.
-        반환 dict: moved, n_measurable, n_moving, n_textured, quorum, consistent, frame_std, cells, status."""
+        측정 성공한 칸이 모두 10px(GRID_SHAKE_THRESHOLD_PX)를 초과해 움직이고,
+        그중 대표 방향과 코사인 유사도 >= GRID_DIRECTION_COS_MIN인 칸이
+        round(n_moving × GRID_QUORUM_FRACTION) 이상이면 moved=True.
+        반환 dict: moved, n_measurable, n_moving, n_textured, quorum, consistent, consistent_quorum, frame_std, cells, status."""
         res = {"moved": False, "n_measurable": 0, "n_moving": 0, "n_textured": 0,
-               "quorum": GRID_QUORUM_FLOOR, "consistent": 0,
-               "frame_std": 0.0, "cells": [], "status": "grid_not_initialized"}
+               "quorum": GRID_QUORUM_FLOOR, "consistent": 0, "consistent_quorum": 0,
+               "all_measured_moving": False, "frame_std": 0.0,
+               "cells": [], "status": "grid_not_initialized"}
         self.last_grid_result = res  # 외부(test 등)에서 칸별 수치 조회에 사용
         anchor = self.anchor_slots.get(ANCHOR_UPDATED) or self.anchor_slots.get(ANCHOR_BASE)
         if not anchor or anchor.get("gray") is None or frame is None:
@@ -3095,12 +3099,17 @@ class AnchorTrackingROIAligner:
             res["moved"] = False
             return res
 
-        # [판정] 10px 이상 움직이고 같은 방향인 칸이 GRID_CONSISTENT_MIN(=3)개 이상이면 카메라 틀어짐.
-        #   일부 칸만/제각각 움직이면(사물) consistent가 부족 → moved=False.
-        res["moved"] = bool(res["consistent"] >= GRID_CONSISTENT_MIN)
+        # [판정] 측정 성공한 칸이 모두 10px 초과로 움직였고,
+        #   그중 같은 방향인 칸이 움직인 칸 수의 GRID_QUORUM_FRACTION 이상이면 카메라 틀어짐.
+        consistent_quorum = int(round(n_moving * GRID_QUORUM_FRACTION))
+        # n_meas >= quorum 은 위 low_texture 체크에서 이미 보장됨 → '모든 측정칸이 움직였나'만 확인.
+        all_measured_moving = (n_moving == n_meas)
+        res["consistent_quorum"] = int(consistent_quorum)
+        res["all_measured_moving"] = bool(all_measured_moving)
+        res["moved"] = bool(all_measured_moving and res["consistent"] >= consistent_quorum)
         tag = "grid_moved" if res["moved"] else "grid_still"
-        res["status"] = (f"{tag}:consistent={res['consistent']}/min={GRID_CONSISTENT_MIN}"
-                         f"/moving={n_moving}/meas={n_meas}")
+        res["status"] = (f"{tag}:consistent={res['consistent']}/q={consistent_quorum}"
+                         f"/moving={n_moving}/meas={n_meas}/all_moving={int(all_measured_moving)}")
         return res
 
 class FrameReader:
@@ -3785,20 +3794,6 @@ class Camera:
                 handler.lines = new_lines
 
 
-    def _detections_to_exclude_boxes(self, *detections_list):
-        boxes = []
-        for detections in detections_list:
-            if detections is None:
-                continue
-            try:
-                for det in detections:
-                    if len(det) >= 4:
-                        boxes.append([float(det[0]), float(det[1]), float(det[2]), float(det[3])])
-            except Exception:
-                continue
-        return boxes
-
-
     def _log_align_blocked(self, decision, detail):
         """앵커 설정 전(대기/실패) 단계에서도 roi_change 카메라가 CSV에 흔적을 남기게 한다.
         로그 파일 없이도 '왜 특정 카메라가 안 뜨는지'를 진단할 수 있다.
@@ -3814,8 +3809,10 @@ class Camera:
                 "camera_key": self.camera_key,
                 "decision": "normal",
                 "suspect_count": 0,
+                "cells_measurable": "",
                 "cells_moving": "",
                 "cells_consistent": "",
+                "consistent_quorum": "",
                 "grid_cells": "",
                 "grid_cells_std": "",
                 "frame_std": "",
@@ -3827,7 +3824,7 @@ class Camera:
         except Exception as e:
             logger.debug(f"[CAM:{getattr(self,'cam_id','?')}] blocked-state log failed: {e}")
 
-    def _update_alignment(self, frame, exclude_boxes=None):
+    def _update_alignment(self, frame):
         """[신설] 전체 화면 3×3 격자 흔들림 감지 경로.
         ROI 폴리곤을 쓰지 않고 전체 프레임을 사용한다. 이벤트(roi_change) 지정 카메라만 동작.
         조명(주/야·IR) 변화는 벡터(평행이동)를 만들지 않으므로 자연히 무시된다."""
@@ -3886,10 +3883,11 @@ class Camera:
         n_mov = int(grid["n_moving"])
         quorum = int(grid.get("quorum", GRID_QUORUM_FLOOR))
         consistent = int(grid.get("consistent", 0))
+        consistent_quorum = int(grid.get("consistent_quorum", 0))
         self.align_ok = (n_meas >= quorum)
 
-        # 앵커 갱신: 카메라가 안 움직였고(측정 가능) 움직인 칸이 거의 없을 때만 → 기준 프레임을 신선하게 유지.
-        refresh_allowed = (not moved) and self.align_ok and (n_mov < GRID_CONSISTENT_MIN)
+        # 앵커 갱신: 카메라가 안 움직였고(측정 가능) 움직인 칸이 정족수보다 적을 때만 → 기준 프레임을 신선하게 유지.
+        refresh_allowed = (not moved) and self.align_ok and (n_mov < quorum)
         anchor_refreshed = False
         if refresh_allowed:
             action = self.aligner.refresh_grid_anchor(frame)
@@ -3908,17 +3906,17 @@ class Camera:
             healthcheck_requested = True
             healthcheck_reason = (
                 f"confirm camera={self.camera_key} cam_id={self.cam_id} "
-                f"consistent={consistent}/min={GRID_CONSISTENT_MIN} "
+                f"consistent={consistent}/q={consistent_quorum} "
                 f"moving={n_mov}/{n_meas} suspect={suspect_count}"
             )
             request_terminal_roi_setup_required(reason=healthcheck_reason)
             self.align_status_text = (
-                f"ROI SETUP REQUIRED confirm consistent={consistent}/{GRID_CONSISTENT_MIN} moving={n_mov}/{n_meas}"
+                f"ROI SETUP REQUIRED confirm consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
             )
         else:
             self.align_status_text = (
                 f"GRID {decision_name} suspect={suspect_count}/{confirm_required} "
-                f"moving={n_mov}/{n_meas} consistent={consistent}/{GRID_CONSISTENT_MIN}"
+                f"moving={n_mov}/{n_meas} consistent={consistent}/{consistent_quorum}"
             )
 
         csv_row = {
@@ -3926,8 +3924,10 @@ class Camera:
             "camera_key": self.camera_key,
             "decision": decision_name,
             "suspect_count": suspect_count,
+            "cells_measurable": n_meas,                                         # std 통과 측정칸 수 (moving==measurable 이면 전부 움직임)
             "cells_moving": n_mov,                                              # >임계(10px)로 움직인 칸 수
-            "cells_consistent": consistent,                                     # 그중 같은 방향 칸 수(>=GRID_CONSISTENT_MIN 이면 suspect)
+            "cells_consistent": consistent,                                     # 그중 같은 방향 칸 수
+            "consistent_quorum": consistent_quorum,                            # 방향 정족수(consistent가 이 값 이상이어야 ②통과)
             # 칸별 이동량(px). 9칸 '|' 구분. 측정칸=이동 px, 제외칸="x"(텍스처 없음/측정 실패)
             "grid_cells": "|".join(_format_grid_cell_diag(c) for c in grid.get("cells", [])),
             # 칸별 std(텍스처). 9칸 '|' 구분. >=GRID_CELL_MIN_STD 이면 측정칸 → 어느 칸이 std 게이트를 통과했는지 확인
@@ -4243,8 +4243,7 @@ class Camera:
         if d_signalman_res is None:
             d_signalman_res = np.empty((0, 6))
 
-        align_exclude_boxes = self._detections_to_exclude_boxes(d_main_res, d_helmet_res, d_signalman_res)
-        self._update_alignment(fr, exclude_boxes=align_exclude_boxes)
+        self._update_alignment(fr)
         motion_mask = None
         if "signal_vehicle" in self.handlers:
             motion_mask = self.motion_det.apply(fr)

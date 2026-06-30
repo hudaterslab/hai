@@ -567,7 +567,7 @@ def main():
                     # 격자 9칸을 칸별로 출력합니다.
                     #   미측정칸="x" / 측정칸=이동량px, (s..)=그 칸 std(텍스처). std임계 이상이면 측정칸.
                     #   움직인 칸(>임계)은 방향 판정도 함께: ✓=대표 방향과 같음(cos>=임계) / ✗=다른 방향, cos값 표시.
-                    # '10px 이상 움직이고 + 같은 방향(✓)'인 칸이 GRID_CONSISTENT_MIN개 이상이면 '틀어짐'.
+                    # 측정 성공한 칸이 모두 10px 이상 움직이고, 그중 같은 방향(✓) 칸이 동적 방향 정족수 이상이면 '틀어짐'.
                     grid_res = getattr(getattr(replay_cam, "aligner", None), "last_grid_result", None)
                     if is_decision and grid_res and grid_res.get("cells"):
                         cell_strs = []
@@ -581,7 +581,9 @@ def main():
                                 cell_strs.append(f"#{ci}:{mv}(s{s})")
                         cell_diag = " ".join(cell_strs)
                         print(
-                            f"    └ cells(같은방향✓ {me.GRID_CONSISTENT_MIN}칸↑=틀어짐 / cos>={me.GRID_DIRECTION_COS_MIN} / std임계 {me.GRID_CELL_MIN_STD:.0f}) "
+                            f"    └ cells(전체측정칸 moving={int(bool(grid_res.get('all_measured_moving')))} / "
+                            f"같은방향✓ {grid_res.get('consistent_quorum', 0)}칸↑=틀어짐 / "
+                            f"cos>={me.GRID_DIRECTION_COS_MIN} / std임계 {me.GRID_CELL_MIN_STD:.0f}) "
                             f"meas={grid_res.get('n_measurable')}/q={grid_res.get('quorum')} "
                             f"moving={grid_res.get('n_moving')} consistent={grid_res.get('consistent')} "
                             f"frame_std={grid_res.get('frame_std', 0.0):.1f}: {cell_diag}"
