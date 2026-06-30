@@ -68,6 +68,16 @@ def _append_csv_log_to_test_dir(row, path=None):
     return _orig_append_csv_log(row, path=TEST_CSV_PATH)
 me.ROI_ALIGN_LEARNING_STORE.append_csv_log = _append_csv_log_to_test_dir
 
+# test.py의 모든 결과물은 test_results 폴더 안에만 있어야 합니다.
+# 운영의 save_event_image_with_mark()는 이벤트 이미지를 CCTV_EVENT_ALERT 폴더에 저장하고
+# API 전송 큐에 등록하므로, 이를 막습니다(반환 None → run_logic은 evidence_paths 없이 진행).
+# 대신 test.py 메인 루프에서 '모든 객체 class/conf가 그려진' render_frame을 test_results에 직접 저장합니다.
+def _test_no_save_event_image(*args, **kwargs):
+    return None
+me.save_event_image_with_mark = _test_no_save_event_image
+# 혹시 다른 경로에서 EVENT_ROOT_DIR을 참조하더라도 test_results 밖으로 새지 않도록 안전망.
+me.EVENT_ROOT_DIR = os.path.abspath(TEST_RESULT_DIR)
+
 # ==========================================
 # [3] 모의 프레임 리더 (단말 속도 모사)
 # ==========================================
@@ -245,14 +255,28 @@ class ReplayCamera(Camera):
             me.ID_G_PERSON: "Person", me.ID_G_CAR: "Car", me.ID_PERSON_LOW: "LowBody",
             me.ID_REFLECTIVE_VEST: "Vest", me.ID_G_TRUCK: "Truck",
         }
+        # 라벨은 2줄로 표시합니다(한 줄에 class+conf를 합치면 화면 가장자리에서 자주 짤림):
+        #   1번째 줄(박스 위)  : 클래스명[tid]
+        #   2번째 줄(박스 안 상단): conf 0.xx
         for t in t_main:
             tid, cls_id = int(t[4]), int(t[6])
-            if tid in alarms or cls_id in allowed:
-                continue  # 알람/감시대상 클래스는 super().draw()가 이미 그림 (중복 방지)
+            conf = float(t[5])
             x1, y1, x2, y2 = map(int, t[:4])
-            cv2.rectangle(out, (x1, y1), (x2, y2), (200, 200, 200), 1)
-            cv2.putText(out, f"{names.get(cls_id, f'cls{cls_id}')}[{tid}]",
-                        (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+            hidden = (tid not in alarms) and (cls_id not in allowed)
+
+            if hidden:
+                # 운영 draw()가 숨긴 객체: 회색 박스 + 클래스명(1번째 줄)을 직접 그림
+                cv2.rectangle(out, (x1, y1), (x2, y2), (200, 200, 200), 1)
+                cv2.putText(out, f"{names.get(cls_id, f'cls{cls_id}')}[{tid}]",
+                            (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+                conf_color = (200, 200, 200)
+            else:
+                # 알람/감시대상 클래스는 super().draw()가 이미 박스+클래스명(1번째 줄)을 그림 → conf만 추가
+                conf_color = (0, 0, 255) if tid in alarms else (0, 255, 255)
+
+            # 2번째 줄: confidence (박스 안 상단)
+            cv2.putText(out, f"conf {conf:.2f}", (x1 + 2, y1 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, conf_color, 1)
         return out
 
 # ==========================================
@@ -590,6 +614,20 @@ def main():
                 status_color = (0, 0, 255) if replay_cam.align_shifted else (0, 255, 0)
                 cv2.putText(render_frame, f"ALIGN: {status_text[:95]}",
                             (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
+
+            # ---------------------------------------------------------
+            # [이벤트 이미지 저장] 운영처럼 CCTV_EVENT_ALERT가 아니라 test_results에 저장합니다.
+            # render_frame에는 모든 탐지 객체의 class명/conf가 그려져 있어(ReplayCamera.draw 오버라이드),
+            # 관제 전송 이미지보다 더 많은 정보를 담습니다. (개인정보 블러도 위에서 이미 적용됨)
+            # ---------------------------------------------------------
+            for ev_data in new_events:
+                ev_name = str(ev_data.get('event_name', 'event'))
+                ev_tids = "_".join(
+                    str(o.get('tid')) for o in ev_data.get('objects', []) if o.get('tid') is not None
+                ) or "x"
+                snap_path = os.path.join(TEST_RESULT_DIR, f"{name_only}_event_FID{fid}_{ev_name}_tid{ev_tids}.jpg")
+                cv2.imwrite(snap_path, render_frame)
+                print(f"💾 이벤트 이미지 저장: {snap_path}")
 
             # 렌더링된 프레임을 영상 파일로 기록
             if video_writer is None:
