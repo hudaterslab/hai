@@ -75,7 +75,7 @@ ROI_ALIGN_CSV_LOG_FILE = os.path.join(PROJECT_ROOT, "logs", "roi_align", "roi_al
 ROI_ALIGN_LEARNING_DEFAULTS = {
     "confirm_count_required": ROI_DRIFT_CONFIRM_COUNT,
 }
-
+# test주석
 # ============================================================
 # 전체 화면 3×3 격자 기반 화각 변경(틀어짐) 감지
 #   - 전체 프레임을 3×3로 나눠 각 칸의 평행이동 벡터를 phaseCorrelate로 측정.
