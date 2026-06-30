@@ -16,6 +16,7 @@ import queue
 import logging
 import psutil
 import atexit
+import tracemalloc
 from collections import deque, defaultdict
 import concurrent.futures
 import re
@@ -221,6 +222,48 @@ def load_system_config():
         return default_config
 
 SYS_CFG = load_system_config()
+def _truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+MEMORY_TRACEMALLOC_ENABLED = bool(SYS_CFG.get("logging", {}).get("memory_probe_tracemalloc", True))
+if MEMORY_TRACEMALLOC_ENABLED and not tracemalloc.is_tracing():
+    tracemalloc.start(25)
+MEMORY_PROBE_DECODE_ONLY = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_DECODE_ONLY",
+        SYS_CFG.get("logging", {}).get("memory_probe_decode_only", False)
+    )
+)
+MEMORY_PROBE_INFERENCE_REUSE_FRAME = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_INFERENCE_REUSE_FRAME",
+        SYS_CFG.get("logging", {}).get("memory_probe_inference_reuse_frame", False)
+    )
+)
+MEMORY_PROBE_KEEP_EXECUTOR = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_KEEP_EXECUTOR",
+        SYS_CFG.get("logging", {}).get("memory_probe_keep_executor", False)
+    )
+)
+MEMORY_PROBE_EXECUTOR_ONLY = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_EXECUTOR_ONLY",
+        SYS_CFG.get("logging", {}).get("memory_probe_executor_only", False)
+    )
+)
+MEMORY_PROBE_SKIP_RECORDER_UPDATE = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_SKIP_RECORDER_UPDATE",
+        SYS_CFG.get("logging", {}).get("memory_probe_skip_recorder_update", False)
+    )
+)
+MEMORY_PROBE_SKIP_EVENT_LOGIC = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_SKIP_EVENT_LOGIC",
+        SYS_CFG.get("logging", {}).get("memory_probe_skip_event_logic", False)
+    )
+)
 BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
 IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -866,6 +909,223 @@ def log_disk_health(paths, threshold_gb=None):
                 )
         except Exception as e:
             logger.warning(f"[DISK HEALTH] check failed | label={label} path={path} | {e}")
+
+MEMORY_PROBE_STATE = {"last_rss_mb": None, "last_ts": None}
+MEMORY_STAGE_BASE = {"loop": None, "rss_mb": None, "uss_mb": None, "private_dirty_mb": None, "pyheap_mb": None}
+
+def _safe_queue_size(q):
+    try:
+        return q.qsize()
+    except Exception:
+        return -1
+
+def _bounded_len(value):
+    try:
+        return len(value)
+    except Exception:
+        return -1
+
+def _read_smaps_rollup_mb():
+    keys = {
+        "Rss", "Pss", "Shared_Clean", "Shared_Dirty", "Private_Clean",
+        "Private_Dirty", "Referenced", "Anonymous", "AnonHugePages", "Swap"
+    }
+    metrics = {}
+    path = f"/proc/{os.getpid()}/smaps_rollup"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, raw_value = line.split(":", 1)
+                if key not in keys:
+                    continue
+                parts = raw_value.strip().split()
+                if not parts:
+                    continue
+                metrics[key] = float(parts[0]) / 1024.0
+    except Exception as e:
+        metrics["_error"] = str(e)
+    return metrics
+
+def _log_tracemalloc_probe(loop_count=None):
+    if not tracemalloc.is_tracing():
+        logger.info("[MEM PYHEAP] tracing=disabled")
+        return
+
+    current, peak = tracemalloc.get_traced_memory()
+    logger.info(
+        f"[MEM PYHEAP] loop={loop_count if loop_count is not None else '-'} "
+        f"current_mb={current / (1024 ** 2):.1f} peak_mb={peak / (1024 ** 2):.1f}"
+    )
+    try:
+        if loop_count is not None and int(loop_count) % 1500 != 0:
+            return
+    except Exception:
+        pass
+
+    try:
+        snapshot = tracemalloc.take_snapshot()
+        top_parts = []
+        for stat in snapshot.statistics("filename")[:8]:
+            frame = stat.traceback[0]
+            top_parts.append(
+                f"{os.path.basename(frame.filename)}={stat.size / (1024 ** 2):.1f}MB/{stat.count}"
+            )
+        logger.info(f"[MEM PYHEAP TOP] {', '.join(top_parts) if top_parts else '-'}")
+    except Exception as e:
+        logger.warning(f"[MEM PYHEAP TOP] failed | {e}")
+
+def _memory_stage_metrics():
+    proc = psutil.Process(os.getpid())
+    mem_info = proc.memory_info()
+    try:
+        full_info = proc.memory_full_info()
+    except Exception:
+        full_info = None
+    smaps = _read_smaps_rollup_mb()
+    pyheap_mb = 0.0
+    if tracemalloc.is_tracing():
+        current, _ = tracemalloc.get_traced_memory()
+        pyheap_mb = current / (1024 ** 2)
+    return {
+        "rss_mb": mem_info.rss / (1024 ** 2),
+        "vms_mb": mem_info.vms / (1024 ** 2),
+        "uss_mb": getattr(full_info, "uss", 0) / (1024 ** 2) if full_info else 0.0,
+        "pss_mb": getattr(full_info, "pss", 0) / (1024 ** 2) if full_info else 0.0,
+        "private_dirty_mb": smaps.get("Private_Dirty", 0.0) if isinstance(smaps, dict) else 0.0,
+        "anonymous_mb": smaps.get("Anonymous", 0.0) if isinstance(smaps, dict) else 0.0,
+        "pyheap_mb": pyheap_mb,
+        "threads": proc.num_threads(),
+    }
+
+def log_memory_stage(stage, loop_count, cams=None, event_save_queues=None):
+    try:
+        metrics = _memory_stage_metrics()
+        if MEMORY_STAGE_BASE.get("loop") != loop_count or stage == "before_process_frame":
+            MEMORY_STAGE_BASE["loop"] = loop_count
+            MEMORY_STAGE_BASE["rss_mb"] = metrics["rss_mb"]
+            MEMORY_STAGE_BASE["uss_mb"] = metrics["uss_mb"]
+            MEMORY_STAGE_BASE["private_dirty_mb"] = metrics["private_dirty_mb"]
+            MEMORY_STAGE_BASE["pyheap_mb"] = metrics["pyheap_mb"]
+
+        rec_q_total = 0
+        rec_buf_total = 0
+        if cams:
+            for cam in cams:
+                recorder = getattr(cam, "recorder", None)
+                rec_q = _safe_queue_size(getattr(recorder, "write_queue", None))
+                if rec_q > 0:
+                    rec_q_total += rec_q
+                rec_buf_total += max(0, _bounded_len(getattr(recorder, "buffer", [])))
+
+        event_q_total = 0
+        if event_save_queues:
+            for q in event_save_queues.values():
+                event_q_total += max(0, _bounded_len(q))
+
+        image_q = _safe_queue_size(getattr(IMAGE_SAVER_POOL, "_work_queue", None))
+        log_q = _safe_queue_size(log_queue)
+        logger.info(
+            f"[MEM STAGE] loop={loop_count} stage={stage} "
+            f"rss_mb={metrics['rss_mb']:.1f} "
+            f"rss_from_loop_start_mb={metrics['rss_mb'] - float(MEMORY_STAGE_BASE.get('rss_mb') or 0.0):.1f} "
+            f"uss_mb={metrics['uss_mb']:.1f} "
+            f"uss_from_loop_start_mb={metrics['uss_mb'] - float(MEMORY_STAGE_BASE.get('uss_mb') or 0.0):.1f} "
+            f"private_dirty_mb={metrics['private_dirty_mb']:.1f} "
+            f"private_dirty_from_loop_start_mb={metrics['private_dirty_mb'] - float(MEMORY_STAGE_BASE.get('private_dirty_mb') or 0.0):.1f} "
+            f"anonymous_mb={metrics['anonymous_mb']:.1f} "
+            f"pyheap_mb={metrics['pyheap_mb']:.1f} "
+            f"pyheap_from_loop_start_mb={metrics['pyheap_mb'] - float(MEMORY_STAGE_BASE.get('pyheap_mb') or 0.0):.1f} "
+            f"threads={metrics['threads']} image_q={image_q} log_q={log_q} "
+            f"rec_q_total={rec_q_total} rec_buf_total={rec_buf_total} event_q_total={event_q_total}"
+        )
+    except Exception as e:
+        logger.warning(f"[MEM STAGE] failed | stage={stage} loop={loop_count} | {e}")
+
+def log_memory_probe(cams, event_save_queues, cpu_usage=None, loop_count=None):
+    try:
+        proc = psutil.Process(os.getpid())
+        mem_info = proc.memory_info()
+        full_info = None
+        try:
+            full_info = proc.memory_full_info()
+        except Exception:
+            full_info = None
+        rss_mb = mem_info.rss / (1024 ** 2)
+        vms_mb = mem_info.vms / (1024 ** 2)
+        uss_mb = getattr(full_info, "uss", 0) / (1024 ** 2) if full_info else 0.0
+        pss_mb = getattr(full_info, "pss", 0) / (1024 ** 2) if full_info else 0.0
+        vm = psutil.virtual_memory()
+        now_ts = time.time()
+        last_rss = MEMORY_PROBE_STATE.get("last_rss_mb")
+        last_ts = MEMORY_PROBE_STATE.get("last_ts")
+        delta_mb = 0.0 if last_rss is None else rss_mb - float(last_rss)
+        delta_sec = 0.0 if last_ts is None else now_ts - float(last_ts)
+        MEMORY_PROBE_STATE["last_rss_mb"] = rss_mb
+        MEMORY_PROBE_STATE["last_ts"] = now_ts
+
+        image_q = _safe_queue_size(getattr(IMAGE_SAVER_POOL, "_work_queue", None))
+        log_q = _safe_queue_size(log_queue)
+        logger.info(
+            f"[MEM PROBE] loop={loop_count if loop_count is not None else '-'} "
+            f"rss_mb={rss_mb:.1f} rss_delta_mb={delta_mb:.1f} delta_sec={delta_sec:.1f} "
+            f"vms_mb={vms_mb:.1f} uss_mb={uss_mb:.1f} pss_mb={pss_mb:.1f} "
+            f"sys_mem_pct={vm.percent:.1f} "
+            f"sys_available_mb={vm.available / (1024 ** 2):.1f} "
+            f"cpu_pct={cpu_usage if cpu_usage is not None else '-'} "
+            f"threads={proc.num_threads()} image_q={image_q} log_q={log_q}"
+        )
+
+        smaps = _read_smaps_rollup_mb()
+        if smaps:
+            if "_error" in smaps:
+                logger.info(f"[MEM SMAPS] error={smaps.get('_error')}")
+            else:
+                logger.info(
+                    f"[MEM SMAPS] rss_mb={smaps.get('Rss', 0.0):.1f} "
+                    f"pss_mb={smaps.get('Pss', 0.0):.1f} "
+                    f"private_dirty_mb={smaps.get('Private_Dirty', 0.0):.1f} "
+                    f"private_clean_mb={smaps.get('Private_Clean', 0.0):.1f} "
+                    f"shared_clean_mb={smaps.get('Shared_Clean', 0.0):.1f} "
+                    f"anonymous_mb={smaps.get('Anonymous', 0.0):.1f} "
+                    f"anon_huge_mb={smaps.get('AnonHugePages', 0.0):.1f} "
+                    f"swap_mb={smaps.get('Swap', 0.0):.1f}"
+                )
+
+        _log_tracemalloc_probe(loop_count=loop_count)
+
+        for cam in cams:
+            recorder = getattr(cam, "recorder", None)
+            rec_q = _safe_queue_size(getattr(recorder, "write_queue", None))
+            rec_buf = getattr(recorder, "buffer", [])
+            event_q = event_save_queues.get(getattr(cam, "ip", None), [])
+            alerted = getattr(cam, "alerted", {})
+            try:
+                alerted_marks = sum(len(v) for v in alerted.values())
+            except Exception:
+                alerted_marks = -1
+            handler_parts = []
+            for name, handler in getattr(cam, "handlers", {}).items():
+                parts = [str(name)]
+                sessions = getattr(handler, "sessions", None)
+                if sessions is not None:
+                    parts.append(f"sessions={_bounded_len(sessions)}")
+                red_tids = getattr(handler, "red_helmet_tids", None)
+                if red_tids is not None:
+                    parts.append(f"red_helmet_tids={_bounded_len(red_tids)}")
+                handler_parts.append(":".join(parts))
+
+            logger.info(
+                f"[MEM PROBE CAM] cam={getattr(cam, 'cam_id', '-')} ip={getattr(cam, 'ip', '-')} "
+                f"rec_q={rec_q} rec_buf={_bounded_len(rec_buf)}/{getattr(rec_buf, 'maxlen', '-')} "
+                f"recording={getattr(recorder, 'recording', '-')} "
+                f"event_q={_bounded_len(event_q)}/{getattr(event_q, 'maxlen', '-')} "
+                f"alerted_tids={_bounded_len(alerted)} alerted_marks={alerted_marks} "
+                f"handlers={','.join(handler_parts) if handler_parts else '-'}"
+            )
+    except Exception as e:
+        logger.warning(f"[MEM PROBE] failed | {e}")
 
 def record_api_send_state(ok, event_id="-"):
     with API_SEND_STATE_LOCK:
@@ -6518,6 +6778,37 @@ def main():
         f"face={resolve_model_path(models_cfg.get('FACE', '-'))} plate={resolve_model_path(models_cfg.get('PLATE', '-'))} "
         f"pools={json.dumps(SYS_CFG.get('model_engine_pool_sizes', {}), ensure_ascii=False)} main_effective_pool={main_pool_size}"
     )
+    if MEMORY_PROBE_DECODE_ONLY:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_DECODE_ONLY=1: running decode/process_frame only; "
+            "inference, event logic, recorder update, and event frame buffering are skipped."
+        )
+    if MEMORY_PROBE_INFERENCE_REUSE_FRAME:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_INFERENCE_REUSE_FRAME=1: caching one frame per camera, "
+            "stopping RTSP readers, and running inference only; event logic, recorder update, "
+            "ROI snapshots, and event frame buffering are skipped."
+        )
+    if MEMORY_PROBE_KEEP_EXECUTOR:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_KEEP_EXECUTOR=1: reusing one inference executor "
+            "instead of creating and shutting it down every loop."
+        )
+    if MEMORY_PROBE_EXECUTOR_ONLY:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_EXECUTOR_ONLY=1: submitting executor tasks only; "
+            "DeepX inference is skipped."
+        )
+    if MEMORY_PROBE_SKIP_RECORDER_UPDATE:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_SKIP_RECORDER_UPDATE=1: normal decode and inference run, "
+            "but recorder.update/prebuffer writes are skipped."
+        )
+    if MEMORY_PROBE_SKIP_EVENT_LOGIC:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_SKIP_EVENT_LOGIC=1: normal decode and inference run, "
+            "but camera run_logic/event tracking is skipped."
+        )
     log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
     global HEALTH_DAEMON
     health_daemon = HealthCheckDaemon(
@@ -6590,6 +6881,74 @@ def main():
 
         return t_main_input, d_helmet_res, d_signalman_res
 
+    def build_memory_probe_reuse_raw_data(timeout_sec=15.0):
+        cached = [None for _ in cams]
+        deadline = time.time() + timeout_sec
+
+        while time.time() < deadline:
+            for idx, cam in enumerate(cams):
+                if cached[idx] is not None:
+                    continue
+                fr, fid, connected = cam.process_frame()
+                if fr is not None:
+                    cached[idx] = (fr.copy(), int(fid or 1), True)
+
+            if all(item is not None for item in cached):
+                break
+            time.sleep(0.2)
+
+        reuse_raw_data = []
+        blank_count = 0
+        for idx, cam in enumerate(cams):
+            item = cached[idx]
+            if item is None:
+                fr = np.zeros((405, 720, 3), dtype=np.uint8)
+                fid = 1
+                blank_count += 1
+            else:
+                fr, fid, _ = item
+
+            try:
+                cam._initialize_base_roi_if_needed(fr)
+            except Exception as e:
+                logger.warning(f"[MEM EXPERIMENT] reuse-frame ROI init failed cam={cam.cam_id} ip={cam.ip}: {e}")
+
+            reader = getattr(cam, "reader", None)
+            if reader is not None:
+                reader.running = False
+                reader.connected = False
+
+            reuse_raw_data.append((fr, max(1, int(fid or 1)), True))
+
+        logger.warning(
+            f"[MEM EXPERIMENT] inference reuse frames prepared: "
+            f"cached={len(reuse_raw_data) - blank_count} blank={blank_count} readers_stopped={len(reuse_raw_data)}"
+        )
+        return reuse_raw_data
+
+    memory_probe_reuse_raw_data = (
+        build_memory_probe_reuse_raw_data()
+        if MEMORY_PROBE_INFERENCE_REUSE_FRAME
+        else None
+    )
+    memory_probe_persistent_executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+        if MEMORY_PROBE_INFERENCE_REUSE_FRAME and MEMORY_PROBE_KEEP_EXECUTOR
+        else None
+    )
+    main_inference_executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+        if not MEMORY_PROBE_INFERENCE_REUSE_FRAME
+        else None
+    )
+    if main_inference_executor is not None:
+        logger.info(
+            f"[INFERENCE EXECUTOR] persistent executor started max_workers={max(1, len(cams))}"
+        )
+
+    def memory_probe_executor_noop(cam_index, fid):
+        return cam_index, fid
+
     last_roi_snapshot_time = time.time() - 3590.0  # 시작 후 10초 뒤 첫 전송
     ROI_SNAPSHOT_INTERVAL_SEC = 3600.0  # 1시간 주기
 
@@ -6621,6 +6980,7 @@ def main():
                         logger.error(f"핫 리로드 중 예외 발생: {e}")
 
             loop_count += 1
+            mem_stage_due = (loop_count % 300 == 0)
 
             if loop_count % fps_calc_interval == 0:
                 current_time = time.time()
@@ -6646,11 +7006,66 @@ def main():
                 mem_usage = psutil.virtual_memory().percent
                 q_size = IMAGE_SAVER_POOL._work_queue.qsize() if hasattr(IMAGE_SAVER_POOL, '_work_queue') else 0
                 log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
+                log_memory_probe(cams, event_save_queues, cpu_usage=cpu_usage, loop_count=loop_count)
 
                 if mem_usage > 80 or q_size > 20:
                     logger.warning(f"?? [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
 
-            raw_data = [c.process_frame() for c in cams]
+            if mem_stage_due:
+                log_memory_stage("before_process_frame", loop_count, cams=cams, event_save_queues=event_save_queues)
+            if MEMORY_PROBE_INFERENCE_REUSE_FRAME and memory_probe_reuse_raw_data is not None:
+                raw_data = [
+                    (fr, fid + loop_count, connected)
+                    for fr, fid, connected in memory_probe_reuse_raw_data
+                ]
+            else:
+                raw_data = [c.process_frame() for c in cams]
+            if mem_stage_due:
+                log_memory_stage("after_process_frame", loop_count, cams=cams, event_save_queues=event_save_queues)
+            if MEMORY_PROBE_DECODE_ONLY:
+                if mem_stage_due:
+                    log_memory_stage("decode_only_continue", loop_count, cams=cams, event_save_queues=event_save_queues)
+                sleep_time = dynamic_delay - (time.time() - start_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
+            if MEMORY_PROBE_INFERENCE_REUSE_FRAME:
+                inference_executor = memory_probe_persistent_executor
+                if inference_executor is None:
+                    inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+                inference_futures = {}
+                for idx, res in enumerate(raw_data):
+                    fr, fid, connected = res
+                    if connected and fr is not None and cams[idx].events:
+                        if MEMORY_PROBE_EXECUTOR_ONLY:
+                            inference_futures[idx] = inference_executor.submit(memory_probe_executor_noop, idx, fid)
+                        else:
+                            inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
+                if mem_stage_due:
+                    submit_stage = "after_executor_submit" if MEMORY_PROBE_EXECUTOR_ONLY else "after_inference_submit"
+                    log_memory_stage(submit_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
+
+                for idx, future in inference_futures.items():
+                    try:
+                        future.result()
+                    except Exception as e:
+                        mode_name = "executor_only" if MEMORY_PROBE_EXECUTOR_ONLY else "inference_reuse_frame"
+                        logger.error(
+                            f"[INFERENCE ERROR] cam={cams[idx].cam_id} ip={cams[idx].ip} "
+                            f"mode={mode_name} | {e}\n{traceback.format_exc()}"
+                        )
+                if mem_stage_due:
+                    result_stage = "after_executor_results" if MEMORY_PROBE_EXECUTOR_ONLY else "after_inference_results"
+                    log_memory_stage(result_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
+                if memory_probe_persistent_executor is None:
+                    inference_executor.shutdown(wait=True)
+                if mem_stage_due:
+                    executor_stage = "after_executor_reuse" if memory_probe_persistent_executor is not None else "after_executor_shutdown"
+                    log_memory_stage(executor_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
+                sleep_time = dynamic_delay - (time.time() - start_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
 
             final_imgs = []
 
@@ -6692,12 +7107,19 @@ def main():
                         reason="roi_snapshot_sent"
                     )
 
-            inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+            if mem_stage_due:
+                log_memory_stage("after_roi_snapshot", loop_count, cams=cams, event_save_queues=event_save_queues)
+
+            inference_executor = main_inference_executor
+            if inference_executor is None:
+                inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
             for idx, res in enumerate(raw_data):
                 fr, _, connected = res
                 if connected and fr is not None and cams[idx].events:
                     inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
+            if mem_stage_due:
+                log_memory_stage("after_inference_submit", loop_count, cams=cams, event_save_queues=event_save_queues)
 
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
@@ -6741,7 +7163,16 @@ def main():
                     continue
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
-                t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                if MEMORY_PROBE_SKIP_EVENT_LOGIC:
+                    t_main = []
+                    t_helmet = []
+                    t_signalman = []
+                    alarms = {}
+                    new_events = []
+                else:
+                    t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(
+                        fr, fid, t_main_input, d_helmet_res, d_signalman_res
+                    )
                 now_fps_log = time.time()
                 cam_ip = cams[idx].ip
                 if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
@@ -6761,7 +7192,8 @@ def main():
                 # -----------------------------------------------------------
                 if connected and fr is not None:
                     # 원본 프레임과 같은 시점의 추론 로그를 버퍼 및 녹화 큐에 업데이트합니다.
-                    cams[idx].recorder.update(fr, infer_meta)
+                    if not MEMORY_PROBE_SKIP_RECORDER_UPDATE:
+                        cams[idx].recorder.update(fr, infer_meta)
 
                     if is_gui_mode:
                         display_fr = cams[idx].draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
@@ -6818,7 +7250,13 @@ def main():
                     event_infer_meta["privacy_blur"] = privacy_blur_meta
                     event_save_queues[cams[idx].ip].append((fid, event_frame, event_infer_meta))
 
-            inference_executor.shutdown(wait=True)
+            if mem_stage_due:
+                log_memory_stage("after_event_logic", loop_count, cams=cams, event_save_queues=event_save_queues)
+            if inference_executor is not main_inference_executor:
+                inference_executor.shutdown(wait=True)
+            if mem_stage_due:
+                executor_stage = "after_executor_reuse" if inference_executor is main_inference_executor else "after_executor_shutdown"
+                log_memory_stage(executor_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
 
             # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
@@ -6865,6 +7303,9 @@ def main():
                     q.clear()
                     last_event_times[ip] = 0.0
 
+            if mem_stage_due:
+                log_memory_stage("after_event_flush", loop_count, cams=cams, event_save_queues=event_save_queues)
+
             if is_gui_mode:
                 if final_imgs:
                     cv2.imshow("Monitor", create_mosaic_image(final_imgs))
@@ -6897,11 +7338,27 @@ def main():
                 except Exception:
                     pass
 
-        if 'inference_executor' in locals():
+        if (
+            'inference_executor' in locals()
+            and (
+                'main_inference_executor' not in locals()
+                or inference_executor is not main_inference_executor
+            )
+        ):
             try:
                 inference_executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 inference_executor.shutdown(wait=False)
+        if 'main_inference_executor' in locals() and main_inference_executor is not None:
+            try:
+                main_inference_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                main_inference_executor.shutdown(wait=False)
+        if 'memory_probe_persistent_executor' in locals() and memory_probe_persistent_executor is not None:
+            try:
+                memory_probe_persistent_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                memory_probe_persistent_executor.shutdown(wait=False)
 
         if is_gui_mode:
             cv2.destroyAllWindows()
