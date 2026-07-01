@@ -17,6 +17,7 @@ import logging
 import psutil
 import atexit
 import signal
+import select
 from collections import deque, defaultdict
 import concurrent.futures
 import re
@@ -196,6 +197,7 @@ def load_system_config():
             "gstreamer_protocols": "tcp",
             "gstreamer_tcp_timeout_us": 3000000,
             "gstreamer_drop_on_latency": True,
+            "gstreamer_frame_read_timeout_sec": 10.0,
             "log_interval_sec": 10.0,
             "verbose_logs": False
         },
@@ -3297,6 +3299,12 @@ class FrameReader:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    def _gstreamer_frame_read_timeout(self):
+        try:
+            return max(1.0, float(self.decode_cfg.get("gstreamer_frame_read_timeout_sec", 10.0)))
+        except Exception:
+            return 10.0
+
     def _emit_decode_log(self, message, level="info"):
         effective_level = level
         if str(level).lower() == "info" and not self._decode_verbose_logs():
@@ -3366,6 +3374,31 @@ class FrameReader:
                 f"[DECODE CLEANUP] CAM:{self.ip} {label} kill failed: {e}",
                 level="debug"
             )
+
+    def _read_gstreamer_frame(self, proc, frame_size, timeout_sec):
+        if proc is None or proc.stdout is None:
+            return b""
+        fd = proc.stdout.fileno()
+        deadline = time.monotonic() + timeout_sec
+        chunks = bytearray()
+
+        while len(chunks) < frame_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"gstreamer_frame_read_timeout_{timeout_sec:g}s")
+
+            ready, _, _ = select.select([fd], [], [], min(1.0, remaining))
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            chunk = os.read(fd, frame_size - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+
+        return bytes(chunks)
 
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
@@ -3678,6 +3711,7 @@ class FrameReader:
         out_w, out_h = self._scaled_output_shape(in_w, in_h)
         frame_size = out_w * out_h * 3
         fps_limit = self._decode_fps_limit()
+        frame_read_timeout_sec = self._gstreamer_frame_read_timeout()
         decoder_info = self._select_gstreamer_decoder(codec)
         if decoder_info is None:
             self._note_decode_failure(f"gstreamer_unsupported_codec_{codec or 'unknown'}")
@@ -3762,7 +3796,7 @@ class FrameReader:
                     f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
                     f"latency_ms={latency_ms} protocols={protocols} tcp_timeout_us={tcp_timeout_us} "
                     f"drop_on_latency={drop_on_latency_text} fps_limit={fps_limit or '-'} "
-                    f"frame_bytes={frame_size}"
+                    f"frame_bytes={frame_size} frame_read_timeout_sec={frame_read_timeout_sec:g}"
                 )
             )
             self._decode_mode_logged = True
@@ -3775,7 +3809,13 @@ class FrameReader:
                     gst_failed = True
                     break
 
-                raw = proc.stdout.read(frame_size)
+                try:
+                    raw = self._read_gstreamer_frame(proc, frame_size, frame_read_timeout_sec)
+                except TimeoutError as e:
+                    self._note_decode_failure(str(e), level="error")
+                    gst_failed = True
+                    break
+
                 if len(raw) != frame_size:
                     self._note_decode_failure(f"gstreamer_short_read_{len(raw)}_of_{frame_size}", level="error")
                     gst_failed = True
