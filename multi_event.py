@@ -16,6 +16,7 @@ import queue
 import logging
 import psutil
 import atexit
+import signal
 from collections import deque, defaultdict
 import concurrent.futures
 import re
@@ -3309,7 +3310,24 @@ class FrameReader:
         self._gst_check_logged = True
         self._emit_decode_log(message, level=level)
 
-    def _terminate_decode_process(self, proc, label):
+    def _use_decode_process_group(self):
+        return sys.platform.startswith("linux")
+
+    def _decode_popen_kwargs(self, use_process_group):
+        if use_process_group:
+            return {"start_new_session": True}
+        return {}
+
+    def _send_decode_process_signal(self, proc, sig, use_process_group):
+        if use_process_group:
+            os.killpg(proc.pid, sig)
+            return
+        if sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+
+    def _terminate_decode_process(self, proc, label, use_process_group=False):
         if proc is None:
             return
         try:
@@ -3320,8 +3338,10 @@ class FrameReader:
             pass
 
         try:
-            proc.terminate()
+            self._send_decode_process_signal(proc, signal.SIGTERM, use_process_group)
             proc.wait(timeout=2.0)
+            return
+        except ProcessLookupError:
             return
         except subprocess.TimeoutExpired:
             pass
@@ -3332,8 +3352,10 @@ class FrameReader:
             )
 
         try:
-            proc.kill()
+            self._send_decode_process_signal(proc, signal.SIGKILL, use_process_group)
             proc.wait(timeout=2.0)
+        except ProcessLookupError:
+            return
         except subprocess.TimeoutExpired:
             self._emit_decode_log(
                 f"[DECODE CLEANUP] CAM:{self.ip} {label} kill wait timed out pid={getattr(proc, 'pid', '-')}",
@@ -3709,8 +3731,16 @@ class FrameReader:
         gst_failed = False
         gst_stderr_lines = deque(maxlen=30)
         gst_stderr_thread = None
+        use_process_group = self._use_decode_process_group()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, bufsize=frame_size * 2)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                bufsize=frame_size * 2,
+                **self._decode_popen_kwargs(use_process_group)
+            )
             if proc.stderr is not None:
                 gst_stderr_thread = threading.Thread(
                     target=self._drain_binary_log_pipe,
@@ -3771,7 +3801,7 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            self._terminate_decode_process(proc, "gstreamer_pipe")
+            self._terminate_decode_process(proc, "gstreamer_pipe", use_process_group=use_process_group)
             if gst_stderr_thread is not None:
                 try:
                     gst_stderr_thread.join(timeout=0.2)
@@ -3812,8 +3842,16 @@ class FrameReader:
             env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
 
         proc = None
+        use_process_group = self._use_decode_process_group()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                bufsize=frame_size * 2,
+                **self._decode_popen_kwargs(use_process_group)
+            )
             if proc.stdout is None:
                 return False
 
@@ -3851,7 +3889,7 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            self._terminate_decode_process(proc, "ffmpeg_vaapi_pipe")
+            self._terminate_decode_process(proc, "ffmpeg_vaapi_pipe", use_process_group=use_process_group)
 
     def _run(self):
         while self.running:
