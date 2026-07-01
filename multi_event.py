@@ -3309,6 +3309,42 @@ class FrameReader:
         self._gst_check_logged = True
         self._emit_decode_log(message, level=level)
 
+    def _terminate_decode_process(self, proc, label):
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                proc.wait(timeout=0.1)
+                return
+        except Exception:
+            pass
+
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as e:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} terminate failed: {e}",
+                level="debug"
+            )
+
+        try:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill wait timed out pid={getattr(proc, 'pid', '-')}",
+                level="warning"
+            )
+        except Exception as e:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill failed: {e}",
+                level="debug"
+            )
+
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
 
@@ -3735,15 +3771,7 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            self._terminate_decode_process(proc, "gstreamer_pipe")
             if gst_stderr_thread is not None:
                 try:
                     gst_stderr_thread.join(timeout=0.2)
@@ -3823,15 +3851,7 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            self._terminate_decode_process(proc, "ffmpeg_vaapi_pipe")
 
     def _run(self):
         while self.running:
