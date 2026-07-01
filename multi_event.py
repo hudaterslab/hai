@@ -3,6 +3,7 @@ import sys
 import gc
 import json
 import csv
+import hashlib
 import shutil
 import subprocess
 import cv2
@@ -3008,6 +3009,21 @@ class ROIAlignLearningStore:
         def write_one_csv(target_path):
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
+            if exists:
+                try:
+                    with open(target_path, "r", newline="", encoding="utf-8") as f:
+                        header_line = f.readline()
+                    current_header = next(csv.reader([header_line])) if header_line else []
+                    if current_header != fieldnames:
+                        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        backup_path = f"{target_path}.bak_header_{stamp}"
+                        os.replace(target_path, backup_path)
+                        logger.info(
+                            f"[ROI DRIFT] CSV header changed; old log moved to {backup_path}"
+                        )
+                        exists = False
+                except Exception as e:
+                    logger.warning(f"[ROI DRIFT] CSV header check failed: {e}")
             with open(target_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not exists:
@@ -5219,6 +5235,17 @@ class HealthCheckDaemon:
                 return cam
         return None
 
+    @staticmethod
+    def _file_sha256(path):
+        if not path or not os.path.exists(path):
+            return None
+
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     def _apply_roi_settings_from_response(self, response_payload):
         if not isinstance(response_payload, dict):
             return []
@@ -5235,7 +5262,7 @@ class HealthCheckDaemon:
             logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
             return []
 
-        handled_cctv_ids = []
+        changed_cctv_ids = []
         changed = False
         runtime_updates = []
 
@@ -5253,6 +5280,12 @@ class HealthCheckDaemon:
             if not isinstance(camera_configs, dict):
                 logger.error("[Health Check] cameras config is not an object; ROI update skipped")
                 return []
+
+            try:
+                before_config_hash = self._file_sha256(self.config_file)
+            except Exception as e:
+                logger.warning(f"[Health Check] failed to hash cameras config before ROI update: {e}")
+                before_config_hash = None
 
             for item in roi_settings:
                 if not isinstance(item, dict):
@@ -5298,8 +5331,8 @@ class HealthCheckDaemon:
                         new_conf[key] = value
                         item_changed = True
 
-                handled_cctv_ids.append(str(cam.cam_id))
                 if item_changed:
+                    changed_cctv_ids.append(str(cam.cam_id))
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     changed = True
@@ -5319,6 +5352,26 @@ class HealthCheckDaemon:
                     logger.error(f"[Health Check] failed to write cameras config for ROI update: {e}")
                     return []
 
+                try:
+                    after_config_hash = self._file_sha256(self.config_file)
+                except Exception as e:
+                    logger.warning(f"[Health Check] failed to hash cameras config after ROI update: {e}")
+                    after_config_hash = None
+
+                if before_config_hash == after_config_hash:
+                    logger.warning(
+                        "[Health Check] ROI settings write did not change cameras config hash; "
+                        "setup request remains pending"
+                    )
+                    return []
+
+                before_short = before_config_hash[:12] if before_config_hash else "-"
+                after_short = after_config_hash[:12] if after_config_hash else "-"
+                logger.info(
+                    f"[Health Check] ROI settings config changed: "
+                    f"hash={before_short}->{after_short} cctvIds={','.join(changed_cctv_ids)}"
+                )
+
         for cam, new_conf, roi_updates in runtime_updates:
             try:
                 cam.update_config(new_conf)
@@ -5331,7 +5384,7 @@ class HealthCheckDaemon:
             except Exception as e:
                 logger.error(f"[Health Check] runtime ROI update failed: cctvId={cam.cam_id} error={e}")
 
-        return handled_cctv_ids
+        return changed_cctv_ids
 
     def _run(self):
         while self.running:
