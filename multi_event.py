@@ -365,6 +365,27 @@ STARTUP_VIDEO_PIPELINE_CHOICES = [
     },
 ]
 
+STARTUP_HW_ACCELERATION_CHOICES = [
+    {
+        "key": "auto",
+        "label": "Auto",
+        "description": "가능하면 VAAPI 하드웨어 디코딩을 쓰고 실패 시 CPU로 전환",
+        "aliases": ("1", "a", "auto", "default"),
+    },
+    {
+        "key": "vaapi",
+        "label": "VAAPI",
+        "description": "VAAPI 하드웨어 디코딩 우선 사용",
+        "aliases": ("2", "v", "vaapi", "hw", "hardware"),
+    },
+    {
+        "key": "cpu",
+        "label": "CPU",
+        "description": "하드웨어 디코딩을 끄고 CPU 디코더 사용",
+        "aliases": ("3", "c", "cpu", "off", "none", "disable", "disabled"),
+    },
+]
+
 STARTUP_MODEL_PROFILE_CHOICES = [
     {
         "key": "ppu",
@@ -404,6 +425,16 @@ def _normalize_startup_video_pipeline(value):
         return "ffmpeg"
     return "gstreamer"
 
+def _normalize_startup_hw_acceleration(value):
+    value = str(value or "").strip().lower()
+    if value in ("", "auto", "a", "default"):
+        return "auto"
+    if value in ("vaapi", "v", "hw", "hardware", "on", "true", "1"):
+        return "vaapi"
+    if value in ("cpu", "c", "off", "none", "false", "0", "disable", "disabled"):
+        return "cpu"
+    return "auto"
+
 def _normalize_startup_model_profile(config):
     model_name = os.path.basename(str(((config.get("models") or {}).get("MAIN")) or "")).lower()
     output_format = str(((config.get("model_output_formats") or {}).get("MAIN")) or "").strip().lower()
@@ -436,10 +467,12 @@ def _prompt_startup_choice(title, choices, default_key):
             return selected
         print("잘못된 선택입니다. 위 번호 또는 이름을 입력하세요.")
 
-def _apply_startup_video_pipeline(config, pipeline):
+def _apply_startup_video_pipeline(config, pipeline, hw_acceleration=None):
     video_decode = config.setdefault("video_decode", {})
     video_decode["backend"] = pipeline
-    video_decode.setdefault("hw_acceleration", "auto")
+    if hw_acceleration is None:
+        hw_acceleration = video_decode.get("hw_acceleration", "auto")
+    video_decode["hw_acceleration"] = _normalize_startup_hw_acceleration(hw_acceleration)
     video_decode.setdefault("fallback_to_cpu", True)
     video_decode.setdefault("fps_limit", 15.0)
     video_decode.setdefault("log_interval_sec", 10.0)
@@ -480,6 +513,7 @@ def ensure_startup_runtime_config(force=False):
 
     config = deep_merge_dict({}, SYS_CFG)
     current_pipeline = _normalize_startup_video_pipeline((config.get("video_decode") or {}).get("backend"))
+    current_hw_acceleration = _normalize_startup_hw_acceleration((config.get("video_decode") or {}).get("hw_acceleration"))
     current_model_profile = _normalize_startup_model_profile(config)
 
     reason = "--configure-startup" if force else "first startup setup"
@@ -489,17 +523,23 @@ def ensure_startup_runtime_config(force=False):
         STARTUP_VIDEO_PIPELINE_CHOICES,
         current_pipeline,
     )
+    selected_hw_acceleration = _prompt_startup_choice(
+        "하드웨어 가속 선택",
+        STARTUP_HW_ACCELERATION_CHOICES,
+        current_hw_acceleration,
+    )
     selected_model_profile = _prompt_startup_choice(
         "모델 프로필 선택",
         STARTUP_MODEL_PROFILE_CHOICES,
         current_model_profile,
     )
 
-    _apply_startup_video_pipeline(config, selected_pipeline)
+    _apply_startup_video_pipeline(config, selected_pipeline, selected_hw_acceleration)
     _apply_startup_model_profile(config, selected_model_profile)
     config["startup_profile"] = {
         "configured": True,
         "video_pipeline": selected_pipeline,
+        "hardware_acceleration": selected_hw_acceleration,
         "model_profile": selected_model_profile,
         "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
@@ -508,6 +548,7 @@ def ensure_startup_runtime_config(force=False):
     BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
     logger.info(
         f"[STARTUP CONFIG] saved video_pipeline={selected_pipeline} "
+        f"hardware_acceleration={selected_hw_acceleration} "
         f"model_profile={selected_model_profile} config={CONFIG_COMMON_FILE}"
     )
     return True
@@ -5973,7 +6014,7 @@ def main():
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
     parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
-    parser.add_argument('--configure-startup', action='store_true', help="시작 영상/모델 선택을 다시 실행하고 system_config.json에 저장합니다.")
+    parser.add_argument('--configure-startup', action='store_true', help="시작 영상/하드웨어 가속/모델 선택을 다시 실행하고 system_config.json에 저장합니다.")
     args = parser.parse_args()
 
     is_gui_mode = args.gui
