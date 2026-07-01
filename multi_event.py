@@ -234,7 +234,12 @@ SYS_CFG = load_system_config()
 def _truthy(value):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
-MEMORY_TRACEMALLOC_ENABLED = bool(SYS_CFG.get("logging", {}).get("memory_probe_tracemalloc", True))
+MEMORY_TRACEMALLOC_ENABLED = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_TRACEMALLOC",
+        SYS_CFG.get("logging", {}).get("memory_probe_tracemalloc", True)
+    )
+)
 if MEMORY_TRACEMALLOC_ENABLED and not tracemalloc.is_tracing():
     tracemalloc.start(25)
 MEMORY_PROBE_DECODE_ONLY = _truthy(
@@ -6365,7 +6370,6 @@ def main():
 
     last_roi_snapshot_time = time.time() - 3590.0  # 시작 후 10초 뒤 첫 전송
     ROI_SNAPSHOT_INTERVAL_SEC = 3600.0  # 1시간 주기
-    inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
 
     try:
         psutil.cpu_percent(interval=None)
