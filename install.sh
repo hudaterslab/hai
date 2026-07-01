@@ -66,7 +66,8 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "ROI_SETUP_REQUIRED_API_ENABLED": true,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
-    "VISUAL_ALARM_DURATION": 5.0
+    "VISUAL_ALARM_DURATION": 5.0,
+    "memory_guard": {"enabled": true, "system_memory_percent_threshold": 60.0, "consecutive_samples": 5, "sample_interval_sec": 60.0, "warmup_grace_sec": 1800.0, "restart_exit_code": 75}
 }
 EOL
     echo "✅ 기본 설정 생성이 완료되었습니다."
@@ -106,7 +107,8 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
     "ROI_SETUP_REQUIRED_API_ENABLED": true,
     "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
-    "VISUAL_ALARM_DURATION": 5.0
+    "VISUAL_ALARM_DURATION": 5.0,
+    "memory_guard": {"enabled": true, "system_memory_percent_threshold": 60.0, "consecutive_samples": 5, "sample_interval_sec": 60.0, "warmup_grace_sec": 1800.0, "restart_exit_code": 75}
 }
 EOL
 

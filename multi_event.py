@@ -61,6 +61,15 @@ TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
 
 DEBUG_MODE = False
 
+MEMORY_GUARD_DEFAULT_CONFIG = {
+    "enabled": True,
+    "system_memory_percent_threshold": 60.0,
+    "consecutive_samples": 5,
+    "sample_interval_sec": 60.0,
+    "warmup_grace_sec": 1800.0,
+    "restart_exit_code": 75,
+}
+
 # ------------------------------------------------------------
 # ROI 보정(Aligner) 튜닝 파라미터
 # ------------------------------------------------------------
@@ -215,7 +224,8 @@ def load_system_config():
         "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
         "ROI_SETUP_REQUIRED_API_ENABLED": True,
         "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
-        "VISUAL_ALARM_DURATION": 5.0
+        "VISUAL_ALARM_DURATION": 5.0,
+        "memory_guard": dict(MEMORY_GUARD_DEFAULT_CONFIG)
     }
 
     if not os.path.exists(CONFIG_COMMON_FILE):
@@ -263,6 +273,61 @@ def get_model_engine_pool_size(model_key, default=1):
         return max(1, int(sizes.get(model_key, default)))
     except Exception:
         return max(1, int(default))
+
+def parse_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+def _config_float(raw_cfg, key, default, minimum=None):
+    try:
+        value = float(raw_cfg.get(key, default))
+    except Exception:
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    return value
+
+def _config_int(raw_cfg, key, default, minimum=None, maximum=None):
+    try:
+        value = int(raw_cfg.get(key, default))
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
+
+def get_memory_guard_config():
+    raw_cfg = SYS_CFG.get("memory_guard", {})
+    if not isinstance(raw_cfg, dict):
+        raw_cfg = {}
+
+    defaults = MEMORY_GUARD_DEFAULT_CONFIG
+    return {
+        "enabled": parse_bool(raw_cfg.get("enabled", defaults["enabled"]), defaults["enabled"]),
+        "system_memory_percent_threshold": _config_float(
+            raw_cfg,
+            "system_memory_percent_threshold",
+            defaults["system_memory_percent_threshold"],
+            minimum=1.0
+        ),
+        "consecutive_samples": _config_int(raw_cfg, "consecutive_samples", defaults["consecutive_samples"], minimum=1),
+        "sample_interval_sec": _config_float(raw_cfg, "sample_interval_sec", defaults["sample_interval_sec"], minimum=5.0),
+        "warmup_grace_sec": _config_float(raw_cfg, "warmup_grace_sec", defaults["warmup_grace_sec"], minimum=0.0),
+        "restart_exit_code": _config_int(raw_cfg, "restart_exit_code", defaults["restart_exit_code"], minimum=1, maximum=255),
+    }
 
 def detection_array(rows):
     """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
@@ -5658,6 +5723,11 @@ def main():
     except Exception:
         current_fps_log_interval_sec = 10.0
     current_fps_last_print = {}
+    memory_guard_cfg = get_memory_guard_config()
+    memory_guard_started_at = time.time()
+    memory_guard_last_check_time = 0.0
+    memory_guard_over_count = 0
+    memory_guard_last_warmup_log_time = 0.0
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
@@ -5672,6 +5742,9 @@ def main():
         f"[SYSTEM CONFIG] active_cameras={len(cams)} batch_size={BATCH_SIZE} rec_fps={SYS_CFG.get('REC_FPS')} "
         f"loop_fps={SYS_CFG.get('LOOP_FPS')} confidences={json.dumps(SYS_CFG.get('model_confidences', {}), ensure_ascii=False)} "
         f"decode={json.dumps(SYS_CFG.get('video_decode', {}), ensure_ascii=False)}"
+    )
+    logger.info(
+        f"[MEMORY GUARD] config={json.dumps(memory_guard_cfg, ensure_ascii=False)}"
     )
     logger.info(
         f"[MODEL CONFIG] main={main_model_path} helmet={resolve_model_path(models_cfg.get('HELMET', '-'))} "
@@ -5761,6 +5834,55 @@ def main():
 
         while True:
             start_time = time.time()
+
+            if memory_guard_cfg["enabled"] and (
+                start_time - memory_guard_last_check_time
+            ) >= memory_guard_cfg["sample_interval_sec"]:
+                memory_guard_last_check_time = start_time
+                gc.collect()
+                vm = psutil.virtual_memory()
+                mem_usage = float(vm.percent)
+                available_mb = float(vm.available) / (1024 * 1024)
+                used_mb = float(vm.used) / (1024 * 1024)
+                warmup_elapsed = start_time - memory_guard_started_at
+
+                if warmup_elapsed < memory_guard_cfg["warmup_grace_sec"]:
+                    memory_guard_over_count = 0
+                    if (
+                        mem_usage >= memory_guard_cfg["system_memory_percent_threshold"]
+                        and start_time - memory_guard_last_warmup_log_time >= 300.0
+                    ):
+                        memory_guard_last_warmup_log_time = start_time
+                        logger.warning(
+                            "[MEMORY GUARD] high memory during warmup "
+                            f"mem={mem_usage:.1f}% threshold={memory_guard_cfg['system_memory_percent_threshold']:.1f}% "
+                            f"available={available_mb:.1f}MB used={used_mb:.1f}MB "
+                            f"warmup_elapsed={warmup_elapsed:.0f}s warmup_grace={memory_guard_cfg['warmup_grace_sec']:.0f}s"
+                        )
+                elif mem_usage >= memory_guard_cfg["system_memory_percent_threshold"]:
+                    memory_guard_over_count += 1
+                    logger.warning(
+                        "[MEMORY GUARD] system memory threshold exceeded "
+                        f"sample={memory_guard_over_count}/{memory_guard_cfg['consecutive_samples']} "
+                        f"mem={mem_usage:.1f}% threshold={memory_guard_cfg['system_memory_percent_threshold']:.1f}% "
+                        f"available={available_mb:.1f}MB used={used_mb:.1f}MB"
+                    )
+                    if memory_guard_over_count >= memory_guard_cfg["consecutive_samples"]:
+                        logger.critical(
+                            "[MEMORY GUARD] restarting service by process exit "
+                            f"exit_code={memory_guard_cfg['restart_exit_code']} "
+                            f"mem={mem_usage:.1f}% threshold={memory_guard_cfg['system_memory_percent_threshold']:.1f}% "
+                            f"samples={memory_guard_over_count}"
+                        )
+                        raise SystemExit(memory_guard_cfg["restart_exit_code"])
+                else:
+                    if memory_guard_over_count > 0:
+                        logger.info(
+                            "[MEMORY GUARD] memory recovered "
+                            f"mem={mem_usage:.1f}% threshold={memory_guard_cfg['system_memory_percent_threshold']:.1f}% "
+                            f"cleared_samples={memory_guard_over_count}"
+                        )
+                    memory_guard_over_count = 0
 
             if output_cleanup_interval_sec > 0 and (start_time - last_output_cleanup_time) >= output_cleanup_interval_sec:
                 run_output_retention_cleanup(output_retention_days)
