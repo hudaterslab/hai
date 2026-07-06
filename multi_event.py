@@ -278,13 +278,19 @@ def detection_array(rows):
         return np.empty((0, 6))
     return np.array(rows, dtype=float)
 
-def split_unified_event_detections(raw_dets, events, main_conf, person_conf, helmet_conf, signalman_conf):
+def split_unified_event_detections(raw_dets, events, main_conf, person_conf, helmet_conf, signalman_conf, max_area_threshold):
     # 단일 통합 모델 출력에서 이벤트별로 필요한 탐지 결과만 나눕니다.
     d_main_res_list = []
     d_helmet_res_list = []
     d_signalman_res_list = []
 
     for d in raw_dets:
+        # 0. [오탐 방어] BBox 면적이 화면의 1/4을 초과하는 거대 객체(비/IR 노이즈 등) 차단
+        obj_w = float(d[2]) - float(d[0])
+        obj_h = float(d[3]) - float(d[1])
+        if (obj_w * obj_h) > max_area_threshold:
+            continue
+
         cls_id = int(d[5])
         conf = float(d[4])
 
@@ -1587,38 +1593,26 @@ class VideoRecorder:
     def __init__(self, ip, cam_id=None):
         self.ip = ip
         self.cam_id = cam_id if cam_id is not None else "-"
-        self.fps = SYS_CFG.get("REC_FPS", 3)
-        self.pre_sec = SYS_CFG.get("REC_PRE_SEC", 10)
-        self.buffer = deque(maxlen=max(1, int(self.fps * self.pre_sec)))
+        # [수정] 지연 횡단을 고려하여 최대 40초 분량(과거 30초+사전 10초)의 프레임 캐싱 보장
+        self.pre_sec = 40.0
+        self.max_buffer_len = int(15 * self.pre_sec) # Max 15FPS 기준
+        self.buffer = deque(maxlen=self.max_buffer_len)
         self.write_queue = queue.Queue()
 
         self.recording = False
         self.record_end_time = 0
         self.current_event = "unknown"
         self.current_meta = None
-        self.current_video_path = None
-        self.current_infer_log_path = None
-        self.current_meta_path = None
         self.current_record_started_at = None
+        self.recorded_fps = 3.0
         self.running = True
-        logger.info(
-            f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:init | "
-            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:0.0 | "
-            f"Frames -> recorder pre-buffer max={self.buffer.maxlen} "
-            f"(REC_FPS={self.fps}, REC_PRE_SEC={self.pre_sec})"
-        )
 
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
 
-    def update(self, frame, infer_meta=None):
-        if frame is None:
-            return
-
-        # 원본 프레임과 그 순간의 AI 판단 결과를 한 묶음으로 보관합니다.
-        # 나중에 영상의 특정 장면과 infer JSONL 한 줄을 맞춰보기 위한 준비입니다.
-        frame_item = (frame.copy(), infer_meta)
-        self.buffer.append(frame_item)
+    def update(self, frame, infer_meta=None, timestamp=None):
+        if frame is None: return
+        self.buffer.append((frame.copy(), infer_meta, timestamp or time.time()))
 
         if self.recording:
             if time.time() > self.record_end_time:
@@ -1626,177 +1620,86 @@ class VideoRecorder:
                 self.write_queue.put(None)
                 logger.info(f"?? [녹화종료] {self.ip} - {self.current_event}")
             else:
-                self.write_queue.put(frame_item)
+                self.write_queue.put((frame.copy(), infer_meta, timestamp or time.time()))
 
-    def trigger(self, event_name, objects_meta=None, event_meta=None, current_fps=0.0): # [수정] objects_meta 매개변수 추가
+    def trigger(self, event_name, objects_meta=None, event_meta=None, current_fps=3.0):
         now = time.time()
-        post_sec = SYS_CFG.get("REC_POST_SEC", 10)
+        post_sec = SYS_CFG.get("REC_POST_SEC", 10.0)
+        
+        # [수정] 선에 처음 닿은 시점 역산 (Crossing Delay 반영)
+        candidate_age_sec = 0.0
+        if isinstance(event_meta, dict) and 'decision_trace' in event_meta:
+            candidate_age_sec = float(event_meta['decision_trace'].get('candidate_age_sec', 0.0))
+        
+        pre_sec = SYS_CFG.get("REC_PRE_SEC", 10.0)
+        target_start_time = now - candidate_age_sec - pre_sec
 
         if self.recording:
-            self.record_end_time = now + post_sec
+            self.record_end_time = max(self.record_end_time, now + post_sec)
         else:
-            logger.info(f"? [녹화시작] {self.ip} - {event_name}")
+            logger.info(f"? [녹화시작] {self.ip} - {event_name} (FPS: {current_fps:.1f})")
             self.recording = True
             self.record_end_time = now + post_sec
             self.current_event = event_name
-            # MP4 옆 JSON에는 BBox뿐 아니라 이벤트 판단 근거(decision_trace)까지 함께 남깁니다.
-            # event_meta가 없는 예전 호출은 objects_meta만 저장해 기존 동작을 유지합니다.
-            self.current_meta = event_meta if event_meta is not None else objects_meta
+            self.current_meta = event_meta
             self.current_record_started_at = now
+            self.recorded_fps = max(1.0, float(current_fps))
 
-            temp_buffer = list(self.buffer)
-            tids = []
-            if objects_meta:
-                for obj in objects_meta:
-                    obj_tid = obj.get("tid")
-                    if obj_tid is not None:
-                        tids.append(str(obj_tid))
-            tid_text = ",".join(tids) if tids else "-"
-            logger.info(
-                f"[FRAME BUFFER] event_id={event_meta.get('event_id', '-') if isinstance(event_meta, dict) else '-'} "
-                f"CAM:{self.cam_id}({self.ip}) | Event:{event_name} | "
-                f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid_text} | FPS:{current_fps:.1f} | "
-                f"Frames -> recorder pre-buffer kept={len(temp_buffer)}/{self.buffer.maxlen}"
-            )
-            for item in temp_buffer:
-                self.write_queue.put(item)
+            for item in list(self.buffer):
+                if item[2] >= target_start_time:
+                    self.write_queue.put(item)
 
     def _writer_loop(self):
         writer = None
         fpath = None
-        meta_path = None
-        # infer_log_file은 녹화 영상과 같은 이름의 ".infer.jsonl" 파일입니다.
-        # 예: 20260521_120000_192.168.0.10_no_helmet.mp4
-        #     20260521_120000_192.168.0.10_no_helmet.infer.jsonl
         infer_log_file = None
-        infer_log_path = None
-        # video_frame_index는 녹화 파일 안에서 몇 번째 프레임인지 나타냅니다.
-        # 영상과 JSONL 로그를 함께 열었을 때 같은 장면을 찾기 쉽게 해줍니다.
         video_frame_index = 0
+        
         while self.running:
-            try:
-                item = self.write_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            try: item = self.write_queue.get(timeout=1.0)
+            except queue.Empty: continue
 
             if item is None:
-                duration_sec = 0.0
-                if writer:
-                    writer.release()
-                    if self.current_record_started_at:
-                        duration_sec = max(0.0, time.time() - self.current_record_started_at)
-                    event_id = "-"
-                    if isinstance(self.current_meta, dict):
-                        event_id = self.current_meta.get("event_id", "-")
-                    logger.info(
-                        f"[RECORDING CLOSED] event_id={event_id} cam={self.cam_id} ip={self.ip} "
-                        f"event={self.current_event} video={fpath or '-'} infer_log={infer_log_path or '-'} "
-                        f"frames={video_frame_index} duration_sec={duration_sec:.1f}"
-                    )
-                    writer = None
-                if infer_log_file:
-                    infer_log_file.close()
-                    infer_log_file = None
-                if isinstance(self.current_meta, dict):
-                    self.current_meta.update({
-                        "video_path": fpath,
-                        "infer_log_path": infer_log_path,
-                        "meta_path": meta_path,
-                        "recording_frames": int(video_frame_index),
-                        "recording_duration_sec": round(float(duration_sec), 3)
-                    })
-                    append_event_audit_record(self.current_meta, stage="recording_closed", status="ok")
-                    logger.info(
-                        f"[EVENT AUDIT] event_id={self.current_meta.get('event_id', '-')} "
-                        f"stage=recording_closed meta={meta_path or '-'} video={fpath or '-'} "
-                        f"infer_log={infer_log_path or '-'}"
-                    )
-                infer_log_path = None
-                fpath = None
-                meta_path = None
-                self.current_video_path = None
-                self.current_infer_log_path = None
-                self.current_meta_path = None
-                self.current_record_started_at = None
-                self.current_meta = None
-                video_frame_index = 0
+                if writer: writer.release()
+                if infer_log_file: infer_log_file.close()
+                writer, infer_log_file = None, None
                 continue
 
-            if isinstance(item, tuple):
-                frame, infer_meta = item
-            else:
-                frame, infer_meta = item, None
+            frame, infer_meta, timestamp = item
 
             if writer is None:
+                # [수정] 모든 산출물을 하나의 videos 디렉토리로 통합
                 dpath = os.path.join(EVENT_ROOT_DIR, "events", self.ip, "videos", self.current_event)
-                if not os.path.exists(dpath):
-                    os.makedirs(dpath, exist_ok=True)
-
-                # 파일명 동기화를 위해 변수 처리
-                time_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                os.makedirs(dpath, exist_ok=True)
+                
+                time_str = datetime.datetime.fromtimestamp(self.current_record_started_at).strftime('%Y%m%d_%H%M%S')
                 fname = f"{time_str}_{self.ip}_{self.current_event}.mp4"
                 fpath = os.path.join(dpath, fname)
-                # 영상 파일 옆에 같은 이름의 infer 로그 파일을 만듭니다.
-                # 영상은 원본 그대로 두고, AI가 본 박스/클래스/이벤트 정보는 이 파일에 저장합니다.
                 infer_log_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.infer.jsonl")
-                self.current_video_path = fpath
-                self.current_infer_log_path = infer_log_path
+                meta_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.meta.json")
 
-                # -----------------------------------------------------------
-                # [추가] 영상 생성 시점에 BBox 상세 수치 데이터(JSON)를 동시 저장
-                # -----------------------------------------------------------
-                if hasattr(self, 'current_meta') and self.current_meta:
-                    meta_fname = f"{time_str}_{self.ip}_{self.current_event}.json"
-                    meta_path = os.path.join(dpath, meta_fname)
-                    self.current_meta_path = meta_path
-                    if isinstance(self.current_meta, dict):
-                        self.current_meta.update({
-                            "video_path": fpath,
-                            "infer_log_path": infer_log_path,
-                            "meta_path": meta_path
-                        })
+                if isinstance(self.current_meta, dict):
+                    self.current_meta.update({"video_path": fpath, "infer_log_path": infer_log_path, "recorded_fps": self.recorded_fps})
                     try:
                         with open(meta_path, 'w', encoding='utf-8') as f_meta:
                             json.dump(to_json_safe(self.current_meta), f_meta, indent=4, ensure_ascii=False)
-                        if isinstance(self.current_meta, dict):
-                            append_event_audit_record(self.current_meta, stage="recording_metadata_written", status="open")
-                            logger.info(
-                                f"[EVENT AUDIT] event_id={self.current_meta.get('event_id', '-')} stage=recording_metadata_written "
-                                f"meta={meta_path} video={fpath} infer_log={infer_log_path}"
-                            )
-                        logger.info(f"?? [BBox 데이터 저장 완료] 경로: {meta_path}")
                     except Exception as e:
-                        logger.error(f"?? BBox JSON 메타데이터 저장 실패: {e}")
-                # -----------------------------------------------------------
+                        logger.error(f"메타데이터 저장 실패: {e}")
 
                 h, w = frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writer = cv2.VideoWriter(fpath, fourcc, self.fps, (w, h))
+                writer = cv2.VideoWriter(fpath, fourcc, self.recorded_fps, (w, h))
 
-                if not writer.isOpened():
-                    logger.error(f"[녹화에러] 파일을 열 수 없습니다: {fpath}")
-                    writer = None
-                    continue
-
-            if writer and infer_log_file is None and infer_log_path:
-                try:
-                    # 실제 영상 파일이 열린 뒤에 로그 파일도 함께 엽니다.
-                    # 영상 저장에 실패한 경우 불필요한 로그 파일만 생기지 않게 하기 위함입니다.
-                    infer_log_file = open(infer_log_path, 'w', encoding='utf-8')
-                    video_frame_index = 0
-                except Exception as e:
-                    logger.error(f"[InferLog] video inference log open failed: {infer_log_path} | {e}")
+                try: infer_log_file = open(infer_log_path, 'w', encoding='utf-8')
+                except Exception: pass
 
             if writer:
                 if infer_log_file and infer_meta is not None:
                     try:
                         log_record = dict(infer_meta)
-                        # 이 두 값으로 "영상 파일의 N번째 프레임"과 "AI 판단 로그"를 연결합니다.
                         log_record["video_frame_index"] = video_frame_index
-                        log_record["video_path"] = fpath
                         infer_log_file.write(json.dumps(to_json_safe(log_record), ensure_ascii=False) + "\n")
-                    except Exception as e:
-                        logger.error(f"[InferLog] video inference log write failed: {infer_log_path} | {e}")
+                    except Exception: pass
 
                 writer.write(frame)
                 video_frame_index += 1
@@ -1936,7 +1839,7 @@ class CrossingDetector(BaseEventDetector):
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
 
-        self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
+        self.candidate_ttl_sec = config.get("candidate_ttl_sec", 30.0)
 
     def _is_intersect(self, p1, p2, p3, p4):
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
@@ -5277,21 +5180,21 @@ def main():
     config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
 
-    debug_ans = guarded_input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
+    debug_ans = guarded_input(">> CLI 디버그 출력을 활성화하시겠습니까? (파일 로그는 항상 상세히 기록됩니다) [y/N]: ").strip().lower()
     DEBUG_MODE = True if debug_ans == 'y' else False
+    
+    _runtime_log_cfg = SYS_CFG.get("logging", {})
+    # [수정] 파일 로그는 무조건 가장 상세한 DEBUG 레벨 고정, 콘솔 출력만 사용자 선택에 따름
+    _debug_file_level = logging.DEBUG 
+    _debug_console_level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    
+    logger.setLevel(logging.DEBUG)
+    queue_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(_debug_file_level)
+    stream_handler.setLevel(_debug_console_level)
+    
     if DEBUG_MODE:
-        _runtime_log_cfg = SYS_CFG.get("logging", {})
-        _debug_file_level = _parse_log_level(_runtime_log_cfg.get("debug_file_level", "DEBUG"), logging.DEBUG)
-        _debug_console_level = _parse_log_level(
-            _runtime_log_cfg.get("debug_console_level", _runtime_log_cfg.get("console_level", "INFO")),
-            logging.INFO
-        )
-        _debug_floor_level = min(_debug_file_level, _debug_console_level)
-        logger.setLevel(_debug_floor_level)
-        queue_handler.setLevel(_debug_floor_level)
-        file_handler.setLevel(_debug_file_level)
-        stream_handler.setLevel(_debug_console_level)
-        logger.debug("??? 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
+        logger.debug("??? 디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.")
 
     if os.path.exists(config_file):
         try:
@@ -5453,6 +5356,10 @@ def main():
         t_main_input = np.empty((0, 6))
         d_signalman_res = np.empty((0, 6))
 
+        # [추가] 프레임 전체 면적의 1/4 (25%) 임계값 계산
+        h, w = fr.shape[:2]
+        max_area_threshold = (h * w) * 0.25
+
         if active_detection_events:
             base_conf = min(main_conf, person_conf, signalman_conf)
             raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
@@ -5462,7 +5369,8 @@ def main():
                 main_conf=main_conf,
                 person_conf=person_conf,
                 helmet_conf=helmet_conf,
-                signalman_conf=signalman_conf
+                signalman_conf=signalman_conf,
+                max_area_threshold=max_area_threshold # [추가] 1/4 임계값 인자 전달
             )
 
         d_helmet_res = np.empty((0, 6))
@@ -5594,67 +5502,51 @@ def main():
             # ---------------------------------------------------------
             # Stage 1 (Producer): 프레임 캡처 및 버퍼 공급
             # ---------------------------------------------------------
+            for idx, worker in enumerate(camera_workers):
+                fr, fid, connected = worker.cam.process_frame()
+                worker.frame_buffer.put((fr, fid, connected))
+
+            # ---------------------------------------------------------
+            # Stage 2 (Consumer): 최신 결과 회수, 마스킹 스냅샷, 및 최적화 렌더링
+            # ---------------------------------------------------------
+            final_imgs = []
             now_time = time.time()
+            
             roi_snapshot_refresh_cctv_ids = get_terminal_roi_snapshot_refresh_cctv_ids()
             periodic_roi_snapshot_due = (now_time - last_roi_snapshot_time) >= ROI_SNAPSHOT_INTERVAL_SEC
             roi_snapshot_queued = False
             refreshed_cctv_ids = set()
-
-            for idx, worker in enumerate(camera_workers):
-                c = worker.cam
-                fr, fid, connected = c.process_frame()
-                
-                # 무부하 버퍼에 프레임 삽입 (Queue.Full 예외 없음)
-                worker.frame_buffer.put((fr, fid, connected))
-
-                cctv_id_text = str(c.cam_id)
-                force_camera_snapshot = cctv_id_text in roi_snapshot_refresh_cctv_ids
-                if not periodic_roi_snapshot_due and not force_camera_snapshot:
-                    continue
-
-                if connected and fr is not None:
-                    c._initialize_base_roi_if_needed(fr)
-                    snap_img = create_roi_snapshot(c, fr)
-                    if snap_img is None:
-                        continue
-                    h, w = snap_img.shape[:2]
-                    roi_info = {"roi_poly_norm": c.roi_poly_norm, "roi_lines_norm": c.roi_lines_norm}
-                    IMAGE_SAVER_POOL.submit(_send_roi_snapshot_task, c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h)
-                    roi_snapshot_queued = True
-                    if force_camera_snapshot:
-                        refreshed_cctv_ids.add(cctv_id_text)
-
-            if roi_snapshot_queued and periodic_roi_snapshot_due:
-                last_roi_snapshot_time = now_time
-            if refreshed_cctv_ids:
-                clear_terminal_roi_snapshot_refresh(cctv_ids=refreshed_cctv_ids, reason="roi_snapshot_sent")
-
-            # ---------------------------------------------------------
-            # Stage 2 (Consumer): 최신 결과 회수 및 렌더링
-            # ---------------------------------------------------------
-            final_imgs = []
             
             for worker in camera_workers:
                 c = worker.cam
-                
-                # 버퍼에서 최신 결과 획득 (블로킹/예외 없음)
                 res = worker.result_buffer.get()
                 
                 if res is None:
-                    # 아직 새 결과가 없다면 이전 화면 렌더링 유지 (끊김 방지)
-                    if is_gui_mode:
-                        final_imgs.append(last_rendered_frames[c.ip])
+                    if is_gui_mode: final_imgs.append(last_rendered_frames[c.ip])
                     continue
 
                 fr, fid, connected, t_main, t_helmet, t_signalman, alarms, new_events, infer_meta = res
+
+                # [수정] 추론 결과를 얻은 직후 개인정보 마스킹을 적용하여 ROI 스냅샷 생성
+                cctv_id_text = str(c.cam_id)
+                force_camera_snapshot = cctv_id_text in roi_snapshot_refresh_cctv_ids
+                if connected and fr is not None and (periodic_roi_snapshot_due or force_camera_snapshot):
+                    blurred_snap, _ = c.apply_privacy_blur(fr.copy(), t_main, blur_face=True, blur_plate=True)
+                    c._initialize_base_roi_if_needed(blurred_snap)
+                    snap_img = create_roi_snapshot(c, blurred_snap)
+                    if snap_img is not None:
+                        h, w = snap_img.shape[:2]
+                        roi_info = {"roi_poly_norm": c.roi_poly_norm, "roi_lines_norm": c.roi_lines_norm}
+                        IMAGE_SAVER_POOL.submit(_send_roi_snapshot_task, c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h)
+                        roi_snapshot_queued = True
+                        if force_camera_snapshot: refreshed_cctv_ids.add(cctv_id_text)
 
                 if connected and fr is not None and loop_count % 100 == 0:
                     try:
                         small_fr = cv2.resize(fr, (640, 360))
                         save_path = os.path.join(RAM_DISK_DIR, f"{c.ip}.jpg")
                         cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    except Exception:
-                        pass
+                    except Exception: pass
 
                 if not connected or fr is None or not c.events:
                     if is_gui_mode:
@@ -5663,81 +5555,53 @@ def main():
                         final_imgs.append(display_fr)
                     continue
 
-                now_fps_log = time.time()
                 cam_ip = c.ip
-                if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
-                    current_fps_last_print[cam_ip] = now_fps_log
+                if now_time - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
+                    current_fps_last_print[cam_ip] = now_time
 
+                # [수정] 얇은 선(1px) 기반의 클린 렌더링 및 이벤트 시간 오버레이
+                record_fr = fr.copy()
+                time_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                cv2.putText(record_fr, f"Event Time: {time_str}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                
+                if len(c.roi_poly) > 2:
+                    cv2.polylines(record_fr, [np.array(c.roi_poly, np.int32)], True, (0, 255, 255), 1)
+                if c.roi_lines:
+                    for i in range(0, len(c.roi_lines), 2):
+                        if i + 1 < len(c.roi_lines):
+                            cv2.line(record_fr, tuple(c.roi_lines[i]), tuple(c.roi_lines[i+1]), (0, 0, 255), 1)
+                            
+                for t in t_main:
+                    tid, cls_id = int(t[4]), int(t[6])
+                    if cls_id not in [ID_G_PERSON, ID_PERSON_LOW, ID_G_CAR, ID_G_TRUCK, ID_SIGNALMAN]: continue
+                    bx1, by1, bx2, by2 = map(int, t[:4])
+                    is_alarmed = tid in alarms
+                    color = (0, 0, 255) if is_alarmed else (0, 255, 0)
+                    cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), color, 1)
+                    if tid in c.trk_main.tracks:
+                        hist = list(c.trk_main.tracks[tid]['history'])
+                        if len(hist) > 1:
+                            cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, 1, cv2.LINE_AA)
+
+                # 최적화된 프레임과 현재 타임스탬프를 동기화하여 Recorder에 전달
                 if infer_meta:
-                    c.recorder.update(fr, infer_meta)
+                    c.recorder.update(record_fr, infer_meta, timestamp=now_time)
 
                 if is_gui_mode:
                     display_fr = c.draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
                     last_rendered_frames[c.ip] = display_fr
                     final_imgs.append(display_fr)
 
-                if new_events:
-                    last_event_times[cam_ip] = time.time()
-                    event_queue = event_save_queues.get(cam_ip)
-                    if event_queue is not None:
-                        for ev_data in new_events:
-                            pass 
-
-                event_window_age = time.time() - last_event_times.get(c.ip, 0.0)
-                if last_event_times.get(c.ip, 0.0) > 0 and event_window_age <= event_frame_save_delay_sec:
-                    event_frame, privacy_blur_meta = c.apply_privacy_blur(fr, t_main)
-                    privacy_blur_meta["scope"] = "event_frame_window"
-                    event_infer_meta = dict(infer_meta) if infer_meta else {}
-                    event_infer_meta["privacy_blur"] = privacy_blur_meta
-                    event_save_queues[c.ip].append((fid, event_frame, event_infer_meta))
-
-            # ---------------------------------------------------------
-            # 만료된 이벤트 저장 구간 데이터 Flush
-            # ---------------------------------------------------------
-            now_time = time.time()
-            for c in cams:
-                ip = c.ip
-                q = event_save_queues.get(ip, [])
-
-                if len(q) > 0 and (now_time - last_event_times.get(ip, 0.0) > event_frame_save_delay_sec):
-                    batch_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                    infer_log_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{batch_ts}.infer.jsonl")
-                    infer_records = []
-                    
-                    for item_fid, item_fr, item_meta in list(q):
-                        event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{item_fid}.jpg")
-                        window_event_id = "-"
-                        if item_meta:
-                            new_events = item_meta.get("new_events", [])
-                            if new_events:
-                                window_event_id = new_events[0].get("event_id", "-")
-                        IMAGE_SAVER_POOL.submit(
-                            _write_image_file,
-                            event_img_path,
-                            item_fr,
-                            "event_frame_window",
-                            window_event_id
-                        )
-                        if item_meta is not None:
-                            record = dict(item_meta)
-                            record["image_path"] = event_img_path
-                            record["event_frame_window_sec"] = event_frame_save_delay_sec
-                            infer_records.append(record)
-                    if infer_records:
-                        IMAGE_SAVER_POOL.submit(_write_jsonl_records, infer_log_path, infer_records)
-                    q.clear()
-                    last_event_times[ip] = 0.0
+            if roi_snapshot_queued and periodic_roi_snapshot_due:
+                last_roi_snapshot_time = now_time
+            if refreshed_cctv_ids:
+                clear_terminal_roi_snapshot_refresh(cctv_ids=refreshed_cctv_ids, reason="roi_snapshot_sent")
 
             if is_gui_mode:
-                if final_imgs:
-                    cv2.imshow("Monitor", create_mosaic_image(final_imgs))
-                key = cv2.waitKey(1)
-                if key == ord('q'):
-                    break
+                if final_imgs: cv2.imshow("Monitor", create_mosaic_image(final_imgs))
+                if cv2.waitKey(1) == ord('q'): break
 
-            sleep_time = dynamic_delay - (time.time() - start_time)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            time.sleep(0.001)
 
     except KeyboardInterrupt:
         logger.info("[종료] 사용자에 의해 시스템이 중단되었습니다.")
