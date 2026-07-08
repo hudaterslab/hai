@@ -1,4 +1,9 @@
 import os
+os.environ["GST_VAAPI_DISPLAY"] = "drm"
+os.environ["GST_VAAPI_DRM_DEVICE"] = "/dev/dri/renderD128"
+os.environ["LIBVA_DRIVER_NAME"] = "iHD"
+os.environ["GST_VAAPI_ALL_DRIVERS"] = "1"
+os.environ["GST_PLUGIN_FEATURE_RANK"] = "vah264dec:MAX,vah265dec:MAX"
 import sys
 import gc
 import json
@@ -171,7 +176,7 @@ def load_system_config():
             }
         },
         "models": {
-            "MAIN": "hanjin_cctv_v2.dxnn",
+            "MAIN": "hanjin_cctv_v3.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
             "HELMET": "helmet_260622.dxnn",
             "PLATE": "license_plate_detector_v2.dxnn"
@@ -239,7 +244,7 @@ def load_system_config():
 
 SYS_CFG = load_system_config()
 BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
-IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 def resolve_model_path(model_path):
     """설정 파일의 모델 경로가 상대 경로면 프로젝트 폴더 기준 절대 경로로 바꿉니다."""
@@ -285,7 +290,7 @@ def split_unified_event_detections(raw_dets, events, main_conf, person_conf, hel
     d_signalman_res_list = []
 
     for d in raw_dets:
-        # 0. [오탐 방어] BBox 면적이 화면의 1/4을 초과하는 거대 객체(비/IR 노이즈 등) 차단
+        # 0. [오탐 방어] BBox 면적이 화면의 1/2을 초과하는 거대 객체(비/IR 노이즈 등) 차단
         obj_w = float(d[2]) - float(d[0])
         obj_h = float(d[3]) - float(d[1])
         if (obj_w * obj_h) > max_area_threshold:
@@ -378,11 +383,11 @@ def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
         resp = requests.post(url, data=data, files=files, verify=False, timeout=15)
 
         if resp.status_code == 200:
-            logger.info(f"?? [ROI Snapshot] CAM:{cam_id} 1시간 주기 스냅샷 전송 성공")
+            logger.info(f" [ROI Snapshot] CAM:{cam_id} 1시간 주기 스냅샷 전송 성공")
         else:
-            logger.error(f"?? [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
+            logger.error(f" [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
     except Exception as e:
-        logger.error(f"?? [ROI Snapshot] CAM:{cam_id} 전송 실패: {e}")
+        logger.error(f" [ROI Snapshot] CAM:{cam_id} 전송 실패: {e}")
 
 # ==========================================
 # [2] 로깅 시스템 초기화
@@ -509,7 +514,7 @@ try:
     from dx_engine import InferenceEngine, InferenceOption
     HAS_DX_ENGINE = True
 except ImportError:
-    logger.warning("?? [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
+    logger.warning(" [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
 
 # ==========================================
 # [4] 공통 유틸리티 함수
@@ -862,9 +867,9 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
                     status="ok",
                     extra={"status_code": response.status_code, "elapsed_ms": elapsed_ms}
                 )
-                logger.info(f"?? [API 전송 성공] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name}")
+                logger.info(f" [API 전송 성공] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name}")
             else:
-                logger.error(f"?? [API 전송 실패] 상태코드: {response.status_code} | 메시지: {response.text}")
+                logger.error(f" [API 전송 실패] 상태코드: {response.status_code} | 메시지: {response.text}")
             if response.status_code != 200:
                 logger.error(
                     f"[API SEND FAIL] event_id={event_id} terminal={terminal_id} cam={cctv_id} "
@@ -882,12 +887,12 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.error(f"[API NETWORK ERROR] event_id={event_id} image={image_path} | {e}")
         record_api_send_state(False, event_id)
         append_event_audit_record(api_audit, stage="api_send", status="failed", extra={"reason": "network_error"})
-        logger.error(f"?? [API 네트워크 예외 발생]: {e}")
+        logger.error(f" [API 네트워크 예외 발생]: {e}")
     except Exception as e:
         logger.error(f"[API UNEXPECTED ERROR] event_id={event_id} image={image_path} | {e}\n{traceback.format_exc()}")
         record_api_send_state(False, event_id)
         append_event_audit_record(api_audit, stage="api_send", status="failed", extra={"reason": "unexpected_error"})
-        logger.error(f"?? [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
+        logger.error(f" [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
 def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_tokens=None):
     """Create an API-only image with event boxes drawn on top."""
@@ -1618,7 +1623,7 @@ class VideoRecorder:
             if time.time() > self.record_end_time:
                 self.recording = False
                 self.write_queue.put(None)
-                logger.info(f"?? [녹화종료] {self.ip} - {self.current_event}")
+                logger.info(f" [녹화종료] {self.ip} - {self.current_event}")
             else:
                 self.write_queue.put((frame.copy(), infer_meta, timestamp or time.time()))
 
@@ -1882,7 +1887,46 @@ class CrossingDetector(BaseEventDetector):
 
         return inter_area / float(area1) if area1 > 0 else 0.0
 
+    def _update_computed_lines(self):
+        """
+        [최적화] ROI 라인이 변경되었을 때만 최초 1회 선분의 기울기를 계산하여
+        해당 선분의 트리거 앵커 타입(TOP, CENTER, FOOT)을 캐싱합니다.
+        """
+        if not hasattr(self, '_cached_lines') or self._cached_lines != self.lines:
+            self.computed_lines = []
+            for p1, p2 in self.lines:
+                dx = float(p2[0] - p1[0])
+                dy = float(p2[1] - p1[1])
+                
+                if dx == 0:
+                    atype = 'TOP'
+                else:
+                    slope = abs(dy / dx)
+                    if slope < 0.57: atype = 'TOP'       # 완만한 가로선 (컨베이어 횡단 방어)
+                    elif slope > 1.73: atype = 'FOOT'    # 가파른 세로선
+                    else: atype = 'CENTER'               # 대각선
+                    
+                self.computed_lines.append({'p1': p1, 'p2': p2, 'anchor_type': atype})
+            self._cached_lines = list(self.lines)
+
+    def _get_dynamic_anchor(self, box, anchor_type):
+        """
+        [최적화] 사전 연산된 anchor_type을 받아 즉시 좌표만 반환합니다. (연산 부하 0)
+        """
+        bx1, by1, bx2, by2 = box
+        bcx = (bx1 + bx2) / 2.0
+        
+        if anchor_type == 'TOP':
+            return (bcx, float(by1))
+        elif anchor_type == 'FOOT':
+            return (bcx, float(by2))
+        else:
+            return (bcx, (by1 + by2) / 2.0)
+
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
+        # [핵심] ROI 라인 정보가 캐싱되어 있는지 확인 (CPU 부하 최소화)
+        self._update_computed_lines()
+        
         triggered = []
         curr_ids = set()
         current_time = time.time()
@@ -1890,7 +1934,6 @@ class CrossingDetector(BaseEventDetector):
         persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
 
-        # 하반신 매칭 및 발 위치 정밀 계산
         for p in persons:
             p_tid = int(p[4])
             curr_ids.add(p_tid)
@@ -1901,10 +1944,9 @@ class CrossingDetector(BaseEventDetector):
             best_low_track = None
             max_ioa = 0
 
-            # 해당 사람과 짝지어질 하반신 탐색
             for lb in low_bodies:
                 lx1, ly1, lx2, ly2 = lb[:4]
-                lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+                lcy = (ly1 + ly2) / 2
 
                 if lcy < py1 + person_height * 0.4:
                     continue
@@ -1915,32 +1957,42 @@ class CrossingDetector(BaseEventDetector):
                     best_low_track = lb
 
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid, 'class_id': ID_G_PERSON}]
+            
             if max_ioa >= 0.4 and best_low_track is not None:
-                lx1, ly1, lx2, ly2 = best_low_track[:4]
-                low_height = max(1, ly2 - ly1)
-                curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
-
-                event_bbox = tuple(best_low_track[:4])
-
+                curr_box = best_low_track[:4]
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4]), 'class_id': ID_PERSON_LOW})
-
             else:
                 if p_tid in self.candidates and current_time - self.candidates[p_tid]['timestamp_time'] > self.candidate_ttl_sec:
                     del self.candidates[p_tid]
                 continue
 
-            # 점프 방어 (너무 큰 순간 이동은 무시)
-            if p_tid in self.prev:
-                jump_dist = get_distance(self.prev[p_tid], curr_pos)
-                if jump_dist > person_height * 0.2:
-                    del self.prev[p_tid]
-                    self.prev[p_tid] = curr_pos
-                    continue
+            # 이전 박스가 없으면 등록 후 스킵
+            if p_tid not in self.prev:
+                self.prev[p_tid] = curr_box
+                continue
+                
+            prev_box = self.prev[p_tid]
+            
+            # 점프 방어는 BBox 중심점을 기준으로 튀는지 검사
+            prev_cx, prev_cy = (prev_box[0]+prev_box[2])/2, (prev_box[1]+prev_box[3])/2
+            curr_cx, curr_cy = (curr_box[0]+curr_box[2])/2, (curr_box[1]+curr_box[3])/2
+            jump_dist = get_distance((prev_cx, prev_cy), (curr_cx, curr_cy))
+            
+            if jump_dist > person_height * 0.2:
+                self.prev[p_tid] = curr_box
+                continue
 
-            # 횡단 판별: 궤적이 선분과 교차하는지 확인
-            if p_tid in self.prev and p_tid not in self.candidates:
-                trajectory = (self.prev[p_tid], curr_pos)
-                for p1, p2 in self.lines:
+            # 횡단 후보군 등록 (사전 연산된 computed_lines 사용)
+            if p_tid not in self.candidates:
+                for c_line in self.computed_lines:
+                    p1, p2 = c_line['p1'], c_line['p2']
+                    atype = c_line['anchor_type']
+                    
+                    # 캐싱된 앵커 타입을 사용하여 연산 없이 즉각 좌표 추출
+                    prev_pos = self._get_dynamic_anchor(prev_box, atype)
+                    curr_pos = self._get_dynamic_anchor(curr_box, atype)
+                    trajectory = (prev_pos, curr_pos)
+                    
                     if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
                         cross_angle = self._get_angle_between_lines((p1, p2), trajectory)
                         if cross_angle >= self.min_crossing_angle:
@@ -1948,28 +2000,30 @@ class CrossingDetector(BaseEventDetector):
                                 'person_height': person_height,
                                 'timestamp_time': current_time,
                                 'line': (p1, p2),
+                                'anchor_type': atype, # [핵심] 판정 시 사용할 앵커 타입 함께 보관
                                 'entry_side': ccw(p1, p2, trajectory[0]),
                                 'cross_angle': cross_angle,
                                 'candidate_trajectory': [trajectory[0], trajectory[1]],
-                                'crossed_pos': curr_pos, # [추가] 선을 넘은 직후의 첫 발 위치 앵커 기록
-                                'bbox': event_bbox,
+                                'crossed_pos': curr_pos, 
+                                'bbox': tuple(curr_box),
                                 'frame': frame.copy() if frame is not None else None,
                                 'fid': fid,
                                 'objects': curr_objects
                             }
                         break
 
-            # 수직 거리 및 교차 후 실이동 거리 기반 최종 알람 트리거
+            # 최종 트리거 판별
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
+                atype = cand['anchor_type']
+                
+                # 저장해둔 앵커 타입으로 현재 위치 즉각 추출
+                curr_pos = self._get_dynamic_anchor(curr_box, atype)
                 curr_side = ccw(p1, p2, curr_pos)
 
-                # 완전히 반대편으로 진입한 상태라면
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
-                    # 1. 라인 기준 수직 침투 깊이
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
-                    # 2. [추가] 앵커(crossed_pos)로부터의 실제 추가 이동 거리
                     post_cross_dist = get_distance(cand['crossed_pos'], curr_pos)
 
                     dx = abs(p2[0] - p1[0])
@@ -1979,7 +2033,6 @@ class CrossingDetector(BaseEventDetector):
                     tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
 
-                    # [핵심 보완] 수직 깊이를 충족하고, 동시에 1프레임 튐이 아니라 실제 발걸음이 발생했을 때만 트리거
                     if perp_dist >= dynamic_threshold and post_cross_dist >= (dynamic_threshold * 0.6):
                         triggered.append({
                             'tid': p_tid,
@@ -1991,35 +2044,22 @@ class CrossingDetector(BaseEventDetector):
                                 'detector': 'CrossingDetector',
                                 'reason': 'line_crossed_after_candidate',
                                 'line': [int_point(p1), int_point(p2)],
+                                'anchor_type': atype,
                                 'entry_side': int(cand['entry_side']),
                                 'current_side': int(curr_side),
-                                'candidate_fid': int(cand.get('fid', fid)),
-                                'trigger_fid': int(fid),
                                 'candidate_age_sec': round(float(current_time - cand['timestamp_time']), 3),
-                                'candidate_trajectory': [int_point(p) for p in cand.get('candidate_trajectory', [])],
                                 'crossed_pos': int_point(cand['crossed_pos']),
                                 'current_pos': int_point(curr_pos),
-                                'cross_angle': round(float(cand.get('cross_angle', 0.0)), 3),
-                                'min_crossing_angle': round(float(self.min_crossing_angle), 3),
                                 'perp_dist': round(float(perp_dist), 3),
                                 'post_cross_dist': round(float(post_cross_dist), 3),
-                                'dynamic_threshold': round(float(dynamic_threshold), 3),
-                                'distance_ratio': round(float(self.distance_ratio), 4),
-                                'tilt_factor': round(float(tilt_factor), 4),
-                                'used_low_body': True,
-                                'low_body_ioa': round(float(max_ioa), 4),
-                                'person_height': round(float(cand['person_height']), 3)
                             }
                         })
                         del self.candidates[p_tid]
-                    else:
-                        if p_tid in self.candidates:
-                            logger.debug(f"[CROSSING CANDIDATE] fid={fid} tid={p_tid} perp_dist={perp_dist:.2f} post_cross_dist={post_cross_dist:.2f} threshold={dynamic_threshold:.2f}")
-
+                
                 elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec:
                     del self.candidates[p_tid]
 
-            self.prev[p_tid] = curr_pos
+            self.prev[p_tid] = curr_box
 
         for tid in list(self.prev.keys()):
             if tid not in curr_ids:
@@ -2287,7 +2327,11 @@ class SignalVehicleDetector(BaseEventDetector):
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
         self.history = defaultdict(lambda: deque(maxlen=30))
-        # 모션 감지용 설정(motion_threshold_ratio) 삭제 완료
+        
+        # [복구 및 최적화] MOG2 모션 감지기 초기화 
+        # 그림자 감지(detectShadows=False)를 꺼서 CPU 부하를 대폭 줄입니다.
+        self.mog = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=32, detectShadows=False)
+        
         self.auth_grace_sec = config.get("auth_grace_sec", 120.0)
         self.presence_threshold_sec = config.get("presence_threshold_sec", 3.0)
         self.parked_threshold_sec = config.get("parked_threshold_sec", 60.0)
@@ -2402,14 +2446,19 @@ class SignalVehicleDetector(BaseEventDetector):
         if self.roi_poly.size == 0 or frame is None: return triggered
 
         h_frame, w_frame = frame.shape[:2]
-        prox_x_thresh, prox_y_thresh = w_frame * self.prox_ratio_x, h_frame * self.prox_ratio_y
+        
+        # [복구 및 최적화] 320x180 초소형 해상도로 MOG 연산 수행 (CPU 연산량 1/16 수준 방어)
+        # 멈춰있던 배경(트럭)이 픽셀 수준에서 진짜 움직였는지 교차 검증하는 용도
+        small_frame = cv2.resize(frame, (320, 180))
+        small_motion_mask = self.mog.apply(small_frame)
 
+        prox_x_thresh, prox_y_thresh = w_frame * self.prox_ratio_x, h_frame * self.prox_ratio_y
         signalman_tracks = kwargs.get('signalman_tracks', [])
         signalmen_info = [{'tid': int(t[4]), 'pt': get_foot_point(*t[:4])} for t in signalman_tracks]
 
         self._remember_recent_cars(tracks, track_map)
-
         self.confirmed_line_truck_ids = set()
+        
         for t in tracks:
             tid = int(t[4])
             if track_map.get(tid) == ID_G_TRUCK and self._is_confirmed_line_truck(t):
@@ -2421,7 +2470,6 @@ class SignalVehicleDetector(BaseEventDetector):
         for curr_tid in curr_ids:
             curr_box = next((t[:4] for t in tracks if int(t[4]) == curr_tid), None)
             if curr_box is None: continue
-
             curr_fc = get_foot_point(*curr_box)
 
             for old_tid in missing_tids:
@@ -2433,10 +2481,8 @@ class SignalVehicleDetector(BaseEventDetector):
 
                 if can_inherit:
                     self.state_inherit_sources[curr_tid] = {
-                        'from_tid': int(old_tid),
-                        'to_tid': int(curr_tid),
-                        'iou': round(float(iou), 4),
-                        'distance': round(float(dist), 3),
+                        'from_tid': int(old_tid), 'to_tid': int(curr_tid),
+                        'iou': round(float(iou), 4), 'distance': round(float(dist), 3),
                         'reason': inherit_reason
                     }
                     if old_tid in self.last_auth_time:
@@ -2467,10 +2513,7 @@ class SignalVehicleDetector(BaseEventDetector):
                     missing_tids.remove(old_tid)
                     break
                 elif inherit_reason.startswith("size_jump"):
-                    logger.debug(
-                        f"[SignalVehicle] state inherit blocked by bbox size jump | "
-                        f"old_tid={old_tid} curr_tid={curr_tid} iou={iou:.3f} dist={dist:.1f} reason={inherit_reason}"
-                    )
+                    pass 
 
         for t in tracks:
             tid = int(t[4])
@@ -2524,7 +2567,7 @@ class SignalVehicleDetector(BaseEventDetector):
                 if current_time - last_seen > 1.5:
                     if tid in self.presence_start_time: del self.presence_start_time[tid]
 
-        # [모션 MOG2 제거] BBox 궤적 중심점 변화량만으로 트럭 물리적 이동 검증
+        # BBox 궤적 거리 + MOG 픽셀 변화량 교차 검증 로직
         for t in tracks:
             tid = int(t[4])
             if tid not in self.confirmed_line_truck_ids: continue
@@ -2542,7 +2585,22 @@ class SignalVehicleDetector(BaseEventDetector):
                 dist = get_distance(start_p, end_p)
                 min_movement = max(v_size * 0.15, 10.0)
 
+                # 1차 검증: BBox 중심점이 충분히 이동했는가?
                 if dist >= min_movement and is_in_roi:
+                    
+                    # 2차 검증 (ID 스위칭 오탐 방어): 실제 해당 영역 픽셀에 움직임(MOG)이 있었는가?
+                    sx1, sy1 = max(0, int(x1 * 320 / w_frame)), max(0, int(y1 * 180 / h_frame))
+                    sx2, sy2 = min(320, int(x2 * 320 / w_frame)), min(180, int(y2 * 180 / h_frame))
+                    
+                    truck_motion = small_motion_mask[sy1:sy2, sx1:sx2]
+                    motion_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+                    motion_ratio = cv2.countNonZero(truck_motion) / motion_area
+                    
+                    # BBox 영역 내 픽셀 변화가 5% 미만이라면 트럭이 이동한게 아니라 트래커 ID가 튄 것으로 간주!
+                    if motion_ratio < 0.05:
+                        self.history[tid].clear() # 튀어버린 잘못된 궤적 초기화
+                        continue
+
                     last_auth = self.last_auth_time.get(tid, 0.0)
                     time_since_auth = current_time - last_auth
 
@@ -2767,7 +2825,7 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     for i in range(0, len(rtsp_list), BATCH_SIZE):
         batch = rtsp_list[i : i + BATCH_SIZE]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             frames = list(executor.map(capture_snapshot, batch))
 
         display = []
@@ -2789,20 +2847,27 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
             r, c = divmod(idx, cols)
             cx, cy = c * cw, r * ch
             cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
-            cv2.putText(mosaic, str(idx + 1), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
+            
+            # [요구사항 반영 2] 배치(Batch) 상대 번호가 아닌 CSV 전체 기준 절대 순차 번호 생성
+            abs_cam_id = i + idx + 1 
+            cv2.putText(mosaic, str(abs_cam_id), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
 
         cv2.imshow("Select Cameras", mosaic)
         cv2.waitKey(1)
 
-        sel = guarded_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: 1,3,5 / 건너뛰기: 엔터): ").strip()
+        # [요구사항 반영 3] 프롬프트 안내 메시지도 절대 번호 기준으로 변경
+        example_ids = f"{i+1},{i+2}" if len(batch) > 1 else f"{i+1}"
+        sel = guarded_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: {example_ids} / 건너뛰기: 엔터): ").strip()
         if not sel:
             continue
 
         try:
             nums = [int(s.strip()) for s in sel.split(',')]
             for n in nums:
-                if 1 <= n <= len(batch) and frames[n-1] is not None:
-                    url = batch[n-1]
+                # [요구사항 반영 3] 사용자가 입력한 절대 번호를 다시 배치 내 로컬 인덱스로 변환하여 처리
+                local_idx = n - i - 1 
+                if 0 <= local_idx < len(batch) and frames[local_idx] is not None:
+                    url = batch[local_idx]
                     ip = extract_ip(url)
 
                     print(f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량")
@@ -2819,11 +2884,11 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     roi_l = []
 
                     if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle"]):
-                        roi_p = get_roi_points_scaled(frames[n-1], f"Polygon - CAM: {ip}")
+                        roi_p = get_roi_points_scaled(frames[local_idx], f"Polygon - CAM: {ip}")
 
                     if "conveyor_crossing" in events:
                         while True:
-                            l = get_roi_points_scaled(frames[n-1], f"Line - CAM: {ip}", mode="line")
+                            l = get_roi_points_scaled(frames[local_idx], f"Line - CAM: {ip}", mode="line")
                             if len(l) == 2:
                                 roi_l.extend(l)
                             if guarded_input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y':
@@ -3181,12 +3246,48 @@ class FrameReader:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
-    def _emit_decode_log(self, message, level="info"):
-        effective_level = level
-        if str(level).lower() == "info" and not self._decode_verbose_logs():
-            effective_level = "debug"
-        log_fn = getattr(logger, effective_level, logger.info)
-        log_fn(message)
+    def _emit_decode_log(self, *args, **kwargs):
+        """
+        [최적화 및 에러 방어] 파라미터 순서와 키워드 호출이 혼용되는 
+        기존 코드의 모든 케이스를 스마트하게 파싱하여 처리합니다.
+        """
+        # 1. 시스템 설정에서 verbose_logs가 명시적으로 켜져 있지 않으면 즉시 드랍
+        if not SYS_CFG.get("verbose_logs", False):
+            return
+
+        if not args:
+            return
+
+        # 2. 첫 번째 인자가 'level'인지 'msg'인지 스마트 판별
+        first_arg = args[0]
+        # 들어온 값이 숫자(int)이거나 알려진 레벨 문자열(debug, info 등)이면 level이 먼저 온 것으로 간주
+        is_level_first = isinstance(first_arg, int) or (isinstance(first_arg, str) and first_arg.upper() in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+
+        if is_level_first:
+            level = first_arg
+            msg = args[1] if len(args) > 1 else ""
+            fmt_args = args[2:]
+        else:
+            msg = first_arg
+            # kwargs에서 level을 빼내고, 없으면 INFO로 기본값 처리
+            level = kwargs.pop('level', logging.INFO)
+            fmt_args = args[1:]
+
+        # 3. 레벨 정규화 (문자열 'debug' -> logging.DEBUG 정수형)
+        if isinstance(level, str):
+            level_int = getattr(logging, level.upper(), logging.INFO)
+        else:
+            level_int = level
+
+        # 4. 로거 레벨 필터링 (불필요한 조립 방지)
+        if not logger.isEnabledFor(level_int):
+            return
+
+        # 5. 안전한 kwarg 추출 (표준 로깅 모듈이 모르는 인자는 버림)
+        valid_kwargs = {k: v for k, v in kwargs.items() if k in ['exc_info', 'stack_info', 'extra']}
+
+        # 6. 최종 로깅 실행 (지연 평가 방식)
+        logger.log(level_int, msg, *fmt_args, **valid_kwargs)
 
     def _emit_gst_check_once(self, message, level="info"):
         if self._gst_check_logged:
@@ -3268,18 +3369,22 @@ class FrameReader:
 
         now = time.time()
         elapsed = now - self._decode_window_start
+        # 1. 쿨타임(기본 10초)이 안 지났으면 아무 연산 없이 즉시 복귀 (CPU 방어)
         if elapsed < self._decode_log_interval():
             return
 
         fps = self._decode_window_frames / max(0.001, elapsed)
         mbps = (self._decode_window_bytes * 8.0) / max(0.001, elapsed) / 1_000_000.0
+        
+        # 2. [핵심 최적화] 레벨을 DEBUG로 낮춰 CLI 출력을 원천 차단.
+        # f-string을 쓰지 않고 % 포맷을 사용해 실제 파일에 쓸 때만 백그라운드에서 조립되게 유도.
         self._emit_decode_log(
-            f"[DECODE FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
-            f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
-            f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
-            f"restarts={self._decode_restarts} connected={self.connected}",
-            level="debug"
+            logging.DEBUG,
+            "[DECODE FPS] CAM:%s mode=%s pid=%s fps=%.2f frames=%d shape=%s pipe_mbps=%.1f read_failures=%d restarts=%d connected=%s",
+            self.ip, self._decode_mode, self._decode_pid, fps, self._decode_frame_count,
+            self._decode_shape, mbps, self._decode_read_failures, self._decode_restarts, self.connected
         )
+        
         self._decode_window_frames = 0
         self._decode_window_bytes = 0
         self._decode_window_start = now
@@ -3535,19 +3640,38 @@ class FrameReader:
             caps_parts.append(f"framerate={framerate_caps}")
         caps = ",".join(caps_parts)
 
+        # -------------------------------------------------------------
+        # [수정 시작] 파이프라인 cmd 조립 부문 교체
+        # -------------------------------------------------------------
         cmd = [
             "gst-launch-1.0", "-q",
             "rtspsrc", f"location={self.url}", f"protocols={protocols}",
             f"latency={latency_ms}", f"drop-on-latency={drop_on_latency_text}", f"tcp-timeout={tcp_timeout_us}",
             "!", depay,
             "!", parser,
-            "!", decoder,
-            "!", "videoconvert",
-            "!", "videoscale",
+            "!", decoder
+        ]
+
+        if decoder_kind == "vaapi":
+            cmd.extend([
+                # GPU 하드웨어 리사이징 수행 후, 메모리 정렬(Stride) 왜곡 방지를 위해
+                # System Memory 규격인 NV12로 명시적 다운로드 및 사이즈 고정
+                "!", "vaapipostproc",
+                "!", f"video/x-raw,format=NV12,width={out_w},height={out_h}",
+                # 안전하게 축소된 NV12를 BGR로 변환 (해상도가 작아 CPU 부하는 0에 수렴)
+                "!", "videoconvert"
+            ])
+        else:
+            cmd.extend([
+                "!", "videoconvert",
+                "!", "videoscale"
+            ])
+
+        cmd.extend([
             "!", "videorate",
             "!", caps,
             "!", "fdsink", "fd=1", "sync=false"
-        ]
+        ])
 
         env = os.environ.copy()
         vaapi_driver = str(self.decode_cfg.get("vaapi_driver", "")).strip()
@@ -3740,19 +3864,19 @@ class FrameReader:
 
             cap = self._open_capture()
             if not cap.isOpened():
-                # ?? [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
-                logger.error(f"?? [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
+                #  [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
+                logger.error(f" [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
                 time.sleep(5)
                 continue
 
             self.connected = True
-            logger.info(f"? [CAM:{self.ip}] 카메라 스트림 연결 성공.")
+            logger.info(f"[CAM:{self.ip}] 카메라 스트림 연결 성공.")
             self.last_t = time.time()
 
             while self.running and cap.isOpened():
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
-                    # ?? [수정] 타임아웃 로깅 레벨 격상
-                    logger.error(f"?? [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
+                    #  [수정] 타임아웃 로깅 레벨 격상
+                    logger.error(f" [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
                     break
 
                 ret, fr = cap.read()
@@ -3872,7 +3996,7 @@ class Camera:
             pass
 
         logger.info(
-            f"?? [CAM:{self.ip}] 무중단 설정 리로드 완료: "
+            f" [CAM:{self.ip}] 무중단 설정 리로드 완료: "
             f"{old_events} -> {self.events} | ROI aligner reset"
         )
         logger.debug(f"[CCTV_Aligner] CAM {self.cam_id} aligner reset after config reload")
@@ -4368,7 +4492,7 @@ class Camera:
                 # 모션 마스크 인자 None 전달
                 triggered = handler.process(handler_tracks, handler_track_map, None, fr, fid, **kwargs)
             except Exception as e:
-                logger.error(f"?? [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
+                logger.error(f" [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
 
             for ev in triggered:
@@ -4395,7 +4519,7 @@ class Camera:
                     objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
 
                     log_msg = (
-                        f"?? [EVENT TRIGGERED] event_id={event_id} CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
+                        f" [EVENT TRIGGERED] event_id={event_id} CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
                         f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FID:{event_fid} | FPS:{self.current_fps:.1f} | "
                         f"Reason:{decision_trace.get('reason', '-')} | "
                         f"Objects -> {objs_log_str}"
@@ -4615,6 +4739,9 @@ class Camera:
 
         y_pos = 15
         for evt in self.events:
+            if evt == "roi_change" or evt == getattr(sys.modules[__name__], 'ROI_CHANGE_EVENT', 'roi_change'):
+                continue
+
             display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
             color = (0, 0, 255) if evt in active_alarms else (0, 255, 0)
             prefix = "[!] " if evt in active_alarms else " -  "
@@ -4752,7 +4879,7 @@ class HealthCheckDaemon:
         # 데몬 스레드로 실행하여 메인 프로세스 종료 시 강제 종료되도록 허용
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        logger.info(f"? [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
+        logger.info(f"[Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
 
 
 
@@ -5093,20 +5220,20 @@ class HealthCheckDaemon:
                         )
 
                     logger.info(
-                        f"?? [Health Check] 전송 성공 "
+                        f" [Health Check] 전송 성공 "
                         f"(CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%, "
                         f"ROI_SETUP: {data['isRoiSetupRequired']})"
                     )
                 else:
                     self._consecutive_failures += 1
                     logger.error(
-                        f"?? [Health Check] API 응답 에러 "
+                        f" [Health Check] API 응답 에러 "
                         f"(상태코드: {response.status_code}, consecutive_failures={self._consecutive_failures}) - {response.text}"
                     )
 
             except Exception as e:
                 self._consecutive_failures += 1
-                logger.error(f"?? [Health Check] 네트워크 연결 예외 발생 (consecutive_failures={self._consecutive_failures}): {e}")
+                logger.error(f" [Health Check] 네트워크 연결 예외 발생 (consecutive_failures={self._consecutive_failures}): {e}")
 
             # interval(300초)을 통으로 sleep하지 않고, 1초마다 running 상태를 체크하여 빠른 셧다운을 지원
             for _ in range(self.interval):
@@ -5194,7 +5321,7 @@ def main():
     stream_handler.setLevel(_debug_console_level)
     
     if DEBUG_MODE:
-        logger.debug("??? 디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.")
+        logger.debug("디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.")
 
     if os.path.exists(config_file):
         try:
@@ -5356,9 +5483,9 @@ def main():
         t_main_input = np.empty((0, 6))
         d_signalman_res = np.empty((0, 6))
 
-        # [추가] 프레임 전체 면적의 1/4 (25%) 임계값 계산
+        # [추가] 프레임 전체 면적의 1/2 (50%) 임계값 계산
         h, w = fr.shape[:2]
-        max_area_threshold = (h * w) * 0.25
+        max_area_threshold = (h * w) * 0.5
 
         if active_detection_events:
             base_conf = min(main_conf, person_conf, signalman_conf)
