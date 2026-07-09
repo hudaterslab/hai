@@ -3,6 +3,7 @@ import sys
 import gc
 import json
 import csv
+import hashlib
 import shutil
 import subprocess
 import cv2
@@ -16,6 +17,9 @@ import queue
 import logging
 import psutil
 import atexit
+import tracemalloc
+import signal
+import select
 from collections import deque, defaultdict
 import concurrent.futures
 import re
@@ -69,8 +73,8 @@ ANCHOR_RETRY_INTERVAL_SEC = 30.0           # 앵커 등록 실패 시 재시도 
 # suspect/confirm 상태머신 (ROIAlignLearningStore.record_check)
 ROI_DRIFT_CONFIRM_COUNT = 3                # 이동 확정에 필요한 연속 횟수
 
-ANCHOR_BASE = "base"                       
-ANCHOR_UPDATED = "updated"                 
+ANCHOR_BASE = "base"
+ANCHOR_UPDATED = "updated"
 ROI_ALIGN_CSV_LOG_FILE = os.path.join(PROJECT_ROOT, "logs", "roi_align", "roi_align_decisions.csv")
 ROI_ALIGN_LEARNING_DEFAULTS = {
     "confirm_count_required": ROI_DRIFT_CONFIRM_COUNT,
@@ -161,8 +165,8 @@ def load_system_config():
         "models": {
             "MAIN": "hanjin_cctv_v2.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
-            "HELMET": "helmet_3cls_v8_ppu.dxnn",
-            "PLATE": "license_plate_detector_ppu.dxnn"
+            "HELMET": "helmet_260622.dxnn",
+            "PLATE": "license_plate_detector_v2.dxnn"
         },
         "model_confidences": {
             "MAIN": 0.6,
@@ -176,7 +180,7 @@ def load_system_config():
             "MAIN": "ppu",
             "FACE": "auto",
             "HELMET": "auto",
-            "PLATE": "auto"
+            "PLATE": "yolo"
         },
         "model_engine_pool_sizes": {
             "MAIN": 3,
@@ -193,7 +197,11 @@ def load_system_config():
             "fps_limit": 15.0,
             "gstreamer_latency_ms": 50,
             "gstreamer_protocols": "tcp",
-            "log_interval_sec": 10.0
+            "gstreamer_tcp_timeout_us": 3000000,
+            "gstreamer_drop_on_latency": True,
+            "gstreamer_frame_read_timeout_sec": 10.0,
+            "log_interval_sec": 10.0,
+            "verbose_logs": False
         },
         "INFERENCE_MODE": "auto",  # compatibility setting; event inference uses MAIN model detections
         "BATCH_SIZE": 9,
@@ -206,6 +214,7 @@ def load_system_config():
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
         "OUTPUT_RETENTION_DAYS": 14,
         "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
+        "ROI_SETUP_REQUIRED_API_ENABLED": True,
         "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
         "VISUAL_ALARM_DURATION": 5.0
     }
@@ -222,6 +231,53 @@ def load_system_config():
         return default_config
 
 SYS_CFG = load_system_config()
+def _truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+MEMORY_TRACEMALLOC_ENABLED = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_TRACEMALLOC",
+        SYS_CFG.get("logging", {}).get("memory_probe_tracemalloc", True)
+    )
+)
+if MEMORY_TRACEMALLOC_ENABLED and not tracemalloc.is_tracing():
+    tracemalloc.start(25)
+MEMORY_PROBE_DECODE_ONLY = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_DECODE_ONLY",
+        SYS_CFG.get("logging", {}).get("memory_probe_decode_only", False)
+    )
+)
+MEMORY_PROBE_INFERENCE_REUSE_FRAME = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_INFERENCE_REUSE_FRAME",
+        SYS_CFG.get("logging", {}).get("memory_probe_inference_reuse_frame", False)
+    )
+)
+MEMORY_PROBE_KEEP_EXECUTOR = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_KEEP_EXECUTOR",
+        SYS_CFG.get("logging", {}).get("memory_probe_keep_executor", False)
+    )
+)
+MEMORY_PROBE_EXECUTOR_ONLY = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_EXECUTOR_ONLY",
+        SYS_CFG.get("logging", {}).get("memory_probe_executor_only", False)
+    )
+)
+MEMORY_PROBE_SKIP_RECORDER_UPDATE = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_SKIP_RECORDER_UPDATE",
+        SYS_CFG.get("logging", {}).get("memory_probe_skip_recorder_update", False)
+    )
+)
+MEMORY_PROBE_SKIP_EVENT_LOGIC = _truthy(
+    os.environ.get(
+        "HAI_MEM_PROBE_SKIP_EVENT_LOGIC",
+        SYS_CFG.get("logging", {}).get("memory_probe_skip_event_logic", False)
+    )
+)
 BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
 IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
@@ -255,6 +311,252 @@ def get_model_engine_pool_size(model_key, default=1):
         return max(1, int(sizes.get(model_key, default)))
     except Exception:
         return max(1, int(default))
+
+STARTUP_MODEL_PROFILES = {
+    "ppu": {
+        "models": {
+            "MAIN": "hanjin_cctv_v2.dxnn",
+            "FACE": "yolov8m-face_ppu.dxnn",
+            "HELMET": "helmet_260622.dxnn",
+            "PLATE": "license_plate_detector_v2.dxnn",
+        },
+        "model_output_formats": {
+            "MAIN": "ppu",
+            "FACE": "ppu",
+            "HELMET": "auto",
+            "PLATE": "yolo",
+        },
+        "model_engine_pool_sizes": {
+            "MAIN": 3,
+            "FACE": 1,
+            "HELMET": 1,
+            "PLATE": 1,
+        },
+    },
+    "normal": {
+        "models": {
+            "MAIN": "hanjin_cctv.dxnn",
+            "FACE": "yolov8m-face.dxnn",
+            "HELMET": "helmet_3cls_v8.dxnn",
+            "PLATE": "license_plate_detector_v2.dxnn",
+        },
+        "model_output_formats": {
+            "MAIN": "yolo",
+            "FACE": "yolo",
+            "HELMET": "auto",
+            "PLATE": "yolo",
+        },
+        "model_engine_pool_sizes": {
+            "MAIN": 1,
+            "FACE": 1,
+            "HELMET": 1,
+            "PLATE": 1,
+        },
+    },
+}
+
+STARTUP_VIDEO_PIPELINE_CHOICES = [
+    {
+        "key": "gstreamer",
+        "label": "GStreamer",
+        "description": "Linux/GStreamer RTSP 파이프라인",
+        "aliases": ("1", "g", "gst", "gstreamer", "gxstreamer", "gxstremer"),
+    },
+    {
+        "key": "ffmpeg",
+        "label": "FFmpeg",
+        "description": "FFmpeg/OpenCV 파이프라인",
+        "aliases": ("2", "f", "ffmpeg", "opencv", "cv2"),
+    },
+]
+
+STARTUP_HW_ACCELERATION_CHOICES = [
+    {
+        "key": "auto",
+        "label": "Auto",
+        "description": "가능하면 VAAPI 하드웨어 디코딩을 쓰고 실패 시 CPU로 전환",
+        "aliases": ("1", "a", "auto", "default"),
+    },
+    {
+        "key": "vaapi",
+        "label": "VAAPI",
+        "description": "VAAPI 하드웨어 디코딩 우선 사용",
+        "aliases": ("2", "v", "vaapi", "hw", "hardware"),
+    },
+    {
+        "key": "cpu",
+        "label": "CPU",
+        "description": "하드웨어 디코딩을 끄고 CPU 디코더 사용",
+        "aliases": ("3", "c", "cpu", "off", "none", "disable", "disabled"),
+    },
+]
+
+STARTUP_MODEL_PROFILE_CHOICES = [
+    {
+        "key": "ppu",
+        "label": "PPU",
+        "description": "PPU 출력 모델 우선 사용",
+        "aliases": ("1", "p", "ppu"),
+    },
+    {
+        "key": "normal",
+        "label": "Normal",
+        "description": "일반 YOLO 출력 모델 사용",
+        "aliases": ("2", "n", "normal", "nonppu", "non-ppu", "yolo"),
+    },
+]
+
+def _atomic_write_json(path, data):
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    filename = os.path.basename(path)
+    tmp_path = os.path.join(directory, f".{filename}.{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+def _normalize_startup_video_pipeline(value):
+    value = str(value or "").strip().lower()
+    if value in ("gstreamer", "gst", "gst_vaapi", "gxstreamer", "gxstremer"):
+        return "gstreamer"
+    if value in ("ffmpeg", "ffmpeg_vaapi", "vaapi", "opencv", "cv2", "ffmpeg_opencv"):
+        return "ffmpeg"
+    return "gstreamer"
+
+def _normalize_startup_hw_acceleration(value):
+    value = str(value or "").strip().lower()
+    if value in ("", "auto", "a", "default"):
+        return "auto"
+    if value in ("vaapi", "v", "hw", "hardware", "on", "true", "1"):
+        return "vaapi"
+    if value in ("cpu", "c", "off", "none", "false", "0", "disable", "disabled"):
+        return "cpu"
+    return "auto"
+
+def _normalize_startup_model_profile(config):
+    model_name = os.path.basename(str(((config.get("models") or {}).get("MAIN")) or "")).lower()
+    output_format = str(((config.get("model_output_formats") or {}).get("MAIN")) or "").strip().lower()
+    if output_format == "ppu" or "ppu" in model_name or model_name == "hanjin_cctv_v2.dxnn":
+        return "ppu"
+    return "normal"
+
+def _prompt_startup_choice(title, choices, default_key):
+    choices_by_alias = {}
+    for index, choice in enumerate(choices, 1):
+        choices_by_alias[str(index)] = choice["key"]
+        choices_by_alias[choice["key"]] = choice["key"]
+        for alias in choice.get("aliases", ()):
+            choices_by_alias[str(alias).lower()] = choice["key"]
+
+    while True:
+        print("")
+        print(title)
+        for index, choice in enumerate(choices, 1):
+            default_mark = " (기본값)" if choice["key"] == default_key else ""
+            print(f"  {index}. {choice['label']} - {choice['description']}{default_mark}")
+        try:
+            raw = guarded_input(">> 선택: ").strip().lower()
+        except EOFError:
+            return default_key
+        if not raw:
+            return default_key
+        selected = choices_by_alias.get(raw)
+        if selected:
+            return selected
+        print("잘못된 선택입니다. 위 번호 또는 이름을 입력하세요.")
+
+def _apply_startup_video_pipeline(config, pipeline, hw_acceleration=None):
+    video_decode = config.setdefault("video_decode", {})
+    video_decode["backend"] = pipeline
+    if hw_acceleration is None:
+        hw_acceleration = video_decode.get("hw_acceleration", "auto")
+    video_decode["hw_acceleration"] = _normalize_startup_hw_acceleration(hw_acceleration)
+    video_decode.setdefault("fallback_to_cpu", True)
+    video_decode.setdefault("fps_limit", 15.0)
+    video_decode.setdefault("log_interval_sec", 10.0)
+    video_decode.setdefault("verbose_logs", False)
+
+def _apply_startup_model_profile(config, profile):
+    profile_config = STARTUP_MODEL_PROFILES[profile]
+    models = config.setdefault("models", {})
+    formats = config.setdefault("model_output_formats", {})
+    pool_sizes = config.setdefault("model_engine_pool_sizes", {})
+    models.update(profile_config["models"])
+    formats.update(profile_config["model_output_formats"])
+    pool_sizes.update(profile_config["model_engine_pool_sizes"])
+
+def get_main_model_engine_pool_size(main_model_path):
+    model_name = os.path.basename(str(main_model_path or "")).lower()
+    if model_name == "hanjin_cctv.dxnn":
+        return 1
+    model_profile = _normalize_startup_model_profile(SYS_CFG)
+    if model_profile == "normal":
+        return 1
+    return get_model_engine_pool_size("MAIN", default=3)
+
+def ensure_startup_runtime_config(force=False):
+    global SYS_CFG, BATCH_SIZE
+
+    startup_profile = SYS_CFG.get("startup_profile", {}) if isinstance(SYS_CFG.get("startup_profile"), dict) else {}
+    already_configured = bool(startup_profile.get("configured"))
+    if not force and already_configured:
+        return False
+
+    if not force and (not sys.stdin or not sys.stdin.isatty()):
+        logger.info(
+            "[STARTUP CONFIG] startup_profile is not configured, "
+            "but stdin is not interactive; keeping current system_config.json."
+        )
+        return False
+
+    config = deep_merge_dict({}, SYS_CFG)
+    current_pipeline = _normalize_startup_video_pipeline((config.get("video_decode") or {}).get("backend"))
+    current_hw_acceleration = _normalize_startup_hw_acceleration((config.get("video_decode") or {}).get("hw_acceleration"))
+    current_model_profile = _normalize_startup_model_profile(config)
+
+    reason = "--configure-startup" if force else "first startup setup"
+    logger.info(f"[STARTUP CONFIG] running {reason}; config={CONFIG_COMMON_FILE}")
+    selected_pipeline = _prompt_startup_choice(
+        "영상 파이프라인 선택",
+        STARTUP_VIDEO_PIPELINE_CHOICES,
+        current_pipeline,
+    )
+    selected_hw_acceleration = _prompt_startup_choice(
+        "하드웨어 가속 선택",
+        STARTUP_HW_ACCELERATION_CHOICES,
+        current_hw_acceleration,
+    )
+    selected_model_profile = _prompt_startup_choice(
+        "모델 프로필 선택",
+        STARTUP_MODEL_PROFILE_CHOICES,
+        current_model_profile,
+    )
+
+    _apply_startup_video_pipeline(config, selected_pipeline, selected_hw_acceleration)
+    _apply_startup_model_profile(config, selected_model_profile)
+    config["startup_profile"] = {
+        "configured": True,
+        "video_pipeline": selected_pipeline,
+        "hardware_acceleration": selected_hw_acceleration,
+        "model_profile": selected_model_profile,
+        "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _atomic_write_json(CONFIG_COMMON_FILE, config)
+    SYS_CFG = load_system_config()
+    BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
+    logger.info(
+        f"[STARTUP CONFIG] saved video_pipeline={selected_pipeline} "
+        f"hardware_acceleration={selected_hw_acceleration} "
+        f"model_profile={selected_model_profile} config={CONFIG_COMMON_FILE}"
+    )
+    return True
 
 def detection_array(rows):
     """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
@@ -318,8 +620,8 @@ def create_roi_snapshot(cam, frame):
 
     return img
 
-def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
-    """관제 서버로 1시간 주기 ROI 스냅샷을 백그라운드에서 전송합니다."""
+def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False):
+    """관제 서버로 ROI 스냅샷을 백그라운드에서 전송합니다."""
     url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
     try:
         # 이미지를 메모리 상에서 JPEG 바이너리로 인코딩
@@ -331,7 +633,7 @@ def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
             "imageWidth": int(w),
             "imageHeight": int(h),
             "cctvServerId": "1",
-            "isReqRoiSetup": False,
+            "isReqRoiSetup": bool(is_req_roi_setup),
             "roiInfo": roi_info_str
         }
 
@@ -342,7 +644,8 @@ def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
         resp = requests.post(url, data=data, files=files, verify=False, timeout=15)
 
         if resp.status_code == 200:
-            logger.info(f"?? [ROI Snapshot] CAM:{cam_id} 1시간 주기 스냅샷 전송 성공")
+            _tag = "ROI재설정요청(isReqRoiSetup=True)" if is_req_roi_setup else "주기 스냅샷"
+            logger.info(f"?? [ROI Snapshot] CAM:{cam_id} {_tag} 전송 성공")
         else:
             logger.error(f"?? [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
     except Exception as e:
@@ -663,6 +966,223 @@ def log_disk_health(paths, threshold_gb=None):
         except Exception as e:
             logger.warning(f"[DISK HEALTH] check failed | label={label} path={path} | {e}")
 
+MEMORY_PROBE_STATE = {"last_rss_mb": None, "last_ts": None}
+MEMORY_STAGE_BASE = {"loop": None, "rss_mb": None, "uss_mb": None, "private_dirty_mb": None, "pyheap_mb": None}
+
+def _safe_queue_size(q):
+    try:
+        return q.qsize()
+    except Exception:
+        return -1
+
+def _bounded_len(value):
+    try:
+        return len(value)
+    except Exception:
+        return -1
+
+def _read_smaps_rollup_mb():
+    keys = {
+        "Rss", "Pss", "Shared_Clean", "Shared_Dirty", "Private_Clean",
+        "Private_Dirty", "Referenced", "Anonymous", "AnonHugePages", "Swap"
+    }
+    metrics = {}
+    path = f"/proc/{os.getpid()}/smaps_rollup"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, raw_value = line.split(":", 1)
+                if key not in keys:
+                    continue
+                parts = raw_value.strip().split()
+                if not parts:
+                    continue
+                metrics[key] = float(parts[0]) / 1024.0
+    except Exception as e:
+        metrics["_error"] = str(e)
+    return metrics
+
+def _log_tracemalloc_probe(loop_count=None):
+    if not tracemalloc.is_tracing():
+        logger.info("[MEM PYHEAP] tracing=disabled")
+        return
+
+    current, peak = tracemalloc.get_traced_memory()
+    logger.info(
+        f"[MEM PYHEAP] loop={loop_count if loop_count is not None else '-'} "
+        f"current_mb={current / (1024 ** 2):.1f} peak_mb={peak / (1024 ** 2):.1f}"
+    )
+    try:
+        if loop_count is not None and int(loop_count) % 1500 != 0:
+            return
+    except Exception:
+        pass
+
+    try:
+        snapshot = tracemalloc.take_snapshot()
+        top_parts = []
+        for stat in snapshot.statistics("filename")[:8]:
+            frame = stat.traceback[0]
+            top_parts.append(
+                f"{os.path.basename(frame.filename)}={stat.size / (1024 ** 2):.1f}MB/{stat.count}"
+            )
+        logger.info(f"[MEM PYHEAP TOP] {', '.join(top_parts) if top_parts else '-'}")
+    except Exception as e:
+        logger.warning(f"[MEM PYHEAP TOP] failed | {e}")
+
+def _memory_stage_metrics():
+    proc = psutil.Process(os.getpid())
+    mem_info = proc.memory_info()
+    try:
+        full_info = proc.memory_full_info()
+    except Exception:
+        full_info = None
+    smaps = _read_smaps_rollup_mb()
+    pyheap_mb = 0.0
+    if tracemalloc.is_tracing():
+        current, _ = tracemalloc.get_traced_memory()
+        pyheap_mb = current / (1024 ** 2)
+    return {
+        "rss_mb": mem_info.rss / (1024 ** 2),
+        "vms_mb": mem_info.vms / (1024 ** 2),
+        "uss_mb": getattr(full_info, "uss", 0) / (1024 ** 2) if full_info else 0.0,
+        "pss_mb": getattr(full_info, "pss", 0) / (1024 ** 2) if full_info else 0.0,
+        "private_dirty_mb": smaps.get("Private_Dirty", 0.0) if isinstance(smaps, dict) else 0.0,
+        "anonymous_mb": smaps.get("Anonymous", 0.0) if isinstance(smaps, dict) else 0.0,
+        "pyheap_mb": pyheap_mb,
+        "threads": proc.num_threads(),
+    }
+
+def log_memory_stage(stage, loop_count, cams=None, event_save_queues=None):
+    try:
+        metrics = _memory_stage_metrics()
+        if MEMORY_STAGE_BASE.get("loop") != loop_count or stage == "before_process_frame":
+            MEMORY_STAGE_BASE["loop"] = loop_count
+            MEMORY_STAGE_BASE["rss_mb"] = metrics["rss_mb"]
+            MEMORY_STAGE_BASE["uss_mb"] = metrics["uss_mb"]
+            MEMORY_STAGE_BASE["private_dirty_mb"] = metrics["private_dirty_mb"]
+            MEMORY_STAGE_BASE["pyheap_mb"] = metrics["pyheap_mb"]
+
+        rec_q_total = 0
+        rec_buf_total = 0
+        if cams:
+            for cam in cams:
+                recorder = getattr(cam, "recorder", None)
+                rec_q = _safe_queue_size(getattr(recorder, "write_queue", None))
+                if rec_q > 0:
+                    rec_q_total += rec_q
+                rec_buf_total += max(0, _bounded_len(getattr(recorder, "buffer", [])))
+
+        event_q_total = 0
+        if event_save_queues:
+            for q in event_save_queues.values():
+                event_q_total += max(0, _bounded_len(q))
+
+        image_q = _safe_queue_size(getattr(IMAGE_SAVER_POOL, "_work_queue", None))
+        log_q = _safe_queue_size(log_queue)
+        logger.info(
+            f"[MEM STAGE] loop={loop_count} stage={stage} "
+            f"rss_mb={metrics['rss_mb']:.1f} "
+            f"rss_from_loop_start_mb={metrics['rss_mb'] - float(MEMORY_STAGE_BASE.get('rss_mb') or 0.0):.1f} "
+            f"uss_mb={metrics['uss_mb']:.1f} "
+            f"uss_from_loop_start_mb={metrics['uss_mb'] - float(MEMORY_STAGE_BASE.get('uss_mb') or 0.0):.1f} "
+            f"private_dirty_mb={metrics['private_dirty_mb']:.1f} "
+            f"private_dirty_from_loop_start_mb={metrics['private_dirty_mb'] - float(MEMORY_STAGE_BASE.get('private_dirty_mb') or 0.0):.1f} "
+            f"anonymous_mb={metrics['anonymous_mb']:.1f} "
+            f"pyheap_mb={metrics['pyheap_mb']:.1f} "
+            f"pyheap_from_loop_start_mb={metrics['pyheap_mb'] - float(MEMORY_STAGE_BASE.get('pyheap_mb') or 0.0):.1f} "
+            f"threads={metrics['threads']} image_q={image_q} log_q={log_q} "
+            f"rec_q_total={rec_q_total} rec_buf_total={rec_buf_total} event_q_total={event_q_total}"
+        )
+    except Exception as e:
+        logger.warning(f"[MEM STAGE] failed | stage={stage} loop={loop_count} | {e}")
+
+def log_memory_probe(cams, event_save_queues, cpu_usage=None, loop_count=None):
+    try:
+        proc = psutil.Process(os.getpid())
+        mem_info = proc.memory_info()
+        full_info = None
+        try:
+            full_info = proc.memory_full_info()
+        except Exception:
+            full_info = None
+        rss_mb = mem_info.rss / (1024 ** 2)
+        vms_mb = mem_info.vms / (1024 ** 2)
+        uss_mb = getattr(full_info, "uss", 0) / (1024 ** 2) if full_info else 0.0
+        pss_mb = getattr(full_info, "pss", 0) / (1024 ** 2) if full_info else 0.0
+        vm = psutil.virtual_memory()
+        now_ts = time.time()
+        last_rss = MEMORY_PROBE_STATE.get("last_rss_mb")
+        last_ts = MEMORY_PROBE_STATE.get("last_ts")
+        delta_mb = 0.0 if last_rss is None else rss_mb - float(last_rss)
+        delta_sec = 0.0 if last_ts is None else now_ts - float(last_ts)
+        MEMORY_PROBE_STATE["last_rss_mb"] = rss_mb
+        MEMORY_PROBE_STATE["last_ts"] = now_ts
+
+        image_q = _safe_queue_size(getattr(IMAGE_SAVER_POOL, "_work_queue", None))
+        log_q = _safe_queue_size(log_queue)
+        logger.info(
+            f"[MEM PROBE] loop={loop_count if loop_count is not None else '-'} "
+            f"rss_mb={rss_mb:.1f} rss_delta_mb={delta_mb:.1f} delta_sec={delta_sec:.1f} "
+            f"vms_mb={vms_mb:.1f} uss_mb={uss_mb:.1f} pss_mb={pss_mb:.1f} "
+            f"sys_mem_pct={vm.percent:.1f} "
+            f"sys_available_mb={vm.available / (1024 ** 2):.1f} "
+            f"cpu_pct={cpu_usage if cpu_usage is not None else '-'} "
+            f"threads={proc.num_threads()} image_q={image_q} log_q={log_q}"
+        )
+
+        smaps = _read_smaps_rollup_mb()
+        if smaps:
+            if "_error" in smaps:
+                logger.info(f"[MEM SMAPS] error={smaps.get('_error')}")
+            else:
+                logger.info(
+                    f"[MEM SMAPS] rss_mb={smaps.get('Rss', 0.0):.1f} "
+                    f"pss_mb={smaps.get('Pss', 0.0):.1f} "
+                    f"private_dirty_mb={smaps.get('Private_Dirty', 0.0):.1f} "
+                    f"private_clean_mb={smaps.get('Private_Clean', 0.0):.1f} "
+                    f"shared_clean_mb={smaps.get('Shared_Clean', 0.0):.1f} "
+                    f"anonymous_mb={smaps.get('Anonymous', 0.0):.1f} "
+                    f"anon_huge_mb={smaps.get('AnonHugePages', 0.0):.1f} "
+                    f"swap_mb={smaps.get('Swap', 0.0):.1f}"
+                )
+
+        _log_tracemalloc_probe(loop_count=loop_count)
+
+        for cam in cams:
+            recorder = getattr(cam, "recorder", None)
+            rec_q = _safe_queue_size(getattr(recorder, "write_queue", None))
+            rec_buf = getattr(recorder, "buffer", [])
+            event_q = event_save_queues.get(getattr(cam, "ip", None), [])
+            alerted = getattr(cam, "alerted", {})
+            try:
+                alerted_marks = sum(len(v) for v in alerted.values())
+            except Exception:
+                alerted_marks = -1
+            handler_parts = []
+            for name, handler in getattr(cam, "handlers", {}).items():
+                parts = [str(name)]
+                sessions = getattr(handler, "sessions", None)
+                if sessions is not None:
+                    parts.append(f"sessions={_bounded_len(sessions)}")
+                red_tids = getattr(handler, "red_helmet_tids", None)
+                if red_tids is not None:
+                    parts.append(f"red_helmet_tids={_bounded_len(red_tids)}")
+                handler_parts.append(":".join(parts))
+
+            logger.info(
+                f"[MEM PROBE CAM] cam={getattr(cam, 'cam_id', '-')} ip={getattr(cam, 'ip', '-')} "
+                f"rec_q={rec_q} rec_buf={_bounded_len(rec_buf)}/{getattr(rec_buf, 'maxlen', '-')} "
+                f"recording={getattr(recorder, 'recording', '-')} "
+                f"event_q={_bounded_len(event_q)}/{getattr(event_q, 'maxlen', '-')} "
+                f"alerted_tids={_bounded_len(alerted)} alerted_marks={alerted_marks} "
+                f"handlers={','.join(handler_parts) if handler_parts else '-'}"
+            )
+    except Exception as e:
+        logger.warning(f"[MEM PROBE] failed | {e}")
+
 def record_api_send_state(ok, event_id="-"):
     with API_SEND_STATE_LOCK:
         failures = int(API_SEND_STATE.get("consecutive_failures", 0) or 0)
@@ -905,7 +1425,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         overlay = api_img.copy()
         cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
-        cv2.putText(api_img, "Signalman Auth [EVIDENCE]", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if not auth_tokens:
             cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -1029,7 +1549,7 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
                     continue
                 item = {
                     "box": [int(b) for b in o['box']],
-                    "label": str(o['label']),
+                    "label": event_type,
                     "score": round(float(o.get('score', 0.95)), 2)
                 }
                 if o.get('tid') is not None:
@@ -1094,7 +1614,8 @@ class YoLoDeepX:
             raise RuntimeError("dx_engine is not installed; YoLoDeepX can only run on a DeepX/NPU runtime.")
 
         self.engine_path = engine_path
-        self.output_format = self._resolve_output_format(output_format)
+        self.requested_output_format = str(output_format or "auto").strip().lower()
+        self.output_format = self._normalize_configured_output_format(output_format) or "yolo"
         self.pool_size = max(1, int(pool_size or 1))
         self.engine_pool = queue.Queue(maxsize=self.pool_size)
         self.engines_ref = []
@@ -1111,6 +1632,7 @@ class YoLoDeepX:
                 self.engines_ref.append(engine)
 
             self._load_input_shape(self.engines_ref[0])
+            self.output_format = self._resolve_output_format(output_format, self.engines_ref[0])
             logger.info(
                 f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)} "
                 f"(output={self.output_format}, pool={self.pool_size}, "
@@ -1136,17 +1658,155 @@ class YoLoDeepX:
                 pass
         self.engines_ref = []
 
-    def _resolve_output_format(self, output_format):
+    def _normalize_configured_output_format(self, output_format):
         fmt = str(output_format or "auto").strip().lower()
         if fmt in ["", "auto"]:
-            model_name = os.path.basename(str(self.engine_path or "")).lower()
-            return "ppu" if "_ppu" in model_name or "-ppu" in model_name else "yolo"
+            return None
         if fmt in ["ppu", "deepx_ppu", "yolov8_ppu"]:
             return "ppu"
         if fmt in ["yolo", "yolov8", "raw", "standard", "raw_yolo"]:
             return "yolo"
         logger.warning(f"[DeepX] 알 수 없는 모델 출력 포맷({output_format})입니다. yolo 후처리로 동작합니다.")
         return "yolo"
+
+    def _resolve_output_format(self, output_format, engine=None):
+        configured = self._normalize_configured_output_format(output_format)
+        if configured:
+            return configured
+
+        detected, detail = self._detect_output_format_from_engine(engine)
+        if detected:
+            logger.info(
+                f"[DeepX] output_format=auto detected {detected}: "
+                f"{os.path.basename(self.engine_path)} ({detail})"
+            )
+            return detected
+
+        fallback = self._detect_output_format_from_filename()
+        logger.warning(
+            f"[DeepX] output_format=auto could not inspect output tensors for "
+            f"{os.path.basename(self.engine_path)} ({detail or 'no metadata'}). "
+            f"Using filename fallback: {fallback}."
+        )
+        return fallback
+
+    def _detect_output_format_from_filename(self):
+        model_name = os.path.basename(str(self.engine_path or "")).lower()
+        return "ppu" if "_ppu" in model_name or "-ppu" in model_name else "yolo"
+
+    def _detect_output_format_from_engine(self, engine):
+        if engine is None:
+            return None, "engine unavailable"
+
+        info_reader = None
+        for method_name in ["get_output_tensors_info", "get_outputs_info", "get_output_tensor_info"]:
+            if hasattr(engine, method_name):
+                info_reader = getattr(engine, method_name)
+                break
+        if info_reader is None:
+            return None, "output tensor metadata API unavailable"
+
+        try:
+            output_info = info_reader()
+        except Exception as e:
+            return None, f"output tensor metadata read failed: {e}"
+
+        entries = self._tensor_info_entries(output_info)
+        if not entries:
+            return None, "empty output tensor metadata"
+
+        metadata_text = self._safe_json_text(entries).lower()
+        shapes = [shape for shape in (self._tensor_shape(entry) for entry in entries) if shape]
+        dtypes = [self._tensor_dtype(entry).lower() for entry in entries if self._tensor_dtype(entry)]
+        detail = f"shapes={shapes or '-'} dtypes={dtypes or '-'}"
+
+        if "ppu" in metadata_text or "postprocess" in metadata_text or "bbox" in metadata_text:
+            return "ppu", detail
+        if self._metadata_looks_raw_yolo(shapes, dtypes):
+            return "yolo", detail
+        if self._metadata_looks_ppu(shapes, dtypes):
+            return "ppu", detail
+
+        return None, detail
+
+    def _tensor_info_entries(self, value):
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            for key in ["outputs", "output", "tensors", "tensor_info"]:
+                nested = value.get(key)
+                if isinstance(nested, (list, tuple)):
+                    return list(nested)
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def _safe_json_text(self, value):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+
+    def _tensor_shape(self, entry):
+        shape = None
+        if isinstance(entry, dict):
+            for key in ["shape", "dims", "dimension", "tensor_shape"]:
+                if key in entry:
+                    shape = entry.get(key)
+                    break
+        else:
+            for key in ["shape", "dims", "dimension", "tensor_shape"]:
+                if hasattr(entry, key):
+                    shape = getattr(entry, key)
+                    break
+
+        if shape is None:
+            return []
+        try:
+            return [int(x) for x in list(shape)]
+        except Exception:
+            numbers = re.findall(r"-?\d+", str(shape))
+            return [int(x) for x in numbers]
+
+    def _tensor_dtype(self, entry):
+        if isinstance(entry, dict):
+            for key in ["dtype", "data_type", "type", "format"]:
+                if key in entry and entry.get(key) is not None:
+                    return str(entry.get(key))
+        else:
+            for key in ["dtype", "data_type", "type", "format"]:
+                if hasattr(entry, key):
+                    return str(getattr(entry, key))
+        return ""
+
+    def _shape_without_ones(self, shape):
+        return [int(x) for x in shape if int(x) > 1]
+
+    def _metadata_looks_raw_yolo(self, shapes, dtypes):
+        for shape in shapes:
+            dims = self._shape_without_ones(shape)
+            if len(dims) < 2:
+                continue
+            has_candidate_axis = max(dims) >= 1000
+            has_class_axis = any(5 <= dim <= 256 for dim in dims)
+            if has_candidate_axis and has_class_axis:
+                return True
+        return False
+
+    def _metadata_looks_ppu(self, shapes, dtypes):
+        has_byte_output = any(dtype in ["uint8", "byte", "bytes"] or "uint8" in dtype for dtype in dtypes)
+        if has_byte_output and any(self._shape_looks_ppu_rows(shape) for shape in shapes):
+            return True
+        return any(self._shape_looks_ppu_rows(shape) for shape in shapes) and not self._metadata_looks_raw_yolo(shapes, dtypes)
+
+    def _shape_looks_ppu_rows(self, shape):
+        dims = self._shape_without_ones(shape)
+        if not dims:
+            return False
+        if len(dims) == 1:
+            return dims[0] % 32 == 0 and dims[0] <= 65536
+        return dims[-1] in [6, 7, 8, 32] and max(dims) < 1000
 
     def _load_input_shape(self, engine):
         try:
@@ -1211,9 +1871,14 @@ class YoLoDeepX:
             if pred.ndim == 3:
                 pred = pred[0]
 
-            # Class-Id 및 Score 추출
-            scores = np.max(pred[:, 4:], axis=1)
-            class_ids = np.argmax(pred[:, 4:], axis=1)
+            class_scores = pred[:, 4:]
+            if class_scores.shape[1] == 1:
+                # Single-class YOLO heads expose one score column after xywh.
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
+            else:
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
 
             # Confidence 필터링
             mask = scores > conf_thres
@@ -1715,12 +2380,6 @@ class ParkingDetector(BaseEventDetector):
                             'triggered': False
                         })
                     else:
-                        self.states[tid].update({
-                            'bbox': t[:4],
-                            'frame': frame.copy() if frame is not None else None,
-                            'fid': fid
-                        })
-
                         duration_sec = current_time - self.states[tid]['start_time']
 
                         if not self.states[tid].get('triggered', False) and duration_sec >= self.trigger_sec:
@@ -2108,6 +2767,9 @@ class HelmetDetector(BaseEventDetector):
                     'objects': [
                         # [수정] 사람(Person) BBox를 페이로드에서 제외하고, 미착용 머리 객체만 전송
                         {'label': 'no_helmet', 'box': [int(x) for x in nh_track_match[:4]], 'score': float(nh_track_match[5]), 'tid': int(nh_track_match[4]), 'class_id': ID_H_NO_HELMET}
+                    ],
+                    'privacy_objects': [
+                        {'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid, 'class_id': ID_G_PERSON}
                     ]
                 })
 
@@ -2131,9 +2793,9 @@ class HelmetDetector(BaseEventDetector):
                 matched_session['last_tid'] = nh_p['tid']
                 matched_session['last_person_bbox'] = nh_p['person_bbox']
                 matched_session['bbox'] = nh_p['head_bbox']
-                matched_session['frame'] = frame.copy() if frame is not None else None
                 matched_session['fid'] = fid
                 matched_session['objects'] = nh_p['objects']
+                matched_session['privacy_objects'] = nh_p.get('privacy_objects', [])
                 matched_session['decision_context'] = nh_p.get('decision_context', {})
 
                 if roi_crop is not None:
@@ -2150,11 +2812,11 @@ class HelmetDetector(BaseEventDetector):
                     'last_tid': nh_p['tid'],
                     'last_person_bbox': nh_p['person_bbox'],
                     'bbox': nh_p['head_bbox'],
-                    'frame': frame.copy() if frame is not None else None,
                     'fid': fid,
                     'triggered': False,
                     'roi_buffer': new_buffer,
                     'objects': nh_p['objects'],
+                    'privacy_objects': nh_p.get('privacy_objects', []),
                     'decision_context': nh_p.get('decision_context', {})
                 })
 
@@ -2181,9 +2843,10 @@ class HelmetDetector(BaseEventDetector):
                     triggered.append({
                         'tid': session['last_tid'],
                         'bbox': session['bbox'],
-                        'frame': session['frame'],
+                        'frame': frame.copy() if frame is not None else None,
                         'fid': session['fid'],
                         'objects': session['objects'],
+                        'privacy_objects': session.get('privacy_objects', []),
                         'decision_trace': {
                             'detector': 'HelmetDetector',
                             'reason': 'no_helmet_duration_exceeded',
@@ -2858,6 +3521,21 @@ class ROIAlignLearningStore:
         def write_one_csv(target_path):
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
+            if exists:
+                try:
+                    with open(target_path, "r", newline="", encoding="utf-8") as f:
+                        header_line = f.readline()
+                    current_header = next(csv.reader([header_line])) if header_line else []
+                    if current_header != fieldnames:
+                        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        backup_path = f"{target_path}.bak_header_{stamp}"
+                        os.replace(target_path, backup_path)
+                        logger.info(
+                            f"[ROI DRIFT] CSV header changed; old log moved to {backup_path}"
+                        )
+                        exists = False
+                except Exception as e:
+                    logger.warning(f"[ROI DRIFT] CSV header check failed: {e}")
             with open(target_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not exists:
@@ -3143,8 +3821,23 @@ class FrameReader:
         except Exception:
             return 10.0
 
+    def _decode_verbose_logs(self):
+        value = self.decode_cfg.get("verbose_logs", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _gstreamer_frame_read_timeout(self):
+        try:
+            return max(1.0, float(self.decode_cfg.get("gstreamer_frame_read_timeout_sec", 10.0)))
+        except Exception:
+            return 10.0
+
     def _emit_decode_log(self, message, level="info"):
-        log_fn = getattr(logger, level, logger.info)
+        effective_level = level
+        if str(level).lower() == "info" and not self._decode_verbose_logs():
+            effective_level = "debug"
+        log_fn = getattr(logger, effective_level, logger.info)
         log_fn(message)
 
     def _emit_gst_check_once(self, message, level="info"):
@@ -3153,8 +3846,132 @@ class FrameReader:
         self._gst_check_logged = True
         self._emit_decode_log(message, level=level)
 
+    def _use_decode_process_group(self):
+        return sys.platform.startswith("linux")
+
+    def _decode_popen_kwargs(self, use_process_group):
+        if use_process_group:
+            return {"start_new_session": True}
+        return {}
+
+    def _send_decode_process_signal(self, proc, sig, use_process_group):
+        if use_process_group:
+            os.killpg(proc.pid, sig)
+            return
+        if sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+
+    def _terminate_decode_process(self, proc, label, use_process_group=False):
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                proc.wait(timeout=0.1)
+                return
+        except Exception:
+            pass
+
+        try:
+            self._send_decode_process_signal(proc, signal.SIGTERM, use_process_group)
+            proc.wait(timeout=2.0)
+            return
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as e:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} terminate failed: {e}",
+                level="debug"
+            )
+
+        try:
+            self._send_decode_process_signal(proc, signal.SIGKILL, use_process_group)
+            proc.wait(timeout=2.0)
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill wait timed out pid={getattr(proc, 'pid', '-')}",
+                level="warning"
+            )
+        except Exception as e:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill failed: {e}",
+                level="debug"
+            )
+
+    def _read_gstreamer_frame(self, proc, frame_size, timeout_sec):
+        if proc is None or proc.stdout is None:
+            return b""
+        fd = proc.stdout.fileno()
+        deadline = time.monotonic() + timeout_sec
+        chunks = bytearray()
+
+        while len(chunks) < frame_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"gstreamer_frame_read_timeout_{timeout_sec:g}s")
+
+            ready, _, _ = select.select([fd], [], [], min(1.0, remaining))
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            chunk = os.read(fd, frame_size - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+
+        return bytes(chunks)
+
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
+
+    def _short_external_output(self, text, limit=800):
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        text = self._mask_pipeline_text(str(text or "").strip())
+        text = re.sub(r"\s+", " ", text)
+        if len(text) > limit:
+            return text[:limit] + "..."
+        return text
+
+    def _ensure_clean_url(self, context):
+        clean_url = sanitize_camera_url(self.url)
+        if clean_url != self.url:
+            logger.warning(
+                f"[CAM:{self.ip}] {context} sanitized runtime stream URL: "
+                f"{self._mask_pipeline_text(repr(self.url))} -> "
+                f"{self._mask_pipeline_text(repr(clean_url))}"
+            )
+            self.url = clean_url
+        return self.url
+
+    def _drain_binary_log_pipe(self, pipe, line_buffer):
+        try:
+            for raw_line in iter(pipe.readline, b""):
+                line = self._short_external_output(raw_line)
+                if line:
+                    line_buffer.append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    def _emit_buffered_stderr(self, label, line_buffer):
+        if not line_buffer:
+            return
+        self._emit_decode_log(
+            f"[{label} STDERR] CAM:{self.ip} {' | '.join(line_buffer)}",
+            level="warning"
+        )
 
     def _cmd_text(self, cmd):
         return self._mask_pipeline_text(" ".join(str(part) for part in cmd))
@@ -3194,7 +4011,8 @@ class FrameReader:
             f"[DECODE FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
             f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
             f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
-            f"restarts={self._decode_restarts} connected={self.connected}"
+            f"restarts={self._decode_restarts} connected={self.connected}",
+            level="debug"
         )
         self._decode_window_frames = 0
         self._decode_window_bytes = 0
@@ -3284,20 +4102,36 @@ class FrameReader:
         return True
 
     def _probe_stream_info(self):
+        probe_url = self._ensure_clean_url("ffprobe")
         cmd = ["ffprobe", "-v", "error"]
-        if self.url.lower().startswith("rtsp://"):
+        if probe_url.lower().startswith("rtsp://"):
             cmd.extend(["-rtsp_transport", "tcp", "-stimeout", "3000000"])
         cmd.extend([
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height,codec_name",
             "-of", "json",
-            self.url,
+            probe_url,
         ])
 
         try:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=8, text=True).strip()
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+                text=True
+            )
+            out = (result.stdout or "").strip()
+            err = (result.stderr or "").strip()
         except Exception as e:
             logger.warning(f"[CAM:{self.ip}] ffprobe stream info failed: {e}")
+            return None
+
+        if result.returncode != 0:
+            logger.warning(
+                f"[CAM:{self.ip}] ffprobe stream info failed: rc={result.returncode} "
+                f"stderr={self._short_external_output(err)} stdout={self._short_external_output(out)}"
+            )
             return None
 
         try:
@@ -3311,9 +4145,15 @@ class FrameReader:
             if width > 0 and height > 0:
                 return width, height, codec
         except Exception as e:
-            logger.warning(f"[CAM:{self.ip}] ffprobe stream info parse failed: {e}")
+            logger.warning(
+                f"[CAM:{self.ip}] ffprobe stream info parse failed: {e} "
+                f"stdout={self._short_external_output(out)} stderr={self._short_external_output(err)}"
+            )
 
-        logger.warning(f"[CAM:{self.ip}] ffprobe returned no usable video info: {out}")
+        logger.warning(
+            f"[CAM:{self.ip}] ffprobe returned no usable video info: "
+            f"stdout={self._short_external_output(out)} stderr={self._short_external_output(err)}"
+        )
         return None
 
     def _probe_stream_shape(self):
@@ -3399,6 +4239,7 @@ class FrameReader:
         out_w, out_h = self._scaled_output_shape(in_w, in_h)
         frame_size = out_w * out_h * 3
         fps_limit = self._decode_fps_limit()
+        frame_read_timeout_sec = self._gstreamer_frame_read_timeout()
         decoder_info = self._select_gstreamer_decoder(codec)
         if decoder_info is None:
             self._note_decode_failure(f"gstreamer_unsupported_codec_{codec or 'unknown'}")
@@ -3407,6 +4248,17 @@ class FrameReader:
         depay, parser, decoder, decoder_kind = decoder_info
         latency_ms = int(self.decode_cfg.get("gstreamer_latency_ms", 50) or 50)
         protocols = str(self.decode_cfg.get("gstreamer_protocols", "tcp") or "tcp").strip().lower()
+        try:
+            tcp_timeout_us = int(self.decode_cfg.get("gstreamer_tcp_timeout_us", 3000000))
+        except Exception:
+            tcp_timeout_us = 3000000
+        tcp_timeout_us = max(0, tcp_timeout_us)
+        drop_on_latency = self.decode_cfg.get("gstreamer_drop_on_latency", True)
+        if isinstance(drop_on_latency, str):
+            drop_on_latency = drop_on_latency.strip().lower() not in ("0", "false", "no", "off")
+        else:
+            drop_on_latency = bool(drop_on_latency)
+        drop_on_latency_text = "true" if drop_on_latency else "false"
         self._emit_decode_log(
             f"[GSTREAMER SELECT] CAM:{self.ip} codec={codec or '-'} "
             f"decoder={decoder} decoder_kind={decoder_kind} fps_limit={fps_limit or '-'}"
@@ -3421,7 +4273,7 @@ class FrameReader:
         cmd = [
             "gst-launch-1.0", "-q",
             "rtspsrc", f"location={self.url}", f"protocols={protocols}",
-            f"latency={latency_ms}", "drop-on-latency=true", "tcp-timeout=3000000",
+            f"latency={latency_ms}", f"drop-on-latency={drop_on_latency_text}", f"tcp-timeout={tcp_timeout_us}",
             "!", depay,
             "!", parser,
             "!", decoder,
@@ -3438,9 +4290,28 @@ class FrameReader:
             env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
 
         proc = None
+        gst_failed = False
+        gst_stderr_lines = deque(maxlen=30)
+        gst_stderr_thread = None
+        use_process_group = self._use_decode_process_group()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                bufsize=frame_size * 2,
+                **self._decode_popen_kwargs(use_process_group)
+            )
+            if proc.stderr is not None:
+                gst_stderr_thread = threading.Thread(
+                    target=self._drain_binary_log_pipe,
+                    args=(proc.stderr, gst_stderr_lines),
+                    daemon=True
+                )
+                gst_stderr_thread.start()
             if proc.stdout is None:
+                gst_failed = True
                 return False
 
             self.connected = True
@@ -3451,8 +4322,9 @@ class FrameReader:
                 cmd=cmd,
                 extra=(
                     f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
-                    f"latency_ms={latency_ms} protocols={protocols} fps_limit={fps_limit or '-'} "
-                    f"frame_bytes={frame_size}"
+                    f"latency_ms={latency_ms} protocols={protocols} tcp_timeout_us={tcp_timeout_us} "
+                    f"drop_on_latency={drop_on_latency_text} fps_limit={fps_limit or '-'} "
+                    f"frame_bytes={frame_size} frame_read_timeout_sec={frame_read_timeout_sec:g}"
                 )
             )
             self._decode_mode_logged = True
@@ -3462,11 +4334,19 @@ class FrameReader:
             while self.running:
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
                     self._note_decode_failure(f"gstreamer_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
+                    gst_failed = True
                     break
 
-                raw = proc.stdout.read(frame_size)
+                try:
+                    raw = self._read_gstreamer_frame(proc, frame_size, frame_read_timeout_sec)
+                except TimeoutError as e:
+                    self._note_decode_failure(str(e), level="error")
+                    gst_failed = True
+                    break
+
                 if len(raw) != frame_size:
                     self._note_decode_failure(f"gstreamer_short_read_{len(raw)}_of_{frame_size}", level="error")
+                    gst_failed = True
                     break
 
                 fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
@@ -3484,19 +4364,19 @@ class FrameReader:
 
             return True
         except Exception as e:
+            gst_failed = True
             logger.warning(f"[CAM:{self.ip}] GStreamer pipe failed: {e}")
             return False
         finally:
             self.connected = False
-            if proc is not None:
+            self._terminate_decode_process(proc, "gstreamer_pipe", use_process_group=use_process_group)
+            if gst_stderr_thread is not None:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
+                    gst_stderr_thread.join(timeout=0.2)
                 except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                    pass
+            if gst_failed:
+                self._emit_buffered_stderr("GSTREAMER", gst_stderr_lines)
 
     def _run_ffmpeg_vaapi_pipe(self):
         shape = self._probe_stream_shape()
@@ -3530,8 +4410,16 @@ class FrameReader:
             env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
 
         proc = None
+        use_process_group = self._use_decode_process_group()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                bufsize=frame_size * 2,
+                **self._decode_popen_kwargs(use_process_group)
+            )
             if proc.stdout is None:
                 return False
 
@@ -3569,15 +4457,7 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            self._terminate_decode_process(proc, "ffmpeg_vaapi_pipe", use_process_group=use_process_group)
 
     def _run(self):
         while self.running:
@@ -3918,6 +4798,37 @@ class Camera:
                 f"GRID {decision_name} suspect={suspect_count}/{confirm_required} "
                 f"moving={n_mov}/{n_meas} consistent={consistent}/{consistent_quorum}"
             )
+
+        # [화각 변경 → 관제센터 빨간불] confirm(suspect>=3)이 유지되는 동안, 검사 주기(300초)마다
+        #   /cctv/roi/img 로 isReqRoiSetup=True + 현재 스냅샷을 전송한다.
+        #   관제센터가 관리자 설정 ROI를 health 응답(roiSettings)으로 내려주면
+        #   HealthCheckDaemon._apply_roi_settings_from_response → update_config →
+        #   _reset_alignment_state 에서 align_shifted=False 가 되어 전송이 자동으로 멈춘다.
+        if self.align_shifted:
+            try:
+                snap_img = create_roi_snapshot(self, frame)
+                if snap_img is not None:
+                    _sh, _sw = snap_img.shape[:2]
+                    roi_info = {
+                        "roi_poly_norm": self.roi_poly_norm,
+                        "roi_lines_norm": self.roi_lines_norm,
+                        "roi_change_poly_norm": []  # 폐기 필드. 관제 서버 호환용 빈 배열.
+                    }
+                    IMAGE_SAVER_POOL.submit(
+                        _send_roi_snapshot_task,
+                        self.cam_id,
+                        SYS_CFG.get("terminal_id", "99999"),
+                        snap_img,
+                        json.dumps(roi_info),
+                        _sw, _sh,
+                        True  # is_req_roi_setup
+                    )
+                    logger.info(
+                        f"[CAM:{self.cam_id}] ROI 재설정 요청 전송(queued) isReqRoiSetup=True "
+                        f"suspect={suspect_count}"
+                    )
+            except Exception as e:
+                logger.error(f"[CAM:{self.cam_id}] ROI 재설정 요청 전송 실패: {e}")
 
         csv_row = {
             "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
@@ -4261,6 +5172,8 @@ class Camera:
         current_alarms = {}
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
         score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
+        track_map_helmet = {int(t[4]): int(t[6]) for t in t_helmet}
+        score_map_helmet = {int(t[4]): round(float(t[5]), 2) for t in t_helmet}
         newly_triggered_events = []
 
         # Recording currently uses the original frame in the main loop.
@@ -4270,13 +5183,22 @@ class Camera:
         for ename, handler in self.handlers.items():
             if ename == "no_helmet":
                 kwargs = {'helmet_tracks': t_helmet}
+                handler_tracks = t_helmet
+                handler_track_map = track_map_helmet
+                handler_score_map = score_map_helmet
             elif ename == "signal_vehicle":
                 kwargs = {'signalman_tracks': t_signalman}
+                handler_tracks = t_main
+                handler_track_map = track_map_main
+                handler_score_map = score_map_main
             else:
                 kwargs = {}
+                handler_tracks = t_main
+                handler_track_map = track_map_main
+                handler_score_map = score_map_main
 
             try:
-                triggered = handler.process(t_main, track_map_main, motion_mask, fr, fid, **kwargs)
+                triggered = handler.process(handler_tracks, handler_track_map, motion_mask, fr, fid, **kwargs)
             except Exception as e:
                 logger.error(f"?? [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
@@ -4287,9 +5209,10 @@ class Camera:
                 ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
                 cooldown = SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 600)
 
-                actual_score = score_map_main.get(tid, 0.95)
+                actual_score = handler_score_map.get(tid, score_map_main.get(tid, 0.95))
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
-                event_privacy_tracks = self._privacy_tracks_from_event_objects(objects_meta)
+                privacy_source_objects = ev.get('privacy_objects', objects_meta)
+                event_privacy_tracks = self._privacy_tracks_from_event_objects(privacy_source_objects)
                 privacy_reference_tracks = event_privacy_tracks if event_privacy_tracks else t_main
                 decision_trace = to_json_safe(ev.get('decision_trace', {
                     'detector': handler.__class__.__name__,
@@ -4494,17 +5417,29 @@ class Camera:
         if "no_helmet" in self.events:
             for t in t_helmet:
                 tid = int(t[4])
-                cls_id = int(t[6]) # 0: Helmet, 1: No-Helmet
+                cls_id = int(t[6]) # Helmet model classes can include helmet/head/person.
 
                 # [수정] 헬멧 착용 여부에 따라 라벨과 색상을 명확히 분리
                 if cls_id == ID_H_HELMET:
                     color = (0, 255, 0) # 초록색
                     label = f"Helmet [{tid}]"
                     thickness = 2
-                else:
+                elif cls_id == ID_H_NO_HELMET:
                     color = (0, 0, 255) # 빨간색
                     label = f"Head [{tid}]"
                     thickness = 3 if tid in alarms else 2
+                elif cls_id == ID_G_PERSON:
+                    color = (0, 255, 0)
+                    label = f"Person(H) [{tid}]"
+                    thickness = 2
+                elif cls_id == ID_PERSON_LOW:
+                    color = (0, 150, 0)
+                    label = f"LowBody(H) [{tid}]"
+                    thickness = 2
+                else:
+                    color = (0, 165, 255)
+                    label = f"HelmetObj {cls_id} [{tid}]"
+                    thickness = 2
 
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
                 cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -4689,6 +5624,8 @@ class HealthCheckDaemon:
         return True
 
     def _should_send_roi_setup_required(self):
+        if not bool(SYS_CFG.get("ROI_SETUP_REQUIRED_API_ENABLED", False)):
+            return False
         with self._roi_setup_required_lock:
             return bool(self._roi_setup_required_pending)
 
@@ -4841,6 +5778,17 @@ class HealthCheckDaemon:
                 return cam
         return None
 
+    @staticmethod
+    def _file_sha256(path):
+        if not path or not os.path.exists(path):
+            return None
+
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     def _apply_roi_settings_from_response(self, response_payload):
         if not isinstance(response_payload, dict):
             return []
@@ -4857,7 +5805,7 @@ class HealthCheckDaemon:
             logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
             return []
 
-        handled_cctv_ids = []
+        changed_cctv_ids = []
         changed = False
         runtime_updates = []
 
@@ -4875,6 +5823,12 @@ class HealthCheckDaemon:
             if not isinstance(camera_configs, dict):
                 logger.error("[Health Check] cameras config is not an object; ROI update skipped")
                 return []
+
+            try:
+                before_config_hash = self._file_sha256(self.config_file)
+            except Exception as e:
+                logger.warning(f"[Health Check] failed to hash cameras config before ROI update: {e}")
+                before_config_hash = None
 
             for item in roi_settings:
                 if not isinstance(item, dict):
@@ -4920,8 +5874,8 @@ class HealthCheckDaemon:
                         new_conf[key] = value
                         item_changed = True
 
-                handled_cctv_ids.append(str(cam.cam_id))
                 if item_changed:
+                    changed_cctv_ids.append(str(cam.cam_id))
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     changed = True
@@ -4941,6 +5895,26 @@ class HealthCheckDaemon:
                     logger.error(f"[Health Check] failed to write cameras config for ROI update: {e}")
                     return []
 
+                try:
+                    after_config_hash = self._file_sha256(self.config_file)
+                except Exception as e:
+                    logger.warning(f"[Health Check] failed to hash cameras config after ROI update: {e}")
+                    after_config_hash = None
+
+                if before_config_hash == after_config_hash:
+                    logger.warning(
+                        "[Health Check] ROI settings write did not change cameras config hash; "
+                        "setup request remains pending"
+                    )
+                    return []
+
+                before_short = before_config_hash[:12] if before_config_hash else "-"
+                after_short = after_config_hash[:12] if after_config_hash else "-"
+                logger.info(
+                    f"[Health Check] ROI settings config changed: "
+                    f"hash={before_short}->{after_short} cctvIds={','.join(changed_cctv_ids)}"
+                )
+
         for cam, new_conf, roi_updates in runtime_updates:
             try:
                 cam.update_config(new_conf)
@@ -4953,7 +5927,7 @@ class HealthCheckDaemon:
             except Exception as e:
                 logger.error(f"[Health Check] runtime ROI update failed: cctvId={cam.cam_id} error={e}")
 
-        return handled_cctv_ids
+        return changed_cctv_ids
 
     def _run(self):
         while self.running:
@@ -5006,7 +5980,7 @@ class HealthCheckDaemon:
                             reason="roi_settings_applied_from_health_response"
                         )
 
-                    logger.debug(
+                    logger.info(
                         f"?? [Health Check] 전송 성공 "
                         f"(CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%, "
                         f"ROI_SETUP: {data['isRoiSetupRequired']})"
@@ -5036,6 +6010,12 @@ class HealthCheckDaemon:
 HEALTH_DAEMON = None
 
 def request_terminal_roi_setup_required(reason=""):
+    if not bool(SYS_CFG.get("ROI_SETUP_REQUIRED_API_ENABLED", False)):
+        logger.info(
+            f"[Health Check] ROI setup required flag suppressed by config | "
+            f"reason={reason or 'unspecified'}"
+        )
+        return False
     if HEALTH_DAEMON is None:
         logger.warning(f"[Health Check] ROI setup required could not be flagged because daemon is not ready | reason={reason or 'unspecified'}")
         return False
@@ -5066,9 +6046,12 @@ def clear_terminal_roi_snapshot_refresh(cctv_ids=None, reason=""):
         return False
 
 def main():
+    global DEBUG_MODE, SYS_CFG, BATCH_SIZE
+
     # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
     parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
+    parser.add_argument('--configure-startup', action='store_true', help="시작 영상/하드웨어 가속/모델 선택을 다시 실행하고 system_config.json에 저장합니다.")
     args = parser.parse_args()
 
     is_gui_mode = args.gui
@@ -5078,8 +6061,9 @@ def main():
     else:
         logger.info("[시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)")
 
-    global DEBUG_MODE
     logger.info("[System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료")
+
+    ensure_startup_runtime_config(force=args.configure_startup)
 
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
     if not rtsp_list:
@@ -5133,6 +6117,7 @@ def main():
     inference_mode = str(SYS_CFG.get("INFERENCE_MODE", "auto")).strip().lower()
     event_inference_mode = "main"
     main_model_path = resolve_model_path(models_cfg.get("MAIN", "hanjin_cctv_v2.dxnn"))
+    main_pool_size = get_main_model_engine_pool_size(main_model_path)
 
     if not os.path.exists(main_model_path):
         logger.error(f"MAIN model file not found: {main_model_path}")
@@ -5144,11 +6129,11 @@ def main():
         logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
 
         # 이벤트 판단용 기본 객체와 신호수는 MAIN 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
-        # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 기존 전용 helmet_3cls_v8 모델 결과를 다시 사용합니다.
+        # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 전용 HELMET 모델 결과를 사용합니다.
         d_main = YoLoDeepX(
             main_model_path,
             output_format=get_main_model_output_format(main_model_path),
-            pool_size=max(3, get_model_engine_pool_size("MAIN"))
+            pool_size=main_pool_size
         )
         d_helmet = YoLoDeepX(
             resolve_model_path(models_cfg["HELMET"]),
@@ -5238,8 +6223,40 @@ def main():
     )
     logger.info(
         f"[MODEL CONFIG] main={main_model_path} helmet={resolve_model_path(models_cfg.get('HELMET', '-'))} "
-        f"face={resolve_model_path(models_cfg.get('FACE', '-'))} plate={resolve_model_path(models_cfg.get('PLATE', '-'))}"
+        f"face={resolve_model_path(models_cfg.get('FACE', '-'))} plate={resolve_model_path(models_cfg.get('PLATE', '-'))} "
+        f"pools={json.dumps(SYS_CFG.get('model_engine_pool_sizes', {}), ensure_ascii=False)} main_effective_pool={main_pool_size}"
     )
+    if MEMORY_PROBE_DECODE_ONLY:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_DECODE_ONLY=1: running decode/process_frame only; "
+            "inference, event logic, recorder update, and event frame buffering are skipped."
+        )
+    if MEMORY_PROBE_INFERENCE_REUSE_FRAME:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_INFERENCE_REUSE_FRAME=1: caching one frame per camera, "
+            "stopping RTSP readers, and running inference only; event logic, recorder update, "
+            "ROI snapshots, and event frame buffering are skipped."
+        )
+    if MEMORY_PROBE_KEEP_EXECUTOR:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_KEEP_EXECUTOR=1: reusing one inference executor "
+            "instead of creating and shutting it down every loop."
+        )
+    if MEMORY_PROBE_EXECUTOR_ONLY:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_EXECUTOR_ONLY=1: submitting executor tasks only; "
+            "DeepX inference is skipped."
+        )
+    if MEMORY_PROBE_SKIP_RECORDER_UPDATE:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_SKIP_RECORDER_UPDATE=1: normal decode and inference run, "
+            "but recorder.update/prebuffer writes are skipped."
+        )
+    if MEMORY_PROBE_SKIP_EVENT_LOGIC:
+        logger.warning(
+            "[MEM EXPERIMENT] HAI_MEM_PROBE_SKIP_EVENT_LOGIC=1: normal decode and inference run, "
+            "but camera run_logic/event tracking is skipped."
+        )
     log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
     global HEALTH_DAEMON
     health_daemon = HealthCheckDaemon(
@@ -5290,23 +6307,98 @@ def main():
     run_output_retention_cleanup(output_retention_days)
 
     def run_camera_inference(cam, fr):
-        active_detection_events = [evt for evt in cam.events if evt != ROI_CHANGE_EVENT]
-        base_conf = min(main_conf, person_conf, signalman_conf)
-        raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
-        t_main_input, _, d_signalman_res = split_unified_event_detections(
-            raw_dets,
-            active_detection_events,
-            main_conf=main_conf,
-            person_conf=person_conf,
-            helmet_conf=helmet_conf,
-            signalman_conf=signalman_conf
-        )
+        active_detection_events = [
+            evt for evt in cam.events
+            if evt not in ("no_helmet", ROI_CHANGE_EVENT)
+        ]
+        t_main_input = np.empty((0, 6))
+        d_signalman_res = np.empty((0, 6))
+
+        if active_detection_events:
+            base_conf = min(main_conf, person_conf, signalman_conf)
+            raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
+            t_main_input, _, d_signalman_res = split_unified_event_detections(
+                raw_dets,
+                active_detection_events,
+                main_conf=main_conf,
+                person_conf=person_conf,
+                helmet_conf=helmet_conf,
+                signalman_conf=signalman_conf
+            )
 
         d_helmet_res = np.empty((0, 6))
         if "no_helmet" in cam.events:
             d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
 
         return t_main_input, d_helmet_res, d_signalman_res
+
+    def build_memory_probe_reuse_raw_data(timeout_sec=15.0):
+        cached = [None for _ in cams]
+        deadline = time.time() + timeout_sec
+
+        while time.time() < deadline:
+            for idx, cam in enumerate(cams):
+                if cached[idx] is not None:
+                    continue
+                fr, fid, connected = cam.process_frame()
+                if fr is not None:
+                    cached[idx] = (fr.copy(), int(fid or 1), True)
+
+            if all(item is not None for item in cached):
+                break
+            time.sleep(0.2)
+
+        reuse_raw_data = []
+        blank_count = 0
+        for idx, cam in enumerate(cams):
+            item = cached[idx]
+            if item is None:
+                fr = np.zeros((405, 720, 3), dtype=np.uint8)
+                fid = 1
+                blank_count += 1
+            else:
+                fr, fid, _ = item
+
+            try:
+                cam._initialize_base_roi_if_needed(fr)
+            except Exception as e:
+                logger.warning(f"[MEM EXPERIMENT] reuse-frame ROI init failed cam={cam.cam_id} ip={cam.ip}: {e}")
+
+            reader = getattr(cam, "reader", None)
+            if reader is not None:
+                reader.running = False
+                reader.connected = False
+
+            reuse_raw_data.append((fr, max(1, int(fid or 1)), True))
+
+        logger.warning(
+            f"[MEM EXPERIMENT] inference reuse frames prepared: "
+            f"cached={len(reuse_raw_data) - blank_count} blank={blank_count} readers_stopped={len(reuse_raw_data)}"
+        )
+        return reuse_raw_data
+
+    memory_probe_reuse_raw_data = (
+        build_memory_probe_reuse_raw_data()
+        if MEMORY_PROBE_INFERENCE_REUSE_FRAME
+        else None
+    )
+    memory_probe_persistent_executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+        if MEMORY_PROBE_INFERENCE_REUSE_FRAME and MEMORY_PROBE_KEEP_EXECUTOR
+        else None
+    )
+    main_inference_executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+        if not MEMORY_PROBE_INFERENCE_REUSE_FRAME
+        else None
+    )
+    if main_inference_executor is not None:
+        logger.info(
+            f"[INFERENCE EXECUTOR] persistent executor started max_workers={max(1, len(cams))}"
+        )
+
+    def memory_probe_executor_noop(cam_index, fid):
+        return cam_index, fid
 
     last_roi_snapshot_time = time.time() - 3590.0  # 시작 후 10초 뒤 첫 전송
     ROI_SNAPSHOT_INTERVAL_SEC = 3600.0  # 1시간 주기
@@ -5339,6 +6431,7 @@ def main():
                         logger.error(f"핫 리로드 중 예외 발생: {e}")
 
             loop_count += 1
+            mem_stage_due = (loop_count % 300 == 0)
 
             if loop_count % fps_calc_interval == 0:
                 current_time = time.time()
@@ -5355,7 +6448,7 @@ def main():
                 dynamic_delay = 1.0 / target_fps
 
                 if DEBUG_MODE:
-                    logger.debug(f"?? [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
+                    logger.info(f"?? [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
 
                 last_fps_time = current_time
 
@@ -5364,11 +6457,66 @@ def main():
                 mem_usage = psutil.virtual_memory().percent
                 q_size = IMAGE_SAVER_POOL._work_queue.qsize() if hasattr(IMAGE_SAVER_POOL, '_work_queue') else 0
                 log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
+                log_memory_probe(cams, event_save_queues, cpu_usage=cpu_usage, loop_count=loop_count)
 
                 if mem_usage > 80 or q_size > 20:
                     logger.warning(f"?? [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
 
-            raw_data = [c.process_frame() for c in cams]
+            if mem_stage_due:
+                log_memory_stage("before_process_frame", loop_count, cams=cams, event_save_queues=event_save_queues)
+            if MEMORY_PROBE_INFERENCE_REUSE_FRAME and memory_probe_reuse_raw_data is not None:
+                raw_data = [
+                    (fr, fid + loop_count, connected)
+                    for fr, fid, connected in memory_probe_reuse_raw_data
+                ]
+            else:
+                raw_data = [c.process_frame() for c in cams]
+            if mem_stage_due:
+                log_memory_stage("after_process_frame", loop_count, cams=cams, event_save_queues=event_save_queues)
+            if MEMORY_PROBE_DECODE_ONLY:
+                if mem_stage_due:
+                    log_memory_stage("decode_only_continue", loop_count, cams=cams, event_save_queues=event_save_queues)
+                sleep_time = dynamic_delay - (time.time() - start_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
+            if MEMORY_PROBE_INFERENCE_REUSE_FRAME:
+                inference_executor = memory_probe_persistent_executor
+                if inference_executor is None:
+                    inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+                inference_futures = {}
+                for idx, res in enumerate(raw_data):
+                    fr, fid, connected = res
+                    if connected and fr is not None and cams[idx].events:
+                        if MEMORY_PROBE_EXECUTOR_ONLY:
+                            inference_futures[idx] = inference_executor.submit(memory_probe_executor_noop, idx, fid)
+                        else:
+                            inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
+                if mem_stage_due:
+                    submit_stage = "after_executor_submit" if MEMORY_PROBE_EXECUTOR_ONLY else "after_inference_submit"
+                    log_memory_stage(submit_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
+
+                for idx, future in inference_futures.items():
+                    try:
+                        future.result()
+                    except Exception as e:
+                        mode_name = "executor_only" if MEMORY_PROBE_EXECUTOR_ONLY else "inference_reuse_frame"
+                        logger.error(
+                            f"[INFERENCE ERROR] cam={cams[idx].cam_id} ip={cams[idx].ip} "
+                            f"mode={mode_name} | {e}\n{traceback.format_exc()}"
+                        )
+                if mem_stage_due:
+                    result_stage = "after_executor_results" if MEMORY_PROBE_EXECUTOR_ONLY else "after_inference_results"
+                    log_memory_stage(result_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
+                if memory_probe_persistent_executor is None:
+                    inference_executor.shutdown(wait=True)
+                if mem_stage_due:
+                    executor_stage = "after_executor_reuse" if memory_probe_persistent_executor is not None else "after_executor_shutdown"
+                    log_memory_stage(executor_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
+                sleep_time = dynamic_delay - (time.time() - start_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
 
             final_imgs = []
 
@@ -5386,6 +6534,7 @@ def main():
 
                     fr, fid, connected = raw_data[idx]
                     if connected and fr is not None:
+                        c._initialize_base_roi_if_needed(fr)
                         snap_img = create_roi_snapshot(c, fr)
                         if snap_img is None:
                             continue
@@ -5397,7 +6546,8 @@ def main():
                         }
                         IMAGE_SAVER_POOL.submit(
                             _send_roi_snapshot_task,
-                            c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h
+                            c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h,
+                            bool(getattr(c, "align_shifted", False))  # 틀어짐 진행중이면 isReqRoiSetup=True 유지
                         )
                         roi_snapshot_queued = True
                         if force_camera_snapshot:
@@ -5410,12 +6560,19 @@ def main():
                         reason="roi_snapshot_sent"
                     )
 
-            inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
+            if mem_stage_due:
+                log_memory_stage("after_roi_snapshot", loop_count, cams=cams, event_save_queues=event_save_queues)
+
+            inference_executor = main_inference_executor
+            if inference_executor is None:
+                inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
             inference_futures = {}
             for idx, res in enumerate(raw_data):
                 fr, _, connected = res
                 if connected and fr is not None and cams[idx].events:
                     inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
+            if mem_stage_due:
+                log_memory_stage("after_inference_submit", loop_count, cams=cams, event_save_queues=event_save_queues)
 
             for idx, res in enumerate(raw_data):
                 fr, fid, connected = res
@@ -5459,7 +6616,16 @@ def main():
                     continue
 
                 # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
-                t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                if MEMORY_PROBE_SKIP_EVENT_LOGIC:
+                    t_main = []
+                    t_helmet = []
+                    t_signalman = []
+                    alarms = {}
+                    new_events = []
+                else:
+                    t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(
+                        fr, fid, t_main_input, d_helmet_res, d_signalman_res
+                    )
                 now_fps_log = time.time()
                 cam_ip = cams[idx].ip
                 if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
@@ -5479,7 +6645,8 @@ def main():
                 # -----------------------------------------------------------
                 if connected and fr is not None:
                     # 원본 프레임과 같은 시점의 추론 로그를 버퍼 및 녹화 큐에 업데이트합니다.
-                    cams[idx].recorder.update(fr, infer_meta)
+                    if not MEMORY_PROBE_SKIP_RECORDER_UPDATE:
+                        cams[idx].recorder.update(fr, infer_meta)
 
                     if is_gui_mode:
                         display_fr = cams[idx].draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
@@ -5536,7 +6703,13 @@ def main():
                     event_infer_meta["privacy_blur"] = privacy_blur_meta
                     event_save_queues[cams[idx].ip].append((fid, event_frame, event_infer_meta))
 
-            inference_executor.shutdown(wait=True)
+            if mem_stage_due:
+                log_memory_stage("after_event_logic", loop_count, cams=cams, event_save_queues=event_save_queues)
+            if inference_executor is not main_inference_executor:
+                inference_executor.shutdown(wait=True)
+            if mem_stage_due:
+                executor_stage = "after_executor_reuse" if inference_executor is main_inference_executor else "after_executor_shutdown"
+                log_memory_stage(executor_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
 
             # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
             now_time = time.time()
@@ -5583,6 +6756,9 @@ def main():
                     q.clear()
                     last_event_times[ip] = 0.0
 
+            if mem_stage_due:
+                log_memory_stage("after_event_flush", loop_count, cams=cams, event_save_queues=event_save_queues)
+
             if is_gui_mode:
                 if final_imgs:
                     cv2.imshow("Monitor", create_mosaic_image(final_imgs))
@@ -5615,11 +6791,27 @@ def main():
                 except Exception:
                     pass
 
-        if 'inference_executor' in locals():
+        if (
+            'inference_executor' in locals()
+            and (
+                'main_inference_executor' not in locals()
+                or inference_executor is not main_inference_executor
+            )
+        ):
             try:
                 inference_executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 inference_executor.shutdown(wait=False)
+        if 'main_inference_executor' in locals() and main_inference_executor is not None:
+            try:
+                main_inference_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                main_inference_executor.shutdown(wait=False)
+        if 'memory_probe_persistent_executor' in locals() and memory_probe_persistent_executor is not None:
+            try:
+                memory_probe_persistent_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                memory_probe_persistent_executor.shutdown(wait=False)
 
         if is_gui_mode:
             cv2.destroyAllWindows()
