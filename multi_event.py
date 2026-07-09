@@ -4704,7 +4704,7 @@ class Camera:
             logger.debug(f"[CAM:{getattr(self,'cam_id','?')}] blocked-state log failed: {e}")
 
     def _update_alignment(self, frame):
-        """[신설] 전체 화면 3×3 격자 흔들림 감지 경로.
+        """[신설] 전체 화면 3×3 격자 흔들림 감지 경로......
         ROI 폴리곤을 쓰지 않고 전체 프레임을 사용한다. 이벤트(roi_change) 지정 카메라만 동작.
         조명(주/야·IR) 변화는 벡터(평행이동)를 만들지 않으므로 자연히 무시된다."""
         if frame is None:
