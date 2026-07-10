@@ -938,13 +938,15 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
     if event_type == "signal_vehicle":
         h_frame, w_frame = api_img.shape[:2]
         token_count = max(1, len(auth_tokens) if auth_tokens else 1)
-        box_w, box_h = 340, 35 + token_count * 40
+        box_w, box_h = 340, 35 + max(1, len(display_items)) * 40
         x_start, y_start = w_frame - box_w - 20, h_frame - box_h - 20
 
-        overlay = api_img.copy()
-        cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
-        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+        roi_sig = fr[y_start:y_start + box_h, x_start:x_start + box_w]
+        black_bg2 = np.zeros_like(roi_sig)
+        cv2.addWeighted(black_bg2, 0.6, roi_sig, 0.4, 0, roi_sig)
+        
+        cv2.putText(fr, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+    
 
         if not auth_tokens:
             cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -3648,7 +3650,7 @@ class FrameReader:
                 "!", f"video/x-raw,format=NV12,width={out_w},height={out_h}",
                 "!", "videoconvert",
                 "!", "videorate",
-                "!", f"video/x-raw{framerate_str}"
+                "!", f"video/x-raw,format=NV12{framerate_str}"
             ])
         else:
             cmd.extend([
@@ -5519,7 +5521,6 @@ def main():
         t_main_input = np.empty((0, 6))
         d_signalman_res = np.empty((0, 6))
 
-        # [추가] 프레임 전체 면적의 1/2 (50%) 임계값 계산
         h, w = fr.shape[:2]
         max_area_threshold = (h * w) * 0.5
 
@@ -5533,12 +5534,21 @@ def main():
                 person_conf=person_conf,
                 helmet_conf=helmet_conf,
                 signalman_conf=signalman_conf,
-                max_area_threshold=max_area_threshold # [추가] 1/4 임계값 인자 전달
+                max_area_threshold=max_area_threshold 
             )
 
         d_helmet_res = np.empty((0, 6))
+        
+        # [복원된 최적화] 메인 모델에서 사람이 검출되었을 때만 헬멧 모델 가동
         if "no_helmet" in cam.events:
-            d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
+            has_person = False
+            for d in t_main_input:
+                if int(d[5]) in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]:
+                    has_person = True
+                    break
+                    
+            if has_person:
+                d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
 
         return t_main_input, d_helmet_res, d_signalman_res
 
@@ -5727,10 +5737,10 @@ def main():
                 if now_time - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
                     current_fps_last_print[cam_ip] = now_time
 
-                # [수정] 얇은 선(1px) 기반의 클린 렌더링 및 이벤트 시간 오버레이
+                # [수정] 얇은 선(1px) 기반의 클린 렌더링 및 이벤트 시간 오버레이 (LINE_AA 삭제)
                 record_fr = fr.copy()
                 time_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                cv2.putText(record_fr, f"Event Time: {time_str}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(record_fr, f"Event Time: {time_str}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                 
                 if len(c.roi_poly) > 2:
                     cv2.polylines(record_fr, [np.array(c.roi_poly, np.int32)], True, (0, 255, 255), 1)
@@ -5749,7 +5759,7 @@ def main():
                     if tid in c.trk_main.tracks:
                         hist = list(c.trk_main.tracks[tid]['history'])
                         if len(hist) > 1:
-                            cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, 1, cv2.LINE_AA)
+                            cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, 1)
 
                 # 최적화된 프레임과 현재 타임스탬프를 동기화하여 Recorder에 전달
                 if infer_meta:
