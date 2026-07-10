@@ -2315,6 +2315,24 @@ class BaseEventDetector:
         self.roi_lines = roi_lines or []
         self.fps = SYS_CFG.get("REC_FPS", 3)
 
+    def _snapshot_tracks(self, tracks):
+        snapshot = []
+        if tracks is None:
+            return snapshot
+
+        for t in tracks:
+            try:
+                if len(t) < 7:
+                    continue
+                snapshot.append([
+                    float(t[0]), float(t[1]), float(t[2]), float(t[3]),
+                    int(t[4]), float(t[5]), int(t[6])
+                ])
+            except Exception:
+                continue
+
+        return snapshot
+
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         return []
 
@@ -2353,6 +2371,7 @@ class ParkingDetector(BaseEventDetector):
         triggered = []
         curr_ids = set()
         current_time = time.time()
+        privacy_tracks = self._snapshot_tracks(kwargs.get('privacy_tracks', tracks))
 
         if self.roi_poly.size == 0:
             return triggered
@@ -2376,6 +2395,8 @@ class ParkingDetector(BaseEventDetector):
                             'bbox': t[:4],
                             'frame': frame.copy() if frame is not None else None,
                             'fid': fid,
+                            'privacy_tracks': privacy_tracks,
+                            'privacy_fid': fid,
                             'triggered': False
                         })
                     else:
@@ -2387,6 +2408,8 @@ class ParkingDetector(BaseEventDetector):
                                 'bbox': self.states[tid]['bbox'],
                                 'frame': self.states[tid]['frame'],
                                 'fid': self.states[tid]['fid'],
+                                'privacy_tracks': self.states[tid].get('privacy_tracks', []),
+                                'privacy_fid': self.states[tid].get('privacy_fid', self.states[tid]['fid']),
                                 'decision_trace': {
                                     'detector': 'ParkingDetector',
                                     'reason': 'stationary_duration_exceeded',
@@ -2472,6 +2495,7 @@ class CrossingDetector(BaseEventDetector):
         triggered = []
         curr_ids = set()
         current_time = time.time()
+        privacy_tracks = self._snapshot_tracks(kwargs.get('privacy_tracks', tracks))
 
         persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
@@ -2541,6 +2565,8 @@ class CrossingDetector(BaseEventDetector):
                                 'bbox': event_bbox,
                                 'frame': frame.copy() if frame is not None else None,
                                 'fid': fid,
+                                'privacy_tracks': privacy_tracks,
+                                'privacy_fid': fid,
                                 'objects': curr_objects
                             }
                         break
@@ -2572,6 +2598,8 @@ class CrossingDetector(BaseEventDetector):
                             'bbox': cand['bbox'],
                             'frame': cand['frame'],
                             'fid': cand['fid'],
+                            'privacy_tracks': cand.get('privacy_tracks', []),
+                            'privacy_fid': cand.get('privacy_fid', cand['fid']),
                             'objects': cand['objects'],
                             'decision_trace': {
                                 'detector': 'CrossingDetector',
@@ -2695,6 +2723,7 @@ class HelmetDetector(BaseEventDetector):
         triggered = []
         helmet_tracks = kwargs.get('helmet_tracks', [])
         current_time = time.time()
+        privacy_tracks = self._snapshot_tracks(kwargs.get('privacy_tracks', tracks))
 
         unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == ID_H_NO_HELMET]
         current_nh_persons = []
@@ -2769,7 +2798,9 @@ class HelmetDetector(BaseEventDetector):
                     ],
                     'privacy_objects': [
                         {'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid, 'class_id': ID_G_PERSON}
-                    ]
+                    ],
+                    'privacy_tracks': privacy_tracks,
+                    'privacy_fid': fid
                 })
 
         for nh_p in current_nh_persons:
@@ -2795,6 +2826,8 @@ class HelmetDetector(BaseEventDetector):
                 matched_session['fid'] = fid
                 matched_session['objects'] = nh_p['objects']
                 matched_session['privacy_objects'] = nh_p.get('privacy_objects', [])
+                matched_session['privacy_tracks'] = nh_p.get('privacy_tracks', [])
+                matched_session['privacy_fid'] = nh_p.get('privacy_fid', fid)
                 matched_session['decision_context'] = nh_p.get('decision_context', {})
 
                 if roi_crop is not None:
@@ -2816,6 +2849,8 @@ class HelmetDetector(BaseEventDetector):
                     'roi_buffer': new_buffer,
                     'objects': nh_p['objects'],
                     'privacy_objects': nh_p.get('privacy_objects', []),
+                    'privacy_tracks': nh_p.get('privacy_tracks', []),
+                    'privacy_fid': nh_p.get('privacy_fid', fid),
                     'decision_context': nh_p.get('decision_context', {})
                 })
 
@@ -2846,6 +2881,8 @@ class HelmetDetector(BaseEventDetector):
                         'fid': session['fid'],
                         'objects': session['objects'],
                         'privacy_objects': session.get('privacy_objects', []),
+                        'privacy_tracks': session.get('privacy_tracks', privacy_tracks),
+                        'privacy_fid': session.get('privacy_fid', session['fid']),
                         'decision_trace': {
                             'detector': 'HelmetDetector',
                             'reason': 'no_helmet_duration_exceeded',
@@ -2995,6 +3032,7 @@ class SignalVehicleDetector(BaseEventDetector):
         triggered = []
         curr_ids = set()
         current_time = time.time()
+        privacy_tracks = self._snapshot_tracks(kwargs.get('privacy_tracks', tracks))
         self.process_seq += 1
 
         if self.roi_poly.size == 0 or motion_mask is None or frame is None: return triggered
@@ -3185,6 +3223,8 @@ class SignalVehicleDetector(BaseEventDetector):
                                     'frame': frame.copy(),
                                     'fid': fid,
                                     'confidence': float(t[5]),
+                                    'privacy_tracks': privacy_tracks,
+                                    'privacy_fid': fid,
                                     'auth_tokens': recent_auths[:1],
                                     'objects': [{
                                         'label': 'LineTruck',
@@ -5165,6 +5205,8 @@ class Camera:
                 handler_track_map = track_map_main
                 handler_score_map = score_map_main
 
+            kwargs['privacy_tracks'] = t_main
+
             try:
                 triggered = handler.process(handler_tracks, handler_track_map, motion_mask, fr, fid, **kwargs)
             except Exception as e:
@@ -5179,9 +5221,18 @@ class Camera:
 
                 actual_score = handler_score_map.get(tid, score_map_main.get(tid, 0.95))
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
-                privacy_source_objects = ev.get('privacy_objects', objects_meta)
-                event_privacy_tracks = self._privacy_tracks_from_event_objects(privacy_source_objects)
-                privacy_reference_tracks = event_privacy_tracks if event_privacy_tracks else t_main
+                event_frame_privacy_tracks = ev.get('privacy_tracks')
+                has_event_frame_privacy_tracks = event_frame_privacy_tracks is not None and len(event_frame_privacy_tracks) > 0
+                privacy_reference_fid = ev.get('privacy_fid', ev.get('fid', fid))
+
+                if has_event_frame_privacy_tracks:
+                    privacy_reference_tracks = event_frame_privacy_tracks
+                    privacy_reference_tracks_label = "event_frame_tracks"
+                else:
+                    privacy_source_objects = ev.get('privacy_objects', objects_meta)
+                    event_privacy_tracks = self._privacy_tracks_from_event_objects(privacy_source_objects)
+                    privacy_reference_tracks = event_privacy_tracks if event_privacy_tracks else t_main
+                    privacy_reference_tracks_label = "event_objects" if event_privacy_tracks else "current_tracks"
                 decision_trace = to_json_safe(ev.get('decision_trace', {
                     'detector': handler.__class__.__name__,
                     'reason': 'event_triggered_without_detail'
@@ -5211,7 +5262,11 @@ class Camera:
                         blur_plate=blur_plate_option
                     )
                     privacy_blur_meta["scope"] = "event_snapshot"
-                    privacy_blur_meta["reference_tracks"] = "event_objects" if event_privacy_tracks else "current_tracks"
+                    privacy_blur_meta["reference_tracks"] = privacy_reference_tracks_label
+                    try:
+                        privacy_blur_meta["reference_fid"] = int(privacy_reference_fid)
+                    except Exception:
+                        privacy_blur_meta["reference_fid"] = None
                     logger.info(
                         f"[PRIVACY BLUR] event_id={event_id} cam={self.cam_id} event={ename} "
                         f"face_enabled={blur_face_option} plate_enabled={blur_plate_option} "
