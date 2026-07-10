@@ -36,5 +36,5 @@ snapshot_exports/
 __pycache__/
 *.swo
 roi_from_snapshots.py
-.codex
+.codex*
 .codex_local_skills/
