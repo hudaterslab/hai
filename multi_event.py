@@ -8,6 +8,7 @@ import sys
 import gc
 import json
 import csv
+import hashlib
 import shutil
 import subprocess
 import cv2
@@ -21,6 +22,8 @@ import queue
 import logging
 import psutil
 import atexit
+import signal
+import select
 from collections import deque, defaultdict
 import concurrent.futures
 import re
@@ -212,6 +215,7 @@ def load_system_config():
             "gstreamer_protocols": "tcp",
             "gstreamer_tcp_timeout_us": 3000000,
             "gstreamer_drop_on_latency": True,
+            "gstreamer_frame_read_timeout_sec": 10.0,
             "log_interval_sec": 10.0,
             "verbose_logs": False
         },
@@ -226,7 +230,7 @@ def load_system_config():
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
         "OUTPUT_RETENTION_DAYS": 14,
         "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
-        "ROI_SETUP_REQUIRED_API_ENABLED": False,
+        "ROI_SETUP_REQUIRED_API_ENABLED": True,
         "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
         "VISUAL_ALARM_DURATION": 5.0
     }
@@ -361,7 +365,7 @@ def create_roi_snapshot(cam, frame):
 
 def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False):
     """관제 서버로 1시간 주기 ROI 스냅샷을 백그라운드에서 전송합니다."""
-    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
+    url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
     try:
         # 이미지를 메모리 상에서 JPEG 바이너리로 인코딩
         _, img_encoded = cv2.imencode('.jpg', img)
@@ -805,7 +809,7 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.debug(f"[API 스킵] 기본 단말 ID(99999) 사용 중: {image_path}")
         return
 
-    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
+    url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
     event_type_mapping = {
         "conveyor_crossing": 1,
         "no_helmet": 2,
@@ -2953,6 +2957,21 @@ class ROIAlignLearningStore:
         def write_one_csv(target_path):
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
+            if exists:
+                try:
+                    with open(target_path, "r", newline="", encoding="utf-8") as f:
+                        header_line = f.readline()
+                    current_header = next(csv.reader([header_line])) if header_line else []
+                    if current_header != fieldnames:
+                        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        backup_path = f"{target_path}.bak_header_{stamp}"
+                        os.replace(target_path, backup_path)
+                        logger.info(
+                            f"[ROI DRIFT] CSV header changed; old log moved to {backup_path}"
+                        )
+                        exists = False
+                except Exception as e:
+                    logger.warning(f"[ROI DRIFT] CSV header check failed: {e}")
             with open(target_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not exists:
@@ -3244,6 +3263,18 @@ class FrameReader:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    # ---------------------------------------------------------
+    # [1. staging 브랜치의 새 함수 살림]
+    # ---------------------------------------------------------
+    def _gstreamer_frame_read_timeout(self):
+        try:
+            return max(1.0, float(self.decode_cfg.get("gstreamer_frame_read_timeout_sec", 10.0)))
+        except Exception:
+            return 10.0
+
+    # ---------------------------------------------------------
+    # [2. 건우님(HEAD)의 극한 최적화 로그 함수 적용]
+    # ---------------------------------------------------------
     def _emit_decode_log(self, *args, **kwargs):
         """
         [최적화 및 에러 방어] 파라미터 순서와 키워드 호출이 혼용되는 
@@ -3292,6 +3323,88 @@ class FrameReader:
             return
         self._gst_check_logged = True
         self._emit_decode_log(message, level=level)
+
+    def _use_decode_process_group(self):
+        return sys.platform.startswith("linux")
+
+    def _decode_popen_kwargs(self, use_process_group):
+        if use_process_group:
+            return {"start_new_session": True}
+        return {}
+
+    def _send_decode_process_signal(self, proc, sig, use_process_group):
+        if use_process_group:
+            os.killpg(proc.pid, sig)
+            return
+        if sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+
+    def _terminate_decode_process(self, proc, label, use_process_group=False):
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                proc.wait(timeout=0.1)
+                return
+        except Exception:
+            pass
+
+        try:
+            self._send_decode_process_signal(proc, signal.SIGTERM, use_process_group)
+            proc.wait(timeout=2.0)
+            return
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as e:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} terminate failed: {e}",
+                level="debug"
+            )
+
+        try:
+            self._send_decode_process_signal(proc, signal.SIGKILL, use_process_group)
+            proc.wait(timeout=2.0)
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill wait timed out pid={getattr(proc, 'pid', '-')}",
+                level="warning"
+            )
+        except Exception as e:
+            self._emit_decode_log(
+                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill failed: {e}",
+                level="debug"
+            )
+
+    def _read_gstreamer_frame(self, proc, frame_size, timeout_sec):
+        if proc is None or proc.stdout is None:
+            return b""
+        fd = proc.stdout.fileno()
+        deadline = time.monotonic() + timeout_sec
+        chunks = bytearray()
+
+        while len(chunks) < frame_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"gstreamer_frame_read_timeout_{timeout_sec:g}s")
+
+            ready, _, _ = select.select([fd], [], [], min(1.0, remaining))
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            chunk = os.read(fd, frame_size - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+
+        return bytes(chunks)
 
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
@@ -3611,6 +3724,7 @@ class FrameReader:
         frame_size = int(out_w * out_h * 1.5)
         
         fps_limit = self._decode_fps_limit()
+        frame_read_timeout_sec = self._gstreamer_frame_read_timeout()
         decoder_info = self._select_gstreamer_decoder(codec)
         if decoder_info is None:
             self._note_decode_failure(f"gstreamer_unsupported_codec_{codec or 'unknown'}")
@@ -3667,9 +3781,16 @@ class FrameReader:
         gst_failed = False
         gst_stderr_lines = deque(maxlen=30)
         gst_stderr_thread = None
-        
+        use_process_group = self._use_decode_process_group()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, bufsize=frame_size * 2)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                bufsize=frame_size * 2,
+                **self._decode_popen_kwargs(use_process_group)
+            )
             if proc.stderr is not None:
                 gst_stderr_thread = threading.Thread(target=self._drain_binary_log_pipe, args=(proc.stderr, gst_stderr_lines), daemon=True)
                 gst_stderr_thread.start()
@@ -3677,7 +3798,19 @@ class FrameReader:
                 return False
 
             self.connected = True
-            self._set_decode_pipeline("gstreamer_pipe_nv12", shape=f"{in_w}x{in_h}->{out_w}x{out_h}", pid=proc.pid, cmd=cmd)
+            self._set_decode_pipeline(
+                "gstreamer_pipe_nv12",
+                shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
+                pid=proc.pid,
+                cmd=cmd,
+                extra=(
+                    f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
+                    f"latency_ms={latency_ms} protocols={protocols} tcp_timeout_us={tcp_timeout_us} "
+                    f"drop_on_latency={drop_on_latency_text} fps_limit={fps_limit or '-'} "
+                    f"frame_bytes={frame_size} format=NV12 frame_read_timeout_sec={locals().get('frame_read_timeout_sec', 10.0):g}"
+                )
+            )
+            self._decode_mode_logged = True
             self.last_t = time.time()
             first_frame_logged = False
 
@@ -3686,7 +3819,13 @@ class FrameReader:
                     self._note_decode_failure(f"gstreamer_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
                     break
 
-                raw = proc.stdout.read(frame_size)
+                try:
+                    raw = self._read_gstreamer_frame(proc, frame_size, frame_read_timeout_sec)
+                except TimeoutError as e:
+                    self._note_decode_failure(str(e), level="error")
+                    gst_failed = True
+                    break
+
                 if len(raw) != frame_size:
                     break
 
@@ -3709,15 +3848,7 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            self._terminate_decode_process(proc, "gstreamer_pipe_nv12", use_process_group=locals().get('use_process_group', False))
             
             if gst_stderr_thread is not None:
                 try:
@@ -3759,8 +3890,16 @@ class FrameReader:
             env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
 
         proc = None
+        use_process_group = self._use_decode_process_group()
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                bufsize=frame_size * 2,
+                **self._decode_popen_kwargs(use_process_group)
+            )
             if proc.stdout is None:
                 return False
 
@@ -3798,15 +3937,7 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            self._terminate_decode_process(proc, "ffmpeg_vaapi_pipe", use_process_group=use_process_group)
 
     def _run(self):
         while self.running:
@@ -4894,7 +5025,7 @@ class HealthCheckDaemon:
         self.version = version
         self.interval = interval_sec
         self.running = True
-        self.url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
+        self.url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
         self.cams = list(cams or [])
         self.config_file = config_file
         self._config_lock = threading.Lock()
@@ -5085,6 +5216,17 @@ class HealthCheckDaemon:
                 return cam
         return None
 
+    @staticmethod
+    def _file_sha256(path):
+        if not path or not os.path.exists(path):
+            return None
+
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     def _apply_roi_settings_from_response(self, response_payload):
         if not isinstance(response_payload, dict):
             return []
@@ -5101,7 +5243,7 @@ class HealthCheckDaemon:
             logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
             return []
 
-        handled_cctv_ids = []
+        changed_cctv_ids = []
         changed = False
         runtime_updates = []
 
@@ -5119,6 +5261,12 @@ class HealthCheckDaemon:
             if not isinstance(camera_configs, dict):
                 logger.error("[Health Check] cameras config is not an object; ROI update skipped")
                 return []
+
+            try:
+                before_config_hash = self._file_sha256(self.config_file)
+            except Exception as e:
+                logger.warning(f"[Health Check] failed to hash cameras config before ROI update: {e}")
+                before_config_hash = None
 
             for item in roi_settings:
                 if not isinstance(item, dict):
@@ -5164,8 +5312,8 @@ class HealthCheckDaemon:
                         new_conf[key] = value
                         item_changed = True
 
-                handled_cctv_ids.append(str(cam.cam_id))
                 if item_changed:
+                    changed_cctv_ids.append(str(cam.cam_id))
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     changed = True
@@ -5185,6 +5333,26 @@ class HealthCheckDaemon:
                     logger.error(f"[Health Check] failed to write cameras config for ROI update: {e}")
                     return []
 
+                try:
+                    after_config_hash = self._file_sha256(self.config_file)
+                except Exception as e:
+                    logger.warning(f"[Health Check] failed to hash cameras config after ROI update: {e}")
+                    after_config_hash = None
+
+                if before_config_hash == after_config_hash:
+                    logger.warning(
+                        "[Health Check] ROI settings write did not change cameras config hash; "
+                        "setup request remains pending"
+                    )
+                    return []
+
+                before_short = before_config_hash[:12] if before_config_hash else "-"
+                after_short = after_config_hash[:12] if after_config_hash else "-"
+                logger.info(
+                    f"[Health Check] ROI settings config changed: "
+                    f"hash={before_short}->{after_short} cctvIds={','.join(changed_cctv_ids)}"
+                )
+
         for cam, new_conf, roi_updates in runtime_updates:
             try:
                 cam.update_config(new_conf)
@@ -5197,7 +5365,7 @@ class HealthCheckDaemon:
             except Exception as e:
                 logger.error(f"[Health Check] runtime ROI update failed: cctvId={cam.cam_id} error={e}")
 
-        return handled_cctv_ids
+        return changed_cctv_ids
 
     def _run(self):
         while self.running:
