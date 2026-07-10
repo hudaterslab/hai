@@ -1,9 +1,13 @@
 import os
+os.environ["GST_VAAPI_DISPLAY"] = "drm"
+os.environ["GST_VAAPI_DRM_DEVICE"] = "/dev/dri/renderD128"
+os.environ["LIBVA_DRIVER_NAME"] = "iHD"
+os.environ["GST_VAAPI_ALL_DRIVERS"] = "1"
+os.environ["GST_PLUGIN_FEATURE_RANK"] = "vah264dec:MAX,vah265dec:MAX"
 import sys
 import gc
 import json
 import csv
-import hashlib
 import shutil
 import subprocess
 import cv2
@@ -17,9 +21,6 @@ import queue
 import logging
 import psutil
 import atexit
-import tracemalloc
-import signal
-import select
 from collections import deque, defaultdict
 import concurrent.futures
 import re
@@ -50,14 +51,26 @@ SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 WATCHDOG_TIMEOUT = 30.0
 
-# YOLOv8 클래스 ID 정의 (hanjin_cctv_v2.dxnn 기준)
+# YOLOv8 클래스 ID 정의 (신규 13개 클래스 통합 모델 기준 hanjin_cctv_v3.dxnn)
+# 0: helmet (MAIN 무시, 전용 모델 사용 유지용 상수)
+# 1: head (MAIN 무시, 전용 모델 사용 유지용 상수)
 ID_H_HELMET = 0
 ID_H_NO_HELMET = 1
+
 ID_G_PERSON = 2
-ID_G_CAR = 3
-ID_PERSON_LOW = 4
-ID_REFLECTIVE_VEST = 5
-ID_G_TRUCK = 6
+ID_G_CAR = 3          # normalvehicle
+ID_PERSON_LOW = 4     # lowerbody
+ID_SIGNALMAN = 5      # signalman (검은가방 포함)
+ID_REFLECTIVE_VEST = 5 # 기존 코드 하위 호환성 유지용 (5번으로 통합)
+ID_G_TRUCK = 6        # trunklinetruck
+
+# 7: xband (무시)
+
+ID_RAINCOAT = 8       # raincoat -> 신호수(5)와 동일 취급
+ID_SIGNALFLAG = 9     # signalflag -> 신호수(5)와 동일 취급
+
+# 10: box, 11: soft_package, 12: sack (무시)
+
 TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
 
 DEBUG_MODE = False
@@ -163,7 +176,7 @@ def load_system_config():
             }
         },
         "models": {
-            "MAIN": "hanjin_cctv_v2.dxnn",
+            "MAIN": "hanjin_cctv_v3.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
             "HELMET": "helmet_260622.dxnn",
             "PLATE": "license_plate_detector_v2.dxnn"
@@ -199,7 +212,6 @@ def load_system_config():
             "gstreamer_protocols": "tcp",
             "gstreamer_tcp_timeout_us": 3000000,
             "gstreamer_drop_on_latency": True,
-            "gstreamer_frame_read_timeout_sec": 10.0,
             "log_interval_sec": 10.0,
             "verbose_logs": False
         },
@@ -214,7 +226,7 @@ def load_system_config():
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,  # 0이면 REC_FPS와 저장 구간 기준으로 자동 계산
         "OUTPUT_RETENTION_DAYS": 14,
         "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
-        "ROI_SETUP_REQUIRED_API_ENABLED": True,
+        "ROI_SETUP_REQUIRED_API_ENABLED": False,
         "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
         "VISUAL_ALARM_DURATION": 5.0
     }
@@ -231,55 +243,8 @@ def load_system_config():
         return default_config
 
 SYS_CFG = load_system_config()
-def _truthy(value):
-    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
-
-MEMORY_TRACEMALLOC_ENABLED = _truthy(
-    os.environ.get(
-        "HAI_MEM_PROBE_TRACEMALLOC",
-        SYS_CFG.get("logging", {}).get("memory_probe_tracemalloc", True)
-    )
-)
-if MEMORY_TRACEMALLOC_ENABLED and not tracemalloc.is_tracing():
-    tracemalloc.start(25)
-MEMORY_PROBE_DECODE_ONLY = _truthy(
-    os.environ.get(
-        "HAI_MEM_PROBE_DECODE_ONLY",
-        SYS_CFG.get("logging", {}).get("memory_probe_decode_only", False)
-    )
-)
-MEMORY_PROBE_INFERENCE_REUSE_FRAME = _truthy(
-    os.environ.get(
-        "HAI_MEM_PROBE_INFERENCE_REUSE_FRAME",
-        SYS_CFG.get("logging", {}).get("memory_probe_inference_reuse_frame", False)
-    )
-)
-MEMORY_PROBE_KEEP_EXECUTOR = _truthy(
-    os.environ.get(
-        "HAI_MEM_PROBE_KEEP_EXECUTOR",
-        SYS_CFG.get("logging", {}).get("memory_probe_keep_executor", False)
-    )
-)
-MEMORY_PROBE_EXECUTOR_ONLY = _truthy(
-    os.environ.get(
-        "HAI_MEM_PROBE_EXECUTOR_ONLY",
-        SYS_CFG.get("logging", {}).get("memory_probe_executor_only", False)
-    )
-)
-MEMORY_PROBE_SKIP_RECORDER_UPDATE = _truthy(
-    os.environ.get(
-        "HAI_MEM_PROBE_SKIP_RECORDER_UPDATE",
-        SYS_CFG.get("logging", {}).get("memory_probe_skip_recorder_update", False)
-    )
-)
-MEMORY_PROBE_SKIP_EVENT_LOGIC = _truthy(
-    os.environ.get(
-        "HAI_MEM_PROBE_SKIP_EVENT_LOGIC",
-        SYS_CFG.get("logging", {}).get("memory_probe_skip_event_logic", False)
-    )
-)
 BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
-IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 def resolve_model_path(model_path):
     """설정 파일의 모델 경로가 상대 경로면 프로젝트 폴더 기준 절대 경로로 바꿉니다."""
@@ -312,287 +277,61 @@ def get_model_engine_pool_size(model_key, default=1):
     except Exception:
         return max(1, int(default))
 
-STARTUP_MODEL_PROFILES = {
-    "ppu": {
-        "models": {
-            "MAIN": "hanjin_cctv_v2.dxnn",
-            "FACE": "yolov8m-face_ppu.dxnn",
-            "HELMET": "helmet_260622.dxnn",
-            "PLATE": "license_plate_detector_v2.dxnn",
-        },
-        "model_output_formats": {
-            "MAIN": "ppu",
-            "FACE": "ppu",
-            "HELMET": "auto",
-            "PLATE": "yolo",
-        },
-        "model_engine_pool_sizes": {
-            "MAIN": 3,
-            "FACE": 1,
-            "HELMET": 1,
-            "PLATE": 1,
-        },
-    },
-    "normal": {
-        "models": {
-            "MAIN": "hanjin_cctv.dxnn",
-            "FACE": "yolov8m-face.dxnn",
-            "HELMET": "helmet_3cls_v8.dxnn",
-            "PLATE": "license_plate_detector_v2.dxnn",
-        },
-        "model_output_formats": {
-            "MAIN": "yolo",
-            "FACE": "yolo",
-            "HELMET": "auto",
-            "PLATE": "yolo",
-        },
-        "model_engine_pool_sizes": {
-            "MAIN": 1,
-            "FACE": 1,
-            "HELMET": 1,
-            "PLATE": 1,
-        },
-    },
-}
-
-STARTUP_VIDEO_PIPELINE_CHOICES = [
-    {
-        "key": "gstreamer",
-        "label": "GStreamer",
-        "description": "Linux/GStreamer RTSP 파이프라인",
-        "aliases": ("1", "g", "gst", "gstreamer", "gxstreamer", "gxstremer"),
-    },
-    {
-        "key": "ffmpeg",
-        "label": "FFmpeg",
-        "description": "FFmpeg/OpenCV 파이프라인",
-        "aliases": ("2", "f", "ffmpeg", "opencv", "cv2"),
-    },
-]
-
-STARTUP_HW_ACCELERATION_CHOICES = [
-    {
-        "key": "auto",
-        "label": "Auto",
-        "description": "가능하면 VAAPI 하드웨어 디코딩을 쓰고 실패 시 CPU로 전환",
-        "aliases": ("1", "a", "auto", "default"),
-    },
-    {
-        "key": "vaapi",
-        "label": "VAAPI",
-        "description": "VAAPI 하드웨어 디코딩 우선 사용",
-        "aliases": ("2", "v", "vaapi", "hw", "hardware"),
-    },
-    {
-        "key": "cpu",
-        "label": "CPU",
-        "description": "하드웨어 디코딩을 끄고 CPU 디코더 사용",
-        "aliases": ("3", "c", "cpu", "off", "none", "disable", "disabled"),
-    },
-]
-
-STARTUP_MODEL_PROFILE_CHOICES = [
-    {
-        "key": "ppu",
-        "label": "PPU",
-        "description": "PPU 출력 모델 우선 사용",
-        "aliases": ("1", "p", "ppu"),
-    },
-    {
-        "key": "normal",
-        "label": "Normal",
-        "description": "일반 YOLO 출력 모델 사용",
-        "aliases": ("2", "n", "normal", "nonppu", "non-ppu", "yolo"),
-    },
-]
-
-def _atomic_write_json(path, data):
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    filename = os.path.basename(path)
-    tmp_path = os.path.join(directory, f".{filename}.{os.getpid()}.tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-            f.write("\n")
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-def _normalize_startup_video_pipeline(value):
-    value = str(value or "").strip().lower()
-    if value in ("gstreamer", "gst", "gst_vaapi", "gxstreamer", "gxstremer"):
-        return "gstreamer"
-    if value in ("ffmpeg", "ffmpeg_vaapi", "vaapi", "opencv", "cv2", "ffmpeg_opencv"):
-        return "ffmpeg"
-    return "gstreamer"
-
-def _normalize_startup_hw_acceleration(value):
-    value = str(value or "").strip().lower()
-    if value in ("", "auto", "a", "default"):
-        return "auto"
-    if value in ("vaapi", "v", "hw", "hardware", "on", "true", "1"):
-        return "vaapi"
-    if value in ("cpu", "c", "off", "none", "false", "0", "disable", "disabled"):
-        return "cpu"
-    return "auto"
-
-def _normalize_startup_model_profile(config):
-    model_name = os.path.basename(str(((config.get("models") or {}).get("MAIN")) or "")).lower()
-    output_format = str(((config.get("model_output_formats") or {}).get("MAIN")) or "").strip().lower()
-    if output_format == "ppu" or "ppu" in model_name or model_name == "hanjin_cctv_v2.dxnn":
-        return "ppu"
-    return "normal"
-
-def _prompt_startup_choice(title, choices, default_key):
-    choices_by_alias = {}
-    for index, choice in enumerate(choices, 1):
-        choices_by_alias[str(index)] = choice["key"]
-        choices_by_alias[choice["key"]] = choice["key"]
-        for alias in choice.get("aliases", ()):
-            choices_by_alias[str(alias).lower()] = choice["key"]
-
-    while True:
-        print("")
-        print(title)
-        for index, choice in enumerate(choices, 1):
-            default_mark = " (기본값)" if choice["key"] == default_key else ""
-            print(f"  {index}. {choice['label']} - {choice['description']}{default_mark}")
-        try:
-            raw = guarded_input(">> 선택: ").strip().lower()
-        except EOFError:
-            return default_key
-        if not raw:
-            return default_key
-        selected = choices_by_alias.get(raw)
-        if selected:
-            return selected
-        print("잘못된 선택입니다. 위 번호 또는 이름을 입력하세요.")
-
-def _apply_startup_video_pipeline(config, pipeline, hw_acceleration=None):
-    video_decode = config.setdefault("video_decode", {})
-    video_decode["backend"] = pipeline
-    if hw_acceleration is None:
-        hw_acceleration = video_decode.get("hw_acceleration", "auto")
-    video_decode["hw_acceleration"] = _normalize_startup_hw_acceleration(hw_acceleration)
-    video_decode.setdefault("fallback_to_cpu", True)
-    video_decode.setdefault("fps_limit", 15.0)
-    video_decode.setdefault("log_interval_sec", 10.0)
-    video_decode.setdefault("verbose_logs", False)
-
-def _apply_startup_model_profile(config, profile):
-    profile_config = STARTUP_MODEL_PROFILES[profile]
-    models = config.setdefault("models", {})
-    formats = config.setdefault("model_output_formats", {})
-    pool_sizes = config.setdefault("model_engine_pool_sizes", {})
-    models.update(profile_config["models"])
-    formats.update(profile_config["model_output_formats"])
-    pool_sizes.update(profile_config["model_engine_pool_sizes"])
-
-def get_main_model_engine_pool_size(main_model_path):
-    model_name = os.path.basename(str(main_model_path or "")).lower()
-    if model_name == "hanjin_cctv.dxnn":
-        return 1
-    model_profile = _normalize_startup_model_profile(SYS_CFG)
-    if model_profile == "normal":
-        return 1
-    return get_model_engine_pool_size("MAIN", default=3)
-
-def ensure_startup_runtime_config(force=False):
-    global SYS_CFG, BATCH_SIZE
-
-    startup_profile = SYS_CFG.get("startup_profile", {}) if isinstance(SYS_CFG.get("startup_profile"), dict) else {}
-    already_configured = bool(startup_profile.get("configured"))
-    if not force and already_configured:
-        return False
-
-    if not force and (not sys.stdin or not sys.stdin.isatty()):
-        logger.info(
-            "[STARTUP CONFIG] startup_profile is not configured, "
-            "but stdin is not interactive; keeping current system_config.json."
-        )
-        return False
-
-    config = deep_merge_dict({}, SYS_CFG)
-    current_pipeline = _normalize_startup_video_pipeline((config.get("video_decode") or {}).get("backend"))
-    current_hw_acceleration = _normalize_startup_hw_acceleration((config.get("video_decode") or {}).get("hw_acceleration"))
-    current_model_profile = _normalize_startup_model_profile(config)
-
-    reason = "--configure-startup" if force else "first startup setup"
-    logger.info(f"[STARTUP CONFIG] running {reason}; config={CONFIG_COMMON_FILE}")
-    selected_pipeline = _prompt_startup_choice(
-        "영상 파이프라인 선택",
-        STARTUP_VIDEO_PIPELINE_CHOICES,
-        current_pipeline,
-    )
-    selected_hw_acceleration = _prompt_startup_choice(
-        "하드웨어 가속 선택",
-        STARTUP_HW_ACCELERATION_CHOICES,
-        current_hw_acceleration,
-    )
-    selected_model_profile = _prompt_startup_choice(
-        "모델 프로필 선택",
-        STARTUP_MODEL_PROFILE_CHOICES,
-        current_model_profile,
-    )
-
-    _apply_startup_video_pipeline(config, selected_pipeline, selected_hw_acceleration)
-    _apply_startup_model_profile(config, selected_model_profile)
-    config["startup_profile"] = {
-        "configured": True,
-        "video_pipeline": selected_pipeline,
-        "hardware_acceleration": selected_hw_acceleration,
-        "model_profile": selected_model_profile,
-        "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
-    _atomic_write_json(CONFIG_COMMON_FILE, config)
-    SYS_CFG = load_system_config()
-    BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
-    logger.info(
-        f"[STARTUP CONFIG] saved video_pipeline={selected_pipeline} "
-        f"hardware_acceleration={selected_hw_acceleration} "
-        f"model_profile={selected_model_profile} config={CONFIG_COMMON_FILE}"
-    )
-    return True
-
 def detection_array(rows):
     """추론 결과 리스트를 트래커/로그가 기대하는 Nx6 numpy 배열 형태로 맞춥니다."""
     if rows is None or len(rows) == 0:
         return np.empty((0, 6))
     return np.array(rows, dtype=float)
 
-def split_unified_event_detections(raw_dets, events, main_conf, person_conf, helmet_conf, signalman_conf):
+def split_unified_event_detections(raw_dets, events, main_conf, person_conf, helmet_conf, signalman_conf, max_area_threshold):
     # 단일 통합 모델 출력에서 이벤트별로 필요한 탐지 결과만 나눕니다.
-    # 이렇게 하면 NPU 추론은 한 번만 하고, 기존 트래커/이벤트 핸들러 입력 형태는 그대로 유지됩니다.
     d_main_res_list = []
     d_helmet_res_list = []
     d_signalman_res_list = []
 
     for d in raw_dets:
+        # 0. [오탐 방어] BBox 면적이 화면의 1/2을 초과하는 거대 객체(비/IR 노이즈 등) 차단
+        obj_w = float(d[2]) - float(d[0])
+        obj_h = float(d[3]) - float(d[1])
+        if (obj_w * obj_h) > max_area_threshold:
+            continue
+
         cls_id = int(d[5])
         conf = float(d[4])
 
-        if cls_id == ID_REFLECTIVE_VEST:
+        # 1. 무시(Drop) 처리할 클래스들: 0, 1 (헬멧 관련), 7, 10, 11, 12 (물류 및 기타)
+        if cls_id in [0, 1, 7, 10, 11, 12]:
+            continue
+
+        # 2. 신호수 통합 처리 (5: signalman, 8: raincoat, 9: signalflag)
+        if cls_id in [ID_SIGNALMAN, ID_RAINCOAT, ID_SIGNALFLAG]:
+            # 트래커 혼동을 막고 단일 객체로 추적하기 위해 ID를 5(ID_SIGNALMAN)로 강제 덮어쓰기
+            mod_d = list(d)
+            mod_d[5] = ID_SIGNALMAN
+            
             if conf >= person_conf:
-                d_main_res_list.append(d)
+                d_main_res_list.append(mod_d)
             if "signal_vehicle" in events and conf >= signalman_conf:
-                d_signalman_res_list.append(d)
-        elif cls_id in [ID_H_HELMET, ID_H_NO_HELMET]:
-            if "no_helmet" in events and conf >= helmet_conf:
-                d_helmet_res_list.append(d)
+                d_signalman_res_list.append(mod_d)
+                
+        # 3. 사람 및 하반신 (2: person, 4: lowerbody)
         elif cls_id in [ID_G_PERSON, ID_PERSON_LOW]:
             if conf >= person_conf:
                 d_main_res_list.append(d)
+                
+        # 4. 차량 (3: normalvehicle, 6: trunklinetruck)
+        elif cls_id in [ID_G_CAR, ID_G_TRUCK]:
+            if conf >= main_conf:
+                d_main_res_list.append(d)
+                
+        # 5. 혹시 모를 그 외의 클래스에 대한 방어 로직
         else:
             if conf >= main_conf:
                 d_main_res_list.append(d)
 
     return (
         detection_array(d_main_res_list),
-        detection_array(d_helmet_res_list),
+        detection_array(d_helmet_res_list), # 헬멧은 전용 모델에서 처리하므로 빈 배열 유지
         detection_array(d_signalman_res_list),
     )
 
@@ -615,12 +354,12 @@ def create_roi_snapshot(cam, frame):
     y_pos = 30
     for evt in cam.events:
         display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
-        cv2.putText(img, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(img, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
         y_pos += 30
 
     return img
 
-def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
+def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False):
     """관제 서버로 1시간 주기 ROI 스냅샷을 백그라운드에서 전송합니다."""
     url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
     try:
@@ -633,7 +372,7 @@ def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
             "imageWidth": int(w),
             "imageHeight": int(h),
             "cctvServerId": "1",
-            "isReqRoiSetup": False,
+            "isReqRoiSetup": bool(is_req_roi_setup),
             "roiInfo": roi_info_str
         }
 
@@ -644,11 +383,12 @@ def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h):
         resp = requests.post(url, data=data, files=files, verify=False, timeout=15)
 
         if resp.status_code == 200:
-            logger.info(f"?? [ROI Snapshot] CAM:{cam_id} 1시간 주기 스냅샷 전송 성공")
+            _tag = "ROI재설정요청(isReqRoiSetup=True)" if is_req_roi_setup else "1시간주기ROI스냅샷"
+            logger.info(f" [ROI Snapshot] CAM:{cam_id} 1시간 주기 스냅샷 전송 성공")
         else:
-            logger.error(f"?? [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
+            logger.error(f" [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
     except Exception as e:
-        logger.error(f"?? [ROI Snapshot] CAM:{cam_id} 전송 실패: {e}")
+        logger.error(f" [ROI Snapshot] CAM:{cam_id} 전송 실패: {e}")
 
 # ==========================================
 # [2] 로깅 시스템 초기화
@@ -775,7 +515,7 @@ try:
     from dx_engine import InferenceEngine, InferenceOption
     HAS_DX_ENGINE = True
 except ImportError:
-    logger.warning("?? [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
+    logger.warning(" [환경 알림] dx_engine 모듈을 찾을 수 없습니다. 서버(GPU/CPU) 환경으로 간주합니다.")
 
 # ==========================================
 # [4] 공통 유틸리티 함수
@@ -952,235 +692,15 @@ def log_disk_health(paths, threshold_gb=None):
             usage = shutil.disk_usage(target)
             free_gb = usage.free / (1024 ** 3)
             total_gb = usage.total / (1024 ** 3)
+            
+            # [최적화] 디스크가 위험 수준일 때만 알림을 울리고 평시 도배 로그는 삭제함
             if free_gb < threshold_gb:
                 logger.warning(
-                    f"[DISK HEALTH] label={label} path={target} free_gb={free_gb:.2f} "
+                    f"⚠️ [DISK HEALTH] label={label} path={target} free_gb={free_gb:.2f} "
                     f"total_gb={total_gb:.2f} threshold_gb={threshold_gb:.2f}"
-                )
-            else:
-                logger.debug(
-                    f"[DISK HEALTH] label={label} path={target} free_gb={free_gb:.2f} "
-                    f"total_gb={total_gb:.2f}"
                 )
         except Exception as e:
             logger.warning(f"[DISK HEALTH] check failed | label={label} path={path} | {e}")
-
-MEMORY_PROBE_STATE = {"last_rss_mb": None, "last_ts": None}
-MEMORY_STAGE_BASE = {"loop": None, "rss_mb": None, "uss_mb": None, "private_dirty_mb": None, "pyheap_mb": None}
-
-def _safe_queue_size(q):
-    try:
-        return q.qsize()
-    except Exception:
-        return -1
-
-def _bounded_len(value):
-    try:
-        return len(value)
-    except Exception:
-        return -1
-
-def _read_smaps_rollup_mb():
-    keys = {
-        "Rss", "Pss", "Shared_Clean", "Shared_Dirty", "Private_Clean",
-        "Private_Dirty", "Referenced", "Anonymous", "AnonHugePages", "Swap"
-    }
-    metrics = {}
-    path = f"/proc/{os.getpid()}/smaps_rollup"
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if ":" not in line:
-                    continue
-                key, raw_value = line.split(":", 1)
-                if key not in keys:
-                    continue
-                parts = raw_value.strip().split()
-                if not parts:
-                    continue
-                metrics[key] = float(parts[0]) / 1024.0
-    except Exception as e:
-        metrics["_error"] = str(e)
-    return metrics
-
-def _log_tracemalloc_probe(loop_count=None):
-    if not tracemalloc.is_tracing():
-        logger.info("[MEM PYHEAP] tracing=disabled")
-        return
-
-    current, peak = tracemalloc.get_traced_memory()
-    logger.info(
-        f"[MEM PYHEAP] loop={loop_count if loop_count is not None else '-'} "
-        f"current_mb={current / (1024 ** 2):.1f} peak_mb={peak / (1024 ** 2):.1f}"
-    )
-    try:
-        if loop_count is not None and int(loop_count) % 1500 != 0:
-            return
-    except Exception:
-        pass
-
-    try:
-        snapshot = tracemalloc.take_snapshot()
-        top_parts = []
-        for stat in snapshot.statistics("filename")[:8]:
-            frame = stat.traceback[0]
-            top_parts.append(
-                f"{os.path.basename(frame.filename)}={stat.size / (1024 ** 2):.1f}MB/{stat.count}"
-            )
-        logger.info(f"[MEM PYHEAP TOP] {', '.join(top_parts) if top_parts else '-'}")
-    except Exception as e:
-        logger.warning(f"[MEM PYHEAP TOP] failed | {e}")
-
-def _memory_stage_metrics():
-    proc = psutil.Process(os.getpid())
-    mem_info = proc.memory_info()
-    try:
-        full_info = proc.memory_full_info()
-    except Exception:
-        full_info = None
-    smaps = _read_smaps_rollup_mb()
-    pyheap_mb = 0.0
-    if tracemalloc.is_tracing():
-        current, _ = tracemalloc.get_traced_memory()
-        pyheap_mb = current / (1024 ** 2)
-    return {
-        "rss_mb": mem_info.rss / (1024 ** 2),
-        "vms_mb": mem_info.vms / (1024 ** 2),
-        "uss_mb": getattr(full_info, "uss", 0) / (1024 ** 2) if full_info else 0.0,
-        "pss_mb": getattr(full_info, "pss", 0) / (1024 ** 2) if full_info else 0.0,
-        "private_dirty_mb": smaps.get("Private_Dirty", 0.0) if isinstance(smaps, dict) else 0.0,
-        "anonymous_mb": smaps.get("Anonymous", 0.0) if isinstance(smaps, dict) else 0.0,
-        "pyheap_mb": pyheap_mb,
-        "threads": proc.num_threads(),
-    }
-
-def log_memory_stage(stage, loop_count, cams=None, event_save_queues=None):
-    try:
-        metrics = _memory_stage_metrics()
-        if MEMORY_STAGE_BASE.get("loop") != loop_count or stage == "before_process_frame":
-            MEMORY_STAGE_BASE["loop"] = loop_count
-            MEMORY_STAGE_BASE["rss_mb"] = metrics["rss_mb"]
-            MEMORY_STAGE_BASE["uss_mb"] = metrics["uss_mb"]
-            MEMORY_STAGE_BASE["private_dirty_mb"] = metrics["private_dirty_mb"]
-            MEMORY_STAGE_BASE["pyheap_mb"] = metrics["pyheap_mb"]
-
-        rec_q_total = 0
-        rec_buf_total = 0
-        if cams:
-            for cam in cams:
-                recorder = getattr(cam, "recorder", None)
-                rec_q = _safe_queue_size(getattr(recorder, "write_queue", None))
-                if rec_q > 0:
-                    rec_q_total += rec_q
-                rec_buf_total += max(0, _bounded_len(getattr(recorder, "buffer", [])))
-
-        event_q_total = 0
-        if event_save_queues:
-            for q in event_save_queues.values():
-                event_q_total += max(0, _bounded_len(q))
-
-        image_q = _safe_queue_size(getattr(IMAGE_SAVER_POOL, "_work_queue", None))
-        log_q = _safe_queue_size(log_queue)
-        logger.info(
-            f"[MEM STAGE] loop={loop_count} stage={stage} "
-            f"rss_mb={metrics['rss_mb']:.1f} "
-            f"rss_from_loop_start_mb={metrics['rss_mb'] - float(MEMORY_STAGE_BASE.get('rss_mb') or 0.0):.1f} "
-            f"uss_mb={metrics['uss_mb']:.1f} "
-            f"uss_from_loop_start_mb={metrics['uss_mb'] - float(MEMORY_STAGE_BASE.get('uss_mb') or 0.0):.1f} "
-            f"private_dirty_mb={metrics['private_dirty_mb']:.1f} "
-            f"private_dirty_from_loop_start_mb={metrics['private_dirty_mb'] - float(MEMORY_STAGE_BASE.get('private_dirty_mb') or 0.0):.1f} "
-            f"anonymous_mb={metrics['anonymous_mb']:.1f} "
-            f"pyheap_mb={metrics['pyheap_mb']:.1f} "
-            f"pyheap_from_loop_start_mb={metrics['pyheap_mb'] - float(MEMORY_STAGE_BASE.get('pyheap_mb') or 0.0):.1f} "
-            f"threads={metrics['threads']} image_q={image_q} log_q={log_q} "
-            f"rec_q_total={rec_q_total} rec_buf_total={rec_buf_total} event_q_total={event_q_total}"
-        )
-    except Exception as e:
-        logger.warning(f"[MEM STAGE] failed | stage={stage} loop={loop_count} | {e}")
-
-def log_memory_probe(cams, event_save_queues, cpu_usage=None, loop_count=None):
-    try:
-        proc = psutil.Process(os.getpid())
-        mem_info = proc.memory_info()
-        full_info = None
-        try:
-            full_info = proc.memory_full_info()
-        except Exception:
-            full_info = None
-        rss_mb = mem_info.rss / (1024 ** 2)
-        vms_mb = mem_info.vms / (1024 ** 2)
-        uss_mb = getattr(full_info, "uss", 0) / (1024 ** 2) if full_info else 0.0
-        pss_mb = getattr(full_info, "pss", 0) / (1024 ** 2) if full_info else 0.0
-        vm = psutil.virtual_memory()
-        now_ts = time.time()
-        last_rss = MEMORY_PROBE_STATE.get("last_rss_mb")
-        last_ts = MEMORY_PROBE_STATE.get("last_ts")
-        delta_mb = 0.0 if last_rss is None else rss_mb - float(last_rss)
-        delta_sec = 0.0 if last_ts is None else now_ts - float(last_ts)
-        MEMORY_PROBE_STATE["last_rss_mb"] = rss_mb
-        MEMORY_PROBE_STATE["last_ts"] = now_ts
-
-        image_q = _safe_queue_size(getattr(IMAGE_SAVER_POOL, "_work_queue", None))
-        log_q = _safe_queue_size(log_queue)
-        logger.info(
-            f"[MEM PROBE] loop={loop_count if loop_count is not None else '-'} "
-            f"rss_mb={rss_mb:.1f} rss_delta_mb={delta_mb:.1f} delta_sec={delta_sec:.1f} "
-            f"vms_mb={vms_mb:.1f} uss_mb={uss_mb:.1f} pss_mb={pss_mb:.1f} "
-            f"sys_mem_pct={vm.percent:.1f} "
-            f"sys_available_mb={vm.available / (1024 ** 2):.1f} "
-            f"cpu_pct={cpu_usage if cpu_usage is not None else '-'} "
-            f"threads={proc.num_threads()} image_q={image_q} log_q={log_q}"
-        )
-
-        smaps = _read_smaps_rollup_mb()
-        if smaps:
-            if "_error" in smaps:
-                logger.info(f"[MEM SMAPS] error={smaps.get('_error')}")
-            else:
-                logger.info(
-                    f"[MEM SMAPS] rss_mb={smaps.get('Rss', 0.0):.1f} "
-                    f"pss_mb={smaps.get('Pss', 0.0):.1f} "
-                    f"private_dirty_mb={smaps.get('Private_Dirty', 0.0):.1f} "
-                    f"private_clean_mb={smaps.get('Private_Clean', 0.0):.1f} "
-                    f"shared_clean_mb={smaps.get('Shared_Clean', 0.0):.1f} "
-                    f"anonymous_mb={smaps.get('Anonymous', 0.0):.1f} "
-                    f"anon_huge_mb={smaps.get('AnonHugePages', 0.0):.1f} "
-                    f"swap_mb={smaps.get('Swap', 0.0):.1f}"
-                )
-
-        _log_tracemalloc_probe(loop_count=loop_count)
-
-        for cam in cams:
-            recorder = getattr(cam, "recorder", None)
-            rec_q = _safe_queue_size(getattr(recorder, "write_queue", None))
-            rec_buf = getattr(recorder, "buffer", [])
-            event_q = event_save_queues.get(getattr(cam, "ip", None), [])
-            alerted = getattr(cam, "alerted", {})
-            try:
-                alerted_marks = sum(len(v) for v in alerted.values())
-            except Exception:
-                alerted_marks = -1
-            handler_parts = []
-            for name, handler in getattr(cam, "handlers", {}).items():
-                parts = [str(name)]
-                sessions = getattr(handler, "sessions", None)
-                if sessions is not None:
-                    parts.append(f"sessions={_bounded_len(sessions)}")
-                red_tids = getattr(handler, "red_helmet_tids", None)
-                if red_tids is not None:
-                    parts.append(f"red_helmet_tids={_bounded_len(red_tids)}")
-                handler_parts.append(":".join(parts))
-
-            logger.info(
-                f"[MEM PROBE CAM] cam={getattr(cam, 'cam_id', '-')} ip={getattr(cam, 'ip', '-')} "
-                f"rec_q={rec_q} rec_buf={_bounded_len(rec_buf)}/{getattr(rec_buf, 'maxlen', '-')} "
-                f"recording={getattr(recorder, 'recording', '-')} "
-                f"event_q={_bounded_len(event_q)}/{getattr(event_q, 'maxlen', '-')} "
-                f"alerted_tids={_bounded_len(alerted)} alerted_marks={alerted_marks} "
-                f"handlers={','.join(handler_parts) if handler_parts else '-'}"
-            )
-    except Exception as e:
-        logger.warning(f"[MEM PROBE] failed | {e}")
 
 def record_api_send_state(ok, event_id="-"):
     with API_SEND_STATE_LOCK:
@@ -1256,7 +776,7 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
 
         if img is None:
             cell_img = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
-            cv2.putText(cell_img, "No Signal", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(cell_img, "No Signal", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1)
         else:
             cell_img = cv2.resize(img, (cell_w, cell_h))
 
@@ -1345,9 +865,9 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
                     status="ok",
                     extra={"status_code": response.status_code, "elapsed_ms": elapsed_ms}
                 )
-                logger.info(f"?? [API 전송 성공] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name}")
+                logger.info(f" [API 전송 성공] 단말:{terminal_id} | CAM:{cctv_id} | 이벤트:{event_name}")
             else:
-                logger.error(f"?? [API 전송 실패] 상태코드: {response.status_code} | 메시지: {response.text}")
+                logger.error(f" [API 전송 실패] 상태코드: {response.status_code} | 메시지: {response.text}")
             if response.status_code != 200:
                 logger.error(
                     f"[API SEND FAIL] event_id={event_id} terminal={terminal_id} cam={cctv_id} "
@@ -1365,12 +885,12 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.error(f"[API NETWORK ERROR] event_id={event_id} image={image_path} | {e}")
         record_api_send_state(False, event_id)
         append_event_audit_record(api_audit, stage="api_send", status="failed", extra={"reason": "network_error"})
-        logger.error(f"?? [API 네트워크 예외 발생]: {e}")
+        logger.error(f" [API 네트워크 예외 발생]: {e}")
     except Exception as e:
         logger.error(f"[API UNEXPECTED ERROR] event_id={event_id} image={image_path} | {e}\n{traceback.format_exc()}")
         record_api_send_state(False, event_id)
         append_event_audit_record(api_audit, stage="api_send", status="failed", extra={"reason": "unexpected_error"})
-        logger.error(f"?? [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
+        logger.error(f" [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
 def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_tokens=None):
     """Create an API-only image with event boxes drawn on top."""
@@ -1400,7 +920,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
 
         is_target = target_tid is not None and obj_tid == target_tid
         color = (0, 0, 255) # if is_target else (0, 165, 255) 고객사 요청으로 그냥 빨간색 표시
-        thickness = 3 if is_target else 2
+        thickness = 1 if is_target else 2
         cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
 
         label = str(event_type)
@@ -1411,8 +931,8 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
 
     if not drawn:
         x1, y1, x2, y2 = map(int, bbox)
-        cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        cv2.putText(api_img, str(event_type), (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
+        cv2.putText(api_img, str(event_type), (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv2.LINE_AA)
 
     # 관제 서버로 전송되는 증거 이미지 우측 하단에 Signalman 상태창 강제 베이킹 (유지)
     if event_type == "signal_vehicle":
@@ -1424,7 +944,7 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         overlay = api_img.copy()
         cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
-        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
         if not auth_tokens:
             cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
@@ -2076,216 +1596,113 @@ class VideoRecorder:
     def __init__(self, ip, cam_id=None):
         self.ip = ip
         self.cam_id = cam_id if cam_id is not None else "-"
-        self.fps = SYS_CFG.get("REC_FPS", 3)
-        self.pre_sec = SYS_CFG.get("REC_PRE_SEC", 10)
-        self.buffer = deque(maxlen=max(1, int(self.fps * self.pre_sec)))
+        # [수정] 지연 횡단을 고려하여 최대 40초 분량(과거 30초+사전 10초)의 프레임 캐싱 보장
+        self.pre_sec = 40.0
+        self.max_buffer_len = int(15 * self.pre_sec) # Max 15FPS 기준
+        self.buffer = deque(maxlen=self.max_buffer_len)
         self.write_queue = queue.Queue()
 
         self.recording = False
         self.record_end_time = 0
         self.current_event = "unknown"
         self.current_meta = None
-        self.current_video_path = None
-        self.current_infer_log_path = None
-        self.current_meta_path = None
         self.current_record_started_at = None
+        self.recorded_fps = 3.0
         self.running = True
-        logger.info(
-            f"[FRAME BUFFER] CAM:{self.cam_id}({self.ip}) | Event:init | "
-            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:0.0 | "
-            f"Frames -> recorder pre-buffer max={self.buffer.maxlen} "
-            f"(REC_FPS={self.fps}, REC_PRE_SEC={self.pre_sec})"
-        )
 
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
 
-    def update(self, frame, infer_meta=None):
-        if frame is None:
-            return
-
-        # 원본 프레임과 그 순간의 AI 판단 결과를 한 묶음으로 보관합니다.
-        # 나중에 영상의 특정 장면과 infer JSONL 한 줄을 맞춰보기 위한 준비입니다.
-        frame_item = (frame.copy(), infer_meta)
-        self.buffer.append(frame_item)
+    def update(self, frame, infer_meta=None, timestamp=None):
+        if frame is None: return
+        self.buffer.append((frame.copy(), infer_meta, timestamp or time.time()))
 
         if self.recording:
             if time.time() > self.record_end_time:
                 self.recording = False
                 self.write_queue.put(None)
-                logger.info(f"?? [녹화종료] {self.ip} - {self.current_event}")
+                logger.info(f" [녹화종료] {self.ip} - {self.current_event}")
             else:
-                self.write_queue.put(frame_item)
+                self.write_queue.put((frame.copy(), infer_meta, timestamp or time.time()))
 
-    def trigger(self, event_name, objects_meta=None, event_meta=None, current_fps=0.0): # [수정] objects_meta 매개변수 추가
+    def trigger(self, event_name, objects_meta=None, event_meta=None, current_fps=3.0):
         now = time.time()
-        post_sec = SYS_CFG.get("REC_POST_SEC", 10)
+        post_sec = SYS_CFG.get("REC_POST_SEC", 10.0)
+        
+        # [수정] 선에 처음 닿은 시점 역산 (Crossing Delay 반영)
+        candidate_age_sec = 0.0
+        if isinstance(event_meta, dict) and 'decision_trace' in event_meta:
+            candidate_age_sec = float(event_meta['decision_trace'].get('candidate_age_sec', 0.0))
+        
+        pre_sec = SYS_CFG.get("REC_PRE_SEC", 10.0)
+        target_start_time = now - candidate_age_sec - pre_sec
 
         if self.recording:
-            self.record_end_time = now + post_sec
+            self.record_end_time = max(self.record_end_time, now + post_sec)
         else:
-            logger.info(f"? [녹화시작] {self.ip} - {event_name}")
+            logger.info(f"? [녹화시작] {self.ip} - {event_name} (FPS: {current_fps:.1f})")
             self.recording = True
             self.record_end_time = now + post_sec
             self.current_event = event_name
-            # MP4 옆 JSON에는 BBox뿐 아니라 이벤트 판단 근거(decision_trace)까지 함께 남깁니다.
-            # event_meta가 없는 예전 호출은 objects_meta만 저장해 기존 동작을 유지합니다.
-            self.current_meta = event_meta if event_meta is not None else objects_meta
+            self.current_meta = event_meta
             self.current_record_started_at = now
+            self.recorded_fps = max(1.0, float(current_fps))
 
-            temp_buffer = list(self.buffer)
-            tids = []
-            if objects_meta:
-                for obj in objects_meta:
-                    obj_tid = obj.get("tid")
-                    if obj_tid is not None:
-                        tids.append(str(obj_tid))
-            tid_text = ",".join(tids) if tids else "-"
-            logger.info(
-                f"[FRAME BUFFER] event_id={event_meta.get('event_id', '-') if isinstance(event_meta, dict) else '-'} "
-                f"CAM:{self.cam_id}({self.ip}) | Event:{event_name} | "
-                f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid_text} | FPS:{current_fps:.1f} | "
-                f"Frames -> recorder pre-buffer kept={len(temp_buffer)}/{self.buffer.maxlen}"
-            )
-            for item in temp_buffer:
-                self.write_queue.put(item)
+            for item in list(self.buffer):
+                if item[2] >= target_start_time:
+                    self.write_queue.put(item)
 
     def _writer_loop(self):
         writer = None
         fpath = None
-        meta_path = None
-        # infer_log_file은 녹화 영상과 같은 이름의 ".infer.jsonl" 파일입니다.
-        # 예: 20260521_120000_192.168.0.10_no_helmet.mp4
-        #     20260521_120000_192.168.0.10_no_helmet.infer.jsonl
         infer_log_file = None
-        infer_log_path = None
-        # video_frame_index는 녹화 파일 안에서 몇 번째 프레임인지 나타냅니다.
-        # 영상과 JSONL 로그를 함께 열었을 때 같은 장면을 찾기 쉽게 해줍니다.
         video_frame_index = 0
+        
         while self.running:
-            try:
-                item = self.write_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            try: item = self.write_queue.get(timeout=1.0)
+            except queue.Empty: continue
 
             if item is None:
-                duration_sec = 0.0
-                if writer:
-                    writer.release()
-                    if self.current_record_started_at:
-                        duration_sec = max(0.0, time.time() - self.current_record_started_at)
-                    event_id = "-"
-                    if isinstance(self.current_meta, dict):
-                        event_id = self.current_meta.get("event_id", "-")
-                    logger.info(
-                        f"[RECORDING CLOSED] event_id={event_id} cam={self.cam_id} ip={self.ip} "
-                        f"event={self.current_event} video={fpath or '-'} infer_log={infer_log_path or '-'} "
-                        f"frames={video_frame_index} duration_sec={duration_sec:.1f}"
-                    )
-                    writer = None
-                if infer_log_file:
-                    infer_log_file.close()
-                    infer_log_file = None
-                if isinstance(self.current_meta, dict):
-                    self.current_meta.update({
-                        "video_path": fpath,
-                        "infer_log_path": infer_log_path,
-                        "meta_path": meta_path,
-                        "recording_frames": int(video_frame_index),
-                        "recording_duration_sec": round(float(duration_sec), 3)
-                    })
-                    append_event_audit_record(self.current_meta, stage="recording_closed", status="ok")
-                    logger.info(
-                        f"[EVENT AUDIT] event_id={self.current_meta.get('event_id', '-')} "
-                        f"stage=recording_closed meta={meta_path or '-'} video={fpath or '-'} "
-                        f"infer_log={infer_log_path or '-'}"
-                    )
-                infer_log_path = None
-                fpath = None
-                meta_path = None
-                self.current_video_path = None
-                self.current_infer_log_path = None
-                self.current_meta_path = None
-                self.current_record_started_at = None
-                self.current_meta = None
-                video_frame_index = 0
+                if writer: writer.release()
+                if infer_log_file: infer_log_file.close()
+                writer, infer_log_file = None, None
                 continue
 
-            if isinstance(item, tuple):
-                frame, infer_meta = item
-            else:
-                frame, infer_meta = item, None
+            frame, infer_meta, timestamp = item
 
             if writer is None:
+                # [수정] 모든 산출물을 하나의 videos 디렉토리로 통합
                 dpath = os.path.join(EVENT_ROOT_DIR, "events", self.ip, "videos", self.current_event)
-                if not os.path.exists(dpath):
-                    os.makedirs(dpath, exist_ok=True)
-
-                # 파일명 동기화를 위해 변수 처리
-                time_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                os.makedirs(dpath, exist_ok=True)
+                
+                time_str = datetime.datetime.fromtimestamp(self.current_record_started_at).strftime('%Y%m%d_%H%M%S')
                 fname = f"{time_str}_{self.ip}_{self.current_event}.mp4"
                 fpath = os.path.join(dpath, fname)
-                # 영상 파일 옆에 같은 이름의 infer 로그 파일을 만듭니다.
-                # 영상은 원본 그대로 두고, AI가 본 박스/클래스/이벤트 정보는 이 파일에 저장합니다.
                 infer_log_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.infer.jsonl")
-                self.current_video_path = fpath
-                self.current_infer_log_path = infer_log_path
+                meta_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.meta.json")
 
-                # -----------------------------------------------------------
-                # [추가] 영상 생성 시점에 BBox 상세 수치 데이터(JSON)를 동시 저장
-                # -----------------------------------------------------------
-                if hasattr(self, 'current_meta') and self.current_meta:
-                    meta_fname = f"{time_str}_{self.ip}_{self.current_event}.json"
-                    meta_path = os.path.join(dpath, meta_fname)
-                    self.current_meta_path = meta_path
-                    if isinstance(self.current_meta, dict):
-                        self.current_meta.update({
-                            "video_path": fpath,
-                            "infer_log_path": infer_log_path,
-                            "meta_path": meta_path
-                        })
+                if isinstance(self.current_meta, dict):
+                    self.current_meta.update({"video_path": fpath, "infer_log_path": infer_log_path, "recorded_fps": self.recorded_fps})
                     try:
                         with open(meta_path, 'w', encoding='utf-8') as f_meta:
                             json.dump(to_json_safe(self.current_meta), f_meta, indent=4, ensure_ascii=False)
-                        if isinstance(self.current_meta, dict):
-                            append_event_audit_record(self.current_meta, stage="recording_metadata_written", status="open")
-                            logger.info(
-                                f"[EVENT AUDIT] event_id={self.current_meta.get('event_id', '-')} stage=recording_metadata_written "
-                                f"meta={meta_path} video={fpath} infer_log={infer_log_path}"
-                            )
-                        logger.info(f"?? [BBox 데이터 저장 완료] 경로: {meta_path}")
                     except Exception as e:
-                        logger.error(f"?? BBox JSON 메타데이터 저장 실패: {e}")
-                # -----------------------------------------------------------
+                        logger.error(f"메타데이터 저장 실패: {e}")
 
                 h, w = frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writer = cv2.VideoWriter(fpath, fourcc, self.fps, (w, h))
+                writer = cv2.VideoWriter(fpath, fourcc, self.recorded_fps, (w, h))
 
-                if not writer.isOpened():
-                    logger.error(f"[녹화에러] 파일을 열 수 없습니다: {fpath}")
-                    writer = None
-                    continue
-
-            if writer and infer_log_file is None and infer_log_path:
-                try:
-                    # 실제 영상 파일이 열린 뒤에 로그 파일도 함께 엽니다.
-                    # 영상 저장에 실패한 경우 불필요한 로그 파일만 생기지 않게 하기 위함입니다.
-                    infer_log_file = open(infer_log_path, 'w', encoding='utf-8')
-                    video_frame_index = 0
-                except Exception as e:
-                    logger.error(f"[InferLog] video inference log open failed: {infer_log_path} | {e}")
+                try: infer_log_file = open(infer_log_path, 'w', encoding='utf-8')
+                except Exception: pass
 
             if writer:
                 if infer_log_file and infer_meta is not None:
                     try:
                         log_record = dict(infer_meta)
-                        # 이 두 값으로 "영상 파일의 N번째 프레임"과 "AI 판단 로그"를 연결합니다.
                         log_record["video_frame_index"] = video_frame_index
-                        log_record["video_path"] = fpath
                         infer_log_file.write(json.dumps(to_json_safe(log_record), ensure_ascii=False) + "\n")
-                    except Exception as e:
-                        logger.error(f"[InferLog] video inference log write failed: {infer_log_path} | {e}")
+                    except Exception: pass
 
                 writer.write(frame)
                 video_frame_index += 1
@@ -2425,7 +1842,7 @@ class CrossingDetector(BaseEventDetector):
         self.min_crossing_angle = config.get("min_crossing_angle", 20.0)
         self.distance_ratio = config.get("distance_ratio", 0.2)
 
-        self.candidate_ttl_sec = config.get("candidate_ttl_sec", 5.0)
+        self.candidate_ttl_sec = config.get("candidate_ttl_sec", 30.0)
 
     def _is_intersect(self, p1, p2, p3, p4):
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
@@ -2468,7 +1885,46 @@ class CrossingDetector(BaseEventDetector):
 
         return inter_area / float(area1) if area1 > 0 else 0.0
 
+    def _update_computed_lines(self):
+        """
+        [최적화] ROI 라인이 변경되었을 때만 최초 1회 선분의 기울기를 계산하여
+        해당 선분의 트리거 앵커 타입(TOP, CENTER, FOOT)을 캐싱합니다.
+        """
+        if not hasattr(self, '_cached_lines') or self._cached_lines != self.lines:
+            self.computed_lines = []
+            for p1, p2 in self.lines:
+                dx = float(p2[0] - p1[0])
+                dy = float(p2[1] - p1[1])
+                
+                if dx == 0:
+                    atype = 'TOP'
+                else:
+                    slope = abs(dy / dx)
+                    if slope < 0.57: atype = 'TOP'       # 완만한 가로선 (컨베이어 횡단 방어)
+                    elif slope > 1.73: atype = 'FOOT'    # 가파른 세로선
+                    else: atype = 'CENTER'               # 대각선
+                    
+                self.computed_lines.append({'p1': p1, 'p2': p2, 'anchor_type': atype})
+            self._cached_lines = list(self.lines)
+
+    def _get_dynamic_anchor(self, box, anchor_type):
+        """
+        [최적화] 사전 연산된 anchor_type을 받아 즉시 좌표만 반환합니다. (연산 부하 0)
+        """
+        bx1, by1, bx2, by2 = box
+        bcx = (bx1 + bx2) / 2.0
+        
+        if anchor_type == 'TOP':
+            return (bcx, float(by1))
+        elif anchor_type == 'FOOT':
+            return (bcx, float(by2))
+        else:
+            return (bcx, (by1 + by2) / 2.0)
+
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
+        # [핵심] ROI 라인 정보가 캐싱되어 있는지 확인 (CPU 부하 최소화)
+        self._update_computed_lines()
+        
         triggered = []
         curr_ids = set()
         current_time = time.time()
@@ -2476,7 +1932,6 @@ class CrossingDetector(BaseEventDetector):
         persons = [t for t in tracks if track_map.get(int(t[4])) == ID_G_PERSON]
         low_bodies = [t for t in tracks if track_map.get(int(t[4])) == ID_PERSON_LOW]
 
-        # 하반신 매칭 및 발 위치 정밀 계산
         for p in persons:
             p_tid = int(p[4])
             curr_ids.add(p_tid)
@@ -2487,10 +1942,9 @@ class CrossingDetector(BaseEventDetector):
             best_low_track = None
             max_ioa = 0
 
-            # 해당 사람과 짝지어질 하반신 탐색
             for lb in low_bodies:
                 lx1, ly1, lx2, ly2 = lb[:4]
-                lcx, lcy = (lx1 + lx2) / 2, (ly1 + ly2) / 2
+                lcy = (ly1 + ly2) / 2
 
                 if lcy < py1 + person_height * 0.4:
                     continue
@@ -2501,32 +1955,42 @@ class CrossingDetector(BaseEventDetector):
                     best_low_track = lb
 
             curr_objects = [{'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid, 'class_id': ID_G_PERSON}]
+            
             if max_ioa >= 0.4 and best_low_track is not None:
-                lx1, ly1, lx2, ly2 = best_low_track[:4]
-                low_height = max(1, ly2 - ly1)
-                curr_pos = (int((lx1 + lx2) / 2), int(ly2 - low_height * 0.1))
-
-                event_bbox = tuple(best_low_track[:4])
-
+                curr_box = best_low_track[:4]
                 curr_objects.append({'label': 'low_body', 'box': [int(x) for x in best_low_track[:4]], 'score': float(best_low_track[5]), 'tid': int(best_low_track[4]), 'class_id': ID_PERSON_LOW})
-
             else:
                 if p_tid in self.candidates and current_time - self.candidates[p_tid]['timestamp_time'] > self.candidate_ttl_sec:
                     del self.candidates[p_tid]
                 continue
 
-            # 점프 방어 (너무 큰 순간 이동은 무시)
-            if p_tid in self.prev:
-                jump_dist = get_distance(self.prev[p_tid], curr_pos)
-                if jump_dist > person_height * 0.2:
-                    del self.prev[p_tid]
-                    self.prev[p_tid] = curr_pos
-                    continue
+            # 이전 박스가 없으면 등록 후 스킵
+            if p_tid not in self.prev:
+                self.prev[p_tid] = curr_box
+                continue
+                
+            prev_box = self.prev[p_tid]
+            
+            # 점프 방어는 BBox 중심점을 기준으로 튀는지 검사
+            prev_cx, prev_cy = (prev_box[0]+prev_box[2])/2, (prev_box[1]+prev_box[3])/2
+            curr_cx, curr_cy = (curr_box[0]+curr_box[2])/2, (curr_box[1]+curr_box[3])/2
+            jump_dist = get_distance((prev_cx, prev_cy), (curr_cx, curr_cy))
+            
+            if jump_dist > person_height * 0.2:
+                self.prev[p_tid] = curr_box
+                continue
 
-            # 횡단 판별: 궤적이 선분과 교차하는지 확인
-            if p_tid in self.prev and p_tid not in self.candidates:
-                trajectory = (self.prev[p_tid], curr_pos)
-                for p1, p2 in self.lines:
+            # 횡단 후보군 등록 (사전 연산된 computed_lines 사용)
+            if p_tid not in self.candidates:
+                for c_line in self.computed_lines:
+                    p1, p2 = c_line['p1'], c_line['p2']
+                    atype = c_line['anchor_type']
+                    
+                    # 캐싱된 앵커 타입을 사용하여 연산 없이 즉각 좌표 추출
+                    prev_pos = self._get_dynamic_anchor(prev_box, atype)
+                    curr_pos = self._get_dynamic_anchor(curr_box, atype)
+                    trajectory = (prev_pos, curr_pos)
+                    
                     if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
                         cross_angle = self._get_angle_between_lines((p1, p2), trajectory)
                         if cross_angle >= self.min_crossing_angle:
@@ -2534,28 +1998,30 @@ class CrossingDetector(BaseEventDetector):
                                 'person_height': person_height,
                                 'timestamp_time': current_time,
                                 'line': (p1, p2),
+                                'anchor_type': atype, # [핵심] 판정 시 사용할 앵커 타입 함께 보관
                                 'entry_side': ccw(p1, p2, trajectory[0]),
                                 'cross_angle': cross_angle,
                                 'candidate_trajectory': [trajectory[0], trajectory[1]],
-                                'crossed_pos': curr_pos, # [추가] 선을 넘은 직후의 첫 발 위치 앵커 기록
-                                'bbox': event_bbox,
+                                'crossed_pos': curr_pos, 
+                                'bbox': tuple(curr_box),
                                 'frame': frame.copy() if frame is not None else None,
                                 'fid': fid,
                                 'objects': curr_objects
                             }
                         break
 
-            # 수직 거리 및 교차 후 실이동 거리 기반 최종 알람 트리거
+            # 최종 트리거 판별
             if p_tid in self.candidates:
                 cand = self.candidates[p_tid]
                 p1, p2 = cand['line']
+                atype = cand['anchor_type']
+                
+                # 저장해둔 앵커 타입으로 현재 위치 즉각 추출
+                curr_pos = self._get_dynamic_anchor(curr_box, atype)
                 curr_side = ccw(p1, p2, curr_pos)
 
-                # 완전히 반대편으로 진입한 상태라면
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
-                    # 1. 라인 기준 수직 침투 깊이
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
-                    # 2. [추가] 앵커(crossed_pos)로부터의 실제 추가 이동 거리
                     post_cross_dist = get_distance(cand['crossed_pos'], curr_pos)
 
                     dx = abs(p2[0] - p1[0])
@@ -2565,7 +2031,6 @@ class CrossingDetector(BaseEventDetector):
                     tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
 
-                    # [핵심 보완] 수직 깊이를 충족하고, 동시에 1프레임 튐이 아니라 실제 발걸음이 발생했을 때만 트리거
                     if perp_dist >= dynamic_threshold and post_cross_dist >= (dynamic_threshold * 0.6):
                         triggered.append({
                             'tid': p_tid,
@@ -2577,35 +2042,22 @@ class CrossingDetector(BaseEventDetector):
                                 'detector': 'CrossingDetector',
                                 'reason': 'line_crossed_after_candidate',
                                 'line': [int_point(p1), int_point(p2)],
+                                'anchor_type': atype,
                                 'entry_side': int(cand['entry_side']),
                                 'current_side': int(curr_side),
-                                'candidate_fid': int(cand.get('fid', fid)),
-                                'trigger_fid': int(fid),
                                 'candidate_age_sec': round(float(current_time - cand['timestamp_time']), 3),
-                                'candidate_trajectory': [int_point(p) for p in cand.get('candidate_trajectory', [])],
                                 'crossed_pos': int_point(cand['crossed_pos']),
                                 'current_pos': int_point(curr_pos),
-                                'cross_angle': round(float(cand.get('cross_angle', 0.0)), 3),
-                                'min_crossing_angle': round(float(self.min_crossing_angle), 3),
                                 'perp_dist': round(float(perp_dist), 3),
                                 'post_cross_dist': round(float(post_cross_dist), 3),
-                                'dynamic_threshold': round(float(dynamic_threshold), 3),
-                                'distance_ratio': round(float(self.distance_ratio), 4),
-                                'tilt_factor': round(float(tilt_factor), 4),
-                                'used_low_body': True,
-                                'low_body_ioa': round(float(max_ioa), 4),
-                                'person_height': round(float(cand['person_height']), 3)
                             }
                         })
                         del self.candidates[p_tid]
-                    else:
-                        if p_tid in self.candidates:
-                            logger.debug(f"[CROSSING CANDIDATE] fid={fid} tid={p_tid} perp_dist={perp_dist:.2f} post_cross_dist={post_cross_dist:.2f} threshold={dynamic_threshold:.2f}")
-
+                
                 elif current_time - cand['timestamp_time'] > self.candidate_ttl_sec:
                     del self.candidates[p_tid]
 
-            self.prev[p_tid] = curr_pos
+            self.prev[p_tid] = curr_box
 
         for tid in list(self.prev.keys()):
             if tid not in curr_ids:
@@ -2873,15 +2325,17 @@ class SignalVehicleDetector(BaseEventDetector):
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
         self.history = defaultdict(lambda: deque(maxlen=30))
-        self.motion_ratio = config.get("motion_threshold_ratio", 0.30)
+        
+        # [복구 및 최적화] MOG2 모션 감지기 초기화 
+        # 그림자 감지(detectShadows=False)를 꺼서 CPU 부하를 대폭 줄입니다.
+        self.mog = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=32, detectShadows=False)
+        
         self.auth_grace_sec = config.get("auth_grace_sec", 120.0)
         self.presence_threshold_sec = config.get("presence_threshold_sec", 3.0)
         self.parked_threshold_sec = config.get("parked_threshold_sec", 60.0)
         self.prox_ratio_x = config.get("prox_ratio_x", 1.0)
         self.prox_ratio_y = config.get("prox_ratio_y", 1.0)
 
-        # 일반 차량이 순간적으로 LineTruck(ID 6)으로 튀는 경우를 막기 위한 확정 필터입니다.
-        # LineTruck이 일반 차량으로 튀는 경우는 거의 없다는 전제를 이용해, Car 이력은 강한 제외 조건으로 봅니다.
         self.line_truck_confirm_frames = max(1, int(config.get("line_truck_confirm_frames", 10)))
         self.line_truck_confirm_ratio = min(1.0, max(0.0, float(config.get("line_truck_confirm_ratio", 0.7))))
         self.line_truck_car_veto_frames = max(0, int(config.get("line_truck_car_veto_frames", 5)))
@@ -2899,10 +2353,7 @@ class SignalVehicleDetector(BaseEventDetector):
         self.presence_start_time = {}
         self.last_auth_time = {}
         self.last_auth_signalman = {}
-
-        # [추가] 1프레임 미탐지 방어(Debounce)용 신호수 마지막 목격 시간 기억
         self.last_signalman_seen_time = {}
-
         self.stationary_anchor = {}
         self.stationary_start_time = {}
 
@@ -2912,8 +2363,6 @@ class SignalVehicleDetector(BaseEventDetector):
         self.state_inherit_sources = {}
 
     def _remember_recent_cars(self, tracks, track_map):
-        # 현재 프레임에서 일반 차량으로 확인된 위치를 잠깐 기억합니다.
-        # 같은 위치에서 바로 LineTruck 후보가 생기면 일반 차량 오탐 가능성이 높으므로 제외하기 위함입니다.
         for t in tracks:
             if track_map.get(int(t[4])) != ID_G_CAR:
                 continue
@@ -2930,8 +2379,6 @@ class SignalVehicleDetector(BaseEventDetector):
             self.recent_car_observations.popleft()
 
     def _has_recent_car_veto(self, truck_box):
-        # 최근 Car 위치와 많이 겹치거나 너무 가까우면 LineTruck 확정을 막습니다.
-        # 현장 가정상 LineTruck이 Car로 잘못 내려오는 일은 없고, Car가 LineTruck으로 튀는 쪽만 문제이기 때문입니다.
         if self.line_truck_car_veto_frames <= 0:
             return False
 
@@ -2963,7 +2410,6 @@ class SignalVehicleDetector(BaseEventDetector):
         _, _, curr_size, curr_area = self._box_size_meta(curr_box)
         _, _, old_size, old_area = self._box_size_meta(old_box)
 
-        # A sudden oversized detection must not make the distance gate loose.
         distance_gate = min(curr_size, old_size) * self.state_inherit_distance_ratio
         spatial_match = iou > 0.3 or dist < distance_gate
         if not spatial_match:
@@ -2977,8 +2423,6 @@ class SignalVehicleDetector(BaseEventDetector):
         return True, "ok"
 
     def _is_confirmed_line_truck(self, track):
-        # LineTruck 후보가 몇 프레임 연속으로 안정적인지 확인합니다.
-        # 한두 프레임짜리 오탐은 여기서 걸러지고, 충분히 누적된 후보만 신호수 차량 이벤트 판정에 들어갑니다.
         tid = int(track[4])
         score = float(track[5])
         box = track[:4]
@@ -2997,36 +2441,33 @@ class SignalVehicleDetector(BaseEventDetector):
         current_time = time.time()
         self.process_seq += 1
 
-        if self.roi_poly.size == 0 or motion_mask is None or frame is None: return triggered
+        if self.roi_poly.size == 0 or frame is None: return triggered
 
         h_frame, w_frame = frame.shape[:2]
-        h_mask, w_mask = motion_mask.shape[:2]
-        scale_x, scale_y = w_mask / float(w_frame), h_mask / float(h_frame)
-        prox_x_thresh, prox_y_thresh = w_frame * self.prox_ratio_x, h_frame * self.prox_ratio_y
+        
+        # [복구 및 최적화] 320x180 초소형 해상도로 MOG 연산 수행 (CPU 연산량 1/16 수준 방어)
+        # 멈춰있던 배경(트럭)이 픽셀 수준에서 진짜 움직였는지 교차 검증하는 용도
+        small_frame = cv2.resize(frame, (320, 180))
+        small_motion_mask = self.mog.apply(small_frame)
 
+        prox_x_thresh, prox_y_thresh = w_frame * self.prox_ratio_x, h_frame * self.prox_ratio_y
         signalman_tracks = kwargs.get('signalman_tracks', [])
         signalmen_info = [{'tid': int(t[4]), 'pt': get_foot_point(*t[:4])} for t in signalman_tracks]
 
         self._remember_recent_cars(tracks, track_map)
-
-        # [0단계] LineTruck 확정 필터
-        # 일반 차량이 잠깐 LineTruck으로 오탐된 경우를 막기 위해, 확정된 LineTruck ID만 아래 상태 머신으로 보냅니다.
         self.confirmed_line_truck_ids = set()
+        
         for t in tracks:
             tid = int(t[4])
             if track_map.get(tid) == ID_G_TRUCK and self._is_confirmed_line_truck(t):
                 curr_ids.add(tid)
                 self.confirmed_line_truck_ids.add(tid)
 
-        # ---------------------------------------------------------
-        # [1단계] 양방향 범용 상태 상속
-        # ---------------------------------------------------------
         missing_tids = [tid for tid in self.last_seen_bbox.keys() if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) < 3.0]
 
         for curr_tid in curr_ids:
             curr_box = next((t[:4] for t in tracks if int(t[4]) == curr_tid), None)
             if curr_box is None: continue
-
             curr_fc = get_foot_point(*curr_box)
 
             for old_tid in missing_tids:
@@ -3038,10 +2479,8 @@ class SignalVehicleDetector(BaseEventDetector):
 
                 if can_inherit:
                     self.state_inherit_sources[curr_tid] = {
-                        'from_tid': int(old_tid),
-                        'to_tid': int(curr_tid),
-                        'iou': round(float(iou), 4),
-                        'distance': round(float(dist), 3),
+                        'from_tid': int(old_tid), 'to_tid': int(curr_tid),
+                        'iou': round(float(iou), 4), 'distance': round(float(dist), 3),
                         'reason': inherit_reason
                     }
                     if old_tid in self.last_auth_time:
@@ -3056,7 +2495,6 @@ class SignalVehicleDetector(BaseEventDetector):
                     if old_tid in self.presence_start_time:
                         self.presence_start_time[curr_tid] = self.presence_start_time[old_tid]
                         del self.presence_start_time[old_tid]
-                    # [추가] 목격 시간 상속
                     if old_tid in self.last_signalman_seen_time:
                         self.last_signalman_seen_time[curr_tid] = self.last_signalman_seen_time[old_tid]
                         del self.last_signalman_seen_time[old_tid]
@@ -3073,14 +2511,8 @@ class SignalVehicleDetector(BaseEventDetector):
                     missing_tids.remove(old_tid)
                     break
                 elif inherit_reason.startswith("size_jump"):
-                    logger.debug(
-                        f"[SignalVehicle] state inherit blocked by bbox size jump | "
-                        f"old_tid={old_tid} curr_tid={curr_tid} iou={iou:.3f} dist={dist:.1f} reason={inherit_reason}"
-                    )
+                    pass 
 
-        # ---------------------------------------------------------
-        # [2단계] 완전 정차(Stationary) 기반 상태 업데이트 (디바운스 적용)
-        # ---------------------------------------------------------
         for t in tracks:
             tid = int(t[4])
             if tid not in self.confirmed_line_truck_ids: continue
@@ -3122,7 +2554,6 @@ class SignalVehicleDetector(BaseEventDetector):
                     has_signalman, matched_sig_tid = True, s_info['tid']
                     break
 
-            # [핵심 수정] 신호수 탐지 1.5초 디바운스 적용
             if has_signalman:
                 self.last_signalman_seen_time[tid] = current_time
                 if tid not in self.presence_start_time: self.presence_start_time[tid] = current_time
@@ -3131,13 +2562,10 @@ class SignalVehicleDetector(BaseEventDetector):
                     self.last_auth_signalman[tid] = matched_sig_tid
             else:
                 last_seen = self.last_signalman_seen_time.get(tid, 0.0)
-                # 1.5초 이상 신호수 트랙을 완벽히 잃어버렸을 때만 타이머 완전 초기화
                 if current_time - last_seen > 1.5:
                     if tid in self.presence_start_time: del self.presence_start_time[tid]
 
-        # ---------------------------------------------------------
-        # [3단계] 이동 검지 및 알람 트리거
-        # ---------------------------------------------------------
+        # BBox 궤적 거리 + MOG 픽셀 변화량 교차 검증 로직
         for t in tracks:
             tid = int(t[4])
             if tid not in self.confirmed_line_truck_ids: continue
@@ -3155,78 +2583,78 @@ class SignalVehicleDetector(BaseEventDetector):
                 dist = get_distance(start_p, end_p)
                 min_movement = max(v_size * 0.15, 10.0)
 
+                # 1차 검증: BBox 중심점이 충분히 이동했는가?
                 if dist >= min_movement and is_in_roi:
-                    mx1, my1 = max(0, int(x1 * scale_x)), max(0, int(y1 * scale_y))
-                    mx2, my2 = min(w_mask, int(x2 * scale_x)), min(h_mask, int(y2 * scale_y))
+                    
+                    # 2차 검증 (ID 스위칭 오탐 방어): 실제 해당 영역 픽셀에 움직임(MOG)이 있었는가?
+                    sx1, sy1 = max(0, int(x1 * 320 / w_frame)), max(0, int(y1 * 180 / h_frame))
+                    sx2, sy2 = min(320, int(x2 * 320 / w_frame)), min(180, int(y2 * 180 / h_frame))
+                    
+                    truck_motion = small_motion_mask[sy1:sy2, sx1:sx2]
+                    motion_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+                    motion_ratio = cv2.countNonZero(truck_motion) / motion_area
+                    
+                    # BBox 영역 내 픽셀 변화가 5% 미만이라면 트럭이 이동한게 아니라 트래커 ID가 튄 것으로 간주!
+                    if motion_ratio < 0.05:
+                        self.history[tid].clear() # 튀어버린 잘못된 궤적 초기화
+                        continue
 
-                    if mx2 > mx1 and my2 > my1:
-                        car_roi = motion_mask[my1:my2, mx1:mx2]
-                        _, m_only = cv2.threshold(car_roi, 250, 255, cv2.THRESH_BINARY)
-                        total_px = (mx2 - mx1) * (my2 - my1)
-                        motion_ratio_value = (cv2.countNonZero(m_only) / total_px) if total_px > 0 else 0.0
+                    last_auth = self.last_auth_time.get(tid, 0.0)
+                    time_since_auth = current_time - last_auth
 
-                        if total_px > 0 and motion_ratio_value > self.motion_ratio:
-                            last_auth = self.last_auth_time.get(tid, 0.0)
-                            time_since_auth = current_time - last_auth
+                    if last_auth == 0.0 or time_since_auth > self.auth_grace_sec:
+                        recent_auths = []
+                        for a_tid, auth_t in self.last_auth_time.items():
+                            remain = max(0, self.auth_grace_sec - (current_time - auth_t))
+                            sig_tid = self.last_auth_signalman.get(a_tid, "Unknown")
+                            recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t, 'sig_tid': sig_tid})
 
-                            if last_auth == 0.0 or time_since_auth > self.auth_grace_sec:
-                                recent_auths = []
-                                for a_tid, auth_t in self.last_auth_time.items():
-                                    remain = max(0, self.auth_grace_sec - (current_time - auth_t))
-                                    sig_tid = self.last_auth_signalman.get(a_tid, "Unknown")
-                                    recent_auths.append({'tid': a_tid, 'remain': remain, 'auth_t': auth_t, 'sig_tid': sig_tid})
+                        recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
+                        votes = list(self.line_truck_votes.get(tid, []))
+                        stationary_start = self.stationary_start_time.get(tid, current_time)
+                        triggered.append({
+                            'tid': tid,
+                            'bbox': t[:4],
+                            'frame': frame.copy() if frame is not None else None,
+                            'fid': fid,
+                            'confidence': float(t[5]),
+                            'auth_tokens': recent_auths[:1],
+                            'objects': [{
+                                'label': 'LineTruck',
+                                'box': [int(x) for x in t[:4]],
+                                'score': float(t[5]),
+                                'tid': tid,
+                                'class_id': ID_G_TRUCK
+                            }],
+                            'decision_trace': {
+                                'detector': 'SignalVehicleDetector',
+                                'reason': 'moving_confirmed_line_truck_without_recent_signalman',
+                                'confirmed_line_truck': True,
+                                'line_truck_vote_count': int(sum(votes)),
+                                'line_truck_vote_window': int(len(votes)),
+                                'line_truck_confirm_frames': int(self.line_truck_confirm_frames),
+                                'line_truck_confirm_ratio': round(float(self.line_truck_confirm_ratio), 4),
+                                'line_truck_min_conf': round(float(self.line_truck_min_conf), 4),
+                                'is_parked': bool(tid in self.is_parked),
+                                'stationary_sec': round(float(current_time - stationary_start), 3),
+                                'parked_threshold_sec': round(float(self.parked_threshold_sec), 3),
+                                'movement_dist': round(float(dist), 3),
+                                'min_movement': round(float(min_movement), 3),
+                                'roi_passed': bool(is_in_roi),
+                                'last_auth_age_sec': None if last_auth == 0.0 else round(float(time_since_auth), 3),
+                                'auth_grace_sec': round(float(self.auth_grace_sec), 3),
+                                'recent_auths': recent_auths[:1],
+                                'state_inherited': self.state_inherit_sources.get(tid),
+                                'history_len': int(len(h_list))
+                            }
+                        })
 
-                                recent_auths.sort(key=lambda x: x['auth_t'], reverse=True)
-                                votes = list(self.line_truck_votes.get(tid, []))
-                                stationary_start = self.stationary_start_time.get(tid, current_time)
-                                triggered.append({
-                                    'tid': tid,
-                                    'bbox': t[:4],
-                                    'frame': frame.copy(),
-                                    'fid': fid,
-                                    'confidence': float(t[5]),
-                                    'auth_tokens': recent_auths[:1],
-                                    'objects': [{
-                                        'label': 'LineTruck',
-                                        'box': [int(x) for x in t[:4]],
-                                        'score': float(t[5]),
-                                        'tid': tid,
-                                        'class_id': ID_G_TRUCK
-                                    }],
-                                    'decision_trace': {
-                                        'detector': 'SignalVehicleDetector',
-                                        'reason': 'moving_confirmed_line_truck_without_recent_signalman',
-                                        'confirmed_line_truck': True,
-                                        'line_truck_vote_count': int(sum(votes)),
-                                        'line_truck_vote_window': int(len(votes)),
-                                        'line_truck_confirm_frames': int(self.line_truck_confirm_frames),
-                                        'line_truck_confirm_ratio': round(float(self.line_truck_confirm_ratio), 4),
-                                        'line_truck_min_conf': round(float(self.line_truck_min_conf), 4),
-                                        'is_parked': bool(tid in self.is_parked),
-                                        'stationary_sec': round(float(current_time - stationary_start), 3),
-                                        'parked_threshold_sec': round(float(self.parked_threshold_sec), 3),
-                                        'movement_dist': round(float(dist), 3),
-                                        'min_movement': round(float(min_movement), 3),
-                                        'motion_ratio': round(float(motion_ratio_value), 4),
-                                        'motion_threshold_ratio': round(float(self.motion_ratio), 4),
-                                        'roi_passed': bool(is_in_roi),
-                                        'last_auth_age_sec': None if last_auth == 0.0 else round(float(time_since_auth), 3),
-                                        'auth_grace_sec': round(float(self.auth_grace_sec), 3),
-                                        'recent_auths': recent_auths[:1],
-                                        'state_inherited': self.state_inherit_sources.get(tid),
-                                        'history_len': int(len(h_list))
-                                    }
-                                })
+                        self.history[tid].clear()
+                        if tid in self.last_auth_time: del self.last_auth_time[tid]
+                        if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
+                        if tid in self.is_parked: self.is_parked.remove(tid)
+                        if tid in self.state_inherit_sources: del self.state_inherit_sources[tid]
 
-                                self.history[tid].clear()
-                                if tid in self.last_auth_time: del self.last_auth_time[tid]
-                                if tid in self.last_auth_signalman: del self.last_auth_signalman[tid]
-                                if tid in self.is_parked: self.is_parked.remove(tid)
-                                if tid in self.state_inherit_sources: del self.state_inherit_sources[tid]
-
-        # ---------------------------------------------------------
-        # [4단계] 상태 정리 (Cleanup)
-        # ---------------------------------------------------------
         for tid in list(self.history.keys()):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0:
                 del self.history[tid]
@@ -3260,8 +2688,6 @@ class SignalVehicleDetector(BaseEventDetector):
             if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) > 3.0:
                 del self.stationary_anchor[tid]
 
-        # 아직 LineTruck으로 확정되지 못한 후보 track도 사라지면 vote 기록을 지웁니다.
-        # 이 정리가 없으면 일반 차량 오탐 후보가 지나간 뒤에도 작은 기록들이 계속 메모리에 남을 수 있습니다.
         visible_tids = {int(t[4]) for t in tracks}
         for tid in list(self.line_truck_votes.keys()):
             if tid not in visible_tids and tid not in curr_ids:
@@ -3397,14 +2823,14 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     for i in range(0, len(rtsp_list), BATCH_SIZE):
         batch = rtsp_list[i : i + BATCH_SIZE]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             frames = list(executor.map(capture_snapshot, batch))
 
         display = []
         for idx, frm in enumerate(frames):
             if frm is None:
                 blk = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(blk, "Conn Fail", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.putText(blk, "Conn Fail", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1)
                 display.append(blk)
             else:
                 display.append(frm)
@@ -3419,20 +2845,27 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
             r, c = divmod(idx, cols)
             cx, cy = c * cw, r * ch
             cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
-            cv2.putText(mosaic, str(idx + 1), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
+            
+            # [요구사항 반영 2] 배치(Batch) 상대 번호가 아닌 CSV 전체 기준 절대 순차 번호 생성
+            abs_cam_id = i + idx + 1 
+            cv2.putText(mosaic, str(abs_cam_id), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 1)
 
         cv2.imshow("Select Cameras", mosaic)
         cv2.waitKey(1)
 
-        sel = guarded_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: 1,3,5 / 건너뛰기: 엔터): ").strip()
+        # [요구사항 반영 3] 프롬프트 안내 메시지도 절대 번호 기준으로 변경
+        example_ids = f"{i+1},{i+2}" if len(batch) > 1 else f"{i+1}"
+        sel = guarded_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: {example_ids} / 건너뛰기: 엔터): ").strip()
         if not sel:
             continue
 
         try:
             nums = [int(s.strip()) for s in sel.split(',')]
             for n in nums:
-                if 1 <= n <= len(batch) and frames[n-1] is not None:
-                    url = batch[n-1]
+                # [요구사항 반영 3] 사용자가 입력한 절대 번호를 다시 배치 내 로컬 인덱스로 변환하여 처리
+                local_idx = n - i - 1 
+                if 0 <= local_idx < len(batch) and frames[local_idx] is not None:
+                    url = batch[local_idx]
                     ip = extract_ip(url)
 
                     print(f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량")
@@ -3449,11 +2882,11 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     roi_l = []
 
                     if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle"]):
-                        roi_p = get_roi_points_scaled(frames[n-1], f"Polygon - CAM: {ip}")
+                        roi_p = get_roi_points_scaled(frames[local_idx], f"Polygon - CAM: {ip}")
 
                     if "conveyor_crossing" in events:
                         while True:
-                            l = get_roi_points_scaled(frames[n-1], f"Line - CAM: {ip}", mode="line")
+                            l = get_roi_points_scaled(frames[local_idx], f"Line - CAM: {ip}", mode="line")
                             if len(l) == 2:
                                 roi_l.extend(l)
                             if guarded_input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y':
@@ -3520,21 +2953,6 @@ class ROIAlignLearningStore:
         def write_one_csv(target_path):
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
-            if exists:
-                try:
-                    with open(target_path, "r", newline="", encoding="utf-8") as f:
-                        header_line = f.readline()
-                    current_header = next(csv.reader([header_line])) if header_line else []
-                    if current_header != fieldnames:
-                        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        backup_path = f"{target_path}.bak_header_{stamp}"
-                        os.replace(target_path, backup_path)
-                        logger.info(
-                            f"[ROI DRIFT] CSV header changed; old log moved to {backup_path}"
-                        )
-                        exists = False
-                except Exception as e:
-                    logger.warning(f"[ROI DRIFT] CSV header check failed: {e}")
             with open(target_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not exists:
@@ -3826,106 +3244,54 @@ class FrameReader:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
-    def _gstreamer_frame_read_timeout(self):
-        try:
-            return max(1.0, float(self.decode_cfg.get("gstreamer_frame_read_timeout_sec", 10.0)))
-        except Exception:
-            return 10.0
+    def _emit_decode_log(self, *args, **kwargs):
+        """
+        [최적화 및 에러 방어] 파라미터 순서와 키워드 호출이 혼용되는 
+        기존 코드의 모든 케이스를 스마트하게 파싱하여 처리합니다.
+        """
+        # 1. 시스템 설정에서 verbose_logs가 명시적으로 켜져 있지 않으면 즉시 드랍
+        if not SYS_CFG.get("verbose_logs", False):
+            return
 
-    def _emit_decode_log(self, message, level="info"):
-        effective_level = level
-        if str(level).lower() == "info" and not self._decode_verbose_logs():
-            effective_level = "debug"
-        log_fn = getattr(logger, effective_level, logger.info)
-        log_fn(message)
+        if not args:
+            return
+
+        # 2. 첫 번째 인자가 'level'인지 'msg'인지 스마트 판별
+        first_arg = args[0]
+        # 들어온 값이 숫자(int)이거나 알려진 레벨 문자열(debug, info 등)이면 level이 먼저 온 것으로 간주
+        is_level_first = isinstance(first_arg, int) or (isinstance(first_arg, str) and first_arg.upper() in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+
+        if is_level_first:
+            level = first_arg
+            msg = args[1] if len(args) > 1 else ""
+            fmt_args = args[2:]
+        else:
+            msg = first_arg
+            # kwargs에서 level을 빼내고, 없으면 INFO로 기본값 처리
+            level = kwargs.pop('level', logging.INFO)
+            fmt_args = args[1:]
+
+        # 3. 레벨 정규화 (문자열 'debug' -> logging.DEBUG 정수형)
+        if isinstance(level, str):
+            level_int = getattr(logging, level.upper(), logging.INFO)
+        else:
+            level_int = level
+
+        # 4. 로거 레벨 필터링 (불필요한 조립 방지)
+        if not logger.isEnabledFor(level_int):
+            return
+
+        # 5. 안전한 kwarg 추출 (표준 로깅 모듈이 모르는 인자는 버림)
+        valid_kwargs = {k: v for k, v in kwargs.items() if k in ['exc_info', 'stack_info', 'extra']}
+
+        # 6. 최종 로깅 실행 (지연 평가 방식)
+        logger.log(level_int, msg, *fmt_args, **valid_kwargs)
 
     def _emit_gst_check_once(self, message, level="info"):
         if self._gst_check_logged:
             return
         self._gst_check_logged = True
         self._emit_decode_log(message, level=level)
-
-    def _use_decode_process_group(self):
-        return sys.platform.startswith("linux")
-
-    def _decode_popen_kwargs(self, use_process_group):
-        if use_process_group:
-            return {"start_new_session": True}
-        return {}
-
-    def _send_decode_process_signal(self, proc, sig, use_process_group):
-        if use_process_group:
-            os.killpg(proc.pid, sig)
-            return
-        if sig == signal.SIGTERM:
-            proc.terminate()
-        else:
-            proc.kill()
-
-    def _terminate_decode_process(self, proc, label, use_process_group=False):
-        if proc is None:
-            return
-        try:
-            if proc.poll() is not None:
-                proc.wait(timeout=0.1)
-                return
-        except Exception:
-            pass
-
-        try:
-            self._send_decode_process_signal(proc, signal.SIGTERM, use_process_group)
-            proc.wait(timeout=2.0)
-            return
-        except ProcessLookupError:
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception as e:
-            self._emit_decode_log(
-                f"[DECODE CLEANUP] CAM:{self.ip} {label} terminate failed: {e}",
-                level="debug"
-            )
-
-        try:
-            self._send_decode_process_signal(proc, signal.SIGKILL, use_process_group)
-            proc.wait(timeout=2.0)
-        except ProcessLookupError:
-            return
-        except subprocess.TimeoutExpired:
-            self._emit_decode_log(
-                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill wait timed out pid={getattr(proc, 'pid', '-')}",
-                level="warning"
-            )
-        except Exception as e:
-            self._emit_decode_log(
-                f"[DECODE CLEANUP] CAM:{self.ip} {label} kill failed: {e}",
-                level="debug"
-            )
-
-    def _read_gstreamer_frame(self, proc, frame_size, timeout_sec):
-        if proc is None or proc.stdout is None:
-            return b""
-        fd = proc.stdout.fileno()
-        deadline = time.monotonic() + timeout_sec
-        chunks = bytearray()
-
-        while len(chunks) < frame_size:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"gstreamer_frame_read_timeout_{timeout_sec:g}s")
-
-            ready, _, _ = select.select([fd], [], [], min(1.0, remaining))
-            if not ready:
-                if proc.poll() is not None:
-                    break
-                continue
-
-            chunk = os.read(fd, frame_size - len(chunks))
-            if not chunk:
-                break
-            chunks.extend(chunk)
-
-        return bytes(chunks)
 
     def _mask_pipeline_text(self, text):
         return re.sub(r"(?i)(rtsp://)([^/@\s]+)@", r"\1***@", str(text))
@@ -4001,18 +3367,22 @@ class FrameReader:
 
         now = time.time()
         elapsed = now - self._decode_window_start
+        # 1. 쿨타임(기본 10초)이 안 지났으면 아무 연산 없이 즉시 복귀 (CPU 방어)
         if elapsed < self._decode_log_interval():
             return
 
         fps = self._decode_window_frames / max(0.001, elapsed)
         mbps = (self._decode_window_bytes * 8.0) / max(0.001, elapsed) / 1_000_000.0
+        
+        # 2. [핵심 최적화] 레벨을 DEBUG로 낮춰 CLI 출력을 원천 차단.
+        # f-string을 쓰지 않고 % 포맷을 사용해 실제 파일에 쓸 때만 백그라운드에서 조립되게 유도.
         self._emit_decode_log(
-            f"[DECODE FPS] CAM:{self.ip} mode={self._decode_mode} pid={self._decode_pid} "
-            f"fps={fps:.2f} frames={self._decode_frame_count} shape={self._decode_shape} "
-            f"pipe_mbps={mbps:.1f} read_failures={self._decode_read_failures} "
-            f"restarts={self._decode_restarts} connected={self.connected}",
-            level="debug"
+            logging.DEBUG,
+            "[DECODE FPS] CAM:%s mode=%s pid=%s fps=%.2f frames=%d shape=%s pipe_mbps=%.1f read_failures=%d restarts=%d connected=%s",
+            self.ip, self._decode_mode, self._decode_pid, fps, self._decode_frame_count,
+            self._decode_shape, mbps, self._decode_read_failures, self._decode_restarts, self.connected
         )
+        
         self._decode_window_frames = 0
         self._decode_window_bytes = 0
         self._decode_window_start = now
@@ -4236,9 +3606,11 @@ class FrameReader:
 
         in_w, in_h, codec = info
         out_w, out_h = self._scaled_output_shape(in_w, in_h)
-        frame_size = out_w * out_h * 3
+        
+        # [핵심 최적화] 파이프 전송량 50% 감축 (BGR: 3 bytes -> NV12: 1.5 bytes)
+        frame_size = int(out_w * out_h * 1.5)
+        
         fps_limit = self._decode_fps_limit()
-        frame_read_timeout_sec = self._gstreamer_frame_read_timeout()
         decoder_info = self._select_gstreamer_decoder(codec)
         if decoder_info is None:
             self._note_decode_failure(f"gstreamer_unsupported_codec_{codec or 'unknown'}")
@@ -4247,27 +3619,8 @@ class FrameReader:
         depay, parser, decoder, decoder_kind = decoder_info
         latency_ms = int(self.decode_cfg.get("gstreamer_latency_ms", 50) or 50)
         protocols = str(self.decode_cfg.get("gstreamer_protocols", "tcp") or "tcp").strip().lower()
-        try:
-            tcp_timeout_us = int(self.decode_cfg.get("gstreamer_tcp_timeout_us", 3000000))
-        except Exception:
-            tcp_timeout_us = 3000000
-        tcp_timeout_us = max(0, tcp_timeout_us)
-        drop_on_latency = self.decode_cfg.get("gstreamer_drop_on_latency", True)
-        if isinstance(drop_on_latency, str):
-            drop_on_latency = drop_on_latency.strip().lower() not in ("0", "false", "no", "off")
-        else:
-            drop_on_latency = bool(drop_on_latency)
-        drop_on_latency_text = "true" if drop_on_latency else "false"
-        self._emit_decode_log(
-            f"[GSTREAMER SELECT] CAM:{self.ip} codec={codec or '-'} "
-            f"decoder={decoder} decoder_kind={decoder_kind} fps_limit={fps_limit or '-'}"
-        )
-
-        caps_parts = ["video/x-raw", "format=BGR", f"width={out_w}", f"height={out_h}"]
-        framerate_caps = self._gst_framerate_caps(fps_limit)
-        if framerate_caps:
-            caps_parts.append(f"framerate={framerate_caps}")
-        caps = ",".join(caps_parts)
+        tcp_timeout_us = 3000000
+        drop_on_latency_text = "true"
 
         cmd = [
             "gst-launch-1.0", "-q",
@@ -4275,100 +3628,97 @@ class FrameReader:
             f"latency={latency_ms}", f"drop-on-latency={drop_on_latency_text}", f"tcp-timeout={tcp_timeout_us}",
             "!", depay,
             "!", parser,
-            "!", decoder,
-            "!", "videoconvert",
-            "!", "videoscale",
-            "!", "videorate",
-            "!", caps,
-            "!", "fdsink", "fd=1", "sync=false"
+            "!", decoder
         ]
 
-        env = os.environ.copy()
-        vaapi_driver = str(self.decode_cfg.get("vaapi_driver", "")).strip()
-        if vaapi_driver:
-            env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
+        # -------------------------------------------------------------
+        # [수정 핵심 1] GStreamer 문법 오류 해결 (15.0/1 -> 15/1 분수 형태 변환)
+        # -------------------------------------------------------------
+        framerate_caps = self._gst_framerate_caps(fps_limit)
+        framerate_str = f",framerate={framerate_caps}" if framerate_caps else ""
 
+        # -------------------------------------------------------------
+        # [수정 핵심 2] 스트라이드 패딩 찌그러짐 원천 차단
+        # vaapipostproc 직후에 videoconvert를 배치하여 GPU 패딩 메모리를 
+        # 파이썬이 읽기 좋은 촘촘한(Dense) NV12 메모리로 쫙 펴줍니다.
+        # -------------------------------------------------------------
+        if decoder_kind == "vaapi":
+            cmd.extend([
+                "!", "vaapipostproc",
+                "!", f"video/x-raw,format=NV12,width={out_w},height={out_h}",
+                "!", "videoconvert",
+                "!", "videorate",
+                "!", f"video/x-raw{framerate_str}"
+            ])
+        else:
+            cmd.extend([
+                "!", "videoconvert",
+                "!", "videoscale",
+                "!", "videorate",
+                "!", f"video/x-raw,format=NV12,width={out_w},height={out_h}{framerate_str}"
+            ])
+
+        cmd.extend([
+            "!", "fdsink", "fd=1", "sync=false"
+        ])
+
+        env = os.environ.copy()
         proc = None
         gst_failed = False
         gst_stderr_lines = deque(maxlen=30)
         gst_stderr_thread = None
-        use_process_group = self._use_decode_process_group()
+        
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                bufsize=frame_size * 2,
-                **self._decode_popen_kwargs(use_process_group)
-            )
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, bufsize=frame_size * 2)
             if proc.stderr is not None:
-                gst_stderr_thread = threading.Thread(
-                    target=self._drain_binary_log_pipe,
-                    args=(proc.stderr, gst_stderr_lines),
-                    daemon=True
-                )
+                gst_stderr_thread = threading.Thread(target=self._drain_binary_log_pipe, args=(proc.stderr, gst_stderr_lines), daemon=True)
                 gst_stderr_thread.start()
             if proc.stdout is None:
-                gst_failed = True
                 return False
 
             self.connected = True
-            self._set_decode_pipeline(
-                "gstreamer_pipe",
-                shape=f"{in_w}x{in_h}->{out_w}x{out_h}",
-                pid=proc.pid,
-                cmd=cmd,
-                extra=(
-                    f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind} "
-                    f"latency_ms={latency_ms} protocols={protocols} tcp_timeout_us={tcp_timeout_us} "
-                    f"drop_on_latency={drop_on_latency_text} fps_limit={fps_limit or '-'} "
-                    f"frame_bytes={frame_size} frame_read_timeout_sec={frame_read_timeout_sec:g}"
-                )
-            )
-            self._decode_mode_logged = True
+            self._set_decode_pipeline("gstreamer_pipe_nv12", shape=f"{in_w}x{in_h}->{out_w}x{out_h}", pid=proc.pid, cmd=cmd)
             self.last_t = time.time()
             first_frame_logged = False
 
             while self.running:
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
                     self._note_decode_failure(f"gstreamer_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
-                    gst_failed = True
                     break
 
-                try:
-                    raw = self._read_gstreamer_frame(proc, frame_size, frame_read_timeout_sec)
-                except TimeoutError as e:
-                    self._note_decode_failure(str(e), level="error")
-                    gst_failed = True
-                    break
-
+                raw = proc.stdout.read(frame_size)
                 if len(raw) != frame_size:
-                    self._note_decode_failure(f"gstreamer_short_read_{len(raw)}_of_{frame_size}", level="error")
-                    gst_failed = True
                     break
 
-                fr = np.frombuffer(raw, dtype=np.uint8).reshape((out_h, out_w, 3)).copy()
+                # [핵심 최적화] Python GIL을 100% 우회하는 OpenCV C++ 초고속 BGR 변환
+                yuv_img = np.frombuffer(raw, dtype=np.uint8).reshape((int(out_h * 1.5), out_w))
+                fr = cv2.cvtColor(yuv_img, cv2.COLOR_YUV2BGR_NV12)
+                
                 with self.lock:
                     self.frame = fr
                     self.fid += 1
                     self.last_t = time.time()
+                    
                 self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
                 if not first_frame_logged:
-                    self._emit_decode_log(
-                        f"[GSTREAMER READY] CAM:{self.ip} first_frame shape={out_w}x{out_h} "
-                        f"codec={codec or '-'} decoder={decoder} decoder_kind={decoder_kind}"
-                    )
                     first_frame_logged = True
 
             return True
         except Exception as e:
-            gst_failed = True
             logger.warning(f"[CAM:{self.ip}] GStreamer pipe failed: {e}")
             return False
         finally:
             self.connected = False
-            self._terminate_decode_process(proc, "gstreamer_pipe", use_process_group=use_process_group)
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            
             if gst_stderr_thread is not None:
                 try:
                     gst_stderr_thread.join(timeout=0.2)
@@ -4409,16 +3759,8 @@ class FrameReader:
             env.setdefault("LIBVA_DRIVER_NAME", vaapi_driver)
 
         proc = None
-        use_process_group = self._use_decode_process_group()
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=env,
-                bufsize=frame_size * 2,
-                **self._decode_popen_kwargs(use_process_group)
-            )
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, bufsize=frame_size * 2)
             if proc.stdout is None:
                 return False
 
@@ -4456,7 +3798,15 @@ class FrameReader:
             return False
         finally:
             self.connected = False
-            self._terminate_decode_process(proc, "ffmpeg_vaapi_pipe", use_process_group=use_process_group)
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
 
     def _run(self):
         while self.running:
@@ -4480,19 +3830,19 @@ class FrameReader:
 
             cap = self._open_capture()
             if not cap.isOpened():
-                # ?? [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
-                logger.error(f"?? [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
+                #  [수정] 초기 연결 실패 로깅 (디버그 모드일때만 빈도수 조절하여 출력하도록 권장하나, 연결 실패는 중요하므로 error 처리)
+                logger.error(f" [CAM:{self.ip}] RTSP 연결 실패. 5초 후 재시도합니다.")
                 time.sleep(5)
                 continue
 
             self.connected = True
-            logger.info(f"? [CAM:{self.ip}] 카메라 스트림 연결 성공.")
+            logger.info(f"[CAM:{self.ip}] 카메라 스트림 연결 성공.")
             self.last_t = time.time()
 
             while self.running and cap.isOpened():
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
-                    # ?? [수정] 타임아웃 로깅 레벨 격상
-                    logger.error(f"?? [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
+                    #  [수정] 타임아웃 로깅 레벨 격상
+                    logger.error(f" [CAM:{self.ip}] 카메라 수신 타임아웃({WATCHDOG_TIMEOUT}s). 재연결을 시도합니다.")
                     break
 
                 ret, fr = cap.read()
@@ -4540,7 +3890,7 @@ class Camera:
 
         self.reader = FrameReader(conf.get('url', ''), ip)
         self.recorder = VideoRecorder(ip, cam_id=self.cam_id)
-        self.motion_det = MotionDetector()
+        # self.motion_det = MotionDetector() 전면 제거 완료
 
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
@@ -4559,13 +3909,12 @@ class Camera:
         self.aligned_roi_poly = []
         self.aligned_roi_lines = []
 
-        self.roi_frame_shape = None # 해상도 변경 감지용
+        self.roi_frame_shape = None 
         self.status_history = deque(maxlen=10)
         self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
 
     def _reset_alignment_state(self, status_text="ALIGN RESET"):
-        """ROI 자동 보정 상태를 초기화한다."""
         self.aligner = AnchorTrackingROIAligner()
         self.anchor_set = False
 
@@ -4582,7 +3931,6 @@ class Camera:
         self.align_shifted = False
 
     def _rebuild_handlers(self):
-        """현재 self.events 기준으로 이벤트 핸들러를 다시 구성한다."""
         self.handlers = {}
 
         for ename in self.events:
@@ -4594,7 +3942,6 @@ class Camera:
                 )
 
     def update_config(self, new_conf):
-        """웹 UI 등 외부에서 cameras.json이 변경되었을 때, 무중단으로 설정을 핫 리로드합니다."""
         old_events = self.events.copy()
 
         self.conf = new_conf
@@ -4615,7 +3962,7 @@ class Camera:
             pass
 
         logger.info(
-            f"?? [CAM:{self.ip}] 무중단 설정 리로드 완료: "
+            f" [CAM:{self.ip}] 무중단 설정 리로드 완료: "
             f"{old_events} -> {self.events} | ROI aligner reset"
         )
         logger.debug(f"[CCTV_Aligner] CAM {self.cam_id} aligner reset after config reload")
@@ -4674,15 +4021,11 @@ class Camera:
 
 
     def _log_align_blocked(self, decision, detail):
-        """앵커 설정 전(대기/실패) 단계에서도 roi_change 카메라가 CSV에 흔적을 남기게 한다.
-        로그 파일 없이도 '왜 특정 카메라가 안 뜨는지'를 진단할 수 있다.
-        매 프레임 스팸을 막기 위해 ALIGN_INTERVAL_SEC 간격으로만 기록한다."""
         try:
             now_b = time.time()
             if now_b - getattr(self, "_last_blocked_csv_time", 0.0) < ALIGN_INTERVAL_SEC:
                 return
             self._last_blocked_csv_time = now_b
-            # 앵커 등록 전(대기/실패) 단계는 판정 이전이라 decision은 normal로 두고, 실제 상태는 reason에 남긴다.
             csv_row = {
                 "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
                 "camera_key": self.camera_key,
@@ -4704,25 +4047,15 @@ class Camera:
             logger.debug(f"[CAM:{getattr(self,'cam_id','?')}] blocked-state log failed: {e}")
 
     def _update_alignment(self, frame):
-        """[신설] 전체 화면 3×3 격자 흔들림 감지 경로.
-        ROI 폴리곤을 쓰지 않고 전체 프레임을 사용한다. 이벤트(roi_change) 지정 카메라만 동작.
-        조명(주/야·IR) 변화는 벡터(평행이동)를 만들지 않으므로 자연히 무시된다."""
         if frame is None:
             return
 
-        # 격자 감지는 전체 화면을 쓰지만, 같은 카메라 객체가 공유하는 다른 이벤트
-        # (no_helmet/drop/signal_vehicle/intrusion/illegal_parking)의 ROI는 핸들러에 주입해야 한다.
-        # [버그수정] 이 주입은 roi_change 여부와 무관하게 항상 수행해야 한다.
-        #   (handler.roi_poly가 이 주입으로만 채워지므로, roi_change 게이트보다 먼저 호출한다.
-        #    이전 버전은 게이트 뒤에 있어 roi_change를 안 켠 카메라는 ROI가 비어 이벤트가 안 떴음.)
         self._initialize_base_roi_if_needed(frame)
 
-        # 격자(화각변경) 감지는 이벤트 지정(cameras.json events)된 카메라만 동작
         if ROI_CHANGE_EVENT not in self.events:
             self.align_status_text = "ROI CHANGE OFF"
             return
 
-        # 최초 앵커(전체 프레임) 등록
         if not self.anchor_set:
             now = time.time()
             if getattr(self, "anchor_startup_wait_started_at", 0.0) <= 0.0:
@@ -4765,14 +4098,12 @@ class Camera:
         consistent_quorum = int(grid.get("consistent_quorum", 0))
         self.align_ok = (n_meas >= quorum)
 
-        # 앵커 갱신: 카메라가 안 움직였고(측정 가능) 움직인 칸이 정족수보다 적을 때만 → 기준 프레임을 신선하게 유지.
         refresh_allowed = (not moved) and self.align_ok and (n_mov < quorum)
         anchor_refreshed = False
         if refresh_allowed:
             action = self.aligner.refresh_grid_anchor(frame)
             anchor_refreshed = str(action).startswith("grid_refresh")
 
-        # 단순 3-상태 판정(normal/suspect/confirm). suspect 연속 N회 → confirm + 헬스체크(API).
         decision = ROI_ALIGN_LEARNING_STORE.record_check(self.camera_key, self.conf, moved)
         decision_name = str(decision.get("decision", "normal"))
         suspect_count = int(decision.get("suspect_count", 0))
@@ -4798,20 +4129,49 @@ class Camera:
                 f"moving={n_mov}/{n_meas} consistent={consistent}/{consistent_quorum}"
             )
 
+        # [화각 변경 → 관제센터 빨간불] confirm(suspect>=3)이 유지되는 동안, 검사 주기(300초)마다
+        #   /cctv/roi/img 로 isReqRoiSetup=True + 현재 스냅샷을 전송한다.
+        #   관제센터가 관리자 설정 ROI를 health 응답(roiSettings)으로 내려주면
+        #   HealthCheckDaemon._apply_roi_settings_from_response → update_config →
+        #   _reset_alignment_state 에서 align_shifted=False 가 되어 전송이 자동으로 멈춘다.
+        if self.align_shifted:
+            try:
+                snap_img = create_roi_snapshot(self, frame)
+                if snap_img is not None:
+                    _sh, _sw = snap_img.shape[:2]
+                    roi_info = {
+                        "roi_poly_norm": self.roi_poly_norm,
+                        "roi_lines_norm": self.roi_lines_norm,
+                        "roi_change_poly_norm": []  # 폐기 필드. 관제 서버 호환용 빈 배열.
+                    }
+                    IMAGE_SAVER_POOL.submit(
+                        _send_roi_snapshot_task,
+                        self.cam_id,
+                        SYS_CFG.get("terminal_id", "99999"),
+                        snap_img,
+                        json.dumps(roi_info),
+                        _sw, _sh,
+                        True  # is_req_roi_setup
+                    )
+                    logger.info(
+                        f"[CAM:{self.cam_id}] ROI 재설정 요청 전송(queued) isReqRoiSetup=True "
+                        f"suspect={suspect_count}"
+                    )
+            except Exception as e:
+                logger.error(f"[CAM:{self.cam_id}] ROI 재설정 요청 전송 실패: {e}")
+
         csv_row = {
             "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
             "camera_key": self.camera_key,
             "decision": decision_name,
             "suspect_count": suspect_count,
-            "cells_measurable": n_meas,                                         # std 통과 측정칸 수 (moving==measurable 이면 전부 움직임)
-            "cells_moving": n_mov,                                              # >임계(10px)로 움직인 칸 수
-            "cells_consistent": consistent,                                     # 그중 같은 방향 칸 수
-            "consistent_quorum": consistent_quorum,                            # 방향 정족수(consistent가 이 값 이상이어야 ②통과)
-            # 칸별 이동량(px). 9칸 '|' 구분. 측정칸=이동 px, 제외칸="x"(텍스처 없음/측정 실패)
+            "cells_measurable": n_meas,
+            "cells_moving": n_mov,
+            "cells_consistent": consistent,
+            "consistent_quorum": consistent_quorum,
             "grid_cells": "|".join(_format_grid_cell_diag(c) for c in grid.get("cells", [])),
-            # 칸별 std(텍스처). 9칸 '|' 구분. >=GRID_CELL_MIN_STD 이면 측정칸 → 어느 칸이 std 게이트를 통과했는지 확인
             "grid_cells_std": "|".join(_format_grid_cell_std(c) for c in grid.get("cells", [])),
-            "frame_std": round(float(grid.get("frame_std", 0.0)), 1),          # 전체 프레임 표준편차
+            "frame_std": round(float(grid.get("frame_std", 0.0)), 1),
             "anchor_refreshed": anchor_refreshed,
             "healthcheck": healthcheck_requested,
             "reason": healthcheck_reason,
@@ -4825,7 +4185,6 @@ class Camera:
 
     def process_frame(self):
         fr, fid, connected = self.reader.read()
-        # [수정] 원본 영상을 바로 Recorder에 밀어넣지 않습니다. (run_logic에서 렌더링 후 삽입)
         return fr, fid, connected
 
     def apply_face_blur(self, frame, person_boxes, return_meta=False):
@@ -4837,41 +4196,33 @@ class Camera:
 
         try:
             face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
-
-            # 1. 원본 전체 프레임을 대상으로 1회만 얼굴 탐지 수행 (NPU 오버헤드 최소화 및 모델 정확도 유지)
             f_dets = self.det_face.infer(blur_img, conf_override=face_conf)
 
             for f in f_dets:
                 fx1, fy1, fx2, fy2 = map(int, f[:4])
                 fw, fh = fx2 - fx1, fy2 - fy1
 
-                # 터무니없는 크기의 오탐 얼굴 방어 (화면의 40% 이상)
                 if fw > blur_img.shape[1] * 0.4:
                     continue
 
-                # 2. 얼굴 BBox의 중심점 좌표 계산
                 fcx = fx1 + (fw / 2.0)
                 fcy = fy1 + (fh / 2.0)
                 is_valid_face = False
 
-                # 3. 해당 얼굴이 '사람 객체' 내부에 속하는지 검증
                 matched_person_tid = -1
                 for p in person_boxes:
                     px1, py1, px2, py2 = map(int, p[:4])
                     pw, ph = px2 - px1, py2 - py1
 
-                    # 얼굴이 사람 BBox 경계선이나 약간 위쪽에 걸치는 경우를 허용하기 위해 동적 여유 공간(패딩) 부여
-                    pad_x = pw * 0.15          # 좌우 15% 여유
-                    pad_y_top = ph * 0.25      # 머리 위쪽 25% 여유
-                    pad_y_bottom = ph * 0.05   # 하단 5% 여유
+                    pad_x = pw * 0.15
+                    pad_y_top = ph * 0.25
+                    pad_y_bottom = ph * 0.05
 
-                    # 얼굴 중심점이 확장된 사람 ROI 내부에 포함되는지 확인
                     if (px1 - pad_x) <= fcx <= (px2 + pad_x) and (py1 - pad_y_top) <= fcy <= (py2 + pad_y_bottom):
                         is_valid_face = True
                         matched_person_tid = int(p[4]) if len(p) > 4 else -1
                         break
 
-                # 4. 검증을 통과한 유효 얼굴(사람 내부)에만 모자이크 렌더링
                 if is_valid_face:
                     roi = blur_img[fy1:fy2, fx1:fx2]
                     if roi.size > 0:
@@ -4898,25 +4249,20 @@ class Camera:
 
         try:
             plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.1)
-
             p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
-
             h_img, w_img = blur_img.shape[:2]
 
             for p in p_dets:
                 px1, py1, px2, py2 = map(int, p[:4])
-
                 px1 = max(0, min(px1, w_img - 1))
                 py1 = max(0, min(py1, h_img - 1))
                 px2 = max(0, min(px2, w_img))
                 py2 = max(0, min(py2, h_img))
-
                 pw = px2 - px1
                 ph = py2 - py1
 
                 if pw <= 0 or ph <= 0:
                     continue
-
                 if pw > w_img * 0.6 or ph > h_img * 0.3:
                     continue
 
@@ -4924,16 +4270,13 @@ class Camera:
                 pcy = py1 + ph / 2.0
 
                 matched_vehicle_tid = -1
-
                 if vehicle_boxes is not None and len(vehicle_boxes) > 0:
                     for v in vehicle_boxes:
                         vx1, vy1, vx2, vy2 = map(int, v[:4])
                         vw = vx2 - vx1
                         vh = vy2 - vy1
-
                         pad_x = vw * 0.10
                         pad_y = vh * 0.10
-
                         if (vx1 - pad_x) <= pcx <= (vx2 + pad_x) and (vy1 - pad_y) <= pcy <= (vy2 + pad_y):
                             matched_vehicle_tid = int(v[4]) if len(v) > 4 else -1
                             break
@@ -4943,9 +4286,7 @@ class Camera:
                     small_w = max(1, pw // 12)
                     small_h = max(1, ph // 12)
                     small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-                    blur_img[py1:py2, px1:px2] = cv2.resize(
-                        small, (pw, ph), interpolation=cv2.INTER_NEAREST
-                    )
+                    blur_img[py1:py2, px1:px2] = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
                     blurred_plates.append({
                         "box": [px1, py1, px2, py2],
                         "score": round(float(p[4]), 4) if len(p) > 4 else 0.0,
@@ -4959,8 +4300,6 @@ class Camera:
         return (blur_img, blurred_plates) if return_meta else blur_img
 
     def apply_privacy_blur(self, frame, t_main, blur_face=True, blur_plate=True):
-        # 이벤트 산출물 저장 전에 개인정보 영역을 모자이크하고, 적용 위치를 로그용 메타데이터로 남깁니다.
-        # 녹화 MP4는 원본 유지가 목적이므로 이 함수는 대표 이미지/10초 이벤트 프레임 저장에만 사용합니다.
         privacy_meta = {
             "blur_face": bool(blur_face),
             "blur_plate": bool(blur_plate),
@@ -5062,14 +4401,11 @@ class Camera:
         return safe_objects
 
     def build_inference_log(self, fid, frame, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events, d_signalman_res=None):
-        # 한 프레임에서 AI가 무엇을 봤고 어떤 이벤트를 판단했는지 한 줄짜리 기록으로 만듭니다.
-        # 이 함수의 결과가 영상 옆 ".infer.jsonl" 파일과 이벤트 프레임 로그에 저장됩니다.
         h, w = frame.shape[:2] if frame is not None else (0, 0)
         kst = pytz.timezone('Asia/Seoul')
         if d_signalman_res is None:
             d_signalman_res = np.empty((0, 6))
         return {
-            # 기본 정보: 언제, 어느 카메라, 몇 번째 프레임인지 확인하는 값입니다.
             "ts": datetime.datetime.now(kst).isoformat(),
             "fid": int(fid),
             "cam_id": int(self.cam_id),
@@ -5077,24 +4413,17 @@ class Camera:
             "frame_shape": [int(h), int(w)],
             "inference_mode": str(self.event_inference_mode),
             "events": list(self.events),
-            # ROI 정보: AI가 어느 영역/선 기준으로 판단했는지 나중에 확인하기 위한 값입니다.
             "roi_poly": [[int(p[0]), int(p[1])] for p in (self.roi_poly or [])],
             "roi_lines": [[int(p[0]), int(p[1])] for p in (self.roi_lines or [])],
-            # detections는 모델이 프레임에서 바로 찾아낸 탐지 결과입니다.
-            # 예: 사람/차량/헬멧 미착용/신호수 같은 객체의 위치와 점수
             "detections": {
                 "main": [self._serialize_detection(d) for d in d_main_res],
                 "helmet": [self._serialize_detection(d) for d in d_helmet_res],
                 "signalman": [self._serialize_detection(d) for d in d_signalman_res]
             },
-            # tracks는 여러 프레임을 이어 보면서 같은 객체에 붙인 추적 ID입니다.
-            # 같은 사람이 계속 같은 tid로 보이면 이동 흐름을 재현하기 쉽습니다.
             "tracks": {
                 "main": [self._serialize_track(t) for t in t_main],
                 "helmet": [self._serialize_track(t) for t in t_helmet]
             },
-            # alarms/new_events는 실제 이벤트로 판단된 결과입니다.
-            # 단순히 객체가 보인 것과, 이벤트가 발생했다고 판단한 것을 구분하기 위해 둘 다 남깁니다.
             "alarms": {str(int(tid)): evt for tid, evt in (alarms or {}).items()},
             "new_events": [
                 {
@@ -5123,17 +4452,10 @@ class Camera:
             d_signalman_res = np.empty((0, 6))
 
         self._update_alignment(fr)
-        motion_mask = None
-        if "signal_vehicle" in self.handlers:
-            motion_mask = self.motion_det.apply(fr)
 
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
-
-        # d_helmet_filtered = [d for d in d_helmet_res if int(d[5]) == ID_H_NO_HELMET]
-        # t_helmet = self.trk_helmet.update(d_helmet_filtered)
         t_helmet = self.trk_helmet.update(d_helmet_res)
-
         t_signalman = self.trk_signalman.update(d_signalman_res)
 
         now = time.time()
@@ -5144,31 +4466,25 @@ class Camera:
         score_map_helmet = {int(t[4]): round(float(t[5]), 2) for t in t_helmet}
         newly_triggered_events = []
 
-        # Recording currently uses the original frame in the main loop.
-        # record_fr = fr.copy()
         record_fr = None
 
         for ename, handler in self.handlers.items():
+            # 1. 이벤트 핸들러에 전달할 인자 세팅
             if ename == "no_helmet":
-                kwargs = {'helmet_tracks': t_helmet}
-                handler_tracks = t_helmet
-                handler_track_map = track_map_helmet
-                handler_score_map = score_map_helmet
+                kwargs = {'helmet_tracks': t_helmet, 'privacy_tracks': t_main}
+                handler_tracks, handler_track_map, handler_score_map = t_helmet, track_map_helmet, score_map_helmet
             elif ename == "signal_vehicle":
-                kwargs = {'signalman_tracks': t_signalman}
-                handler_tracks = t_main
-                handler_track_map = track_map_main
-                handler_score_map = score_map_main
+                kwargs = {'signalman_tracks': t_signalman, 'privacy_tracks': t_main}
+                handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
             else:
-                kwargs = {}
-                handler_tracks = t_main
-                handler_track_map = track_map_main
-                handler_score_map = score_map_main
+                kwargs = {'privacy_tracks': t_main}
+                handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
 
             try:
-                triggered = handler.process(handler_tracks, handler_track_map, motion_mask, fr, fid, **kwargs)
+                # 핸들러 실행 (내부에서 과거 시점의 privacy_tracks를 저장하고 ev에 담아 반환해야 함)
+                triggered = handler.process(handler_tracks, handler_track_map, None, fr, fid, **kwargs)
             except Exception as e:
-                logger.error(f"?? [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
+                logger.error(f"🚨 [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
 
             for ev in triggered:
@@ -5179,9 +4495,24 @@ class Camera:
 
                 actual_score = handler_score_map.get(tid, score_map_main.get(tid, 0.95))
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
-                privacy_source_objects = ev.get('privacy_objects', objects_meta)
-                event_privacy_tracks = self._privacy_tracks_from_event_objects(privacy_source_objects)
-                privacy_reference_tracks = event_privacy_tracks if event_privacy_tracks else t_main
+                
+                # ---------------------------------------------------------
+                # [핵심 로직] 과거 프레임의 모든 객체(privacy_tracks) 복원
+                # ---------------------------------------------------------
+                event_frame_privacy_tracks = ev.get('privacy_tracks')
+                privacy_reference_fid = ev.get('privacy_fid', ev.get('fid', fid))
+                
+                # 타임캡슐(privacy_tracks)이 온전히 반환되었다면 그것을 사용 (과거의 전체 객체)
+                if event_frame_privacy_tracks is not None and len(event_frame_privacy_tracks) > 0:
+                    privacy_reference_tracks = event_frame_privacy_tracks
+                    privacy_reference_tracks_label = "event_frame_tracks"
+                else:
+                    # 타임캡슐이 없다면 기존 방식대로 범인 BBox만 추출, 그것도 없으면 현재 t_main 폴백
+                    privacy_source_objects = ev.get('privacy_objects', objects_meta)
+                    event_privacy_tracks = self._privacy_tracks_from_event_objects(privacy_source_objects)
+                    privacy_reference_tracks = event_privacy_tracks if event_privacy_tracks else t_main
+                    privacy_reference_tracks_label = "event_objects" if event_privacy_tracks else "current_tracks"
+
                 decision_trace = to_json_safe(ev.get('decision_trace', {
                     'detector': handler.__class__.__name__,
                     'reason': 'event_triggered_without_detail'
@@ -5192,10 +4523,10 @@ class Camera:
                     event_ts = event_ts_dt.isoformat()
                     event_fid = int(ev.get('fid', fid))
                     event_id = make_event_id(self.cam_id, self.ip, ename, tid, event_fid, event_ts_dt)
+                    
                     objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
-
                     log_msg = (
-                        f"?? [EVENT TRIGGERED] event_id={event_id} CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
+                        f"🔥 [EVENT TRIGGERED] event_id={event_id} CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
                         f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FID:{event_fid} | FPS:{self.current_fps:.1f} | "
                         f"Reason:{decision_trace.get('reason', '-')} | "
                         f"Objects -> {objs_log_str}"
@@ -5205,13 +4536,22 @@ class Camera:
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
                     blur_plate_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_plate", True)
 
+                    # 완벽하게 동기화된 트랙(privacy_reference_tracks)으로 블러 처리
                     saved_img, privacy_blur_meta = self.apply_privacy_blur(
-                        ev_frame, privacy_reference_tracks,
+                        ev_frame, 
+                        privacy_reference_tracks,
                         blur_face=blur_face_option,
                         blur_plate=blur_plate_option
                     )
+                    
+                    # 블러 처리 메타데이터 로깅 (추적용)
                     privacy_blur_meta["scope"] = "event_snapshot"
-                    privacy_blur_meta["reference_tracks"] = "event_objects" if event_privacy_tracks else "current_tracks"
+                    privacy_blur_meta["reference_tracks"] = privacy_reference_tracks_label
+                    try:
+                        privacy_blur_meta["reference_fid"] = int(privacy_reference_fid)
+                    except Exception:
+                        privacy_blur_meta["reference_fid"] = None
+                        
                     logger.info(
                         f"[PRIVACY BLUR] event_id={event_id} cam={self.cam_id} event={ename} "
                         f"face_enabled={blur_face_option} plate_enabled={blur_plate_option} "
@@ -5261,7 +4601,7 @@ class Camera:
                         ename,
                         objects_meta=objects_meta,
                         event_meta=event_meta,
-                        current_fps=self.current_fps
+                        current_fps=SYS_CFG.get("video_decode", {}).get("fps_limit", 15.0)
                     )
                     self.alerted[tid].add(ename)
                     self.last_evt_t[ename] = now
@@ -5297,25 +4637,21 @@ class Camera:
             for t in t_main:
                 t_id = int(t[4])
                 is_alarmed = t_id in current_alarms
-
                 color = (0, 0, 255) if is_alarmed else (0, 255, 0)
-                thickness = 3 if is_alarmed else 1
+                thickness = 1 if is_alarmed else 1
                 bx1, by1, bx2, by2 = map(int, t[:4])
-
                 cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), color, thickness)
-
                 if t_id in self.trk_main.tracks:
                     hist = list(self.trk_main.tracks[t_id]['history'])
                     if len(hist) > 1:
                         cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, thickness, cv2.LINE_AA)
 
-        # [수정] draw 메서드에서 렌더링할 수 있도록 t_signalman을 리턴에 포함
         return t_main, t_helmet, t_signalman, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
     def draw(self, fr, t_main, t_helmet, t_signalman, alarms, connected=True):
         if fr is None or not connected:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
-            cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+            cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 1)
             cv2.putText(blank, self.ip, (50, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
             return blank
 
@@ -5331,9 +4667,6 @@ class Camera:
                 if i + 1 < len(self.roi_lines):
                     cv2.line(fr, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0, 0, 255), 2)
 
-        # -----------------------------------------------------------
-        # [핵심] 카메라별 설정된 이벤트에 따라 화면에 그릴 클래스(ID) 동적 필터링
-        # -----------------------------------------------------------
         allowed_classes = set()
         if "signal_vehicle" in self.events:
             allowed_classes.add(ID_G_TRUCK)
@@ -5342,18 +4675,16 @@ class Camera:
         if "illegal_parking" in self.events or "intrusion" in self.events:
             allowed_classes.update(TARGET_VEHICLES)
 
-        # 1. Main Tracker BBox 렌더링
         for t in t_main:
             tid = int(t[4])
             cls_id = int(t[6])
             is_alarmed = tid in alarms
 
-            # 알람이 울린 객체가 아니고, 해당 카메라의 감시 대상 클래스가 아니면 화면에서 깔끔하게 숨김
             if not is_alarmed and cls_id not in allowed_classes:
                 continue
 
             color = (0, 0, 255) if is_alarmed else (0, 255, 0)
-            thickness = 2 if is_alarmed else 1
+            thickness = 1 if is_alarmed else 1
 
             if tid in self.trk_main.tracks:
                 hist = list(self.trk_main.tracks[tid]['history'])
@@ -5371,74 +4702,68 @@ class Camera:
                 label = f"ALARM: {label}"
 
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
-            cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-        # 2. Signalman 커스텀 모델 전용 Tracker BBox 렌더링
         if "signal_vehicle" in self.events:
             for t in t_signalman:
                 tid = int(t[4])
-                color, thickness = (0, 255, 255), 2
+                color, thickness = (0, 255, 255), 1
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
-                cv2.putText(fr, f"Signalman [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(fr, f"Signalman [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-        # 3. Helmet Tracker BBox 렌더링 (정상 헬멧과 미착용 분리)
         if "no_helmet" in self.events:
             for t in t_helmet:
                 tid = int(t[4])
-                cls_id = int(t[6]) # Helmet model classes can include helmet/head/person.
+                cls_id = int(t[6]) 
 
-                # [수정] 헬멧 착용 여부에 따라 라벨과 색상을 명확히 분리
                 if cls_id == ID_H_HELMET:
-                    color = (0, 255, 0) # 초록색
+                    color = (0, 255, 0) 
                     label = f"Helmet [{tid}]"
-                    thickness = 2
+                    thickness = 1
                 elif cls_id == ID_H_NO_HELMET:
-                    color = (0, 0, 255) # 빨간색
+                    color = (0, 0, 255) 
                     label = f"Head [{tid}]"
                     thickness = 3 if tid in alarms else 2
                 elif cls_id == ID_G_PERSON:
                     color = (0, 255, 0)
                     label = f"Person(H) [{tid}]"
-                    thickness = 2
+                    thickness = 1
                 elif cls_id == ID_PERSON_LOW:
                     color = (0, 150, 0)
                     label = f"LowBody(H) [{tid}]"
-                    thickness = 2
+                    thickness = 1
                 else:
                     color = (0, 165, 255)
                     label = f"HelmetObj {cls_id} [{tid}]"
-                    thickness = 2
+                    thickness = 1
 
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
-                cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-        # 좌측 상단 카메라 ID 및 FPS
-        cv2.rectangle(fr, (0, 0), (115, 40), (0, 0, 0), -1)
+        #cv2.rectangle(fr, (0, 0), (115, 40), (0, 0, 0), -1)
         cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-        fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
+        fps_color = (0, 0, 0) if self.current_fps >= 10.0 else (0, 0, 255)
         cv2.putText(fr, f"AI FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
 
         active_alarms = set(alarms.values())
 
-        # 우측 상단 이벤트 메뉴
         menu_height = len(self.events) * 20 + 10
-        overlay = fr.copy()
-        cv2.rectangle(overlay, (w_frame - 150, 0), (w_frame, menu_height), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.5, fr, 0.5, 0, fr)
+        #overlay = fr.copy()
+        #cv2.rectangle(overlay, (w_frame - 150, 0), (w_frame, menu_height), (0, 0, 0), -1)
+        #cv2.addWeighted(overlay, 0.5, fr, 0.5, 0, fr)
 
         y_pos = 15
         for evt in self.events:
+            if evt == "roi_change" or evt == getattr(sys.modules[__name__], 'ROI_CHANGE_EVENT', 'roi_change'):
+                continue
+
             display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
             color = (0, 0, 255) if evt in active_alarms else (0, 255, 0)
             prefix = "[!] " if evt in active_alarms else " -  "
-
             cv2.putText(fr, f"{prefix}{display_name}", (w_frame - 145, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
             y_pos += 20
 
-        # -----------------------------------------------------------
-        # Signalman Auth 상태창 렌더링
-        # -----------------------------------------------------------
         if "signal_vehicle" in self.events and "signal_vehicle" in self.handlers:
             sv_handler = self.handlers["signal_vehicle"]
             current_time = time.time()
@@ -5465,7 +4790,6 @@ class Camera:
 
             auth_tids = [item['tid'] for item in display_items]
 
-            # [수정] BBox가 사라져도 알람이 울린 대상은 화면에 강제로 유지합니다.
             current_trucks = set([int(t[4]) for t in t_main if int(t[6]) == ID_G_TRUCK and int(t[4]) in confirmed_line_truck_ids])
             alarmed_tids = set([tid for tid, evt in alarms.items() if evt == "signal_vehicle"])
             target_tids = current_trucks.union(alarmed_tids)
@@ -5515,7 +4839,7 @@ class Camera:
             overlay2 = fr.copy()
             cv2.rectangle(overlay2, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
             cv2.addWeighted(overlay2, 0.6, fr, 0.4, 0, fr)
-            cv2.putText(fr, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(fr, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
             if not display_items:
                 cv2.putText(fr, "No active tokens", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
@@ -5549,6 +4873,21 @@ def get_system_temperature():
 
     return 0.0 # 센서가 없는 PC 환경 등의 폴백(Fallback)
 
+def get_npu_temperature():
+    """dxrt-cli 명령어를 통해 DeepX NPU의 최대 온도를 파싱하여 반환합니다."""
+    if not HAS_DX_ENGINE:
+        return 0.0
+    try:
+        # 터미널 명령어 실행 (응답 지연 방지를 위해 2초 타임아웃)
+        output = subprocess.check_output(["dxrt-cli", "-s"], stderr=subprocess.DEVNULL, text=True, timeout=2)
+        # 정규식으로 "temperature XX'C" 패턴을 모두 검색
+        temps = re.findall(r"temperature\s+(\d+)'C", output)
+        if temps:
+            return float(max(int(t) for t in temps))
+    except Exception:
+        pass
+    return 0.0
+
 class HealthCheckDaemon:
     def __init__(self, terminal_id, version="v1.1.0", interval_sec=60, cams=None, config_file=CONFIG_CAMERAS_FILE):
         self.terminal_id = terminal_id
@@ -5571,7 +4910,7 @@ class HealthCheckDaemon:
         # 데몬 스레드로 실행하여 메인 프로세스 종료 시 강제 종료되도록 허용
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        logger.info(f"? [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
+        logger.info(f"[Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: {self.interval}초)")
 
 
 
@@ -5746,17 +5085,6 @@ class HealthCheckDaemon:
                 return cam
         return None
 
-    @staticmethod
-    def _file_sha256(path):
-        if not path or not os.path.exists(path):
-            return None
-
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-
     def _apply_roi_settings_from_response(self, response_payload):
         if not isinstance(response_payload, dict):
             return []
@@ -5773,7 +5101,7 @@ class HealthCheckDaemon:
             logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
             return []
 
-        changed_cctv_ids = []
+        handled_cctv_ids = []
         changed = False
         runtime_updates = []
 
@@ -5791,12 +5119,6 @@ class HealthCheckDaemon:
             if not isinstance(camera_configs, dict):
                 logger.error("[Health Check] cameras config is not an object; ROI update skipped")
                 return []
-
-            try:
-                before_config_hash = self._file_sha256(self.config_file)
-            except Exception as e:
-                logger.warning(f"[Health Check] failed to hash cameras config before ROI update: {e}")
-                before_config_hash = None
 
             for item in roi_settings:
                 if not isinstance(item, dict):
@@ -5842,8 +5164,8 @@ class HealthCheckDaemon:
                         new_conf[key] = value
                         item_changed = True
 
+                handled_cctv_ids.append(str(cam.cam_id))
                 if item_changed:
-                    changed_cctv_ids.append(str(cam.cam_id))
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     changed = True
@@ -5863,26 +5185,6 @@ class HealthCheckDaemon:
                     logger.error(f"[Health Check] failed to write cameras config for ROI update: {e}")
                     return []
 
-                try:
-                    after_config_hash = self._file_sha256(self.config_file)
-                except Exception as e:
-                    logger.warning(f"[Health Check] failed to hash cameras config after ROI update: {e}")
-                    after_config_hash = None
-
-                if before_config_hash == after_config_hash:
-                    logger.warning(
-                        "[Health Check] ROI settings write did not change cameras config hash; "
-                        "setup request remains pending"
-                    )
-                    return []
-
-                before_short = before_config_hash[:12] if before_config_hash else "-"
-                after_short = after_config_hash[:12] if after_config_hash else "-"
-                logger.info(
-                    f"[Health Check] ROI settings config changed: "
-                    f"hash={before_short}->{after_short} cctvIds={','.join(changed_cctv_ids)}"
-                )
-
         for cam, new_conf, roi_updates in runtime_updates:
             try:
                 cam.update_config(new_conf)
@@ -5895,81 +5197,87 @@ class HealthCheckDaemon:
             except Exception as e:
                 logger.error(f"[Health Check] runtime ROI update failed: cctvId={cam.cam_id} error={e}")
 
-        return changed_cctv_ids
+        return handled_cctv_ids
 
     def _run(self):
         while self.running:
             try:
-                # 자원 수집
+                # 1. 시스템 자원 및 하드웨어 정보 싹쓸이 수집
                 cpu = psutil.cpu_percent(interval=1.0)
                 mem = psutil.virtual_memory().percent
-                temp = get_system_temperature()
+                sys_temp = get_system_temperature()
+                npu_temp = get_npu_temperature()
+                
+                # 디스크 용량 수집
+                disk_usage = shutil.disk_usage(PROJECT_ROOT)
+                disk_free_gb = disk_usage.free / (1024 ** 3)
+                disk_total_gb = disk_usage.total / (1024 ** 3)
 
-                # ISO 8601 포맷
+                # 카메라 연결 상태 확인
+                total_cams = len(self.cams)
+                connected_cams = sum(1 for cam in self.cams if getattr(cam.reader, "connected", False))
+
+                # ISO 8601 포맷 타임스탬프
                 kst = pytz.timezone('Asia/Seoul')
                 reported_at = datetime.datetime.now(kst).strftime('%Y-%m-%dT%H:%M:%S')
                 is_roi_setup_required = self._should_send_roi_setup_required()
 
+                # API 데이터 (API 서버가 NPU 온도를 모를 수 있으므로, 둘 중 가장 높은 위험 온도를 대표로 보냅니다)
                 data = {
                     "terminalId": str(self.terminal_id),
                     "reportedAt": reported_at,
                     "cpuUsage": round(cpu, 1),
                     "memoryUsage": round(mem, 1),
-                    "temperature": round(temp, 1),
+                    "temperature": round(max(sys_temp, npu_temp), 1), 
                     "softwareVersion": self.version,
                     "isRoiSetupRequired": is_roi_setup_required
                 }
 
-                # requests 모듈은 딕셔너리를 data= 에 넘기면 자동으로 application/x-www-form-urlencoded 로 처리합니다.
                 headers = {"accept": "application/json"}
-
                 response = requests.post(self.url, headers=headers, data=data, timeout=10, verify=False)
 
+                # 2. 결과 종합 및 로깅
                 if response.status_code == 200:
+                    api_status = "OK"
                     if self._consecutive_failures > 0:
-                        logger.info(
-                            f"[Health Check] recovered after {self._consecutive_failures} consecutive failures"
-                        )
+                        api_status = f"RECOVERED({self._consecutive_failures})"
                     self._consecutive_failures = 0
+                    
                     if is_roi_setup_required:
                         self._mark_roi_setup_required_sent()
 
                     try:
                         response_payload = response.json()
-                    except Exception as e:
-                        response_payload = {}
-                        logger.warning(f"[Health Check] failed to parse response JSON: {e}")
-
-                    applied_roi_cctv_ids = self._apply_roi_settings_from_response(response_payload)
-                    if applied_roi_cctv_ids:
-                        self.clear_roi_setup_required(reason="roi_settings_applied_from_health_response")
-                        self.request_roi_snapshot_refresh(
-                            cctv_ids=applied_roi_cctv_ids,
-                            reason="roi_settings_applied_from_health_response"
-                        )
-
-                    logger.info(
-                        f"?? [Health Check] 전송 성공 "
-                        f"(CPU: {data['cpuUsage']}%, Mem: {data['memoryUsage']}%, "
-                        f"ROI_SETUP: {data['isRoiSetupRequired']})"
-                    )
+                        applied_roi_cctv_ids = self._apply_roi_settings_from_response(response_payload)
+                        if applied_roi_cctv_ids:
+                            self.clear_roi_setup_required(reason="roi_settings_applied_from_health_response")
+                            self.request_roi_snapshot_refresh(
+                                cctv_ids=applied_roi_cctv_ids,
+                                reason="roi_settings_applied_from_health_response"
+                            )
+                    except Exception:
+                        pass
                 else:
                     self._consecutive_failures += 1
-                    logger.error(
-                        f"?? [Health Check] API 응답 에러 "
-                        f"(상태코드: {response.status_code}, consecutive_failures={self._consecutive_failures}) - {response.text}"
-                    )
+                    api_status = f"FAIL({response.status_code})"
+
+                # [핵심] 모니터링하기 가장 좋은 포맷으로 1분마다 출력
+                logger.info(
+                    f"📊 [SYSTEM STATUS] API:{api_status} | CAM:{connected_cams}/{total_cams} | "
+                    f"CPU:{cpu:.1f}% | MEM:{mem:.1f}% | DISK:{disk_free_gb:.1f}/{disk_total_gb:.1f}GB | "
+                    f"TEMP(Sys/NPU):{sys_temp:.1f}'C/{npu_temp:.1f}'C"
+                )
 
             except Exception as e:
                 self._consecutive_failures += 1
-                logger.error(f"?? [Health Check] 네트워크 연결 예외 발생 (consecutive_failures={self._consecutive_failures}): {e}")
+                logger.error(f"🚨 [Health Check] 네트워크/데이터 수집 실패 (누적:{self._consecutive_failures}): {e}")
 
-            # interval(300초)을 통으로 sleep하지 않고, 1초마다 running 상태를 체크하여 빠른 셧다운을 지원
+            # interval(기본 60초) 대기하되, 프로세스 종료 신호(running)를 1초마다 감시
             for _ in range(self.interval):
                 if not self.running:
                     break
                 time.sleep(1)
-
+                
     def stop(self):
         self.running = False
         if self.thread.is_alive():
@@ -6014,12 +5322,8 @@ def clear_terminal_roi_snapshot_refresh(cctv_ids=None, reason=""):
         return False
 
 def main():
-    global DEBUG_MODE, SYS_CFG, BATCH_SIZE
-
-    # 1. argparse를 활용한 실행 옵션 분기 (기본값: CLI 모드)
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
     parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
-    parser.add_argument('--configure-startup', action='store_true', help="시작 영상/하드웨어 가속/모델 선택을 다시 실행하고 system_config.json에 저장합니다.")
     args = parser.parse_args()
 
     is_gui_mode = args.gui
@@ -6029,9 +5333,8 @@ def main():
     else:
         logger.info("[시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)")
 
+    global DEBUG_MODE
     logger.info("[System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료")
-
-    ensure_startup_runtime_config(force=args.configure_startup)
 
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
     if not rtsp_list:
@@ -6041,21 +5344,21 @@ def main():
     config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
 
-    debug_ans = guarded_input(">> 디버그 모드를 활성화하시겠습니까? (상세 로그 출력) [y/N]: ").strip().lower()
+    debug_ans = guarded_input(">> CLI 디버그 출력을 활성화하시겠습니까? (파일 로그는 항상 상세히 기록됩니다) [y/N]: ").strip().lower()
     DEBUG_MODE = True if debug_ans == 'y' else False
+    
+    _runtime_log_cfg = SYS_CFG.get("logging", {})
+    # [수정] 파일 로그는 무조건 가장 상세한 DEBUG 레벨 고정, 콘솔 출력만 사용자 선택에 따름
+    _debug_file_level = logging.DEBUG 
+    _debug_console_level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    
+    logger.setLevel(logging.DEBUG)
+    queue_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(_debug_file_level)
+    stream_handler.setLevel(_debug_console_level)
+    
     if DEBUG_MODE:
-        _runtime_log_cfg = SYS_CFG.get("logging", {})
-        _debug_file_level = _parse_log_level(_runtime_log_cfg.get("debug_file_level", "DEBUG"), logging.DEBUG)
-        _debug_console_level = _parse_log_level(
-            _runtime_log_cfg.get("debug_console_level", _runtime_log_cfg.get("console_level", "INFO")),
-            logging.INFO
-        )
-        _debug_floor_level = min(_debug_file_level, _debug_console_level)
-        logger.setLevel(_debug_floor_level)
-        queue_handler.setLevel(_debug_floor_level)
-        file_handler.setLevel(_debug_file_level)
-        stream_handler.setLevel(_debug_console_level)
-        logger.debug("??? 디버그 모드가 활성화되었습니다. 상세 로깅이 시작됩니다.")
+        logger.debug("디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.")
 
     if os.path.exists(config_file):
         try:
@@ -6085,7 +5388,6 @@ def main():
     inference_mode = str(SYS_CFG.get("INFERENCE_MODE", "auto")).strip().lower()
     event_inference_mode = "main"
     main_model_path = resolve_model_path(models_cfg.get("MAIN", "hanjin_cctv_v2.dxnn"))
-    main_pool_size = get_main_model_engine_pool_size(main_model_path)
 
     if not os.path.exists(main_model_path):
         logger.error(f"MAIN model file not found: {main_model_path}")
@@ -6096,30 +5398,33 @@ def main():
     try:
         logger.info(f"DeepX 모델을 VPU 메모리로 할당 중... (event inference: {event_inference_mode})")
 
-        # 이벤트 판단용 기본 객체와 신호수는 MAIN 모델 한 번의 추론 결과를 클래스별로 나눠서 사용합니다.
-        # 헬멧 미착용은 현장 오탐/미탐을 줄이기 위해 전용 HELMET 모델 결과를 사용합니다.
+        # [수정] OOM 방지: 카메라 대수에 맞추지 않고, VPU 4GB 한계에 맞춰 풀 사이즈를 엄격히 제한합니다.
+        # MAIN 모델은 4개, HELMET 모델은 2개로 제한하여 메모리 스파이크를 방지합니다.
+        main_pool_size = min(4, get_model_engine_pool_size("MAIN", default=3))
+        helmet_pool_size = min(2, get_model_engine_pool_size("HELMET", default=1))
+        
         d_main = YoLoDeepX(
             main_model_path,
             output_format=get_main_model_output_format(main_model_path),
             pool_size=main_pool_size
         )
+        
         d_helmet = YoLoDeepX(
             resolve_model_path(models_cfg["HELMET"]),
             output_format=get_model_output_format("HELMET"),
-            pool_size=get_model_engine_pool_size("HELMET")
+            pool_size=helmet_pool_size
         )
         d_signalman = None
 
-        # 개인정보 블러는 이벤트 판단 모델과 목적이 달라 별도 모델을 유지합니다.
         d_face = YoLoDeepX(
             resolve_model_path(models_cfg["FACE"]),
             output_format=get_model_output_format("FACE"),
-            pool_size=get_model_engine_pool_size("FACE")
+            pool_size=get_model_engine_pool_size("FACE", default=1)
         )
         d_plate = YoLoDeepX(
             resolve_model_path(models_cfg["PLATE"]),
             output_format=get_model_output_format("PLATE"),
-            pool_size=get_model_engine_pool_size("PLATE")
+            pool_size=get_model_engine_pool_size("PLATE", default=1)
         )
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
@@ -6131,10 +5436,8 @@ def main():
         conf = camera_configs.get(ip)
 
         if not conf:
-            logger.warning(f"[CAMERA SKIP] cam_index={i+1} ip={ip} reason=missing_camera_config")
             continue
         if not conf.get('events'):
-            logger.warning(f"[CAMERA SKIP] cam_index={i+1} ip={ip} reason=no_enabled_events")
             continue
         conf['url'] = rtsp
         cams.append(Camera(
@@ -6152,79 +5455,26 @@ def main():
         logger.error("[SYSTEM STARTUP] no active cameras loaded; check cameras.csv and cameras.json events.")
         return
 
-    # 환경 변수 스로틀링 기준
     target_fps = SYS_CFG.get("REC_FPS", 15)
+    sys_target_fps = float(SYS_CFG.get("LOOP_FPS", 15.0))
     main_conf = SYS_CFG["model_confidences"]["MAIN"]
     helmet_conf = SYS_CFG["model_confidences"]["HELMET"]
-    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.5)  # [추가] 설정값 로드
+    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.5) 
     signalman_conf = SYS_CFG.get("model_confidences", {}).get("SIGNALMAN", person_conf)
     loop_count = 0
     fps_calc_interval = 30
     last_fps_time = time.time()
     cpu_usage = 0.0
-    dynamic_delay = 1.0 / target_fps
+    
     try:
-        current_fps_log_interval_sec = max(
-            1.0,
-            float(SYS_CFG.get(
-                "CURRENT_FPS_LOG_INTERVAL_SEC",
-                SYS_CFG.get("video_decode", {}).get("log_interval_sec", 10.0)
-            ))
-        )
+        current_fps_log_interval_sec = max(1.0, float(SYS_CFG.get("CURRENT_FPS_LOG_INTERVAL_SEC", 10.0)))
     except Exception:
         current_fps_log_interval_sec = 10.0
     current_fps_last_print = {}
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
     software_version = "v1.1.0"
-    git_meta = get_git_metadata()
-    logger.info(
-        f"[SYSTEM STARTUP] version={software_version} git_branch={git_meta.get('branch', '-')} "
-        f"git_commit={git_meta.get('commit', '-')} terminal_id={terminal_id} "
-        f"project_root={PROJECT_ROOT} config={CONFIG_COMMON_FILE} cameras_config={config_file} "
-        f"python={sys.version.split()[0]} opencv={cv2.__version__}"
-    )
-    logger.info(
-        f"[SYSTEM CONFIG] active_cameras={len(cams)} batch_size={BATCH_SIZE} rec_fps={SYS_CFG.get('REC_FPS')} "
-        f"loop_fps={SYS_CFG.get('LOOP_FPS')} confidences={json.dumps(SYS_CFG.get('model_confidences', {}), ensure_ascii=False)} "
-        f"decode={json.dumps(SYS_CFG.get('video_decode', {}), ensure_ascii=False)}"
-    )
-    logger.info(
-        f"[MODEL CONFIG] main={main_model_path} helmet={resolve_model_path(models_cfg.get('HELMET', '-'))} "
-        f"face={resolve_model_path(models_cfg.get('FACE', '-'))} plate={resolve_model_path(models_cfg.get('PLATE', '-'))} "
-        f"pools={json.dumps(SYS_CFG.get('model_engine_pool_sizes', {}), ensure_ascii=False)} main_effective_pool={main_pool_size}"
-    )
-    if MEMORY_PROBE_DECODE_ONLY:
-        logger.warning(
-            "[MEM EXPERIMENT] HAI_MEM_PROBE_DECODE_ONLY=1: running decode/process_frame only; "
-            "inference, event logic, recorder update, and event frame buffering are skipped."
-        )
-    if MEMORY_PROBE_INFERENCE_REUSE_FRAME:
-        logger.warning(
-            "[MEM EXPERIMENT] HAI_MEM_PROBE_INFERENCE_REUSE_FRAME=1: caching one frame per camera, "
-            "stopping RTSP readers, and running inference only; event logic, recorder update, "
-            "ROI snapshots, and event frame buffering are skipped."
-        )
-    if MEMORY_PROBE_KEEP_EXECUTOR:
-        logger.warning(
-            "[MEM EXPERIMENT] HAI_MEM_PROBE_KEEP_EXECUTOR=1: reusing one inference executor "
-            "instead of creating and shutting it down every loop."
-        )
-    if MEMORY_PROBE_EXECUTOR_ONLY:
-        logger.warning(
-            "[MEM EXPERIMENT] HAI_MEM_PROBE_EXECUTOR_ONLY=1: submitting executor tasks only; "
-            "DeepX inference is skipped."
-        )
-    if MEMORY_PROBE_SKIP_RECORDER_UPDATE:
-        logger.warning(
-            "[MEM EXPERIMENT] HAI_MEM_PROBE_SKIP_RECORDER_UPDATE=1: normal decode and inference run, "
-            "but recorder.update/prebuffer writes are skipped."
-        )
-    if MEMORY_PROBE_SKIP_EVENT_LOGIC:
-        logger.warning(
-            "[MEM EXPERIMENT] HAI_MEM_PROBE_SKIP_EVENT_LOGIC=1: normal decode and inference run, "
-            "but camera run_logic/event tracking is skipped."
-        )
+    
     log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
     global HEALTH_DAEMON
     health_daemon = HealthCheckDaemon(
@@ -6245,33 +5495,20 @@ def main():
         try: os.makedirs(RAM_DISK_DIR, exist_ok=True)
         except: RAM_DISK_DIR = "./web_frames"
 
-    # [수정] 카메라별 이벤트 저장 구간 큐 및 타이머 초기화
-    # 이벤트가 한 번 발생하면 바로 한 장만 저장하지 않고, 이후 몇 초 동안 원본 프레임을 더 모읍니다.
-    # 이렇게 하면 "이벤트 직전/직후 상황"을 사람이 다시 보면서 재현하기 쉽습니다.
     event_frame_save_delay_sec = float(SYS_CFG.get("EVENT_FRAME_SAVE_DELAY_SEC", 10.0))
     configured_event_frame_save_max_count = int(SYS_CFG.get("EVENT_FRAME_SAVE_MAX_COUNT", 0) or 0)
     event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
     if configured_event_frame_save_max_count > 0:
-        # 현장 상황을 알고 있다면 system_config.json에서 최대 저장 장수를 직접 지정할 수 있습니다.
         event_frame_save_max_count = configured_event_frame_save_max_count
     else:
-        # 별도 지정이 없으면 녹화 FPS와 저장 시간을 기준으로 자동 계산합니다.
-        # 예: 10초, REC_FPS 3이면 약 45장까지 보관합니다. 실제 저장 장수는 들어온 프레임 수만큼입니다.
         event_frame_save_max_count = int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5))
     event_frame_save_max_count = max(1, int(event_frame_save_max_count))
     event_save_queues = {c.ip: deque(maxlen=event_frame_save_max_count) for c in cams}
     last_event_times = {c.ip: 0.0 for c in cams}
-    for c in cams:
-        logger.info(
-            f"[EVENT FRAME BUFFER] CAM:{c.cam_id}({c.ip}) | Event:init | "
-            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:{c.current_fps:.1f} | "
-            f"Frames -> event-frame buffer max={event_save_queues[c.ip].maxlen} "
-            f"(window={event_frame_save_delay_sec:.1f}s, fps_basis={event_frame_save_fps:.1f})"
-        )
+    
     output_retention_days = float(SYS_CFG.get("OUTPUT_RETENTION_DAYS", 14))
     output_cleanup_interval_sec = float(SYS_CFG.get("OUTPUT_CLEANUP_INTERVAL_SEC", 86400))
     last_output_cleanup_time = time.time()
-    logger.info(f"[Retention] 산출물 보관 정책: {output_retention_days:g}일 보관, {output_cleanup_interval_sec / 3600.0:.1f}시간마다 정리")
     run_output_retention_cleanup(output_retention_days)
 
     def run_camera_inference(cam, fr):
@@ -6282,6 +5519,10 @@ def main():
         t_main_input = np.empty((0, 6))
         d_signalman_res = np.empty((0, 6))
 
+        # [추가] 프레임 전체 면적의 1/2 (50%) 임계값 계산
+        h, w = fr.shape[:2]
+        max_area_threshold = (h * w) * 0.5
+
         if active_detection_events:
             base_conf = min(main_conf, person_conf, signalman_conf)
             raw_dets = cam.det_main.infer(fr, conf_override=base_conf)
@@ -6291,7 +5532,8 @@ def main():
                 main_conf=main_conf,
                 person_conf=person_conf,
                 helmet_conf=helmet_conf,
-                signalman_conf=signalman_conf
+                signalman_conf=signalman_conf,
+                max_area_threshold=max_area_threshold # [추가] 1/4 임계값 인자 전달
             )
 
         d_helmet_res = np.empty((0, 6))
@@ -6300,77 +5542,82 @@ def main():
 
         return t_main_input, d_helmet_res, d_signalman_res
 
-    def build_memory_probe_reuse_raw_data(timeout_sec=15.0):
-        cached = [None for _ in cams]
-        deadline = time.time() + timeout_sec
+    # -----------------------------------------------------------
+    # [최적화] 무부하 최신 프레임 버퍼 (Zero-Overhead Buffer)
+    # 무거운 Queue Exception 오버헤드를 없애고 락(Lock) 기반으로 덮어쓰기만 수행
+    # -----------------------------------------------------------
+    class LatestItemBuffer:
+        def __init__(self):
+            self.item = None
+            self.has_new = False
+            self.lock = threading.Lock()
 
-        while time.time() < deadline:
-            for idx, cam in enumerate(cams):
-                if cached[idx] is not None:
+        def put(self, item):
+            with self.lock:
+                self.item = item
+                self.has_new = True
+
+        def get(self):
+            with self.lock:
+                if not self.has_new:
+                    return None
+                self.has_new = False
+                return self.item
+
+    class CameraWorker(threading.Thread):
+        def __init__(self, cam):
+            super().__init__(daemon=True)
+            self.cam = cam
+            self.frame_buffer = LatestItemBuffer()
+            self.result_buffer = LatestItemBuffer()
+            self.running = True
+
+        def run(self):
+            while self.running:
+                item = self.frame_buffer.get()
+                
+                # 새로운 프레임이 없다면 즉시 GIL을 해제(Release)하여 다른 스레드에 양보
+                if item is None:
+                    time.sleep(0.005)
                     continue
-                fr, fid, connected = cam.process_frame()
-                if fr is not None:
-                    cached[idx] = (fr.copy(), int(fid or 1), True)
 
-            if all(item is not None for item in cached):
-                break
-            time.sleep(0.2)
+                fr, fid, connected = item
 
-        reuse_raw_data = []
-        blank_count = 0
-        for idx, cam in enumerate(cams):
-            item = cached[idx]
-            if item is None:
-                fr = np.zeros((405, 720, 3), dtype=np.uint8)
-                fid = 1
-                blank_count += 1
-            else:
-                fr, fid, _ = item
+                if not connected or fr is None or not self.cam.events:
+                    self.result_buffer.put((fr, fid, connected, [], [], [], {}, [], None))
+                    continue
 
-            try:
-                cam._initialize_base_roi_if_needed(fr)
-            except Exception as e:
-                logger.warning(f"[MEM EXPERIMENT] reuse-frame ROI init failed cam={cam.cam_id} ip={cam.ip}: {e}")
+                try:
+                    # 추론과 로직을 한 워커에서 순차 처리하여 스레드 통신 오버헤드 제거
+                    t_main_input, d_helmet_res, d_signalman_res = run_camera_inference(self.cam, fr)
+                    t_main, t_helmet, t_signalman, alarms, new_events = self.cam.run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                    infer_meta = self.cam.build_inference_log(fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events, d_signalman_res=d_signalman_res)
+                    
+                    self.result_buffer.put((fr, fid, connected, t_main, t_helmet, t_signalman, alarms, new_events, infer_meta))
+                except Exception as e:
+                    logger.error(f"[Worker Error] CAM {self.cam.cam_id}: {e}\n{traceback.format_exc()}")
+                    self.result_buffer.put((fr, fid, connected, [], [], [], {}, [], None))
 
-            reader = getattr(cam, "reader", None)
-            if reader is not None:
-                reader.running = False
-                reader.connected = False
+    camera_workers = []
+    last_rendered_frames = {}
 
-            reuse_raw_data.append((fr, max(1, int(fid or 1)), True))
+    for c in cams:
+        worker = CameraWorker(c)
+        worker.start()
+        camera_workers.append(worker)
+        
+        blank = np.zeros((360, 640, 3), dtype=np.uint8)
+        cv2.putText(blank, "WAITING...", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (150, 150, 150), 2)
+        last_rendered_frames[c.ip] = blank
 
-        logger.warning(
-            f"[MEM EXPERIMENT] inference reuse frames prepared: "
-            f"cached={len(reuse_raw_data) - blank_count} blank={blank_count} readers_stopped={len(reuse_raw_data)}"
-        )
-        return reuse_raw_data
+    last_roi_snapshot_time = time.time() - 3590.0
+    ROI_SNAPSHOT_INTERVAL_SEC = 3600.0
 
-    memory_probe_reuse_raw_data = (
-        build_memory_probe_reuse_raw_data()
-        if MEMORY_PROBE_INFERENCE_REUSE_FRAME
-        else None
-    )
-    memory_probe_persistent_executor = (
-        concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
-        if MEMORY_PROBE_INFERENCE_REUSE_FRAME and MEMORY_PROBE_KEEP_EXECUTOR
-        else None
-    )
-    main_inference_executor = (
-        concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
-        if not MEMORY_PROBE_INFERENCE_REUSE_FRAME
-        else None
-    )
-    if main_inference_executor is not None:
-        logger.info(
-            f"[INFERENCE EXECUTOR] persistent executor started max_workers={max(1, len(cams))}"
-        )
-
-    def memory_probe_executor_noop(cam_index, fid):
-        return cam_index, fid
-
-    last_roi_snapshot_time = time.time() - 3590.0  # 시작 후 10초 뒤 첫 전송
-    ROI_SNAPSHOT_INTERVAL_SEC = 3600.0  # 1시간 주기
-
+    
+    target_fps = sys_target_fps
+    dynamic_delay = 1.0 / target_fps
+    last_processed_fids = {}
+    
     try:
         psutil.cpu_percent(interval=None)
 
@@ -6384,7 +5631,6 @@ def main():
             if loop_count > 0 and loop_count % 45 == 0 and os.path.exists(config_file):
                 current_mtime = os.path.getmtime(config_file)
                 if current_mtime > last_config_mtime:
-                    logger.info("??? [System] cameras.json 변경 감지. 카메라 설정을 무중단 핫 리로드합니다.")
                     try:
                         with open(config_file, 'r', encoding='utf-8') as f:
                             new_configs = json.load(f)
@@ -6392,32 +5638,23 @@ def main():
                             if c.ip in new_configs:
                                 c.update_config(new_configs[c.ip])
                         last_config_mtime = current_mtime
-
-                        # [추가] 만약 system_config.json 도 함께 체크하거나 리로드 구조가 있다면
-                        # 여기에서 person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.5) 를 갱신할 수 있습니다.
                     except Exception as e:
-                        logger.error(f"핫 리로드 중 예외 발생: {e}")
+                        pass
 
             loop_count += 1
-            mem_stage_due = (loop_count % 300 == 0)
 
             if loop_count % fps_calc_interval == 0:
                 current_time = time.time()
                 elapsed_time = current_time - last_fps_time
                 actual_fps = fps_calc_interval / elapsed_time
-
                 cpu_usage = psutil.cpu_percent(interval=None)
 
-                if cpu_usage > 85:
-                    target_fps = max(5, target_fps - 2)
-                elif cpu_usage < 60:
-                    target_fps = min(15, target_fps + 1)
+                if cpu_usage < 75:
+                    target_fps = min(sys_target_fps, target_fps + 1.0)
+                elif cpu_usage > 90:
+                    target_fps = max(8.0, target_fps - 1.0)
 
                 dynamic_delay = 1.0 / target_fps
-
-                if DEBUG_MODE:
-                    logger.info(f"?? [Performance Debug] CPU: {cpu_usage:.1f}% | 실제 속도: {actual_fps:.1f} FPS (목표: {target_fps} FPS)")
-
                 last_fps_time = current_time
 
             if loop_count % 300 == 0:
@@ -6425,317 +5662,114 @@ def main():
                 mem_usage = psutil.virtual_memory().percent
                 q_size = IMAGE_SAVER_POOL._work_queue.qsize() if hasattr(IMAGE_SAVER_POOL, '_work_queue') else 0
                 log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
-                log_memory_probe(cams, event_save_queues, cpu_usage=cpu_usage, loop_count=loop_count)
 
-                if mem_usage > 80 or q_size > 20:
-                    logger.warning(f"?? [System Health] CPU: {cpu_usage:.1f}% | Mem: {mem_usage:.1f}% | API Queue: {q_size}")
+            # ---------------------------------------------------------
+            # Stage 1 (Producer): 프레임 캡처 및 버퍼 공급
+            # ---------------------------------------------------------
+            for idx, worker in enumerate(camera_workers):
+                fr, fid, connected = worker.cam.process_frame()
+                # [수정 시작 1-2] 이전과 완전히 동일한 프레임이면 스킵! (NPU 중복 추론 방지)
+                last_fid = last_processed_fids.get(worker.cam.ip, -1)
+                if fid != last_fid:
+                    worker.frame_buffer.put((fr, fid, connected))
+                    last_processed_fids[worker.cam.ip] = fid
 
-            if mem_stage_due:
-                log_memory_stage("before_process_frame", loop_count, cams=cams, event_save_queues=event_save_queues)
-            if MEMORY_PROBE_INFERENCE_REUSE_FRAME and memory_probe_reuse_raw_data is not None:
-                raw_data = [
-                    (fr, fid + loop_count, connected)
-                    for fr, fid, connected in memory_probe_reuse_raw_data
-                ]
-            else:
-                raw_data = [c.process_frame() for c in cams]
-            if mem_stage_due:
-                log_memory_stage("after_process_frame", loop_count, cams=cams, event_save_queues=event_save_queues)
-            if MEMORY_PROBE_DECODE_ONLY:
-                if mem_stage_due:
-                    log_memory_stage("decode_only_continue", loop_count, cams=cams, event_save_queues=event_save_queues)
-                sleep_time = dynamic_delay - (time.time() - start_time)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                continue
-            if MEMORY_PROBE_INFERENCE_REUSE_FRAME:
-                inference_executor = memory_probe_persistent_executor
-                if inference_executor is None:
-                    inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
-                inference_futures = {}
-                for idx, res in enumerate(raw_data):
-                    fr, fid, connected = res
-                    if connected and fr is not None and cams[idx].events:
-                        if MEMORY_PROBE_EXECUTOR_ONLY:
-                            inference_futures[idx] = inference_executor.submit(memory_probe_executor_noop, idx, fid)
-                        else:
-                            inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
-                if mem_stage_due:
-                    submit_stage = "after_executor_submit" if MEMORY_PROBE_EXECUTOR_ONLY else "after_inference_submit"
-                    log_memory_stage(submit_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
-
-                for idx, future in inference_futures.items():
-                    try:
-                        future.result()
-                    except Exception as e:
-                        mode_name = "executor_only" if MEMORY_PROBE_EXECUTOR_ONLY else "inference_reuse_frame"
-                        logger.error(
-                            f"[INFERENCE ERROR] cam={cams[idx].cam_id} ip={cams[idx].ip} "
-                            f"mode={mode_name} | {e}\n{traceback.format_exc()}"
-                        )
-                if mem_stage_due:
-                    result_stage = "after_executor_results" if MEMORY_PROBE_EXECUTOR_ONLY else "after_inference_results"
-                    log_memory_stage(result_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
-                if memory_probe_persistent_executor is None:
-                    inference_executor.shutdown(wait=True)
-                if mem_stage_due:
-                    executor_stage = "after_executor_reuse" if memory_probe_persistent_executor is not None else "after_executor_shutdown"
-                    log_memory_stage(executor_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
-                sleep_time = dynamic_delay - (time.time() - start_time)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                continue
-
+            # ---------------------------------------------------------
+            # Stage 2 (Consumer): 최신 결과 회수, 마스킹 스냅샷, 및 최적화 렌더링
+            # ---------------------------------------------------------
             final_imgs = []
-
             now_time = time.time()
+            
             roi_snapshot_refresh_cctv_ids = get_terminal_roi_snapshot_refresh_cctv_ids()
             periodic_roi_snapshot_due = (now_time - last_roi_snapshot_time) >= ROI_SNAPSHOT_INTERVAL_SEC
-            if periodic_roi_snapshot_due or roi_snapshot_refresh_cctv_ids:
-                roi_snapshot_queued = False
-                refreshed_cctv_ids = set()
-                for idx, c in enumerate(cams):
-                    cctv_id_text = str(c.cam_id)
-                    force_camera_snapshot = cctv_id_text in roi_snapshot_refresh_cctv_ids
-                    if not periodic_roi_snapshot_due and not force_camera_snapshot:
-                        continue
+            roi_snapshot_queued = False
+            refreshed_cctv_ids = set()
+            
+            for worker in camera_workers:
+                c = worker.cam
+                res = worker.result_buffer.get()
+                
+                if res is None:
+                    if is_gui_mode: final_imgs.append(last_rendered_frames[c.ip])
+                    continue
 
-                    fr, fid, connected = raw_data[idx]
-                    if connected and fr is not None:
-                        c._initialize_base_roi_if_needed(fr)
-                        snap_img = create_roi_snapshot(c, fr)
-                        if snap_img is None:
-                            continue
+                fr, fid, connected, t_main, t_helmet, t_signalman, alarms, new_events, infer_meta = res
+
+                # [수정] 추론 결과를 얻은 직후 개인정보 마스킹을 적용하여 ROI 스냅샷 생성
+                cctv_id_text = str(c.cam_id)
+                force_camera_snapshot = cctv_id_text in roi_snapshot_refresh_cctv_ids
+                if connected and fr is not None and (periodic_roi_snapshot_due or force_camera_snapshot):
+                    blurred_snap, _ = c.apply_privacy_blur(fr.copy(), t_main, blur_face=True, blur_plate=True)
+                    c._initialize_base_roi_if_needed(blurred_snap)
+                    snap_img = create_roi_snapshot(c, blurred_snap)
+                    if snap_img is not None:
                         h, w = snap_img.shape[:2]
-                        roi_info = {
-                            "roi_poly_norm": c.roi_poly_norm,
-                            "roi_lines_norm": c.roi_lines_norm,
-                            "roi_change_poly_norm": []  # 폐기된 필드. 관제 서버 호환을 위해 빈 배열로 유지.
-                        }
-                        IMAGE_SAVER_POOL.submit(
-                            _send_roi_snapshot_task,
-                            c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h
-                        )
+                        roi_info = {"roi_poly_norm": c.roi_poly_norm, "roi_lines_norm": c.roi_lines_norm}
+                        IMAGE_SAVER_POOL.submit(_send_roi_snapshot_task, c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h, bool(getattr(c, "align_shifted", False)))
                         roi_snapshot_queued = True
-                        if force_camera_snapshot:
-                            refreshed_cctv_ids.add(cctv_id_text)
-                if roi_snapshot_queued and periodic_roi_snapshot_due:
-                    last_roi_snapshot_time = now_time
-                if refreshed_cctv_ids:
-                    clear_terminal_roi_snapshot_refresh(
-                        cctv_ids=refreshed_cctv_ids,
-                        reason="roi_snapshot_sent"
-                    )
-
-            if mem_stage_due:
-                log_memory_stage("after_roi_snapshot", loop_count, cams=cams, event_save_queues=event_save_queues)
-
-            inference_executor = main_inference_executor
-            if inference_executor is None:
-                inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(cams)))
-            inference_futures = {}
-            for idx, res in enumerate(raw_data):
-                fr, _, connected = res
-                if connected and fr is not None and cams[idx].events:
-                    inference_futures[idx] = inference_executor.submit(run_camera_inference, cams[idx], fr)
-            if mem_stage_due:
-                log_memory_stage("after_inference_submit", loop_count, cams=cams, event_save_queues=event_save_queues)
-
-            for idx, res in enumerate(raw_data):
-                fr, fid, connected = res
+                        if force_camera_snapshot: refreshed_cctv_ids.add(cctv_id_text)
 
                 if connected and fr is not None and loop_count % 100 == 0:
                     try:
                         small_fr = cv2.resize(fr, (640, 360))
-                        save_path = os.path.join(RAM_DISK_DIR, f"{cams[idx].ip}.jpg")
+                        save_path = os.path.join(RAM_DISK_DIR, f"{c.ip}.jpg")
                         cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    except Exception as e:
-                        pass
+                    except Exception: pass
 
-                if not cams[idx].events:
-                    if connected and fr is not None:
-                        final_imgs.append(cams[idx].draw(fr, [], [], [], {}, True))
-                    else:
-                        final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                    continue
-
-                if not connected or fr is None:
-                    final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                    continue
-
-                # ---------------------------------------------------------
-                # [수정] 사람(2) 및 신호수(5) 클래스 전용 Confidence 개별 적용
-                # ---------------------------------------------------------
-                future = inference_futures.get(idx)
-                if future is None:
-                    final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                    continue
-
-                try:
-                    t_main_input, d_helmet_res, d_signalman_res = future.result()
-                except Exception as e:
-                    logger.error(
-                        f"[INFERENCE ERROR] cam={cams[idx].cam_id} ip={cams[idx].ip} fid={fid} "
-                        f"events={','.join(cams[idx].events) or '-'} | {e}\n{traceback.format_exc()}"
-                    )
+                if not connected or fr is None or not c.events:
                     if is_gui_mode:
-                        final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                    continue
-
-                # 트래커에는 필터링이 완료된 t_main_input을 전달합니다.
-                if MEMORY_PROBE_SKIP_EVENT_LOGIC:
-                    t_main = []
-                    t_helmet = []
-                    t_signalman = []
-                    alarms = {}
-                    new_events = []
-                else:
-                    t_main, t_helmet, t_signalman, alarms, new_events = cams[idx].run_logic(
-                        fr, fid, t_main_input, d_helmet_res, d_signalman_res
-                    )
-                now_fps_log = time.time()
-                cam_ip = cams[idx].ip
-                if now_fps_log - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
-                    logger.debug(
-                        f"[POST INFER FPS] CAM:{cams[idx].cam_id}({cam_ip}) "
-                        f"current_fps={cams[idx].current_fps:.1f} fid={fid} "
-                        f"connected={connected} events={','.join(cams[idx].events) or '-'}"
-                    )
-                    current_fps_last_print[cam_ip] = now_fps_log
-                infer_meta = cams[idx].build_inference_log(
-                    fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events,
-                    d_signalman_res=d_signalman_res
-                )
-
-                # -----------------------------------------------------------
-                # [수정] 녹화기는 원본 프레임을 저장하고, GUI에만 오버레이를 표시합니다.
-                # -----------------------------------------------------------
-                if connected and fr is not None:
-                    # 원본 프레임과 같은 시점의 추론 로그를 버퍼 및 녹화 큐에 업데이트합니다.
-                    if not MEMORY_PROBE_SKIP_RECORDER_UPDATE:
-                        cams[idx].recorder.update(fr, infer_meta)
-
-                    if is_gui_mode:
-                        display_fr = cams[idx].draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
+                        display_fr = c.draw(None, [], [], [], {}, False)
+                        last_rendered_frames[c.ip] = display_fr
                         final_imgs.append(display_fr)
-                else:
-                    if is_gui_mode:
-                        final_imgs.append(cams[idx].draw(None, [], [], [], {}, False))
-                # -----------------------------------------------------------
+                    continue
 
-                if new_events:
-                    # [수정] 디스크에 바로 쓰지 않고, 큐에 스택(Stacking)하며 이벤트 시간 갱신
-                    # 메인 루프 참조 문제 방지를 위해 fr.copy() 사용
-                    cam_ip = cams[idx].ip
-                    last_event_times[cam_ip] = time.time()
-                    event_queue = event_save_queues.get(cam_ip)
-                    if event_queue is not None:
-                        event_names = ",".join(str(ev.get("event_name", "unknown")) for ev in new_events)
-                        event_tids = []
-                        for ev in new_events:
-                            for obj in ev.get("objects", []):
-                                obj_tid = obj.get("tid")
-                                if obj_tid is not None:
-                                    event_tids.append(str(obj_tid))
-                        event_tid_text = ",".join(event_tids) if event_tids else "-"
-                        logger.info(
-                            f"[EVENT FRAME BUFFER] CAM:{cams[idx].cam_id}({cam_ip}) | Event:{event_names} | "
-                            f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{event_tid_text} | "
-                            f"FPS:{cams[idx].current_fps:.1f} | "
-                            f"Frames -> start keeping frames {len(event_queue)}/{event_queue.maxlen} "
-                            f"(window={event_frame_save_delay_sec:.1f}s)"
-                        )
+                cam_ip = c.ip
+                if now_time - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
+                    current_fps_last_print[cam_ip] = now_time
 
-                    for ev_data in new_events:
-                        api_payload = []
-                        for obj in ev_data['objects']:
-                            api_payload.append({
-                                "box": obj['box'],
-                                "label": ev_data['event_name'],
-                                "score": obj['score']
-                            })
-                        logger.debug(
-                            f"[API PAYLOAD DEBUG] event_id={ev_data.get('event_id', '-')} "
-                            f"cam={cams[idx].ip} event={ev_data['event_name']} payload={json.dumps(api_payload)}"
-                        )
+                # [수정] 얇은 선(1px) 기반의 클린 렌더링 및 이벤트 시간 오버레이
+                record_fr = fr.copy()
+                time_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                cv2.putText(record_fr, f"Event Time: {time_str}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                
+                if len(c.roi_poly) > 2:
+                    cv2.polylines(record_fr, [np.array(c.roi_poly, np.int32)], True, (0, 255, 255), 1)
+                if c.roi_lines:
+                    for i in range(0, len(c.roi_lines), 2):
+                        if i + 1 < len(c.roi_lines):
+                            cv2.line(record_fr, tuple(c.roi_lines[i]), tuple(c.roi_lines[i+1]), (0, 0, 255), 1)
+                            
+                for t in t_main:
+                    tid, cls_id = int(t[4]), int(t[6])
+                    if cls_id not in [ID_G_PERSON, ID_PERSON_LOW, ID_G_CAR, ID_G_TRUCK, ID_SIGNALMAN]: continue
+                    bx1, by1, bx2, by2 = map(int, t[:4])
+                    is_alarmed = tid in alarms
+                    color = (0, 0, 255) if is_alarmed else (0, 255, 0)
+                    cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), color, 1)
+                    if tid in c.trk_main.tracks:
+                        hist = list(c.trk_main.tracks[tid]['history'])
+                        if len(hist) > 1:
+                            cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, 1, cv2.LINE_AA)
 
-                # 이벤트가 발생한 뒤 설정된 시간 동안 privacy blur가 적용된 프레임과 AI 판단 로그를 계속 모읍니다.
-                # 녹화 MP4는 원본으로 두고, 별도 이벤트 프레임 이미지에는 개인정보 보호 처리를 적용합니다.
-                event_window_age = time.time() - last_event_times.get(cams[idx].ip, 0.0)
-                if last_event_times.get(cams[idx].ip, 0.0) > 0 and event_window_age <= event_frame_save_delay_sec:
-                    event_frame, privacy_blur_meta = cams[idx].apply_privacy_blur(fr, t_main)
-                    privacy_blur_meta["scope"] = "event_frame_window"
+                # 최적화된 프레임과 현재 타임스탬프를 동기화하여 Recorder에 전달
+                if infer_meta:
+                    c.recorder.update(record_fr, infer_meta, timestamp=now_time)
 
-                    event_infer_meta = dict(infer_meta)
-                    event_infer_meta["privacy_blur"] = privacy_blur_meta
-                    event_save_queues[cams[idx].ip].append((fid, event_frame, event_infer_meta))
+                if is_gui_mode:
+                    display_fr = c.draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
+                    last_rendered_frames[c.ip] = display_fr
+                    final_imgs.append(display_fr)
 
-            if mem_stage_due:
-                log_memory_stage("after_event_logic", loop_count, cams=cams, event_save_queues=event_save_queues)
-            if inference_executor is not main_inference_executor:
-                inference_executor.shutdown(wait=True)
-            if mem_stage_due:
-                executor_stage = "after_executor_reuse" if inference_executor is main_inference_executor else "after_executor_shutdown"
-                log_memory_stage(executor_stage, loop_count, cams=cams, event_save_queues=event_save_queues)
-
-            # [수정] 설정된 이벤트 저장 구간 만료 체크 및 큐 비우기 (Flush)
-            now_time = time.time()
-            for c in cams:
-                ip = c.ip
-                q = event_save_queues.get(ip, [])
-
-                # 큐에 데이터가 있고, 마지막 이벤트로부터 설정된 저장 구간 이상 경과했다면
-                if len(q) > 0 and (now_time - last_event_times.get(ip, 0.0) > event_frame_save_delay_sec):
-                    batch_ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                    # 이벤트 프레임 묶음도 별도 infer 로그를 남깁니다.
-                    # 각 줄에는 저장된 이미지 경로(image_path)와 그 이미지의 AI 판단 결과가 같이 들어갑니다.
-                    infer_log_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{batch_ts}.infer.jsonl")
-                    infer_records = []
-                    logger.info(
-                        f"[EVENT FRAME BUFFER] CAM:{c.cam_id}({ip}) | Event:flush | "
-                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:- | FPS:{c.current_fps:.1f} | "
-                        f"Frames -> flush kept={len(q)}/{q.maxlen} "
-                        f"(window={event_frame_save_delay_sec:.1f}s)"
-                    )
-                    for item_fid, item_fr, item_meta in list(q):
-                        event_img_path = os.path.join(EVENT_ROOT_DIR, f"cam_{ip}_{item_fid}.jpg")
-                        # 디스크 쓰기 병목 방지를 위해 스레드 풀에 작업 위임 (Off-loading)
-                        window_event_id = "-"
-                        if item_meta:
-                            new_events = item_meta.get("new_events", [])
-                            if new_events:
-                                window_event_id = new_events[0].get("event_id", "-")
-                        IMAGE_SAVER_POOL.submit(
-                            _write_image_file,
-                            event_img_path,
-                            item_fr,
-                            "event_frame_window",
-                            window_event_id
-                        )
-                        if item_meta is not None:
-                            record = dict(item_meta)
-                            # 이 image_path가 실제 저장된 원본 이미지와 AI 판단 로그를 이어주는 연결고리입니다.
-                            record["image_path"] = event_img_path
-                            record["event_frame_window_sec"] = event_frame_save_delay_sec
-                            infer_records.append(record)
-                    if infer_records:
-                        IMAGE_SAVER_POOL.submit(_write_jsonl_records, infer_log_path, infer_records)
-                    q.clear()
-                    last_event_times[ip] = 0.0
-
-            if mem_stage_due:
-                log_memory_stage("after_event_flush", loop_count, cams=cams, event_save_queues=event_save_queues)
+            if roi_snapshot_queued and periodic_roi_snapshot_due:
+                last_roi_snapshot_time = now_time
+            if refreshed_cctv_ids:
+                clear_terminal_roi_snapshot_refresh(cctv_ids=refreshed_cctv_ids, reason="roi_snapshot_sent")
 
             if is_gui_mode:
-                if final_imgs:
-                    cv2.imshow("Monitor", create_mosaic_image(final_imgs))
-                key = cv2.waitKey(1)
-                if key == ord('q'):
-                    break
+                if final_imgs: cv2.imshow("Monitor", create_mosaic_image(final_imgs))
+                if cv2.waitKey(1) == ord('q'): break
 
-            sleep_time = dynamic_delay - (time.time() - start_time)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            time.sleep(0.001)
 
     except KeyboardInterrupt:
         logger.info("[종료] 사용자에 의해 시스템이 중단되었습니다.")
@@ -6743,12 +5777,15 @@ def main():
         logger.error(f"[치명적 오류] {e}\n{traceback.format_exc()}")
     finally:
         if 'health_daemon' in locals():
-            logger.info("?? [Health Check] 데몬 스레드를 안전하게 종료합니다.")
             health_daemon.stop()
 
         for c in cams:
             c.reader.running = False
             c.recorder.running = False
+
+        if 'camera_workers' in locals():
+            for w in camera_workers:
+                w.running = False
 
         for model_name in ["d_main", "d_helmet", "d_signalman", "d_face", "d_plate"]:
             model = locals().get(model_name)
@@ -6757,28 +5794,6 @@ def main():
                     model.release()
                 except Exception:
                     pass
-
-        if (
-            'inference_executor' in locals()
-            and (
-                'main_inference_executor' not in locals()
-                or inference_executor is not main_inference_executor
-            )
-        ):
-            try:
-                inference_executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                inference_executor.shutdown(wait=False)
-        if 'main_inference_executor' in locals() and main_inference_executor is not None:
-            try:
-                main_inference_executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                main_inference_executor.shutdown(wait=False)
-        if 'memory_probe_persistent_executor' in locals() and memory_probe_persistent_executor is not None:
-            try:
-                memory_probe_persistent_executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                memory_probe_persistent_executor.shutdown(wait=False)
 
         if is_gui_mode:
             cv2.destroyAllWindows()
