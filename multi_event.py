@@ -353,6 +353,10 @@ def create_roi_snapshot(cam, frame):
     # 3. 설정된 이벤트 명 좌측 상단에 표시
     y_pos = 30
     for evt in cam.events:
+        # [수정] roi_change 이벤트는 관제 스냅샷 텍스트 렌더링에서 제외합니다.
+        if evt == "roi_change" or evt == getattr(sys.modules[__name__], 'ROI_CHANGE_EVENT', 'roi_change'):
+            continue
+
         display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
         cv2.putText(img, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
         y_pos += 30
@@ -5512,14 +5516,15 @@ def main():
     run_output_retention_cleanup(output_retention_days)
 
     def run_camera_inference(cam, fr):
+        # [수정] no_helmet 이벤트 역시 사람 객체를 찾기 위해 MAIN 모델 추론이 필수적으로 요구됩니다.
         active_detection_events = [
             evt for evt in cam.events
-            if evt not in ("no_helmet", ROI_CHANGE_EVENT)
+            if evt != getattr(sys.modules[__name__], 'ROI_CHANGE_EVENT', 'roi_change')
         ]
         t_main_input = np.empty((0, 6))
         d_signalman_res = np.empty((0, 6))
 
-        # [추가] 프레임 전체 면적의 1/2 (50%) 임계값 계산
+        # 프레임 전체 면적의 1/2 (50%) 임계값 계산
         h, w = fr.shape[:2]
         max_area_threshold = (h * w) * 0.5
 
@@ -5533,12 +5538,21 @@ def main():
                 person_conf=person_conf,
                 helmet_conf=helmet_conf,
                 signalman_conf=signalman_conf,
-                max_area_threshold=max_area_threshold # [추가] 1/4 임계값 인자 전달
+                max_area_threshold=max_area_threshold 
             )
 
         d_helmet_res = np.empty((0, 6))
+        
+        # 메인 모델에서 사람이 검출되었을 때만 헬멧 모델 가동 (최적화 유지)
         if "no_helmet" in cam.events:
-            d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
+            has_person = False
+            for d in t_main_input:
+                if int(d[5]) in [ID_G_PERSON, ID_PERSON_LOW, ID_REFLECTIVE_VEST]:
+                    has_person = True
+                    break
+                    
+            if has_person:
+                d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
 
         return t_main_input, d_helmet_res, d_signalman_res
 
