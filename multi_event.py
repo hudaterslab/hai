@@ -4337,7 +4337,8 @@ class Camera:
                 handler.lines = new_lines
 
     def _shift_roi_points(self, points, shift):
-        """ROI 점들을 (dx, dy)만큼 평행이동한 새 리스트로 반환(roi_change_apply 보정용)."""
+        """ROI 점들을 (dx, dy)만큼 평행이동한 새 리스트로 반환(roi_change_apply 보정용).homography가
+        안됬을때 (조건미달등 이유로) 사용되는 fallback 함수."""
         dx = int(round(shift[0]))
         dy = int(round(shift[1]))
         shifted = []
