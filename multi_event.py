@@ -84,18 +84,25 @@ DEBUG_MODE = False
 # ROI 보정(Aligner) 튜닝 파라미터
 # ------------------------------------------------------------
 ALIGN_INTERVAL_SEC = 300.0                 # 화각변경 검사 주기(초)
-ROI_CHANGE_EVENT = "roi_change"            # 이 이벤트가 지정된 카메라만 동작(cameras.json events)
+ROI_CHANGE_EVENT = "roi_change"            # 이 이벤트가 지정된 카메라만 화각변경 '감지+알림'
+ROI_CHANGE_APPLY_EVENT = "roi_change_apply"  # 감지 + 측정된 평행이동만큼 ROI를 '자동 보정'까지 하는 카메라
+GRID_APPLY_MAX_SHIFT_PX = 150.0            # 자동 보정 허용 이동 상한(px). 초과 시 보정 안 하고 알림만(=사람 재설정 필요)
+GRID_APPLY_SHIFT_SIGN = 1.0                # ROI 보정 방향 부호. 보정이 반대로 되면 -1.0으로 (phaseCorrelate 부호 실측 후 조정)
 ANCHOR_STARTUP_DELAY_SEC = 10.0            # RTSP 연결 직후 무효 프레임 회피용 안정화 대기
 ANCHOR_RETRY_INTERVAL_SEC = 30.0           # 앵커 등록 실패 시 재시도 간격
 
 # suspect/confirm 상태머신 (ROIAlignLearningStore.record_check)
 ROI_DRIFT_CONFIRM_COUNT = 3                # 이동 확정에 필요한 연속 횟수
+GRID_DISTURBED_CONFIRM_COUNT = 3           # 전 칸 이동이지만 방향이 흩어진 큰 변화 알림에 필요한 연속 횟수
+GRID_ABNORMAL_CONFIRM_COUNT = 3            # suspect/disturbed를 합산한 카메라별 연속 이상 횟수
 
 ANCHOR_BASE = "base"
 ANCHOR_UPDATED = "updated"
 ROI_ALIGN_CSV_LOG_FILE = os.path.join(PROJECT_ROOT, "logs", "roi_align", "roi_align_decisions.csv")
 ROI_ALIGN_LEARNING_DEFAULTS = {
     "confirm_count_required": ROI_DRIFT_CONFIRM_COUNT,
+    "disturbed_confirm_count_required": GRID_DISTURBED_CONFIRM_COUNT,
+    "abnormal_count_required": GRID_ABNORMAL_CONFIRM_COUNT,
 }
 # test주석
 # ============================================================
@@ -110,7 +117,7 @@ ROI_ALIGN_LEARNING_DEFAULTS = {
 # ============================================================
 GRID_ROWS = 3
 GRID_COLS = 3
-GRID_SHAKE_THRESHOLD_PX = 10.0       # 칸의 이동량이 이 값을 초과하면 '움직인 칸'(px)
+GRID_SHAKE_THRESHOLD_PX = 15.0       # 칸의 이동량이 이 값을 초과하면 '움직인 칸'(px)
 GRID_CELL_MIN_STD = 10.0             # 칸 픽셀 표준편차가 이 미만이면 텍스처 없음 → 측정 제외
 # 적응형 정족수: 카메라마다 쓸 수 있는(텍스처 있는) 칸 수가 다르므로(멀티터미널 다양한 장면),
 #   고정값 대신 그 프레임의 텍스처 칸 수(n_textured)에 비례해 정족수를 정한다.
@@ -119,6 +126,26 @@ GRID_CELL_MIN_STD = 10.0             # 칸 픽셀 표준편차가 이 미만이�
 GRID_QUORUM_FRACTION = 0.6           # 텍스처 칸 중 이 비율이 측정돼야 판단 가능
 GRID_QUORUM_FLOOR = 3                # 정족수 하한(최소 이만큼은 측정돼야 판단)
 GRID_DIRECTION_COS_MIN = 0.6         # 움직인 칸 벡터와 대표(median) 방향의 코사인 유사도가 이 이상이면 '같은 방향'(0.6≈±53°)
+
+# --- homography 기반 ROI 자동 보정(1순위) 파라미터 ----------------------------
+# confirm 시 앵커(틀어지기 전)↔현재 프레임을 ORB 특징점 매칭 + RANSAC homography로 정합해
+# ROI 점들을 변환한다. 렌즈 왜곡으로 지역별 이동량이 다른 경우(실측: 중앙 99px vs 구석 76px)
+# 전역 평행이동보다 ROI 위치에서 정확하다. 게이트를 하나라도 통과 못 하면 평행이동 보정으로 폴백.
+GRID_HOMOGRAPHY_MAX_FEATURES = 1500     # ORB 특징점 수 상한
+GRID_HOMOGRAPHY_MIN_INLIERS = 15        # RANSAC 인라이어 최소 수(이 미만이면 매칭 신뢰 불가)
+GRID_HOMOGRAPHY_RANSAC_REPROJ_PX = 5.0  # RANSAC 재투영 오차 임계(px)
+GRID_HOMOGRAPHY_SHIFT_TOL_PX = 40.0     # H의 화면중심 이동량과 격자 median 측정값의 허용 차(교차검증)
+# 스케일 게이트: 렌즈 왜곡이 있으면 최적 H가 스케일 성분을 갖는 게 정상(실측 sv=1.16에서
+# 상한 1.15로 아깝게 탈락했던 이력 있음 → 0.75~1.35로 완화. 오매칭 방어는 인라이어 수 +
+# 중심이동 교차검증 + ROI 점 변위 상한이 담당).
+GRID_HOMOGRAPHY_SCALE_MIN = 0.75        # 허용 스케일 하한
+GRID_HOMOGRAPHY_SCALE_MAX = 1.35        # 허용 스케일 상한
+GRID_HOMOGRAPHY_PERSPECTIVE_MAX = 1e-3  # 원근 성분(H[2,0], H[2,1]) 상한(ROI 찌그러짐 방어)
+# ROI 지역 잔차 정밀 보정: H는 전 화면 최적 근사라 ROI 지점에는 몇 px 잔차가 남을 수 있다.
+# H로 워핑한 앵커(=보정이 완벽할 때의 현재 화면 예측)와 실제 현재 프레임을 ROI 중심 패치에서
+# phaseCorrelate로 1회 비교해 잔차를 측정하고 ROI에 추가 반영한다.
+GRID_APPLY_REFINE_PATCH_PX = 192        # 잔차 측정 패치 한 변 크기(px)
+GRID_APPLY_REFINE_MAX_PX = 15.0         # 측정된 잔차가 이보다 크면 이상 측정으로 보고 무시
 
 def _format_grid_cell_diag(c):
     """격자 칸 1개가 '얼마나 움직였는지'(px)만 적는다(CSV/로그 공용).
@@ -391,9 +418,14 @@ def create_roi_snapshot(cam, frame):
 
     return img
 
-def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False):
-    """관제 서버로 1시간 주기 ROI 스냅샷을 백그라운드에서 전송합니다."""
+def _send_roi_snapshot_task( cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False, send_type="hourly"):
+    """관제 서버로 ROI 스냅샷을 백그라운드에서 전송합니다."""
     url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
+    send_label = {
+        "roi_check_5min": "5분 ROI 화각검사",
+        "roi_refresh": "ROI 설정반영 스냅샷",
+        "hourly": "1시간 정기 ROI 스냅샷",
+    }.get(str(send_type), f"ROI 스냅샷({send_type})")
     try:
         # 이미지를 메모리 상에서 JPEG 바이너리로 인코딩
         _, img_encoded = cv2.imencode('.jpg', img)
@@ -415,12 +447,17 @@ def _send_roi_snapshot_task(cam_id, terminal_id, img, roi_info_str, w, h, is_req
         resp = requests.post(url, data=data, files=files, verify=False, timeout=15)
 
         if resp.status_code == 200:
-            _tag = "ROI재설정요청(isReqRoiSetup=True)" if is_req_roi_setup else "1시간주기ROI스냅샷"
-            logger.info(f" [ROI Snapshot] CAM:{cam_id} 1시간 주기 스냅샷 전송 성공")
+            logger.info(
+                f" [ROI Snapshot][{send_label}] CAM:{cam_id} 전송 성공 "
+                f"isReqRoiSetup={bool(is_req_roi_setup)}"
+            )
         else:
-            logger.error(f" [ROI Snapshot] CAM:{cam_id} API 에러 ({resp.status_code}): {resp.text}")
+            logger.error(
+                f" [ROI Snapshot][{send_label}] CAM:{cam_id} API 에러 "
+                f"({resp.status_code}): {resp.text}"
+            )
     except Exception as e:
-        logger.error(f" [ROI Snapshot] CAM:{cam_id} 전송 실패: {e}")
+        logger.error(f" [ROI Snapshot][{send_label}] CAM:{cam_id} 전송 실패: {e}")
 
 # ==========================================
 # [2] 로깅 시스템 초기화
@@ -2945,15 +2982,22 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     url = batch[local_idx]
                     ip = extract_ip(url)
 
-                    print(f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량")
-                    evts = guarded_input(f"[{ip}] 이벤트 선택 (예: 1,4): ")
+                    print(
+                        f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량 "
+                        f"6.roi화각변경 7.roi화각변경+자동보정"
+                    )
+                    evts = guarded_input(f"[{ip}] 이벤트 선택 (예: 1,4,7): ")
                     events = []
 
-                    if '1' in evts: events.append("intrusion")
-                    if '2' in evts: events.append("illegal_parking")
-                    if '3' in evts: events.append("no_helmet")
-                    if '4' in evts: events.append("conveyor_crossing")
-                    if '5' in evts: events.append("signal_vehicle")
+                    selected_events = {s.strip() for s in evts.split(',') if s.strip()}
+
+                    if '1' in selected_events: events.append("intrusion")
+                    if '2' in selected_events: events.append("illegal_parking")
+                    if '3' in selected_events: events.append("no_helmet")
+                    if '4' in selected_events: events.append("conveyor_crossing")
+                    if '5' in selected_events: events.append("signal_vehicle")
+                    if '6' in selected_events: events.append(ROI_CHANGE_EVENT)
+                    if '7' in selected_events: events.append(ROI_CHANGE_APPLY_EVENT)
 
                     roi_p = []
                     roi_l = []
@@ -3006,9 +3050,12 @@ class ROIAlignLearningStore:
             logger.warning(f"[ROI DRIFT] CSV state load failed: {e}")
         return False
 
-    # 3×3 격자 전용 CSV 스키마(단순화: decision은 normal/suspect/confirm 3종).
+    # 3×3 격자 전용 CSV 스키마(decision은 normal/suspect/confirm/disturbed 4종).
     #   decision        : normal(이동 없음) / suspect(이동 감지, 누적 중) / confirm(연속 N회 도달 → API)
+    #                     / disturbed(전 칸 이동 + 방향 불일치: 큰 회전/줌/장면 전환, 연속 3회 도달 → 확정)
     #   suspect_count   : 연속 suspect 횟수(normal이 나오면 0으로 리셋). confirm_count_required(기본 3) 도달 시 confirm
+    #   disturbed_count : 연속 disturbed 횟수. disturbed_confirm_count_required(기본 3) 도달 시 확정
+    #   abnormal_count  : 카메라별 연속 suspect/disturbed 합산 횟수. normal일 때만 0으로 초기화
     #   cells_measurable: std 게이트 통과(측정 가능)한 칸 수. cells_moving == cells_measurable 이면 '전부 움직임'(①)
     #   cells_moving    : >GRID_SHAKE_THRESHOLD_PX(10px) 로 움직인 칸 수
     #   cells_consistent: 움직인 칸 중 같은 방향인 칸 수
@@ -3018,11 +3065,12 @@ class ROIAlignLearningStore:
     #   grid_cells_std  : 칸별 std(텍스처, 9칸 '|'). >= GRID_CELL_MIN_STD(10) 이면 측정칸 → 어느 칸이 통과했는지 확인
     #   frame_std       : 전체 프레임 표준편차(텍스처/대비)
     #   anchor_refreshed: 이번 검사에서 앵커를 갱신했는지(True/False)
-    #   healthcheck     : 이 줄에서 ROI 재설정 요청(API)을 발사했는지
+    #   healthcheck     : ROI 재설정 필요(pending) 상태. confirm/disturbed 확정부터 관제센터가
+    #                     ROI를 내려줄(update_config) 때까지 계속 True. 발사 순간은 reason이 채워진 행
     def append_csv_log(self, row, path=ROI_ALIGN_CSV_LOG_FILE):
         fieldnames = [
             "timestamp", "camera_key", "decision",
-            "suspect_count", "cells_measurable", "cells_moving", "cells_consistent", "consistent_quorum",
+            "suspect_count", "disturbed_count", "abnormal_count", "cells_measurable", "cells_moving", "cells_consistent", "consistent_quorum",
             "grid_cells", "grid_cells_std", "frame_std",
             "anchor_refreshed", "healthcheck", "reason",
         ]
@@ -3030,6 +3078,22 @@ class ROIAlignLearningStore:
         def write_one_csv(target_path):
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             exists = os.path.exists(target_path) and os.path.getsize(target_path) > 0
+            if exists:
+                # 스키마(컬럼) 변경 시 기존 로그를 백업으로 밀어내고 새 헤더로 시작(컬럼 어긋남 방지)
+                try:
+                    with open(target_path, "r", newline="", encoding="utf-8") as f:
+                        header_line = f.readline()
+                    current_header = next(csv.reader([header_line])) if header_line else []
+                    if current_header != fieldnames:
+                        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        backup_path = f"{target_path}.bak_header_{stamp}"
+                        os.replace(target_path, backup_path)
+                        logger.info(
+                            f"[ROI DRIFT] CSV header changed; old log moved to {backup_path}"
+                        )
+                        exists = False
+                except Exception as e:
+                    logger.warning(f"[ROI DRIFT] CSV header check failed: {e}")
             with open(target_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not exists:
@@ -3058,45 +3122,177 @@ class ROIAlignLearningStore:
         state = self.data.setdefault("cameras", {}).setdefault(camera_key, {})
         params = self._camera_params(camera_key, camera_conf)
         params["confirm_count_required"] = int(params.get("confirm_count_required", ROI_DRIFT_CONFIRM_COUNT))
+        params["disturbed_confirm_count_required"] = int(
+            params.get("disturbed_confirm_count_required", GRID_DISTURBED_CONFIRM_COUNT)
+        )
+        params["abnormal_count_required"] = int(
+            params.get("abnormal_count_required", GRID_ABNORMAL_CONFIRM_COUNT)
+        )
         state.setdefault("consecutive_suspect", 0)
+        state.setdefault("consecutive_disturbed", 0)
+        state.setdefault("consecutive_abnormal", 0)
+        state.setdefault("awaiting_roi_setup", False)
+        state.setdefault("latched_abnormal_kind", "")
         state["params"] = params
         return state, params
 
-    def record_check(self, camera_key, camera_conf, moved):
-        """단순 3-상태 판정(normal / suspect / confirm).
+    def reset_camera(self, camera_key, reason="roi_updated"):
+        """관제 ROI가 적용된 카메라의 누적 판정 상태를 초기화한다."""
+        with self.lock:
+            state = self.data.setdefault("cameras", {}).get(camera_key)
+            if state is None:
+                return False
+            state["consecutive_suspect"] = 0
+            state["consecutive_disturbed"] = 0
+            state["consecutive_abnormal"] = 0
+            state["awaiting_roi_setup"] = False
+            state["latched_abnormal_kind"] = ""
+            state["last_decision"] = "normal"
+            state["last_reset_at"] = self._now_iso()
+            state["last_reset_reason"] = str(reason)
+            return True
+
+    def record_check(self, camera_key, camera_conf, moved, disturbed=False):
+        """단순 3-상태 판정(normal / suspect / confirm) + disturbed(방향 흩어진 큰 변화).
           moved=False → normal (suspect 카운터를 0으로 리셋)
           moved=True  → suspect 카운터 +1
                         · 카운터 < confirm_count_required(기본 3) → 'suspect'
                         · 카운터 == confirm_count_required        → 'confirm' + 헬스체크(API) 1회 발사
                         · 카운터 >  confirm_count_required        → 'confirm' 유지(이미 발사했으므로 재발사 X)
-        중간에 한 번이라도 normal이 나오면 suspect는 0으로 초기화된다(=연속 N회만 인정)."""
+          disturbed=True(전 칸 이동 + 방향 불일치: 큰 회전/줌/장면 전환) → disturbed 카운터 +1
+                        · 연속 disturbed_confirm_count_required(기본 3)회 도달 시 disturbed 확정
+          suspect 또는 disturbed이면 카메라별 abnormal_count +1, 요청 전 normal이면 0으로 초기화
+                        · abnormal_count_required(기본 3) 도달 순간 헬스체크(API) 1회 발사
+                        · 요청 후에는 관제 ROI가 적용될 때까지 confirm을 유지하며 검사마다 +1
+                        · 자동보정은 하지 않음(방향이 흩어져 median 이동량 신뢰 불가 → 사람이 재설정)
+        관제 ROI 적용 시 reset_camera()가 세 카운터와 pending 상태를 초기화한다."""
         with self.lock:
             state, params = self._ensure_camera_locked(camera_key, camera_conf)
             now_iso = self._now_iso()
             state["last_checked_at"] = now_iso
             confirm_required = max(1, int(params.get("confirm_count_required", ROI_DRIFT_CONFIRM_COUNT)))
+            disturbed_required = max(
+                1,
+                int(params.get("disturbed_confirm_count_required", GRID_DISTURBED_CONFIRM_COUNT))
+            )
+            abnormal_required = max(
+                1,
+                int(params.get("abnormal_count_required", GRID_ABNORMAL_CONFIRM_COUNT))
+            )
+
+            # 알림 발생 후에는 새 ROI 수신 전까지 판정을 잠근다. 현재 화면 상태와 관계없이
+            # abnormal_count를 검사 주기마다 증가시켜 대기 지속 시간을 로그에서 확인한다.
+            if bool(state.get("awaiting_roi_setup", False)):
+                abnormal_count = int(state.get("consecutive_abnormal", 0)) + 1
+                state["consecutive_abnormal"] = abnormal_count
+                latched_kind = str(state.get("latched_abnormal_kind", ""))
+                if latched_kind not in ("suspect", "disturbed"):
+                    latched_kind = (
+                        "disturbed"
+                        if int(state.get("consecutive_disturbed", 0)) >= int(state.get("consecutive_suspect", 0))
+                        else "suspect"
+                    )
+                    state["latched_abnormal_kind"] = latched_kind
+                if latched_kind == "disturbed":
+                    disturbed_count = int(state.get("consecutive_disturbed", 0)) + 1
+                    state["consecutive_disturbed"] = disturbed_count
+                    suspect_count = 0
+                    state["consecutive_suspect"] = 0
+                else:
+                    suspect_count = int(state.get("consecutive_suspect", 0)) + 1
+                    state["consecutive_suspect"] = suspect_count
+                    disturbed_count = 0
+                    state["consecutive_disturbed"] = 0
+                state["last_decision"] = "confirm"
+                observed = "disturbed" if disturbed else ("suspect" if moved else "normal")
+                return {
+                    "decision": "confirm",
+                    "observed_decision": observed,
+                    "latched_abnormal_kind": latched_kind,
+                    "suspect_count": suspect_count,
+                    "disturbed_count": disturbed_count,
+                    "abnormal_count": abnormal_count,
+                    "confirmed": False,
+                    "disturbed_confirmed": False,
+                    "pending": True,
+                    "healthcheck": False,
+                    "confirm_count_required": confirm_required,
+                    "disturbed_confirm_count_required": disturbed_required,
+                    "abnormal_count_required": abnormal_required,
+                }
+
+            if disturbed:
+                state["consecutive_suspect"] = 0
+                disturbed_count = int(state.get("consecutive_disturbed", 0)) + 1
+                state["consecutive_disturbed"] = disturbed_count
+                abnormal_count = int(state.get("consecutive_abnormal", 0)) + 1
+                state["consecutive_abnormal"] = abnormal_count
+                state["last_decision"] = "disturbed"
+                healthcheck = (abnormal_count == abnormal_required)
+                if healthcheck:
+                    state["last_healthcheck_at"] = now_iso
+                    state["awaiting_roi_setup"] = True
+                    state["latched_abnormal_kind"] = "disturbed"
+                return {"decision": "confirm" if healthcheck else "disturbed",
+                        "observed_decision": "disturbed",
+                        "suspect_count": 0, "disturbed_count": disturbed_count,
+                        "abnormal_count": abnormal_count,
+                        "confirmed": False, "disturbed_confirmed": disturbed_count >= disturbed_required,
+                        "pending": healthcheck,
+                        "healthcheck": healthcheck, "confirm_count_required": confirm_required,
+                        "disturbed_confirm_count_required": disturbed_required,
+                        "abnormal_count_required": abnormal_required}
 
             if not moved:
                 state["consecutive_suspect"] = 0
+                state["consecutive_disturbed"] = 0
+                state["consecutive_abnormal"] = 0
                 state["last_decision"] = "normal"
-                return {"decision": "normal", "suspect_count": 0, "confirmed": False,
-                        "healthcheck": False, "confirm_count_required": confirm_required}
+                return {"decision": "normal", "suspect_count": 0, "disturbed_count": 0,
+                        "abnormal_count": 0,
+                        "confirmed": False, "disturbed_confirmed": False,
+                        "pending": False,
+                        "healthcheck": False, "confirm_count_required": confirm_required,
+                        "disturbed_confirm_count_required": disturbed_required,
+                        "abnormal_count_required": abnormal_required}
 
+            state["consecutive_disturbed"] = 0
             suspect_count = int(state.get("consecutive_suspect", 0)) + 1
             state["consecutive_suspect"] = suspect_count
+            abnormal_count = int(state.get("consecutive_abnormal", 0)) + 1
+            state["consecutive_abnormal"] = abnormal_count
+            healthcheck = (abnormal_count == abnormal_required)
 
             if suspect_count < confirm_required:
                 state["last_decision"] = "suspect"
-                return {"decision": "suspect", "suspect_count": suspect_count, "confirmed": False,
-                        "healthcheck": False, "confirm_count_required": confirm_required}
+                if healthcheck:
+                    state["last_healthcheck_at"] = now_iso
+                    state["awaiting_roi_setup"] = True
+                    state["latched_abnormal_kind"] = "suspect"
+                return {"decision": "confirm" if healthcheck else "suspect",
+                        "observed_decision": "suspect",
+                        "suspect_count": suspect_count, "disturbed_count": 0,
+                        "abnormal_count": abnormal_count,
+                        "confirmed": False, "disturbed_confirmed": False,
+                        "pending": healthcheck,
+                        "healthcheck": healthcheck, "confirm_count_required": confirm_required,
+                        "disturbed_confirm_count_required": disturbed_required,
+                        "abnormal_count_required": abnormal_required}
 
             # suspect_count >= confirm_required → confirm. API는 '막 도달한 순간'(==)에만 1회 발사.
             state["last_decision"] = "confirm"
-            healthcheck = (suspect_count == confirm_required)
             if healthcheck:
                 state["last_healthcheck_at"] = now_iso
-            return {"decision": "confirm", "suspect_count": suspect_count, "confirmed": True,
-                    "healthcheck": healthcheck, "confirm_count_required": confirm_required}
+                state["awaiting_roi_setup"] = True
+                state["latched_abnormal_kind"] = "suspect"
+            return {"decision": "confirm", "observed_decision": "suspect",
+                    "suspect_count": suspect_count, "disturbed_count": 0,
+                    "abnormal_count": abnormal_count,
+                    "confirmed": True, "disturbed_confirmed": False,
+                    "pending": healthcheck,
+                    "healthcheck": healthcheck, "confirm_count_required": confirm_required,
+                    "disturbed_confirm_count_required": disturbed_required,
+                    "abnormal_count_required": abnormal_required}
 
     def was_roi_setup_reported(self):
         with self.lock:
@@ -3194,9 +3390,10 @@ class AnchorTrackingROIAligner:
         그중 대표 방향과 코사인 유사도 >= GRID_DIRECTION_COS_MIN인 칸이
         round(n_moving × GRID_QUORUM_FRACTION) 이상이면 moved=True.
         반환 dict: moved, n_measurable, n_moving, n_textured, quorum, consistent, consistent_quorum, frame_std, cells, status."""
-        res = {"moved": False, "n_measurable": 0, "n_moving": 0, "n_textured": 0,
+        res = {"moved": False, "disturbed": False, "n_measurable": 0, "n_moving": 0, "n_textured": 0,
                "quorum": GRID_QUORUM_FLOOR, "consistent": 0, "consistent_quorum": 0,
                "all_measured_moving": False, "frame_std": 0.0,
+               "median_dx": 0.0, "median_dy": 0.0,   # 움직인 칸들의 대표 평행이동(roi_change_apply 보정용)
                "cells": [], "status": "grid_not_initialized"}
         self.last_grid_result = res  # 외부(test 등)에서 칸별 수치 조회에 사용
         anchor = self.anchor_slots.get(ANCHOR_UPDATED) or self.anchor_slots.get(ANCHOR_BASE)
@@ -3256,6 +3453,8 @@ class AnchorTrackingROIAligner:
             arr = np.array([(mc["dx"], mc["dy"]) for mc in moving_cells], dtype=np.float32)
             mdx = float(np.median(arr[:, 0]))
             mdy = float(np.median(arr[:, 1]))
+            res["median_dx"] = mdx   # 움직인 칸들의 대표 이동벡터(ROI 자동 보정에 사용)
+            res["median_dy"] = mdy
             ref_mag = float(math.hypot(mdx, mdy))
             if ref_mag > 1e-6:
                 mags = np.hypot(arr[:, 0], arr[:, 1])
@@ -3264,6 +3463,14 @@ class AnchorTrackingROIAligner:
                     mc["cos"] = float(cs)
                     mc["consistent"] = bool(cs >= GRID_DIRECTION_COS_MIN)
                 res["consistent"] = int(np.sum(cos_sim >= GRID_DIRECTION_COS_MIN))
+                # 보정용 대표 이동벡터(median_dx/dy)는 '방향 일치 칸'만으로 재계산.
+                # (반대 방향으로 측정된 아웃라이어 칸(내용 변화)이 median을 오염시키는 것 방지.
+                #  실측: cos=-0.83으로 17.7px 측정된 칸이 전체 median을 1.7px 끌어내렸음)
+                cons_vecs = [(mc["dx"], mc["dy"]) for mc in moving_cells if mc.get("consistent")]
+                if cons_vecs:
+                    arr_c = np.array(cons_vecs, dtype=np.float32)
+                    res["median_dx"] = float(np.median(arr_c[:, 0]))
+                    res["median_dy"] = float(np.median(arr_c[:, 1]))
 
         if n_meas < quorum:
             # 측정칸이 정족수 미달(주로 저텍스처/야간) → 판단 보류(moved=False, 알람 안 함).
@@ -3279,10 +3486,112 @@ class AnchorTrackingROIAligner:
         res["consistent_quorum"] = int(consistent_quorum)
         res["all_measured_moving"] = bool(all_measured_moving)
         res["moved"] = bool(all_measured_moving and res["consistent"] >= consistent_quorum)
-        tag = "grid_moved" if res["moved"] else "grid_still"
+        # 전 칸 이동했지만 방향이 흩어짐(정족수 미달) = 평행이동으로 설명 안 되는 큰 변화(회전/줌/장면 전환)
+        res["disturbed"] = bool(all_measured_moving and res["consistent"] < consistent_quorum)
+        tag = "grid_moved" if res["moved"] else ("grid_disturbed" if res["disturbed"] else "grid_still")
         res["status"] = (f"{tag}:consistent={res['consistent']}/q={consistent_quorum}"
                          f"/moving={n_moving}/meas={n_meas}/all_moving={int(all_measured_moving)}")
         return res
+
+def transform_roi_points_h(points, H):
+    """ROI 점 리스트를 homography H로 변환한 새 리스트를 반환(roi_change_apply homography 보정용)."""
+    if not points:
+        return []
+    arr = np.array([[float(p[0]), float(p[1])] for p in points], dtype=np.float32).reshape(-1, 1, 2)
+    out = cv2.perspectiveTransform(arr, H).reshape(-1, 2)
+    return [[int(round(float(x))), int(round(float(y)))] for x, y in out]
+
+def estimate_alignment_homography(anchor_gray, cur_gray, expected_shift):
+    """앵커(틀어지기 전) gray ↔ 현재 gray를 ORB 특징점 매칭 + RANSAC으로 정합해 homography를 추정.
+    렌즈 왜곡으로 지역별 이동량이 다른 경우까지 반영하므로 평행이동(median)보다 ROI 위치에서
+    정확한 보정이 가능하다. confirm 시점에 1회만 호출된다.
+    아래 게이트를 하나라도 통과 못 하면 (None, 사유)를 반환 → 호출부가 평행이동 보정으로 폴백.
+      게이트 1: RANSAC 인라이어 수 >= GRID_HOMOGRAPHY_MIN_INLIERS (매칭 신뢰성)
+      게이트 2: H의 화면중심 이동량 ≈ 격자 median 측정(expected_shift) (교차검증, 오매칭 방어)
+      게이트 3: 스케일/원근 성분 상한 (ROI가 찌그러지는 비정상 변환 방어)
+    반환: (H(3x3 np.ndarray) 또는 None, 상태 문자열)"""
+    try:
+        if anchor_gray is None or cur_gray is None or anchor_gray.shape != cur_gray.shape:
+            return None, "homography_bad_input"
+        orb = cv2.ORB_create(nfeatures=GRID_HOMOGRAPHY_MAX_FEATURES)
+        kp1, des1 = orb.detectAndCompute(anchor_gray, None)
+        kp2, des2 = orb.detectAndCompute(cur_gray, None)
+        if des1 is None or des2 is None:
+            return None, "homography_no_features"
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = matcher.match(des1, des2)
+        if len(matches) < GRID_HOMOGRAPHY_MIN_INLIERS:
+            return None, f"homography_low_matches:{len(matches)}"
+        matches = sorted(matches, key=lambda m: m.distance)[:300]
+        src = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, GRID_HOMOGRAPHY_RANSAC_REPROJ_PX)
+        if H is None:
+            return None, "homography_ransac_fail"
+        inliers = int(mask.sum()) if mask is not None else 0
+        if inliers < GRID_HOMOGRAPHY_MIN_INLIERS:
+            return None, f"homography_low_inliers:{inliers}"
+
+        # 게이트 2: 화면 중심의 이동량이 격자 측정과 대략 일치해야 함(전혀 다른 곳에 매칭된 경우 방어)
+        h, w = anchor_gray.shape[:2]
+        center = np.float32([[[w / 2.0, h / 2.0]]])
+        moved = cv2.perspectiveTransform(center, H)[0][0]
+        tdx = float(moved[0]) - w / 2.0
+        tdy = float(moved[1]) - h / 2.0
+        edx, edy = float(expected_shift[0]), float(expected_shift[1])
+        if math.hypot(tdx - edx, tdy - edy) > GRID_HOMOGRAPHY_SHIFT_TOL_PX:
+            return None, (f"homography_shift_mismatch:H=({tdx:.1f},{tdy:.1f})"
+                          f"/grid=({edx:.1f},{edy:.1f})")
+
+        # 게이트 3: 과도한 스케일/원근 변형 방지. 렌즈 왜곡 때문에 스케일이 1에서 다소 벗어나는 건
+        # 정상이므로 상한을 여유 있게 둔다(GRID_HOMOGRAPHY_SCALE_MIN/MAX 주석 참고).
+        h33 = float(H[2, 2]) if abs(float(H[2, 2])) > 1e-9 else 1.0
+        A = np.array(H[:2, :2], dtype=np.float64) / h33
+        sv = np.linalg.svd(A, compute_uv=False)
+        if float(sv[0]) > GRID_HOMOGRAPHY_SCALE_MAX or float(sv[1]) < GRID_HOMOGRAPHY_SCALE_MIN:
+            return None, f"homography_scale_out:sv=({float(sv[0]):.2f},{float(sv[1]):.2f})"
+        if (abs(float(H[2, 0])) > GRID_HOMOGRAPHY_PERSPECTIVE_MAX
+                or abs(float(H[2, 1])) > GRID_HOMOGRAPHY_PERSPECTIVE_MAX):
+            return None, "homography_perspective_excessive"
+
+        return H, f"homography_ok:inliers={inliers} center_shift=({tdx:.1f},{tdy:.1f}) sv=({float(sv[0]):.2f},{float(sv[1]):.2f})"
+    except Exception as e:
+        return None, f"homography_error:{e}"
+
+def refine_roi_local_residual(anchor_gray, cur_gray, H, roi_center,
+                              patch_px=None):
+    """homography 적용 후 ROI 지역에 남는 잔차 평행이동을 측정한다(roi_change_apply 정밀 보정).
+    앵커를 H로 워핑하면 '보정이 완벽할 때의 현재 화면 예측'이 되므로, ROI 중심 주변 패치에서
+    예측(워핑 앵커)과 실제(현재 프레임)의 차이를 phaseCorrelate로 1회 측정해 반환한다.
+    부호 규약은 격자 측정과 동일: 반환값 = 그 지역 내용물이 예측 대비 이동한 방향/거리
+    → ROI 점들에 그대로 더하면 된다.
+    측정 불가(텍스처 부족)거나 잔차가 비정상적으로 크면 (None, 사유)를 반환한다.
+    반환: ((rdx, rdy) 또는 None, 상태 문자열)"""
+    try:
+        if patch_px is None:
+            patch_px = GRID_APPLY_REFINE_PATCH_PX
+        h, w = cur_gray.shape[:2]
+        half = max(32, int(patch_px) // 2)
+        # 패치가 화면 안에 완전히 들어오도록 중심을 클램프
+        cx = min(max(float(roi_center[0]), half), w - half)
+        cy = min(max(float(roi_center[1]), half), h - half)
+        x1 = int(round(cx - half)); x2 = x1 + 2 * half
+        y1 = int(round(cy - half)); y2 = y1 + 2 * half
+        if x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+            return None, "refine_patch_out_of_frame"
+        warped = cv2.warpPerspective(anchor_gray, H, (w, h))
+        a = warped[y1:y2, x1:x2].astype(np.float32)
+        b = cur_gray[y1:y2, x1:x2].astype(np.float32)
+        # 워핑 경계의 검은 영역/무늬 없는 패치는 측정 불가
+        if min(float(a.std()), float(b.std())) < GRID_CELL_MIN_STD:
+            return None, "refine_low_texture"
+        win = cv2.createHanningWindow((a.shape[1], a.shape[0]), cv2.CV_32F)
+        (rdx, rdy), _ = cv2.phaseCorrelate(a, b, win)
+        if math.hypot(rdx, rdy) > GRID_APPLY_REFINE_MAX_PX:
+            return None, f"refine_residual_too_big:({rdx:.1f},{rdy:.1f})"
+        return (float(rdx), float(rdy)), f"refine_ok:({rdx:.1f},{rdy:.1f})"
+    except Exception as e:
+        return None, f"refine_error:{e}"
 
 class FrameReader:
     def __init__(self, url, ip):
@@ -4001,6 +4310,9 @@ class Camera:
         self.base_roi_lines = []
         self.aligned_roi_poly = []
         self.aligned_roi_lines = []
+        self.roi_shift = [0.0, 0.0]      # roi_change_apply: base ROI에 적용된 평행이동(px)
+        self.roi_auto_corrected = False  # roi_change_apply 1회 보정 래치. True면 관제센터 ROI 수신(update_config) 전까지 추가 보정 금지
+        self.roi_setup_pending = False   # confirm/disturbed 확정 후 관제센터 ROI 수신 전까지 True(=서버에 true 전송 중인 상태). CSV healthcheck 컬럼에 기록
 
         self.last_align_time = 0.0
         self.last_anchor_attempt_time = 0.0
@@ -4022,6 +4334,9 @@ class Camera:
 
     def update_config(self, new_conf):
         old_events = self.events.copy()
+
+        # 관제센터에서 새 ROI가 적용되면 해당 카메라의 pending/count를 해제한다.
+        ROI_ALIGN_LEARNING_STORE.reset_camera(self.camera_key, reason="camera_config_updated")
 
         self.conf = new_conf
         self.events = new_conf.get('events', [])
@@ -4066,6 +4381,8 @@ class Camera:
         self.base_roi_poly = denormalize_roi_points(self.roi_poly_norm, w, h) if self.roi_poly_norm else []
         self.base_roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h) if self.roi_lines_norm else []
 
+        self.roi_shift = [0.0, 0.0]      # 새 base 기준이므로 보정량·1회 보정 래치 초기화
+        self.roi_auto_corrected = False
         self.aligned_roi_poly = list(self.base_roi_poly)
         self.aligned_roi_lines = list(self.base_roi_lines)
         self.roi_frame_shape = frame.shape[:2]
@@ -4098,6 +4415,15 @@ class Camera:
                         new_lines.append((lines[i], lines[i + 1]))
                 handler.lines = new_lines
 
+    def _shift_roi_points(self, points, shift):
+        """ROI 점들을 (dx, dy)만큼 평행이동한 새 리스트로 반환(roi_change_apply 보정용).homography가
+        안됬을때 (조건미달등 이유로) 사용되는 fallback 함수."""
+        dx = int(round(shift[0]))
+        dy = int(round(shift[1]))
+        shifted = []
+        for p in (points or []):
+            shifted.append([int(p[0]) + dx, int(p[1]) + dy])
+        return shifted
 
     def _log_align_blocked(self, decision, detail):
         try:
@@ -4110,6 +4436,8 @@ class Camera:
                 "camera_key": self.camera_key,
                 "decision": "normal",
                 "suspect_count": 0,
+                "disturbed_count": 0,
+                "abnormal_count": 0,
                 "cells_measurable": "",
                 "cells_moving": "",
                 "cells_consistent": "",
@@ -4118,8 +4446,12 @@ class Camera:
                 "grid_cells_std": "",
                 "frame_std": "",
                 "anchor_refreshed": False,
-                "healthcheck": False,
-                "reason": f"{decision}:{detail}",
+                "healthcheck": bool(getattr(self, "roi_setup_pending", False)),
+                "reason": (
+                    f"{decision}:{detail} "
+                    f"applied_shift=({getattr(self, 'roi_shift', [0.0, 0.0])[0]:.1f},"
+                    f"{getattr(self, 'roi_shift', [0.0, 0.0])[1]:.1f})"
+                ),
             }
             ROI_ALIGN_LEARNING_STORE.append_csv_log(csv_row)
         except Exception as e:
@@ -4131,7 +4463,10 @@ class Camera:
 
         self._initialize_base_roi_if_needed(frame)
 
-        if ROI_CHANGE_EVENT not in self.events:
+        # 격자(화각변경) 감지는 이벤트 지정(cameras.json events)된 카메라만 동작
+        #   roi_change       = 감지 + 알림(사람이 재설정)
+        #   roi_change_apply = 감지 + ROI 자동 보정(둘 중 하나만 있어도 감지는 켜짐)
+        if ROI_CHANGE_EVENT not in self.events and ROI_CHANGE_APPLY_EVENT not in self.events:
             self.align_status_text = "ROI CHANGE OFF"
             return
 
@@ -4170,6 +4505,7 @@ class Camera:
 
         grid = self.aligner.detect_grid_camera_motion(frame)
         moved = bool(grid["moved"])
+        disturbed = bool(grid.get("disturbed", False))
         n_meas = int(grid["n_measurable"])
         n_mov = int(grid["n_moving"])
         quorum = int(grid.get("quorum", GRID_QUORUM_FLOOR))
@@ -4177,43 +4513,222 @@ class Camera:
         consistent_quorum = int(grid.get("consistent_quorum", 0))
         self.align_ok = (n_meas >= quorum)
 
-        refresh_allowed = (not moved) and self.align_ok and (n_mov < quorum)
+        refresh_allowed = (
+            (not moved)
+            and self.align_ok
+            and (n_mov < quorum)
+            and not self.roi_setup_pending
+        )
         anchor_refreshed = False
         if refresh_allowed:
             action = self.aligner.refresh_grid_anchor(frame)
             anchor_refreshed = str(action).startswith("grid_refresh")
 
-        decision = ROI_ALIGN_LEARNING_STORE.record_check(self.camera_key, self.conf, moved)
+        decision = ROI_ALIGN_LEARNING_STORE.record_check(self.camera_key, self.conf, moved, disturbed=disturbed)
         decision_name = str(decision.get("decision", "normal"))
+        observed_decision = str(decision.get("observed_decision", decision_name))
+        decision_pending = bool(decision.get("pending", False))
         suspect_count = int(decision.get("suspect_count", 0))
+        disturbed_count = int(decision.get("disturbed_count", 0))
+        abnormal_count = int(decision.get("abnormal_count", 0))
         confirm_required = int(decision.get("confirm_count_required", ROI_DRIFT_CONFIRM_COUNT))
+        disturbed_required = int(decision.get("disturbed_confirm_count_required", GRID_DISTURBED_CONFIRM_COUNT))
+        abnormal_required = int(decision.get("abnormal_count_required", GRID_ABNORMAL_CONFIRM_COUNT))
+        if decision_pending:
+            self.roi_setup_pending = True
         self.align_shifted = bool(decision.get("confirmed", False))
+
+        # ---- ROI 자동 보정 (roi_change_apply 카메라 전용) ------------------------------
+        # confirm 시점에 [1순위] homography 보정을 시도한다:
+        #   앵커(틀어지기 전) gray ↔ 현재 프레임을 ORB 특징점 매칭으로 정합해, 렌즈 왜곡에 의한
+        #   지역별 이동량 차이까지 반영해 ROI 점들을 변환한다(전역 평행이동보다 정확).
+        #   검증 게이트(estimate_alignment_homography)를 통과 못 하면
+        #   [2순위] 격자 median 평행이동 보정으로 폴백한다. 시도 결과(h=...)는 CSV reason에 기록.
+        # 보정 후 현재 프레임으로 재앵커한다(→ 다음 검사는 새 위치 기준 → 이중 보정 방지).
+        # 보정은 관제센터가 ROI를 내려줄 때까지 '1회만' 한다(roi_auto_corrected 래치).
+        #   보정 후 추가 틀어짐이 감지돼도 다시 보정하지 않고 setup required 보고만 유지하며,
+        #   관제센터가 ROI를 내려주면 update_config → _reset_alignment_state에서 래치가 풀린다.
+        # 보정 성공 여부와 무관하게 confirm이면 아래에서 서버에 setup required를 보고한다.
+        #   (pending 플래그는 관제센터가 헬스체크 응답으로 ROI를 내려줄(확인) 때까지 계속 true로 전송됨)
+        # 이동량이 상한 초과(평행이동으로 설명 안 되는 큰 변화)면 보정 없이 보고만 한다.
+        roi_corrected = False
+        roi_correct_method = ""
+        h_status = ""
+        mdx = float(grid.get("median_dx", 0.0))
+        mdy = float(grid.get("median_dy", 0.0))
+        shift_mag = math.hypot(mdx, mdy)
+        can_auto_correct = (
+            ROI_CHANGE_APPLY_EVENT in self.events
+            and not self.roi_auto_corrected
+            and decision.get("confirmed", False)
+            and not disturbed
+            and 0.0 < shift_mag <= GRID_APPLY_MAX_SHIFT_PX
+            and (self.base_roi_poly or self.base_roi_lines)
+        )
+        if can_auto_correct:
+            # [1순위] homography 보정 시도 (앵커 gray는 이미 aligner에 보관돼 있음)
+            new_poly = None
+            new_lines = None
+            h_status = "homography_no_anchor"
+            anchor_slot = (self.aligner.anchor_slots.get(ANCHOR_UPDATED)
+                           or self.aligner.anchor_slots.get(ANCHOR_BASE))
+            anchor_gray = anchor_slot.get("gray") if anchor_slot else None
+            if anchor_gray is not None:
+                cur_gray = self.aligner._gray_plain(frame)
+                H, h_status = estimate_alignment_homography(
+                    anchor_gray,
+                    cur_gray,
+                    expected_shift=(GRID_APPLY_SHIFT_SIGN * mdx, GRID_APPLY_SHIFT_SIGN * mdy),
+                )
+                if H is not None:
+                    cand_poly = transform_roi_points_h(self.base_roi_poly, H)
+                    cand_lines = transform_roi_points_h(self.base_roi_lines, H)
+                    # ROI 점 단위 최종 검증: 변위가 비정상적으로 크면 폴백
+                    base_all = list(self.base_roi_poly) + list(self.base_roi_lines)
+                    cand_all = cand_poly + cand_lines
+                    disps = [(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+                             for b, a in zip(base_all, cand_all)]
+                    max_disp = max((math.hypot(dx, dy) for dx, dy in disps), default=0.0)
+                    if 0.0 < max_disp <= GRID_APPLY_MAX_SHIFT_PX * 1.5:
+                        # [정밀화] ROI 지역 잔차 보정: H는 전 화면 최적 근사라 ROI 지점에는
+                        # 몇 px 잔차가 남을 수 있음 → ROI 중심 패치에서 잔차를 1회 더 측정해 반영
+                        roi_center = (
+                            sum(float(p[0]) for p in cand_all) / len(cand_all),
+                            sum(float(p[1]) for p in cand_all) / len(cand_all),
+                        )
+                        residual, refine_status = refine_roi_local_residual(
+                            anchor_gray, cur_gray, H, roi_center)
+                        h_status = f"{h_status} {refine_status}"
+                        if residual is not None:
+                            rdx = int(round(residual[0]))
+                            rdy = int(round(residual[1]))
+                            cand_poly = [[p[0] + rdx, p[1] + rdy] for p in cand_poly]
+                            cand_lines = [[p[0] + rdx, p[1] + rdy] for p in cand_lines]
+                            cand_all = cand_poly + cand_lines
+                            disps = [(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+                                     for b, a in zip(base_all, cand_all)]
+                        new_poly, new_lines = cand_poly, cand_lines
+                        # 오버레이/로그용 유효 평행이동 = ROI 점들의 평균 변위(잔차 반영 후)
+                        self.roi_shift = [
+                            sum(d[0] for d in disps) / len(disps),
+                            sum(d[1] for d in disps) / len(disps),
+                        ]
+                    else:
+                        h_status = f"homography_point_disp_out:max={max_disp:.1f}"
+
+            if new_poly is not None or new_lines is not None:
+                roi_correct_method = "homography"
+                self.aligned_roi_poly = new_poly or []
+                self.aligned_roi_lines = new_lines or []
+            else:
+                # [2순위] 평행이동(격자 median) 폴백
+                roi_correct_method = "translation"
+                self.roi_shift[0] += GRID_APPLY_SHIFT_SIGN * mdx
+                self.roi_shift[1] += GRID_APPLY_SHIFT_SIGN * mdy
+                self.aligned_roi_poly = self._shift_roi_points(self.base_roi_poly, self.roi_shift)
+                self.aligned_roi_lines = self._shift_roi_points(self.base_roi_lines, self.roi_shift)
+
+            self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
+            self.aligner.refresh_grid_anchor(frame)   # 보정 후 현재 프레임을 새 기준 앵커로
+            anchor_refreshed = True                   # CSV 반영: 보정하면서 재앵커함
+            self.align_shifted = False                # 보정 완료 → confirm 상태 해제
+            self.roi_auto_corrected = True            # 래치 잠금: 관제센터 ROI 수신 전까지 추가 보정 금지
+            roi_corrected = True
+            logger.warning(
+                f"[ROI AUTO-CORRECT] cam={self.cam_id} ip={self.ip} method={roi_correct_method} "
+                f"grid_shift=({mdx:.1f},{mdy:.1f}) mag={shift_mag:.1f}px "
+                f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
+                f"h={h_status} consistent={consistent}/{consistent_quorum}"
+            )
+        # -----------------------------------------------------------------------------
 
         healthcheck_requested = False
         healthcheck_reason = ""
         if decision.get("healthcheck", False):
+            # confirm/disturbed 확정 시 서버에 ROI 재설정 필요를 보고. 자동 보정 성공 여부와 무관하게 보내며,
+            # pending 플래그는 관제센터가 헬스체크 응답으로 ROI를 내려줄 때까지 유지된다(계속 true 전송).
             healthcheck_requested = True
-            healthcheck_reason = (
-                f"confirm camera={self.camera_key} cam_id={self.cam_id} "
-                f"consistent={consistent}/q={consistent_quorum} "
-                f"moving={n_mov}/{n_meas} suspect={suspect_count}"
-            )
+            self.roi_setup_pending = True   # 관제 확인(update_config) 전까지 계속 true로 전송/기록
+            if observed_decision == "disturbed":
+                healthcheck_reason = (
+                    f"disturbed camera={self.camera_key} cam_id={self.cam_id} "
+                    f"consistent={consistent}/q={consistent_quorum} "
+                    f"moving={n_mov}/{n_meas} disturbed={disturbed_count}/{disturbed_required} "
+                    f"abnormal={abnormal_count}/{abnormal_required} "
+                    f"auto_corrected=False"
+                )
+            elif observed_decision == "suspect" and not decision.get("confirmed", False):
+                healthcheck_reason = (
+                    f"abnormal camera={self.camera_key} cam_id={self.cam_id} "
+                    f"current=suspect consistent={consistent}/q={consistent_quorum} "
+                    f"moving={n_mov}/{n_meas} suspect={suspect_count}/{confirm_required} "
+                    f"abnormal={abnormal_count}/{abnormal_required} "
+                    f"auto_corrected=False"
+                )
+            else:
+                healthcheck_reason = (
+                    f"confirm camera={self.camera_key} cam_id={self.cam_id} "
+                    f"consistent={consistent}/q={consistent_quorum} "
+                    f"moving={n_mov}/{n_meas} suspect={suspect_count}/{confirm_required} "
+                    f"abnormal={abnormal_count}/{abnormal_required} "
+                    f"auto_corrected={roi_corrected} method={roi_correct_method or '-'} "
+                    f"grid_shift=({mdx:.1f},{mdy:.1f}) mag={shift_mag:.1f} "
+                    f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
+                    f"h={h_status or '-'}"
+                )
             request_terminal_roi_setup_required(reason=healthcheck_reason)
+            if observed_decision == "disturbed":
+                self.align_status_text = (
+                    f"ROI SETUP REQUIRED disturbed={disturbed_count}/{disturbed_required} "
+                    f"abnormal={abnormal_count}/{abnormal_required} "
+                    f"consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
+                )
+            elif observed_decision == "suspect" and not decision.get("confirmed", False):
+                self.align_status_text = (
+                    f"ROI SETUP REQUIRED abnormal={abnormal_count}/{abnormal_required} "
+                    f"current=suspect={suspect_count}/{confirm_required} "
+                    f"consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
+                )
+            elif roi_corrected:
+                self.align_status_text = (
+                    f"ROI AUTO-CORRECT[{roi_correct_method}] + SETUP REQUIRED "
+                    f"shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
+                    f"mag={shift_mag:.1f}px consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
+                )
+            else:
+                self.align_status_text = (
+                    f"ROI SETUP REQUIRED confirm consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
+                )
+        elif roi_corrected:
+            healthcheck_reason = (
+                f"auto_correct method={roi_correct_method} grid_shift=({mdx:.1f},{mdy:.1f}) mag={shift_mag:.1f}px "
+                f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) h={h_status or '-'}"
+            )
             self.align_status_text = (
-                f"ROI SETUP REQUIRED confirm consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
+                f"ROI AUTO-CORRECT[{roi_correct_method}] "
+                f"shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) mag={shift_mag:.1f}px"
+            )
+        elif decision_pending:
+            self.align_status_text = (
+                f"ROI SETUP PENDING confirm abnormal={abnormal_count}/{abnormal_required} "
+                f"observed={observed_decision} moving={n_mov}/{n_meas} "
+                f"consistent={consistent}/{consistent_quorum}"
             )
         else:
             self.align_status_text = (
-                f"GRID {decision_name} suspect={suspect_count}/{confirm_required} "
+                f"GRID {decision_name} suspect={suspect_count}/{confirm_required} disturbed={disturbed_count}/{disturbed_required} "
+                f"abnormal={abnormal_count}/{abnormal_required} "
                 f"moving={n_mov}/{n_meas} consistent={consistent}/{consistent_quorum}"
             )
 
-        # [화각 변경 → 관제센터 빨간불] confirm(suspect>=3)이 유지되는 동안, 검사 주기(300초)마다
-        #   /cctv/roi/img 로 isReqRoiSetup=True + 현재 스냅샷을 전송한다.
-        #   관제센터가 관리자 설정 ROI를 health 응답(roiSettings)으로 내려주면
-        #   HealthCheckDaemon._apply_roi_settings_from_response → update_config →
-        #   _reset_alignment_state 에서 align_shifted=False 가 되어 전송이 자동으로 멈춘다.
-        if self.align_shifted:
+        # [화각 변경 → 관제센터 빨간불] confirm(suspect>=3) 또는 pending(자동보정 후 관제 확인 대기)
+        #   상태가 유지되는 동안, 검사 주기(300초)마다 /cctv/roi/img 로
+        #   isReqRoiSetup=True + 현재 스냅샷을 전송한다.
+        #   roi_change_apply 자동보정이 성공해도(align_shifted=False) 관제센터가 ROI를 내려줄
+        #   때까지는 계속 true를 보낸다(roi_setup_pending). 관제센터가 관리자 설정 ROI를
+        #   health 응답(roiSettings)으로 내려주면 HealthCheckDaemon._apply_roi_settings_from_response
+        #   → update_config → _reset_alignment_state 에서 두 플래그가 모두 풀려 전송이 멈춘다.
+        if self.align_shifted or self.roi_setup_pending:
             try:
                 snap_img = create_roi_snapshot(self, frame)
                 if snap_img is not None:
@@ -4230,20 +4745,40 @@ class Camera:
                         snap_img,
                         json.dumps(roi_info),
                         _sw, _sh,
-                        True  # is_req_roi_setup
+                        True,  # is_req_roi_setup
+                        "roi_check_5min"
                     )
                     logger.info(
                         f"[CAM:{self.cam_id}] ROI 재설정 요청 전송(queued) isReqRoiSetup=True "
-                        f"suspect={suspect_count}"
+                        f"suspect={suspect_count} disturbed={disturbed_count} abnormal={abnormal_count}"
                     )
             except Exception as e:
                 logger.error(f"[CAM:{self.cam_id}] ROI 재설정 요청 전송 실패: {e}")
+
+        shift_reason = (
+            f"grid_shift=({mdx:.1f},{mdy:.1f}) "
+            f"mag={shift_mag:.1f}px "
+            f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
+            f"method={roi_correct_method or '-'}"
+        )
+        if decision_pending:
+            shift_reason = (
+                f"awaiting_roi_setup observed={observed_decision} "
+                f"abnormal={abnormal_count}/{abnormal_required} {shift_reason}"
+            )
+        csv_reason = healthcheck_reason
+        if not csv_reason:
+            csv_reason = shift_reason
+        elif "applied_shift=" not in csv_reason:
+            csv_reason = f"{csv_reason} {shift_reason}"
 
         csv_row = {
             "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
             "camera_key": self.camera_key,
             "decision": decision_name,
             "suspect_count": suspect_count,
+            "disturbed_count": disturbed_count,
+            "abnormal_count": abnormal_count,
             "cells_measurable": n_meas,
             "cells_moving": n_mov,
             "cells_consistent": consistent,
@@ -4252,8 +4787,10 @@ class Camera:
             "grid_cells_std": "|".join(_format_grid_cell_std(c) for c in grid.get("cells", [])),
             "frame_std": round(float(grid.get("frame_std", 0.0)), 1),
             "anchor_refreshed": anchor_refreshed,
-            "healthcheck": healthcheck_requested,
-            "reason": healthcheck_reason,
+            # pending 상태를 기록: confirm 확정 순간부터 관제센터가 ROI를 내려줄 때까지 계속 True.
+            # (발사 '순간'은 reason 컬럼이 채워진 행으로 구분 가능)
+            "healthcheck": bool(self.roi_setup_pending),
+            "reason": csv_reason,
         }
         ROI_ALIGN_LEARNING_STORE.append_csv_log(csv_row)
         self.status_history.append(self.align_status_text)
@@ -5246,6 +5783,13 @@ class HealthCheckDaemon:
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     changed = True
+                elif bool(getattr(cam, "roi_setup_pending", False)):
+                    # 값이 동일해도 관제센터가 ROI를 내려준 사실 자체를 pending 해제 응답으로 본다.
+                    runtime_updates.append((cam, new_conf, roi_updates))
+                    logger.info(
+                        f"[Health Check] ROI settings acknowledged pending camera: "
+                        f"cctvId={item.get('cctvId')!r} keys={','.join(sorted(roi_updates.keys()))}"
+                    )
                 else:
                     logger.info(
                         f"[Health Check] ROI settings already up to date: "
@@ -5598,9 +6142,14 @@ def main():
     run_output_retention_cleanup(output_retention_days)
 
     def run_camera_inference(cam, fr):
+        # [통합] fixbug의 기존 방어 로직과 shpark-roi-final의 세분화된 제외 대상 모두 수용
         active_detection_events = [
             evt for evt in cam.events
-            if evt != getattr(sys.modules[__name__], 'ROI_CHANGE_EVENT', 'roi_change')
+            if evt not in (
+                "no_helmet", 
+                getattr(sys.modules[__name__], 'ROI_CHANGE_EVENT', 'roi_change'), 
+                getattr(sys.modules[__name__], 'ROI_CHANGE_APPLY_EVENT', 'roi_change_apply')
+            )
         ]
         t_main_input = np.empty((0, 6))
         d_signalman_res = np.empty((0, 6))
@@ -5864,10 +6413,20 @@ def main():
                     if snap_img is not None:
                         h, w = snap_img.shape[:2]
                         roi_info = {"roi_poly_norm": c.roi_poly_norm, "roi_lines_norm": c.roi_lines_norm}
-                        IMAGE_SAVER_POOL.submit(_send_roi_snapshot_task, c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h, bool(getattr(c, "align_shifted", False)))
+
+                        # [통합] shpark-roi-final의 상세 스냅샷 전송 파라미터 + fixbug의 개별 타이머 갱신 로직 병합
+                        snapshot_send_type = "roi_refresh" if force_camera_snapshot else "hourly"
+                        IMAGE_SAVER_POOL.submit(
+                            _send_roi_snapshot_task,
+                            c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h,
+                            bool(getattr(c, "align_shifted", False) or getattr(c, "roi_setup_pending", False)),
+                            snapshot_send_type,
+                        )  # 틀어짐/보정후 관제확인 대기 중이면 True 유지
+                        roi_snapshot_queued = True
                         
-                        # [수정] 전송 성공 즉시 해당 카메라 타이머만 갱신
+                        # [수정 - fixbug 유지] 전송 성공(큐 삽입) 즉시 해당 카메라 타이머만 갱신
                         last_roi_snapshot_times[c.ip] = now_time
+
                         if force_camera_snapshot: refreshed_cctv_ids.add(cctv_id_text)
 
                 if connected and fr is not None and loop_count % 100 == 0:
