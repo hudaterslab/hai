@@ -117,13 +117,13 @@ ROI_ALIGN_LEARNING_DEFAULTS = {
 # ============================================================
 GRID_ROWS = 3
 GRID_COLS = 3
-GRID_SHAKE_THRESHOLD_PX = 15.0       # 칸의 이동량이 이 값을 초과하면 '움직인 칸'(px)
+GRID_SHAKE_THRESHOLD_PX = 7.5       # 칸의 이동량이 이 값을 초과하면 '움직인 칸'(px)
 GRID_CELL_MIN_STD = 10.0             # 칸 픽셀 표준편차가 이 미만이면 텍스처 없음 → 측정 제외
 # 적응형 정족수: 카메라마다 쓸 수 있는(텍스처 있는) 칸 수가 다르므로(멀티터미널 다양한 장면),
 #   고정값 대신 그 프레임의 텍스처 칸 수(n_textured)에 비례해 정족수를 정한다.
 #   quorum = max(GRID_QUORUM_FLOOR, round(n_textured × GRID_QUORUM_FRACTION))
 #   예) 9칸 → 5, 하늘3칸이라 6칸 → 4, 5칸 → 3. (측정칸이 정족수 미만이면 판단 보류=알람 안 함)
-GRID_QUORUM_FRACTION = 0.6           # 텍스처 칸 중 이 비율이 측정돼야 판단 가능
+GRID_QUORUM_FRACTION = 0.45           # 텍스처 칸 중 이 비율이 측정돼야 판단 가능
 GRID_QUORUM_FLOOR = 3                # 정족수 하한(최소 이만큼은 측정돼야 판단)
 GRID_DIRECTION_COS_MIN = 0.6         # 움직인 칸 벡터와 대표(median) 방향의 코사인 유사도가 이 이상이면 '같은 방향'(0.6≈±53°)
 
@@ -5861,21 +5861,14 @@ class HealthCheckDaemon:
                         new_conf[key] = value
                         item_changed = True
 
-                handled_cctv_ids.append(str(cam.cam_id))
                 if item_changed:
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
+                    handled_cctv_ids.append(str(cam.cam_id))
                     changed = True
-                elif bool(getattr(cam, "roi_setup_pending", False)):
-                    # 값이 동일해도 관제센터가 ROI를 내려준 사실 자체를 pending 해제 응답으로 본다.
-                    runtime_updates.append((cam, new_conf, roi_updates))
-                    logger.info(
-                        f"[Health Check] ROI settings acknowledged pending camera: "
-                        f"cctvId={item.get('cctvId')!r} keys={','.join(sorted(roi_updates.keys()))}"
-                    )
                 else:
                     logger.info(
-                        f"[Health Check] ROI settings already up to date: "
+                        f"[Health Check] ROI settings unchanged; pending kept: "
                         f"cctvId={item.get('cctvId')!r} keys={','.join(sorted(roi_updates.keys()))}"
                     )
 
