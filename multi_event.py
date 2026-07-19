@@ -6455,8 +6455,9 @@ def main():
                             pass
                             
                         conf = camera_configs.get(c.ip, c.conf)
+                        # [수정 핵심] d_main을 최신 아키텍처에 맞게 d_main_v2, d_main_v3로 변경
                         new_cam = Camera(
-                            c.ip, conf, d_main, d_helmet, d_face, d_signalman, d_plate,
+                            c.ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate,
                             cam_id=c.cam_id,
                             event_inference_mode=event_inference_mode
                         )
