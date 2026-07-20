@@ -1282,10 +1282,150 @@ class YoLoDeepX:
             return None
         if fmt in ["ppu", "deepx_ppu", "yolov8_ppu"]:
             return "ppu"
+        if fmt in ["yolo_xyxy", "xyxy"]:
+            return "yolo_xyxy"
+        if fmt in ["yolo_tlwh", "tlwh"]:
+            return "yolo_tlwh"
         if fmt in ["yolo", "yolov8", "raw", "standard", "raw_yolo"]:
             return "yolo"
         logger.warning(f"[DeepX] 알 수 없는 모델 출력 포맷({output_format})입니다. yolo 후처리로 동작합니다.")
         return "yolo"
+
+    def postprocess_xyxy(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+        """출력이 [x1, y1, x2, y2, score, class_id...] 형태일 때의 후처리"""
+        try:
+            pred = np.array(output_tensor[0])
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
+                pred = pred.transpose((0, 2, 1))
+            if pred.ndim == 3:
+                pred = pred[0]
+
+            class_scores = pred[:, 4:]
+            if class_scores.shape[1] == 1:
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
+            else:
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
+
+            mask = scores > conf_thres
+            pred = pred[mask]
+            scores = scores[mask]
+            class_ids = class_ids[mask]
+
+            if len(pred) == 0: return []
+
+            boxes_xywh = np.zeros((len(pred), 4), dtype=np.float32)
+            boxes_xywh[:, 0] = pred[:, 0]               
+            boxes_xywh[:, 1] = pred[:, 1]               
+            boxes_xywh[:, 2] = pred[:, 2] - pred[:, 0]  
+            boxes_xywh[:, 3] = pred[:, 3] - pred[:, 1]  
+
+            max_wh = 7680
+            class_offset = class_ids * max_wh
+            boxes_shifted = boxes_xywh.copy()
+            boxes_shifted[:, 0] += class_offset
+            boxes_shifted[:, 1] += class_offset
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+
+            results = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x_min, y_min, w, h = boxes_xywh[i]
+                    results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
+            return results
+        except Exception as e:
+            logger.error(f"NPU XYXY Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
+
+    def postprocess_tlwh(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+        """출력이 [TopLeft_X, TopLeft_Y, Width, Height, score, class_id...] 형태일 때의 후처리"""
+        try:
+            pred = np.array(output_tensor[0])
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
+                pred = pred.transpose((0, 2, 1))
+            if pred.ndim == 3:
+                pred = pred[0]
+
+            class_scores = pred[:, 4:]
+            if class_scores.shape[1] == 1:
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
+            else:
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
+
+            mask = scores > conf_thres
+            pred = pred[mask]
+            scores = scores[mask]
+            class_ids = class_ids[mask]
+
+            if len(pred) == 0: return []
+
+            # 이미 좌상단 좌표이므로 크기의 절반을 빼는 연산 생략
+            boxes_xywh = pred[:, :4].copy()
+
+            max_wh = 7680
+            class_offset = class_ids * max_wh
+            boxes_shifted = boxes_xywh.copy()
+            boxes_shifted[:, 0] += class_offset
+            boxes_shifted[:, 1] += class_offset
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+
+            results = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x_min, y_min, w, h = boxes_xywh[i]
+                    results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
+            return results
+        except Exception as e:
+            logger.error(f"NPU TLWH Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
+
+    def infer(self, img, conf_override=None):
+        if img is None:
+            return np.empty((0,6))
+
+        h_orig, w_orig = img.shape[:2]
+        npu_input, scale, offset = self.letter_box(img)
+        input_tensor = self._prepare_input_tensor(npu_input)
+        engine = self.engine_pool.get()
+
+        try:
+            output_tensor = engine.run([input_tensor])
+            thres = conf_override if conf_override is not None else 0.40
+            
+            # [수정] 출력 포맷에 맞춘 라우팅 적용
+            if self.output_format == "ppu":
+                raw_dets = self.postprocess_ppu(output_tensor, conf_thres=thres)
+            elif self.output_format == "yolo_xyxy":
+                raw_dets = self.postprocess_xyxy(output_tensor, conf_thres=thres)
+            elif self.output_format == "yolo_tlwh":
+                raw_dets = self.postprocess_tlwh(output_tensor, conf_thres=thres)
+            else:
+                raw_dets = self.postprocess(output_tensor, conf_thres=thres)
+
+            if not raw_dets:
+                return np.empty((0,6))
+
+            res = []
+            dw, dh = offset
+
+            for box, score, cls_id in raw_dets:
+                x1 = np.clip((box[0] - dw) / scale, 0, w_orig)
+                y1 = np.clip((box[1] - dh) / scale, 0, h_orig)
+                x2 = np.clip((box[2] - dw) / scale, 0, w_orig)
+                y2 = np.clip((box[3] - dh) / scale, 0, h_orig)
+                res.append([x1, y1, x2, y2, score, cls_id])
+
+            return np.array(res, dtype=float)
+        except Exception as e:
+            logger.error(f"NPU Inference Error: {e}")
+            return np.empty((0,6))
+        finally:
+            self.engine_pool.put(engine)
 
     def _resolve_output_format(self, output_format, engine=None):
         configured = self._normalize_configured_output_format(output_format)
@@ -1587,46 +1727,7 @@ class YoLoDeepX:
         except Exception as e:
             logger.error(f"NPU PPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
             return []
-
-    def infer(self, img, conf_override=None):
-        if img is None:
-            return np.empty((0,6))
-
-        h_orig, w_orig = img.shape[:2]
-        npu_input, scale, offset = self.letter_box(img)
-        input_tensor = self._prepare_input_tensor(npu_input)
-        engine = self.engine_pool.get()
-
-        try:
-            output_tensor = engine.run([input_tensor])
-
-            thres = conf_override if conf_override is not None else 0.40
-            if self.output_format == "ppu":
-                raw_dets = self.postprocess_ppu(output_tensor, conf_thres=thres)
-            else:
-                raw_dets = self.postprocess(output_tensor, conf_thres=thres)
-
-            if not raw_dets:
-                return np.empty((0,6))
-
-            res = []
-            dw, dh = offset
-
-            for box, score, cls_id in raw_dets:
-                x1 = np.clip((box[0] - dw) / scale, 0, w_orig)
-                y1 = np.clip((box[1] - dh) / scale, 0, h_orig)
-                x2 = np.clip((box[2] - dw) / scale, 0, w_orig)
-                y2 = np.clip((box[3] - dh) / scale, 0, h_orig)
-
-                res.append([x1, y1, x2, y2, score, cls_id])
-
-            return np.array(res, dtype=float)
-        except Exception as e:
-            logger.error(f"NPU Inference Error: {e}")
-            return np.empty((0,6))
-        finally:
-            self.engine_pool.put(engine)
-
+        
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
 # ==========================================
@@ -4803,45 +4904,49 @@ class Camera:
         fr, fid, connected = self.reader.read()
         return fr, fid, connected
 
-    def apply_face_blur(self, frame, person_boxes, return_meta=False):
+    def apply_face_blur(self, frame, person_boxes, helmet_tracks=None, return_meta=False):
         if frame is None:
             return (frame, []) if return_meta else frame
 
         blur_img = frame.copy()
         blurred_faces = []
+        blurred_person_tids = set()
+        h_img, w_img = blur_img.shape[:2]
 
         try:
-            if self.det_face is not None:
-                # [기존 로직 유지] 딥러닝 얼굴 모델이 로드된 경우
+            # [1단계] AI 얼굴 모델 적용 (동적 15% 패딩)
+            if getattr(self, 'det_face', None) is not None:
                 face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
                 f_dets = self.det_face.infer(blur_img, conf_override=face_conf)
 
                 for f in f_dets:
-                    fx1, fy1, fx2, fy2 = map(int, f[:4])
+                    orig_fx1, orig_fy1, orig_fx2, orig_fy2 = map(int, f[:4])
+                    orig_fw, orig_fh = orig_fx2 - orig_fx1, orig_fy2 - orig_fy1
+
+                    if orig_fw > w_img * 0.4: continue
+
+                    pad_x, pad_y = int(orig_fw * 0.15), int(orig_fh * 0.15)
+                    fx1 = max(0, orig_fx1 - pad_x)
+                    fy1 = max(0, orig_fy1 - pad_y)
+                    fx2 = min(w_img, orig_fx2 + pad_x)
+                    fy2 = min(h_img, orig_fy2 + pad_y)
                     fw, fh = fx2 - fx1, fy2 - fy1
 
-                    if fw > blur_img.shape[1] * 0.4:
-                        continue
-
-                    fcx = fx1 + (fw / 2.0)
-                    fcy = fy1 + (fh / 2.0)
-                    is_valid_face = False
-
+                    fcx, fcy = orig_fx1 + (orig_fw / 2.0), orig_fy1 + (orig_fh / 2.0)
                     matched_person_tid = -1
+
                     for p in person_boxes:
                         px1, py1, px2, py2 = map(int, p[:4])
                         pw, ph = px2 - px1, py2 - py1
+                        person_pad_x, person_pad_y_top, person_pad_y_bottom = pw * 0.15, ph * 0.25, ph * 0.05
 
-                        pad_x = pw * 0.15
-                        pad_y_top = ph * 0.25
-                        pad_y_bottom = ph * 0.05
-
-                        if (px1 - pad_x) <= fcx <= (px2 + pad_x) and (py1 - pad_y_top) <= fcy <= (py2 + pad_y_bottom):
-                            is_valid_face = True
+                        if (px1 - person_pad_x) <= fcx <= (px2 + person_pad_x) and (py1 - person_pad_y_top) <= fcy <= (py2 + person_pad_y_bottom):
                             matched_person_tid = int(p[4]) if len(p) > 4 else -1
+                            if matched_person_tid != -1:
+                                blurred_person_tids.add(matched_person_tid)
                             break
 
-                    if is_valid_face:
+                    if matched_person_tid != -1:
                         roi = blur_img[fy1:fy2, fx1:fx2]
                         if roi.size > 0:
                             small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
@@ -4852,34 +4957,77 @@ class Camera:
                                 "class_id": int(f[5]) if len(f) > 5 else -1,
                                 "matched_person_tid": matched_person_tid
                             })
-            else:
-                # [추가] 휴리스틱 우회 모자이크: AI 모델이 없을 때 사람 BBox를 기준으로 상단 영역 강제 모자이크
-                h_img, w_img = blur_img.shape[:2]
+
+            # [2단계] AI 헬멧/머리 트래킹 데이터 활용 (얼굴 모델 누락자 대상)
+            if helmet_tracks is not None and len(helmet_tracks) > 0:
                 for p in person_boxes:
+                    p_tid = int(p[4]) if len(p) > 4 else -1
+                    if p_tid in blurred_person_tids or p_tid == -1: continue
+
                     px1, py1, px2, py2 = map(int, p[:4])
                     pw, ph = px2 - px1, py2 - py1
-                    
-                    if pw <= 0 or ph <= 0: continue
-                    
-                    # 얼굴 영역 추정: 가로 중앙 50%, 상단 20%
-                    fx1 = max(0, int(px1 + pw * 0.25))
-                    fy1 = max(0, py1)
-                    fx2 = min(w_img, int(px2 - pw * 0.25))
-                    fy2 = min(h_img, int(py1 + ph * 0.20))
-                    
-                    fw, fh = fx2 - fx1, fy2 - fy1
-                    if fw <= 0 or fh <= 0: continue
-                    
-                    roi = blur_img[fy1:fy2, fx1:fx2]
-                    if roi.size > 0:
-                        small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
-                        blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
-                        blurred_faces.append({
-                            "box": [fx1, fy1, fx2, fy2],
-                            "score": 1.0,  # 휴리스틱 적용이므로 고정값 부여
-                            "class_id": -1,
-                            "matched_person_tid": int(p[4]) if len(p) > 4 else -1
-                        })
+                    best_match = None
+                    max_ioa = 0
+
+                    for h_track in helmet_tracks:
+                        hx1, hy1, hx2, hy2 = map(int, h_track[:4])
+                        hcx, hcy = hx1 + (hx2 - hx1) / 2.0, hy1 + (hy2 - hy1) / 2.0
+                        
+                        if hcy > py1 + ph * 0.4: continue
+                        if hcx < px1 - pw * 0.15 or hcx > px2 + pw * 0.15: continue
+                        
+                        inter_w = max(0, min(hx2, px2) - max(hx1, px1))
+                        inter_h = max(0, min(hy2, py2) - max(hy1, py1))
+                        head_area = max(1, (hx2 - hx1) * (hy2 - hy1))
+                        ioa = (inter_w * inter_h) / head_area
+
+                        if ioa > max_ioa:
+                            max_ioa = ioa
+                            best_match = h_track
+
+                    if max_ioa > 0.3 and best_match is not None:
+                        hx1, hy1, hx2, hy2 = map(int, best_match[:4])
+                        # 헬멧/머리 영역도 15% 패딩
+                        hw, hh = hx2 - hx1, hy2 - hy1
+                        pad_x, pad_y = int(hw * 0.15), int(hh * 0.15)
+                        hx1, hy1 = max(0, hx1 - pad_x), max(0, hy1 - pad_y)
+                        hx2, hy2 = min(w_img, hx2 + pad_x), min(h_img, hy2 + pad_y)
+                        hw, hh = hx2 - hx1, hy2 - hy1
+
+                        roi = blur_img[hy1:hy2, hx1:hx2]
+                        if roi.size > 0:
+                            small = cv2.resize(roi, (max(1, hw//15), max(1, hh//15)), interpolation=cv2.INTER_LINEAR)
+                            blur_img[hy1:hy2, hx1:hx2] = cv2.resize(small, (hw, hh), interpolation=cv2.INTER_NEAREST)
+                            blurred_faces.append({
+                                "box": [hx1, hy1, hx2, hy2],
+                                "score": round(float(best_match[5]), 4) if len(best_match) > 5 else 0.0,
+                                "class_id": int(best_match[6]) if len(best_match) > 6 else -1,
+                                "matched_person_tid": p_tid
+                            })
+                            blurred_person_tids.add(p_tid)
+
+            # [3단계] 최후의 휴리스틱 비율 추정 적용 (1, 2단계 모두 실패한 사람만)
+            for p in person_boxes:
+                p_tid = int(p[4]) if len(p) > 4 else -1
+                if p_tid in blurred_person_tids or p_tid == -1: continue
+
+                px1, py1, px2, py2 = map(int, p[:4])
+                pw, ph = px2 - px1, py2 - py1
+                if pw <= 0 or ph <= 0: continue
+
+                fx1, fy1 = max(0, int(px1 + pw * 0.20)), max(0, int(py1 - ph * 0.05))
+                fx2, fy2 = min(w_img, int(px2 - pw * 0.20)), min(h_img, int(py1 + ph * 0.25))
+                fw, fh = fx2 - fx1, fy2 - fy1
+                if fw <= 0 or fh <= 0: continue
+
+                roi = blur_img[fy1:fy2, fx1:fx2]
+                if roi.size > 0:
+                    small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
+                    blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                    blurred_faces.append({
+                        "box": [fx1, fy1, fx2, fy2],
+                        "score": 1.0, "class_id": -1, "matched_person_tid": p_tid
+                    })
 
         except Exception as e:
             logger.error(f"모자이크 처리 실패: {e}")
@@ -4893,48 +5041,44 @@ class Camera:
 
         blur_img = frame.copy()
         blurred_plates = []
+        blurred_vehicle_tids = set()
+        h_img, w_img = blur_img.shape[:2]
 
         try:
-            if self.det_plate is not None:
-                # [기존 로직 유지] 딥러닝 번호판 모델이 로드된 경우
+            # [1단계] AI 번호판 모델 적용 (동적 15% 패딩)
+            if getattr(self, 'det_plate', None) is not None:
                 plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.1)
                 p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
-                h_img, w_img = blur_img.shape[:2]
 
                 for p in p_dets:
-                    px1, py1, px2, py2 = map(int, p[:4])
-                    px1 = max(0, min(px1, w_img - 1))
-                    py1 = max(0, min(py1, h_img - 1))
-                    px2 = max(0, min(px2, w_img))
-                    py2 = max(0, min(py2, h_img))
-                    pw = px2 - px1
-                    ph = py2 - py1
+                    orig_px1, orig_py1, orig_px2, orig_py2 = map(int, p[:4])
+                    orig_pw, orig_ph = orig_px2 - orig_px1, orig_py2 - orig_py1
 
-                    if pw <= 0 or ph <= 0:
-                        continue
-                    if pw > w_img * 0.6 or ph > h_img * 0.3:
-                        continue
+                    if orig_pw <= 0 or orig_ph <= 0 or orig_pw > w_img * 0.6 or orig_ph > h_img * 0.3: continue
 
-                    pcx = px1 + pw / 2.0
-                    pcy = py1 + ph / 2.0
+                    pad_x, pad_y = int(orig_pw * 0.15), int(orig_ph * 0.15)
+                    px1 = max(0, orig_px1 - pad_x)
+                    py1 = max(0, orig_py1 - pad_y)
+                    px2 = min(w_img, orig_px2 + pad_x)
+                    py2 = min(h_img, orig_py2 + pad_y)
+                    pw, ph = px2 - px1, py2 - py1
 
+                    pcx, pcy = orig_px1 + (orig_pw / 2.0), orig_py1 + (orig_ph / 2.0)
                     matched_vehicle_tid = -1
-                    if vehicle_boxes is not None and len(vehicle_boxes) > 0:
+
+                    if vehicle_boxes is not None:
                         for v in vehicle_boxes:
                             vx1, vy1, vx2, vy2 = map(int, v[:4])
-                            vw = vx2 - vx1
-                            vh = vy2 - vy1
-                            pad_x = vw * 0.10
-                            pad_y = vh * 0.10
-                            if (vx1 - pad_x) <= pcx <= (vx2 + pad_x) and (vy1 - pad_y) <= pcy <= (vy2 + pad_y):
+                            vw, vh = vx2 - vx1, vy2 - vy1
+                            if (vx1 - vw * 0.10) <= pcx <= (vx2 + vw * 0.10) and (vy1 - vh * 0.10) <= pcy <= (vy2 + vh * 0.10):
                                 matched_vehicle_tid = int(v[4]) if len(v) > 4 else -1
+                                if matched_vehicle_tid != -1:
+                                    blurred_vehicle_tids.add(matched_vehicle_tid)
                                 break
 
                     roi = blur_img[py1:py2, px1:px2]
                     if roi.size > 0:
-                        small_w = max(1, pw // 12)
-                        small_h = max(1, ph // 12)
-                        small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                        small = cv2.resize(roi, (max(1, pw // 12), max(1, ph // 12)), interpolation=cv2.INTER_LINEAR)
                         blur_img[py1:py2, px1:px2] = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
                         blurred_plates.append({
                             "box": [px1, py1, px2, py2],
@@ -4942,45 +5086,38 @@ class Camera:
                             "class_id": int(p[5]) if len(p) > 5 else -1,
                             "matched_vehicle_tid": matched_vehicle_tid
                         })
-            else:
-                # [추가] 휴리스틱 우회 모자이크: AI 모델이 없을 때 차량 BBox를 기준으로 하단 특정 영역 강제 모자이크
-                h_img, w_img = blur_img.shape[:2]
-                if vehicle_boxes is not None:
-                    for v in vehicle_boxes:
-                        vx1, vy1, vx2, vy2 = map(int, v[:4])
-                        vw = vx2 - vx1
-                        vh = vy2 - vy1
-                        
-                        if vw <= 0 or vh <= 0: continue
-                        
-                        # 번호판 영역 추정: 가로 중앙 40%, 하단 5~25%
-                        px1 = max(0, int(vx1 + vw * 0.30))
-                        py1 = max(0, int(vy2 - vh * 0.25))
-                        px2 = min(w_img, int(vx2 - vw * 0.30))
-                        py2 = min(h_img, int(vy2 - vh * 0.05))
-                        
-                        pw, ph = px2 - px1, py2 - py1
-                        if pw <= 0 or ph <= 0: continue
-                        
-                        roi = blur_img[py1:py2, px1:px2]
-                        if roi.size > 0:
-                            small_w = max(1, pw // 12)
-                            small_h = max(1, ph // 12)
-                            small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-                            blur_img[py1:py2, px1:px2] = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
-                            blurred_plates.append({
-                                "box": [px1, py1, px2, py2],
-                                "score": 1.0,
-                                "class_id": -1,
-                                "matched_vehicle_tid": int(v[4]) if len(v) > 4 else -1
-                            })
+
+            # [2단계] 하단 휴리스틱 비율 추정 (AI 모델 누락 차량 대상)
+            if vehicle_boxes is not None:
+                for v in vehicle_boxes:
+                    v_tid = int(v[4]) if len(v) > 4 else -1
+                    if v_tid in blurred_vehicle_tids or v_tid == -1: continue
+
+                    vx1, vy1, vx2, vy2 = map(int, v[:4])
+                    vw, vh = vx2 - vx1, vy2 - vy1
+                    if vw <= 0 or vh <= 0: continue
+                    
+                    px1, py1 = max(0, int(vx1 + vw * 0.25)), max(0, int(vy2 - vh * 0.30))
+                    px2, py2 = min(w_img, int(vx2 - vw * 0.25)), min(h_img, int(vy2 - vh * 0.05))
+                    pw, ph = px2 - px1, py2 - py1
+                    if pw <= 0 or ph <= 0: continue
+                    
+                    roi = blur_img[py1:py2, px1:px2]
+                    if roi.size > 0:
+                        small = cv2.resize(roi, (max(1, pw // 12), max(1, ph // 12)), interpolation=cv2.INTER_LINEAR)
+                        blur_img[py1:py2, px1:px2] = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
+                        blurred_plates.append({
+                            "box": [px1, py1, px2, py2],
+                            "score": 1.0, "class_id": -1, "matched_vehicle_tid": v_tid
+                        })
 
         except Exception as e:
             logger.error(f"번호판 모자이크 처리 실패: {e}")
 
         return (blur_img, blurred_plates) if return_meta else blur_img
 
-    def apply_privacy_blur(self, frame, t_main, blur_face=True, blur_plate=True):
+    # 파라미터에 t_helmet 추가
+    def apply_privacy_blur(self, frame, t_main, t_helmet=None, blur_face=True, blur_plate=True):
         privacy_meta = {
             "blur_face": bool(blur_face),
             "blur_plate": bool(blur_plate),
@@ -4996,7 +5133,8 @@ class Camera:
         vehicle_boxes = [t for t in t_main if int(t[6]) in TARGET_VEHICLES]
 
         if blur_face:
-            blurred_img, face_blurs = self.apply_face_blur(blurred_img, person_boxes, return_meta=True)
+            # 헬멧 정보를 인자로 함께 넘김
+            blurred_img, face_blurs = self.apply_face_blur(blurred_img, person_boxes, helmet_tracks=t_helmet, return_meta=True)
             privacy_meta["face"] = face_blurs
 
         if blur_plate:
@@ -5216,10 +5354,11 @@ class Camera:
                     blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
                     blur_plate_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_plate", True)
 
-                    # 완벽하게 동기화된 트랙(privacy_reference_tracks)으로 블러 처리
+                    # 완벽하게 동기화된 트랙(privacy_reference_tracks) 및 t_helmet 으로 다단계 블러 적용
                     saved_img, privacy_blur_meta = self.apply_privacy_blur(
                         ev_frame, 
                         privacy_reference_tracks,
+                        t_helmet=t_helmet,
                         blur_face=blur_face_option,
                         blur_plate=blur_plate_option
                     )
@@ -6120,15 +6259,33 @@ def main():
             output_format=get_model_output_format("MAIN_V3"),
             pool_size=main_v3_pool_size
         )
-        
         d_helmet = YoLoDeepX(
-            resolve_model_path(models_cfg["HELMET"]),
+            resolve_model_path(models_cfg.get("HELMET")),
             output_format=get_model_output_format("HELMET"),
             pool_size=helmet_pool_size
         )
+        
+        # [복구 및 활성화] d_face 및 d_plate 모델 로드 (좌표 매칭 오류 픽스)
+        face_fmt = get_model_output_format("FACE")
+        if face_fmt in ["auto", "yolo"]: 
+            face_fmt = "yolo_xyxy" # 사용 중이신 얼굴 모델의 출력 형식에 따라 xyxy 또는 yolo_tlwh 적용
+            
+        d_face = YoLoDeepX(
+            resolve_model_path(models_cfg.get("FACE", "yolov8m-face.dxnn")),
+            output_format=face_fmt,
+            pool_size=get_model_engine_pool_size("FACE", default=1)
+        )
+        
+        plate_fmt = get_model_output_format("PLATE")
+        if plate_fmt in ["auto", "yolo"]:
+            plate_fmt = "yolo_xyxy"
+            
+        d_plate = YoLoDeepX(
+            resolve_model_path(models_cfg.get("PLATE", "license_plate_detector_v2.dxnn")),
+            output_format=plate_fmt,
+            pool_size=get_model_engine_pool_size("PLATE", default=1)
+        )
         d_signalman = None
-        d_face = None  # 리소스 확보를 위해 미사용 선언 (기존 로직 보존)
-        d_plate = None # 리소스 확보를 위해 미사용 선언 (기존 로직 보존)
     except Exception as e:
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
