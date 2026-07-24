@@ -125,7 +125,7 @@ GRID_CELL_MIN_STD = 10.0             # 칸 픽셀 표준편차가 이 미만이�
 #   예) 9칸 → 5, 하늘3칸이라 6칸 → 4, 5칸 → 3. (측정칸이 정족수 미만이면 판단 보류=알람 안 함)
 GRID_QUORUM_FRACTION = 0.45           # 텍스처 칸 중 이 비율이 측정돼야 판단 가능
 GRID_QUORUM_FLOOR = 3                # 정족수 하한(최소 이만큼은 측정돼야 판단)
-GRID_DIRECTION_COS_MIN = 0.6         # 움직인 칸 벡터와 대표(median) 방향의 코사인 유사도가 이 이상이면 '같은 방향'(0.6≈±53°)
+GRID_DIRECTION_COS_MIN = 0.4         # 움직인 칸 벡터와 대표(median) 방향의 코사인 유사도가 이 이상이면 '같은 방향'(0.6≈±53°)
 
 # --- homography 기반 ROI 자동 보정(1순위) 파라미터 ----------------------------
 # confirm 시 앵커(틀어지기 전)↔현재 프레임을 ORB 특징점 매칭 + RANSAC homography로 정합해
