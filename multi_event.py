@@ -222,7 +222,7 @@ def load_system_config():
             "MAIN_V2": 0.6,
             "MAIN_V3": 0.6,
             "FACE": 0.35,
-            "HELMET": 0.55,
+            "HELMET": 0.85,
             "PERSON": 0.5,
             "SIGNALMAN": 0.5,
             "PLATE": 0.1
