@@ -420,7 +420,7 @@ def create_roi_snapshot(cam, frame):
 
 def _send_roi_snapshot_task( cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False, send_type="hourly"):
     """관제 서버로 ROI 스냅샷을 백그라운드에서 전송합니다."""
-    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
+    url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
     send_label = {
         "roi_check_5min": "5분 ROI 화각검사",
         "roi_refresh": "ROI 설정반영 스냅샷",
@@ -871,7 +871,7 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.debug(f"[API 스킵] 기본 단말 ID(99999) 사용 중: {image_path}")
         return
 
-    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
+    url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
     event_type_mapping = {
         "conveyor_crossing": 1,
         "no_helmet": 2,
@@ -4904,219 +4904,118 @@ class Camera:
         fr, fid, connected = self.reader.read()
         return fr, fid, connected
 
-    def apply_face_blur(self, frame, person_boxes, helmet_tracks=None, return_meta=False):
-        if frame is None:
+    def apply_face_blur(self, frame, person_boxes, return_meta=False):
+        if frame is None or self.det_face is None:
             return (frame, []) if return_meta else frame
 
         blur_img = frame.copy()
         blurred_faces = []
-        blurred_person_tids = set()
-        h_img, w_img = blur_img.shape[:2]
 
         try:
-            # [1단계] AI 얼굴 모델 적용 (동적 15% 패딩)
-            if getattr(self, 'det_face', None) is not None:
-                face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
-                f_dets = self.det_face.infer(blur_img, conf_override=face_conf)
+            face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
+            f_dets = self.det_face.infer(blur_img, conf_override=face_conf)
 
-                for f in f_dets:
-                    orig_fx1, orig_fy1, orig_fx2, orig_fy2 = map(int, f[:4])
-                    orig_fw, orig_fh = orig_fx2 - orig_fx1, orig_fy2 - orig_fy1
+            for f in f_dets:
+                fx1, fy1, fx2, fy2 = map(int, f[:4])
+                fw, fh = fx2 - fx1, fy2 - fy1
 
-                    if orig_fw > w_img * 0.4: continue
+                if fw > blur_img.shape[1] * 0.4:
+                    continue
 
-                    pad_x, pad_y = int(orig_fw * 0.15), int(orig_fh * 0.15)
-                    fx1 = max(0, orig_fx1 - pad_x)
-                    fy1 = max(0, orig_fy1 - pad_y)
-                    fx2 = min(w_img, orig_fx2 + pad_x)
-                    fy2 = min(h_img, orig_fy2 + pad_y)
-                    fw, fh = fx2 - fx1, fy2 - fy1
+                fcx = fx1 + (fw / 2.0)
+                fcy = fy1 + (fh / 2.0)
+                is_valid_face = False
 
-                    fcx, fcy = orig_fx1 + (orig_fw / 2.0), orig_fy1 + (orig_fh / 2.0)
-                    matched_person_tid = -1
-
-                    for p in person_boxes:
-                        px1, py1, px2, py2 = map(int, p[:4])
-                        pw, ph = px2 - px1, py2 - py1
-                        person_pad_x, person_pad_y_top, person_pad_y_bottom = pw * 0.15, ph * 0.25, ph * 0.05
-
-                        if (px1 - person_pad_x) <= fcx <= (px2 + person_pad_x) and (py1 - person_pad_y_top) <= fcy <= (py2 + person_pad_y_bottom):
-                            matched_person_tid = int(p[4]) if len(p) > 4 else -1
-                            if matched_person_tid != -1:
-                                blurred_person_tids.add(matched_person_tid)
-                            break
-
-                    if matched_person_tid != -1:
-                        roi = blur_img[fy1:fy2, fx1:fx2]
-                        if roi.size > 0:
-                            small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
-                            blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
-                            blurred_faces.append({
-                                "box": [fx1, fy1, fx2, fy2],
-                                "score": round(float(f[4]), 4) if len(f) > 4 else 0.0,
-                                "class_id": int(f[5]) if len(f) > 5 else -1,
-                                "matched_person_tid": matched_person_tid
-                            })
-
-            # [2단계] AI 헬멧/머리 트래킹 데이터 활용 (얼굴 모델 누락자 대상)
-            if helmet_tracks is not None and len(helmet_tracks) > 0:
+                matched_person_tid = -1
                 for p in person_boxes:
-                    p_tid = int(p[4]) if len(p) > 4 else -1
-                    if p_tid in blurred_person_tids or p_tid == -1: continue
-
                     px1, py1, px2, py2 = map(int, p[:4])
                     pw, ph = px2 - px1, py2 - py1
-                    best_match = None
-                    max_ioa = 0
 
-                    for h_track in helmet_tracks:
-                        hx1, hy1, hx2, hy2 = map(int, h_track[:4])
-                        hcx, hcy = hx1 + (hx2 - hx1) / 2.0, hy1 + (hy2 - hy1) / 2.0
-                        
-                        if hcy > py1 + ph * 0.4: continue
-                        if hcx < px1 - pw * 0.15 or hcx > px2 + pw * 0.15: continue
-                        
-                        inter_w = max(0, min(hx2, px2) - max(hx1, px1))
-                        inter_h = max(0, min(hy2, py2) - max(hy1, py1))
-                        head_area = max(1, (hx2 - hx1) * (hy2 - hy1))
-                        ioa = (inter_w * inter_h) / head_area
+                    pad_x = pw * 0.15
+                    pad_y_top = ph * 0.25
+                    pad_y_bottom = ph * 0.05
 
-                        if ioa > max_ioa:
-                            max_ioa = ioa
-                            best_match = h_track
+                    if (px1 - pad_x) <= fcx <= (px2 + pad_x) and (py1 - pad_y_top) <= fcy <= (py2 + pad_y_bottom):
+                        is_valid_face = True
+                        matched_person_tid = int(p[4]) if len(p) > 4 else -1
+                        break
 
-                    if max_ioa > 0.3 and best_match is not None:
-                        hx1, hy1, hx2, hy2 = map(int, best_match[:4])
-                        # 헬멧/머리 영역도 15% 패딩
-                        hw, hh = hx2 - hx1, hy2 - hy1
-                        pad_x, pad_y = int(hw * 0.15), int(hh * 0.15)
-                        hx1, hy1 = max(0, hx1 - pad_x), max(0, hy1 - pad_y)
-                        hx2, hy2 = min(w_img, hx2 + pad_x), min(h_img, hy2 + pad_y)
-                        hw, hh = hx2 - hx1, hy2 - hy1
-
-                        roi = blur_img[hy1:hy2, hx1:hx2]
-                        if roi.size > 0:
-                            small = cv2.resize(roi, (max(1, hw//15), max(1, hh//15)), interpolation=cv2.INTER_LINEAR)
-                            blur_img[hy1:hy2, hx1:hx2] = cv2.resize(small, (hw, hh), interpolation=cv2.INTER_NEAREST)
-                            blurred_faces.append({
-                                "box": [hx1, hy1, hx2, hy2],
-                                "score": round(float(best_match[5]), 4) if len(best_match) > 5 else 0.0,
-                                "class_id": int(best_match[6]) if len(best_match) > 6 else -1,
-                                "matched_person_tid": p_tid
-                            })
-                            blurred_person_tids.add(p_tid)
-
-            # [3단계] 최후의 휴리스틱 비율 추정 적용 (1, 2단계 모두 실패한 사람만)
-            for p in person_boxes:
-                p_tid = int(p[4]) if len(p) > 4 else -1
-                if p_tid in blurred_person_tids or p_tid == -1: continue
-
-                px1, py1, px2, py2 = map(int, p[:4])
-                pw, ph = px2 - px1, py2 - py1
-                if pw <= 0 or ph <= 0: continue
-
-                fx1, fy1 = max(0, int(px1 + pw * 0.20)), max(0, int(py1 - ph * 0.05))
-                fx2, fy2 = min(w_img, int(px2 - pw * 0.20)), min(h_img, int(py1 + ph * 0.25))
-                fw, fh = fx2 - fx1, fy2 - fy1
-                if fw <= 0 or fh <= 0: continue
-
-                roi = blur_img[fy1:fy2, fx1:fx2]
-                if roi.size > 0:
-                    small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
-                    blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
-                    blurred_faces.append({
-                        "box": [fx1, fy1, fx2, fy2],
-                        "score": 1.0, "class_id": -1, "matched_person_tid": p_tid
-                    })
+                if is_valid_face:
+                    roi = blur_img[fy1:fy2, fx1:fx2]
+                    if roi.size > 0:
+                        small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
+                        blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                        blurred_faces.append({
+                            "box": [fx1, fy1, fx2, fy2],
+                            "score": round(float(f[4]), 4) if len(f) > 4 else 0.0,
+                            "class_id": int(f[5]) if len(f) > 5 else -1,
+                            "matched_person_tid": matched_person_tid
+                        })
 
         except Exception as e:
             logger.error(f"모자이크 처리 실패: {e}")
 
         return (blur_img, blurred_faces) if return_meta else blur_img
 
-
     def apply_plate_blur(self, frame, vehicle_boxes=None, return_meta=False):
-        if frame is None:
+        if frame is None or self.det_plate is None:
             return (frame, []) if return_meta else frame
 
         blur_img = frame.copy()
         blurred_plates = []
-        blurred_vehicle_tids = set()
-        h_img, w_img = blur_img.shape[:2]
 
         try:
-            # [1단계] AI 번호판 모델 적용 (동적 15% 패딩)
-            if getattr(self, 'det_plate', None) is not None:
-                plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.1)
-                p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
+            plate_conf = SYS_CFG.get("model_confidences", {}).get("PLATE", 0.1)
+            p_dets = self.det_plate.infer(blur_img, conf_override=plate_conf)
+            h_img, w_img = blur_img.shape[:2]
 
-                for p in p_dets:
-                    orig_px1, orig_py1, orig_px2, orig_py2 = map(int, p[:4])
-                    orig_pw, orig_ph = orig_px2 - orig_px1, orig_py2 - orig_py1
+            for p in p_dets:
+                px1, py1, px2, py2 = map(int, p[:4])
+                px1 = max(0, min(px1, w_img - 1))
+                py1 = max(0, min(py1, h_img - 1))
+                px2 = max(0, min(px2, w_img))
+                py2 = max(0, min(py2, h_img))
+                pw = px2 - px1
+                ph = py2 - py1
 
-                    if orig_pw <= 0 or orig_ph <= 0 or orig_pw > w_img * 0.6 or orig_ph > h_img * 0.3: continue
+                if pw <= 0 or ph <= 0:
+                    continue
+                if pw > w_img * 0.6 or ph > h_img * 0.3:
+                    continue
 
-                    pad_x, pad_y = int(orig_pw * 0.15), int(orig_ph * 0.15)
-                    px1 = max(0, orig_px1 - pad_x)
-                    py1 = max(0, orig_py1 - pad_y)
-                    px2 = min(w_img, orig_px2 + pad_x)
-                    py2 = min(h_img, orig_py2 + pad_y)
-                    pw, ph = px2 - px1, py2 - py1
+                pcx = px1 + pw / 2.0
+                pcy = py1 + ph / 2.0
 
-                    pcx, pcy = orig_px1 + (orig_pw / 2.0), orig_py1 + (orig_ph / 2.0)
-                    matched_vehicle_tid = -1
+                matched_vehicle_tid = -1
+                if vehicle_boxes is not None and len(vehicle_boxes) > 0:
+                    for v in vehicle_boxes:
+                        vx1, vy1, vx2, vy2 = map(int, v[:4])
+                        vw = vx2 - vx1
+                        vh = vy2 - vy1
+                        pad_x = vw * 0.10
+                        pad_y = vh * 0.10
+                        if (vx1 - pad_x) <= pcx <= (vx2 + pad_x) and (vy1 - pad_y) <= pcy <= (vy2 + pad_y):
+                            matched_vehicle_tid = int(v[4]) if len(v) > 4 else -1
+                            break
 
-                    if vehicle_boxes is not None:
-                        for v in vehicle_boxes:
-                            vx1, vy1, vx2, vy2 = map(int, v[:4])
-                            vw, vh = vx2 - vx1, vy2 - vy1
-                            if (vx1 - vw * 0.10) <= pcx <= (vx2 + vw * 0.10) and (vy1 - vh * 0.10) <= pcy <= (vy2 + vh * 0.10):
-                                matched_vehicle_tid = int(v[4]) if len(v) > 4 else -1
-                                if matched_vehicle_tid != -1:
-                                    blurred_vehicle_tids.add(matched_vehicle_tid)
-                                break
-
-                    roi = blur_img[py1:py2, px1:px2]
-                    if roi.size > 0:
-                        small = cv2.resize(roi, (max(1, pw // 12), max(1, ph // 12)), interpolation=cv2.INTER_LINEAR)
-                        blur_img[py1:py2, px1:px2] = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
-                        blurred_plates.append({
-                            "box": [px1, py1, px2, py2],
-                            "score": round(float(p[4]), 4) if len(p) > 4 else 0.0,
-                            "class_id": int(p[5]) if len(p) > 5 else -1,
-                            "matched_vehicle_tid": matched_vehicle_tid
-                        })
-
-            # [2단계] 하단 휴리스틱 비율 추정 (AI 모델 누락 차량 대상)
-            if vehicle_boxes is not None:
-                for v in vehicle_boxes:
-                    v_tid = int(v[4]) if len(v) > 4 else -1
-                    if v_tid in blurred_vehicle_tids or v_tid == -1: continue
-
-                    vx1, vy1, vx2, vy2 = map(int, v[:4])
-                    vw, vh = vx2 - vx1, vy2 - vy1
-                    if vw <= 0 or vh <= 0: continue
-                    
-                    px1, py1 = max(0, int(vx1 + vw * 0.25)), max(0, int(vy2 - vh * 0.30))
-                    px2, py2 = min(w_img, int(vx2 - vw * 0.25)), min(h_img, int(vy2 - vh * 0.05))
-                    pw, ph = px2 - px1, py2 - py1
-                    if pw <= 0 or ph <= 0: continue
-                    
-                    roi = blur_img[py1:py2, px1:px2]
-                    if roi.size > 0:
-                        small = cv2.resize(roi, (max(1, pw // 12), max(1, ph // 12)), interpolation=cv2.INTER_LINEAR)
-                        blur_img[py1:py2, px1:px2] = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
-                        blurred_plates.append({
-                            "box": [px1, py1, px2, py2],
-                            "score": 1.0, "class_id": -1, "matched_vehicle_tid": v_tid
-                        })
+                roi = blur_img[py1:py2, px1:px2]
+                if roi.size > 0:
+                    small_w = max(1, pw // 12)
+                    small_h = max(1, ph // 12)
+                    small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                    blur_img[py1:py2, px1:px2] = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
+                    blurred_plates.append({
+                        "box": [px1, py1, px2, py2],
+                        "score": round(float(p[4]), 4) if len(p) > 4 else 0.0,
+                        "class_id": int(p[5]) if len(p) > 5 else -1,
+                        "matched_vehicle_tid": matched_vehicle_tid
+                    })
 
         except Exception as e:
             logger.error(f"번호판 모자이크 처리 실패: {e}")
 
         return (blur_img, blurred_plates) if return_meta else blur_img
 
-    # 파라미터에 t_helmet 추가
     def apply_privacy_blur(self, frame, t_main, t_helmet=None, blur_face=True, blur_plate=True):
         privacy_meta = {
             "blur_face": bool(blur_face),
@@ -5133,8 +5032,7 @@ class Camera:
         vehicle_boxes = [t for t in t_main if int(t[6]) in TARGET_VEHICLES]
 
         if blur_face:
-            # 헬멧 정보를 인자로 함께 넘김
-            blurred_img, face_blurs = self.apply_face_blur(blurred_img, person_boxes, helmet_tracks=t_helmet, return_meta=True)
+            blurred_img, face_blurs = self.apply_face_blur(blurred_img, person_boxes, return_meta=True)
             privacy_meta["face"] = face_blurs
 
         if blur_plate:
@@ -5730,7 +5628,7 @@ class HealthCheckDaemon:
         self.version = version
         self.interval = interval_sec
         self.running = True
-        self.url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
+        self.url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
         self.cams = list(cams or [])
         self.config_file = config_file
         self._config_lock = threading.Lock()
