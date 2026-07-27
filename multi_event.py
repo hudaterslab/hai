@@ -420,7 +420,7 @@ def create_roi_snapshot(cam, frame):
 
 def _send_roi_snapshot_task( cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False, send_type="hourly"):
     """관제 서버로 ROI 스냅샷을 백그라운드에서 전송합니다."""
-    url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
+    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
     send_label = {
         "roi_check_5min": "5분 ROI 화각검사",
         "roi_refresh": "ROI 설정반영 스냅샷",
@@ -871,7 +871,7 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.debug(f"[API 스킵] 기본 단말 ID(99999) 사용 중: {image_path}")
         return
 
-    url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
+    url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/img"
     event_type_mapping = {
         "conveyor_crossing": 1,
         "no_helmet": 2,
@@ -5628,7 +5628,7 @@ class HealthCheckDaemon:
         self.version = version
         self.interval = interval_sec
         self.running = True
-        self.url = "1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
+        self.url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health"
         self.cams = list(cams or [])
         self.config_file = config_file
         self._config_lock = threading.Lock()
