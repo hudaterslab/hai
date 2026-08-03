@@ -392,7 +392,9 @@ def split_unified_event_detections(raw_dets, events, main_conf, person_conf, hel
 
 def create_roi_snapshot(cam, frame):
     """현재 카메라 프레임에 ROI와 설정된 이벤트 명만 그립니다."""
-    if frame is None: return None
+    if frame is None:
+        return None
+
     img = frame.copy()
 
     # 1. ROI Polygon 그리기
@@ -405,16 +407,43 @@ def create_roi_snapshot(cam, frame):
             if i + 1 < len(cam.roi_lines):
                 cv2.line(img, tuple(cam.roi_lines[i]), tuple(cam.roi_lines[i+1]), (0, 0, 255), 2)
 
-    # 3. 설정된 이벤트 명 좌측 상단에 표시
-    y_pos = 30
-    for evt in cam.events:
-        # [수정] roi_change 이벤트는 관제 스냅샷 텍스트 렌더링에서 제외합니다.
-        if evt == "roi_change" or evt == getattr(sys.modules[__name__], 'ROI_CHANGE_EVENT', 'roi_change'):
-            continue
+    # 3. 스냅샷 전용 짧은 이벤트명 매핑
+    snapshot_event_names = {
+        "intrusion": "INTRUDE",
+        "illegal_parking": "PARK",
+        "no_helmet": "HELMET",
+        "conveyor_crossing": "CROSS",
+        "signal_vehicle": "SIGNAL",
+        "roi_change": "ROI",
+        "roi_change_apply": "ROIA",
+    }
 
-        display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
-        cv2.putText(img, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
-        y_pos += 30
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    thickness = 1
+    x_pos = 20
+    bottom_margin = 20
+    line_gap = 30
+
+    event_texts = []
+    for evt in cam.events:
+        display_name = snapshot_event_names.get(evt, evt.upper())
+        event_texts.append(display_name)
+
+    y_pos = img.shape[0] - bottom_margin
+
+    for text in event_texts:
+        cv2.putText(
+            img,
+            text,
+            (x_pos, y_pos),
+            font,
+            font_scale,
+            (0, 255, 0),
+            thickness,
+            cv2.LINE_AA
+        )
+        y_pos -= line_gap
 
     return img
 
@@ -565,6 +594,9 @@ def run_output_retention_cleanup(retention_days):
     # 실행 로그도 같은 보관 정책으로 한 번 더 정리합니다.
     # TimedRotatingFileHandler가 시간 단위 회전을 맡고, 이 함수가 오래된 날짜 파일을 보조 정리합니다.
     cleanup_old_files(LOG_DIR, retention_days, "실행 로그")
+    # ROI 정합 판정 CSV(날짜별 파일)도 같은 보관 정책으로 정리합니다.
+    # LOG_DIR 설정이 다른 경로로 바뀌어도 이 폴더가 정리 대상에서 빠지지 않도록 명시적으로 호출합니다.
+    cleanup_old_files(os.path.dirname(ROI_ALIGN_CSV_LOG_FILE), retention_days, "ROI 정합 로그")
 
 # ==========================================
 # [3] 딥엑스 NPU 엔진 및 환경변수 설정
@@ -3135,21 +3167,16 @@ class ROIAlignLearningStore:
     def __init__(self):
         self.lock = threading.Lock()
         self.data = {"cameras": {}}
-        self.roi_setup_reported = self._load_reported_from_csv()
 
-    def _load_reported_from_csv(self, path=ROI_ALIGN_CSV_LOG_FILE):
-        if not os.path.exists(path):
-            return False
+    def _daily_csv_path(self, row=None, base_path=ROI_ALIGN_CSV_LOG_FILE):
+        timestamp = str((row or {}).get("timestamp", "")).strip()
         try:
-            with open(path, "r", newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    # 신/구 컬럼명 모두 허용
-                    requested = str(row.get("healthcheck", row.get("healthcheck_requested", ""))).strip().lower()
-                    if requested in ("true", "1", "yes", "y"):
-                        return True
-        except Exception as e:
-            logger.warning(f"[ROI DRIFT] CSV state load failed: {e}")
-        return False
+            log_day = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%Y%m%d")
+        except (TypeError, ValueError):
+            log_day = datetime.datetime.now(pytz.timezone("Asia/Seoul")).strftime("%Y%m%d")
+
+        stem, ext = os.path.splitext(os.path.basename(base_path))
+        return os.path.join(os.path.dirname(base_path), f"{stem}_{log_day}{ext}")
 
     # 3×3 격자 전용 CSV 스키마(decision은 normal/suspect/confirm/disturbed 4종).
     #   decision        : normal(이동 없음) / suspect(이동 감지, 누적 중) / confirm(연속 N회 도달 → API)
@@ -3168,7 +3195,7 @@ class ROIAlignLearningStore:
     #   anchor_refreshed: 이번 검사에서 앵커를 갱신했는지(True/False)
     #   healthcheck     : ROI 재설정 필요(pending) 상태. confirm/disturbed 확정부터 관제센터가
     #                     ROI를 내려줄(update_config) 때까지 계속 True. 발사 순간은 reason이 채워진 행
-    def append_csv_log(self, row, path=ROI_ALIGN_CSV_LOG_FILE):
+    def append_csv_log(self, row, path=None):
         fieldnames = [
             "timestamp", "camera_key", "decision",
             "suspect_count", "disturbed_count", "abnormal_count", "cells_measurable", "cells_moving", "cells_consistent", "consistent_quorum",
@@ -3202,7 +3229,7 @@ class ROIAlignLearningStore:
                 writer.writerow({k: row.get(k, "") for k in fieldnames})
 
         try:
-            write_one_csv(path)
+            write_one_csv(path or self._daily_csv_path(row))
 
         except Exception as e:
             logger.warning(f"[ROI DRIFT] CSV log append failed: {e}")
@@ -3394,14 +3421,6 @@ class ROIAlignLearningStore:
                     "healthcheck": healthcheck, "confirm_count_required": confirm_required,
                     "disturbed_confirm_count_required": disturbed_required,
                     "abnormal_count_required": abnormal_required}
-
-    def was_roi_setup_reported(self):
-        with self.lock:
-            return bool(self.roi_setup_reported)
-
-    def mark_roi_setup_reported(self):
-        with self.lock:
-            self.roi_setup_reported = True
 
 ROI_ALIGN_LEARNING_STORE = ROIAlignLearningStore()
 
