@@ -9,14 +9,56 @@ PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 SERVICE_NAME="cctv_ai.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
+NIC_STABILITY_SERVICE_NAME="hai-nic-stability.service"
+NIC_STABILITY_SERVICE_PATH="/etc/systemd/system/$NIC_STABILITY_SERVICE_NAME"
+NIC_STABILITY_SCRIPT_PATH="/usr/local/sbin/hai-nic-stability.sh"
 CAM_CONFIG_FILE="$PROJECT_DIR/cameras.json"
 CAM_CSV_FILE="$PROJECT_DIR/cameras.csv"
 SYS_CONFIG_FILE="$PROJECT_DIR/system_config.json"
 TARGET_SCRIPT="$PROJECT_DIR/multi_event.py"
 MODEL_DOWNLOAD_SCRIPT="$PROJECT_DIR/downdxnn.sh"
 DX_DIR="$USER_HOME/dx-runtime"
+NUMPY_VERSION="1.26.4"
+DX_FW_TAG="v2.5.6"
+DX_FW_VERSION="2.5.6"
+DX_FW_DIR="$DX_DIR/dx_fw"
+NETWORK_TUNING_FILE="/etc/sysctl.d/99-network-tuning.conf"
 
-sudo apt install ssh -y
+sudo apt install -y ssh ethtool
+
+echo "-----------------------------------------------------"
+echo " Network kernel tuning and PCIe ASPM configuration"
+echo "-----------------------------------------------------"
+sudo bash -c "cat > $NETWORK_TUNING_FILE" << 'EOL'
+# Network interface backlog queue and socket buffer limits.
+net.core.netdev_max_backlog = 65536
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+EOL
+
+if sudo sysctl -p "$NETWORK_TUNING_FILE" > /dev/null 2>&1; then
+    echo "-> Network kernel tuning applied."
+else
+    echo "[경고] Network kernel tuning could not be applied."
+fi
+
+if [ -f /etc/default/grub ] && command -v update-grub > /dev/null 2>&1; then
+    if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
+        if grep -q 'pcie_aspm=off' /etc/default/grub; then
+            echo "-> pcie_aspm=off is already configured."
+        else
+            sudo sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 pcie_aspm=off"/' /etc/default/grub
+            sudo update-grub > /dev/null 2>&1
+            echo "-> pcie_aspm=off will be applied after the next reboot."
+        fi
+    else
+        echo "[경고] GRUB_CMDLINE_LINUX_DEFAULT was not found; ASPM setting skipped."
+    fi
+else
+    echo "-> GRUB or update-grub is unavailable; ASPM setting skipped."
+fi
 
 echo "====================================================="
 echo " Raspberry Pi Edge AI CCTV 서비스 하이브리드 설치"
@@ -59,8 +101,24 @@ if [ ! -f "$SYS_CONFIG_FILE" ]; then
         "HELMET": "helmet_260622.dxnn",
         "PLATE": "license_plate_detector_v2.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},
-    "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "yolo"},
+    "model_confidences": {
+        "MAIN_V2": 0.6,
+        "MAIN_V3": 0.6,
+        "FACE": 0.35,
+        "HELMET": 0.85,
+        "PERSON": 0.5,
+        "SIGNALMAN": 0.5,
+        "PLATE": 0.1,
+        "MAIN": 0.6
+    },
+    "model_output_formats": {
+        "MAIN_V2": "ppu",
+        "MAIN_V3": "ppu",
+        "FACE": "ppu",
+        "HELMET": "auto",
+        "PLATE": "yolo",
+        "MAIN": "ppu"
+    },
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "verbose_logs": false},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
@@ -99,8 +157,24 @@ cat > "$DEFAULT_SYS_CONFIG_FILE" << EOL
         "HELMET": "helmet_260622.dxnn",
         "PLATE": "license_plate_detector_v2.dxnn"
     },
-    "model_confidences": {"MAIN": 0.6, "FACE": 0.35, "HELMET": 0.55, "PERSON": 0.5, "SIGNALMAN": 0.5, "PLATE": 0.1},
-    "model_output_formats": {"MAIN": "ppu", "FACE": "auto", "HELMET": "auto", "PLATE": "yolo"},
+    "model_confidences": {
+        "MAIN_V2": 0.6,
+        "MAIN_V3": 0.6,
+        "FACE": 0.35,
+        "HELMET": 0.85,
+        "PERSON": 0.5,
+        "SIGNALMAN": 0.5,
+        "PLATE": 0.1,
+        "MAIN": 0.6
+    },
+    "model_output_formats": {
+        "MAIN_V2": "ppu",
+        "MAIN_V3": "ppu",
+        "FACE": "ppu",
+        "HELMET": "auto",
+        "PLATE": "yolo",
+        "MAIN": "ppu"
+    },
     "model_engine_pool_sizes": {"MAIN": 3, "FACE": 1, "HELMET": 1, "PLATE": 1},
     "video_decode": {"backend": "gstreamer", "hw_acceleration": "auto", "hw_device": "/dev/dri/renderD128", "vaapi_driver": "iHD", "fallback_to_cpu": true, "fps_limit": 15.0, "gstreamer_latency_ms": 50, "gstreamer_protocols": "tcp", "log_interval_sec": 10.0, "verbose_logs": false},
     "BATCH_SIZE": 9, "REC_FPS": 3, "PERF_LOG_INTERVAL_SEC": 10.0, "REC_PRE_SEC": 10, "REC_POST_SEC": 10,
@@ -173,9 +247,9 @@ echo "-> 'python' 심볼릭 링크를 생성합니다..."
 sudo ln -sf /usr/bin/python3 /usr/bin/python
 
 # 필수 파이썬 패키지 설치 (최신 우분투/데비안의 PEP-668 제약 우회를 위해 break-system-packages 옵션 추가 대비)
-echo "-> 필수 파이썬 패키지를 설치합니다 (pytz, psutil, requests, opencv-python)..."
-python -m pip install pytz psutil requests opencv-python || \
-python -m pip install pytz psutil requests opencv-python --break-system-packages
+echo "-> 필수 파이썬 패키지를 설치합니다 (numpy==$NUMPY_VERSION, pytz, psutil, requests, opencv-python)..."
+python -m pip install --upgrade "numpy==$NUMPY_VERSION" pytz psutil requests opencv-python || \
+python -m pip install --upgrade "numpy==$NUMPY_VERSION" pytz psutil requests opencv-python --break-system-packages
 
 echo "-> FFmpeg VAAPI 하드웨어 디코딩 패키지를 설치합니다..."
 sudo apt install -y ffmpeg intel-media-va-driver vainfo
@@ -269,10 +343,52 @@ else
     echo "-> dx_engine과 dxrt-cli가 이미 확인되어 dx-runtime install.sh 실행을 건너뜁니다."
 fi
 
+echo "-> numpy 버전을 $NUMPY_VERSION 로 고정하고 검증합니다..."
+python -m pip install --upgrade "numpy==$NUMPY_VERSION" || \
+python -m pip install --upgrade "numpy==$NUMPY_VERSION" --break-system-packages
+
+if ! python - "$NUMPY_VERSION" << 'PY'
+import sys
+import numpy
+
+expected_version = sys.argv[1]
+if numpy.__version__ != expected_version:
+    print(f"[numpy] expected {expected_version}, found {numpy.__version__}")
+    sys.exit(1)
+
+print(f"[numpy] version verified: {numpy.__version__}")
+PY
+then
+    echo "[오류] numpy 버전 고정 또는 검증에 실패했습니다."
+    exit 1
+fi
+
+if [ ! -d "$DX_FW_DIR" ]; then
+    echo "[오류] dx_fw 서브모듈 경로를 찾을 수 없습니다: $DX_FW_DIR"
+    exit 1
+fi
+
+echo "-> dx_fw 펌웨어를 $DX_FW_TAG 태그로 고정합니다..."
+if ! sudo -u "$ACTUAL_USER" git -C "$DX_FW_DIR" fetch --tags --force; then
+    echo "[오류] dx_fw 태그 정보를 가져오지 못했습니다."
+    exit 1
+fi
+
+if ! sudo -u "$ACTUAL_USER" git -C "$DX_FW_DIR" checkout --detach "$DX_FW_TAG"; then
+    echo "[오류] dx_fw $DX_FW_TAG 고정에 실패했습니다."
+    exit 1
+fi
+
+if [ ! -f "$DX_FW_DIR/m1/$DX_FW_VERSION/mdot2/fw.bin" ] || \
+   [ ! -f "$DX_FW_DIR/m1m/$DX_FW_VERSION/mdot2/fw.bin" ]; then
+    echo "[오류] dx_fw $DX_FW_VERSION 펌웨어 파일을 찾을 수 없습니다."
+    exit 1
+fi
+
 if command -v dxrt-cli &> /dev/null; then
-    echo "-> M.2 / PCIe 기반 펌웨어(FW) 업데이트를 시도합니다..."
-    dxrt-cli -u "$DX_DIR/dx_fw/m1/latest/mdot2/fw.bin" || echo "⚠️ [안내] 펌웨어 업데이트 건너뜀 (이미 최신이거나 재부팅 필요)"
-    dxrt-cli -u "$DX_DIR/dx_fw/m1m/latest/mdot2/fw.bin" > /dev/null 2>&1 || true
+    echo "-> M.2 / PCIe 기반 펌웨어(FW) $DX_FW_VERSION 업데이트를 시도합니다..."
+    dxrt-cli -u "$DX_FW_DIR/m1/$DX_FW_VERSION/mdot2/fw.bin" || echo "⚠️ [안내] 펌웨어 업데이트 건너뜀 (동일 버전이거나 재부팅 필요)"
+    dxrt-cli -u "$DX_FW_DIR/m1m/$DX_FW_VERSION/mdot2/fw.bin" > /dev/null 2>&1 || true
 else
     echo "⚠️ 'dxrt-cli' 명령어를 찾을 수 없어 펌웨어 업데이트를 건너뜁니다."
 fi
@@ -333,6 +449,74 @@ fi
 
 echo "-----------------------------------------------------"
 echo " 9. Systemd 백그라운드 서비스 등록"
+echo "-----------------------------------------------------"
+echo "-----------------------------------------------------"
+echo " NIC stability service registration"
+echo "-----------------------------------------------------"
+sudo bash -c "cat > $NIC_STABILITY_SCRIPT_PATH" << 'EOL'
+#!/bin/bash
+set -u
+
+ETHTOOL_BIN="$(command -v ethtool || true)"
+
+if [ -z "$ETHTOOL_BIN" ]; then
+    echo "[hai-nic-stability] ethtool is not installed"
+    exit 0
+fi
+
+for DEVICE_PATH in /sys/class/net/*; do
+    IFACE="$(basename "$DEVICE_PATH")"
+
+    case "$IFACE" in
+        lo|docker*|br-*|veth*|virbr*|tailscale*|tun*|tap*)
+            continue
+            ;;
+    esac
+
+    # Only handle physical Ethernet interfaces. This excludes Wi-Fi and virtual adapters.
+    if [ ! -e "$DEVICE_PATH/device" ] || [ -e "$DEVICE_PATH/wireless" ]; then
+        continue
+    fi
+
+    if [ "$(cat "$DEVICE_PATH/type" 2>/dev/null || true)" != "1" ]; then
+        continue
+    fi
+
+    "$ETHTOOL_BIN" -G "$IFACE" rx 4096 tx 4096 \
+        && echo "[hai-nic-stability] $IFACE ring: RX/TX 4096" \
+        || echo "[hai-nic-stability] $IFACE ring setting skipped or unsupported"
+
+    "$ETHTOOL_BIN" -K "$IFACE" tso off gso off gro off \
+        && echo "[hai-nic-stability] $IFACE TSO/GSO/GRO: disabled" \
+        || echo "[hai-nic-stability] $IFACE offload setting skipped or unsupported"
+
+    "$ETHTOOL_BIN" --set-eee "$IFACE" eee off \
+        && echo "[hai-nic-stability] $IFACE EEE: disabled" \
+        || echo "[hai-nic-stability] $IFACE EEE setting skipped or unsupported"
+done
+EOL
+
+sudo chmod 0755 "$NIC_STABILITY_SCRIPT_PATH"
+
+sudo bash -c "cat > $NIC_STABILITY_SERVICE_PATH" << EOL
+[Unit]
+Description=HAI Ethernet NIC stability settings
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=$NIC_STABILITY_SCRIPT_PATH
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+sudo systemctl daemon-reload
+sudo systemctl enable "$NIC_STABILITY_SERVICE_NAME"
+sudo systemctl start "$NIC_STABILITY_SERVICE_NAME"
+
+echo "-----------------------------------------------------"
+echo " 10. Systemd 백그라운드 서비스 등록"
 echo "-----------------------------------------------------"
 sudo bash -c "cat > $SERVICE_PATH" << EOL
 [Unit]
