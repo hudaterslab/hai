@@ -1,0 +1,199 @@
+hudaters@hudaters-nuc13brfa4:~/hai$ python multi_event.py --gui
+2026-08-12 20:00:00 | INFO    | [main] [시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)
+2026-08-12 20:00:00 | INFO    | [main] [System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료
+2026-08-12 20:00:00 | INFO    | [load_rtsp_list_from_csv] 카메라 CSV 로드 완료: 5대
+>> CLI 디버그 출력을 활성화하시겠습니까? (파일 로그는 항상 상세히 기록됩니다) [y/N]: y
+2026-08-12 20:00:01 | DEBUG   | [main] 디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.
+>> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: 
+2026-08-12 20:00:03 | INFO    | [main] DeepX 모델을 VPU 메모리로 할당 중... (event inference: main)
+2026-08-12 20:00:03 | INFO    | [_resolve_output_format] [DeepX] output_format=auto detected ppu: pctc_v1.dxnn (shapes=[[8400]] dtypes=['bbox'])
+2026-08-12 20:00:03 | INFO    | [__init__] [DeepX] 모델 로드 성공: pctc_v1.dxnn (output=ppu, pool=3, input=640x640, layout=nhwc)
+2026-08-12 20:00:03 | INFO    | [_resolve_output_format] [DeepX] output_format=auto detected yolo: helmet_3cls_v8.dxnn (shapes=[[1, 7, 8400]] dtypes=["<class 'numpy.float32'>"])
+2026-08-12 20:00:03 | INFO    | [__init__] [DeepX] 모델 로드 성공: helmet_3cls_v8.dxnn (output=yolo, pool=1, input=640x640, layout=nhwc)
+2026-08-12 20:00:03 | INFO    | [__init__] [DeepX] 모델 로드 성공: yolov8m-face_ppu.dxnn (output=yolo_xyxy, pool=1, input=640x640, layout=nhwc)
+2026-08-12 20:00:03 | INFO    | [__init__] [DeepX] 모델 로드 성공: license_plate_detector_v2.dxnn (output=yolo_xyxy, pool=1, input=640x640, layout=nhwc)
+2026-08-12 20:00:03 | INFO    | [main] [CAMERA LOADED] cam=1 ip=173_cam1 events=walkway_out roi_poly_points=4 roi_line_points=0
+2026-08-12 20:00:03 | INFO    | [main] [CAMERA LOADED] cam=2 ip=173_cam2 events=abnormal_drive roi_poly_points=0 roi_line_points=12
+2026-08-12 20:00:03 | INFO    | [main] [CAMERA LOADED] cam=3 ip=173_cam3 events=spreader_danger_zone roi_poly_points=0 roi_line_points=0
+2026-08-12 20:00:03 | INFO    | [main] [CAMERA LOADED] cam=4 ip=173_cam4 events=yard_crossing roi_poly_points=4 roi_line_points=0
+2026-08-12 20:00:03 | INFO    | [main] [CAMERA LOADED] cam=5 ip=173_cam5 events=spreader_danger_zone roi_poly_points=0 roi_line_points=0
+2026-08-12 20:00:03 | INFO    | [__init__] [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: 60초)
+2026-08-12 20:00:04 | WARNING | [_probe_stream_info] [CAM:173_cam1] ffprobe stream info failed: rc=1 stderr=[rtsp @ 0x5a5c8424dec0] method DESCRIBE failed: 404 Not Found rtsp://192.168.1.173:8554/cam1: Server returned 404 Not Found stdout={ }
+2026-08-12 20:00:04 | WARNING | [_run] [CAM:173_cam1] GStreamer pipe unavailable; trying FFmpeg/OpenCV fallback
+[rtsp @ 0x7f01d8004c00] method DESCRIBE failed: 404Not Found
+[ WARN:4@3.490] global cap.cpp:215 open VIDEOIO(FFMPEG): backend is generally available but can't be used to capture by name
+2026-08-12 20:00:04 | ERROR   | [_run]  [CAM:173_cam1] RTSP 연결 실패. 5초 후 재시도합니다.
+2026-08-12 20:00:05 | ERROR   | [_run] 🚨 [Health Check] 네트워크/데이터 수집 실패 (누적:1): No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health'
+2026-08-12 20:00:09 | WARNING | [_probe_stream_info] [CAM:173_cam1] ffprobe stream info failed: rc=1 stderr=[rtsp @ 0x5c794c3d9ec0] method DESCRIBE failed: 404 Not Found rtsp://192.168.1.173:8554/cam1: Server returned 404 Not Found stdout={ }
+2026-08-12 20:00:09 | WARNING | [_run] [CAM:173_cam1] GStreamer pipe unavailable; trying FFmpeg/OpenCV fallback
+[rtsp @ 0x7f01d8007080] method DESCRIBE failed: 404Not Found
+[ WARN:4@8.596] global cap.cpp:215 open VIDEOIO(FFMPEG): backend is generally available but can't be used to capture by name
+2026-08-12 20:00:09 | ERROR   | [_run]  [CAM:173_cam1] RTSP 연결 실패. 5초 후 재시도합니다.
+2026-08-12 20:00:14 | WARNING | [_probe_stream_info] [CAM:173_cam1] ffprobe stream info failed: rc=1 stderr=[rtsp @ 0x5be103961ec0] method DESCRIBE failed: 404 Not Found rtsp://192.168.1.173:8554/cam1: Server returned 404 Not Found stdout={ }
+2026-08-12 20:00:14 | WARNING | [_run] [CAM:173_cam1] GStreamer pipe unavailable; trying FFmpeg/OpenCV fallback
+[rtsp @ 0x7f01d800a380] method DESCRIBE failed: 404Not Found
+[ WARN:4@13.940] global cap.cpp:215 open VIDEOIO(FFMPEG): backend is generally available but can't be used to capture by name
+2026-08-12 20:00:14 | ERROR   | [_run]  [CAM:173_cam1] RTSP 연결 실패. 5초 후 재시도합니다.
+2026-08-12 20:00:14 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 31, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:14 | INFO    | [_initialize_base_roi_if_needed] [CAM:3] base ROI init | poly=0 lines=0 shape=(480, 640)
+2026-08-12 20:00:14 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 3, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 636.850, min_val: -52.605
+2026-08-12 20:00:15 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:3 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 30, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 31, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 33, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 38, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 36, 32), max_val: 251.000, min_val: 0.000
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 35, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 37, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 33, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 38, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 41, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 29, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 36, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 34, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 33, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 38, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 39, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 2, 32), max_val: 244.000, min_val: 0.000
+2026-08-12 20:00:17 | INFO    | [_initialize_base_roi_if_needed] [CAM:5] base ROI init | poly=0 lines=0 shape=(480, 640)
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 637.077, min_val: -56.489
+2026-08-12 20:00:17 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:5 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 40, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 388, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | INFO    | [_initialize_base_roi_if_needed] [CAM:4] base ROI init | poly=4 lines=0 shape=(480, 640)
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 2, 32), max_val: 245.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 635.951, min_val: -54.439
+2026-08-12 20:00:17 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:4 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 382, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 2, 32), max_val: 245.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 38, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 48, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | INFO    | [_initialize_base_roi_if_needed] [CAM:2] base ROI init | poly=0 lines=12 shape=(480, 640)
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 636.849, min_val: -57.402
+2026-08-12 20:00:17 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:2 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 4, 32), max_val: 250.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 385, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 42, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 50, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 48, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 6, 32), max_val: 245.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 386, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 43, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 387, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 44, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 4, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 43, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 46, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 7, 32), max_val: 251.000, min_val: 0.000
+2026-08-12 20:00:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 392, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 37, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 42, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 32), max_val: 243.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 38, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 396, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 4, 32), max_val: 248.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 47, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 390, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 36, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 6, 32), max_val: 244.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 45, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 393, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 36, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 6, 32), max_val: 248.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 42, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 398, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 38, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 44, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 396, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 45, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 6, 32), max_val: 246.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 45, 32), max_val: 251.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 395, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 43, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 6, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 44, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 395, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 39, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 47, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 39, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 390, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 45, 32), max_val: 251.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 386, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 37, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 2, 32), max_val: 229.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 48, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 383, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 31, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 49, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 385, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 27, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 2, 32), max_val: 232.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 51, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 382, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 28, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 1, 32), max_val: 228.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 54, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 28, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 392, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 4, 32), max_val: 236.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 53, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | WARNING | [_probe_stream_info] [CAM:173_cam1] ffprobe stream info failed: rc=1 stderr=[rtsp @ 0x5e8316b0eec0] method DESCRIBE failed: 404 Not Found rtsp://192.168.1.173:8554/cam1: Server returned 404 Not Found stdout={ }
+2026-08-12 20:00:19 | WARNING | [_run] [CAM:173_cam1] GStreamer pipe unavailable; trying FFmpeg/OpenCV fallback
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 23, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 387, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 4, 32), max_val: 254.000, min_val: 0.000
+[rtsp @ 0x7f01d800b280] method DESCRIBE failed: 404Not Found
+[ WARN:4@19.244] global cap.cpp:215 open VIDEOIO(FFMPEG): backend is generally available but can't be used to capture by name
+2026-08-12 20:00:19 | ERROR   | [_run]  [CAM:173_cam1] RTSP 연결 실패. 5초 후 재시도합니다.
+2026-08-12 20:00:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 51, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 390, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 28, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 6, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 45, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 29, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 380, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 32), max_val: 238.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 41, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 395, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 28, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 3, 32), max_val: 244.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 44, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 388, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 25, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 45, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 389, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 27, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 51, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 394, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 26, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 1, 32), max_val: 216.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 57, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 392, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 22, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 1, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 45, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 40, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 394, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 1, 32), max_val: 228.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 54, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 391, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 31, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 2, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 56, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 383, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 47, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 4, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 58, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 44, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 20:00:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 376, 32), max_val: 255.000, min_val: 0.000
+
+2026-08-12 20:03:40 | INFO    | [graceful_shutdown] [SYSTEM] Waiting for background I/O tasks to finish.

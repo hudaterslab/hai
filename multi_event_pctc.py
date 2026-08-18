@@ -56,19 +56,12 @@ SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 WATCHDOG_TIMEOUT = 30.0
 
-# PCTC 단일 MAIN 모델 클래스 정의
+# PCTC main model class map.
+# The weak helmet/head outputs from this model are intentionally ignored;
+# no-helmet detection keeps using the dedicated HELMET model.
 PCTC_CLASS_NAMES = (
-    "helmet",
-    "head",
-    "person",
-    "car",
-    "Truck",
-    "Y/T",
-    "Chassis",
-    "Container",
-    "Corn",
-    "Y/C",
-    "Spreader",
+    "helmet", "head", "person", "car", "Truck", "Y/T",
+    "Chassis", "Container", "Corn", "Y/C", "Spreader",
 )
 
 ID_PCTC_HELMET = 0
@@ -83,169 +76,52 @@ ID_PCTC_CORN = 8
 ID_PCTC_YC = 9
 ID_PCTC_SPREADER = 10
 
-PCTC_MAIN_IGNORED_CLASS_IDS = {ID_PCTC_HELMET, ID_PCTC_HEAD}
-PCTC_MAIN_TRACK_CLASS_IDS = {
-    ID_PCTC_PERSON,
-    ID_PCTC_CAR,
-    ID_PCTC_TRUCK,
-    ID_PCTC_YT,
-    ID_PCTC_CHASSIS,
-    ID_PCTC_CONTAINER,
-    ID_PCTC_CORN,
-    ID_PCTC_YC,
-    ID_PCTC_SPREADER,
-}
-
-# 전용 HELMET 모델 클래스
+# Dedicated HELMET model class map.
 ID_H_HELMET = 0
 ID_H_HEAD = 1
-ID_H_PERSON = 2
 
-INTRUSION_CLASS_IDS = set(PCTC_MAIN_TRACK_CLASS_IDS)
-PARKING_CLASS_IDS = {
+PCTC_MAIN_IGNORED_CLASS_IDS = frozenset({ID_PCTC_HELMET, ID_PCTC_HEAD})
+PCTC_MAIN_TRACK_CLASS_IDS = frozenset(range(ID_PCTC_PERSON, ID_PCTC_SPREADER + 1))
+INTRUSION_CLASS_IDS = PCTC_MAIN_TRACK_CLASS_IDS
+PARKING_CLASS_IDS = frozenset({
     ID_PCTC_CAR,
     ID_PCTC_TRUCK,
     ID_PCTC_YT,
     ID_PCTC_CHASSIS,
     ID_PCTC_CONTAINER,
     ID_PCTC_YC,
-}
-ABNORMAL_DRIVE_CLASS_IDS = {
-    ID_PCTC_YT,
-    ID_PCTC_CAR,
-    ID_PCTC_CHASSIS,
-}
-DANGER_APPROACH_CLASS_IDS = {
-    ID_PCTC_PERSON,
+})
+PLATE_CANDIDATE_CLASS_IDS = frozenset({
     ID_PCTC_CAR,
     ID_PCTC_TRUCK,
     ID_PCTC_YT,
     ID_PCTC_CHASSIS,
-}
-PLATE_PRIVACY_CLASS_IDS = set(PARKING_CLASS_IDS)
+})
 
-SAFETY_EVENT_NAMES = (
-    "intrusion",
-    "illegal_parking",
-    "no_helmet",
-    "yard_crossing",
-    "abnormal_drive",
-    "walkway_out",
-    "spreader_danger_zone",
-)
+DETECTION_EVENT_NAMES = ("intrusion", "illegal_parking", "no_helmet")
+DEPRECATED_EVENT_NAMES = frozenset({"conveyor_crossing", "signal_vehicle"})
 
-PORT_EVENT_NAMES = (
-    "yard_crossing",
-    "abnormal_drive",
-    "walkway_out",
-    "spreader_danger_zone",
-)
-
-ROI_POLYGON_EVENT_NAMES = {
-    "intrusion",
-    "illegal_parking",
-    "no_helmet",
-    "yard_crossing",
-    "walkway_out",
-}
-
-SUPPORTED_CAMERA_EVENTS = set(SAFETY_EVENT_NAMES) | {
-    "roi_change",
-    "roi_change_apply",
-}
-
-EVENT_NAME_ALIASES = {
-    "wrong_way_uturn": "abnormal_drive",
-    "walkway_departure": "walkway_out",
-}
-
-EVENT_CONFIG_NAMES = frozenset(SAFETY_EVENT_NAMES)
-CONFIG_SCHEMA_VERSION = 3
-
-MODEL_SECTION_ALLOWED_KEYS = {
-    "models": frozenset(("MAIN", "FACE", "HELMET", "PLATE")),
-    "model_confidences": frozenset(("MAIN", "PERSON", "HELMET_PERSON", "FACE", "HELMET", "PLATE")),
-    "model_output_formats": frozenset(("MAIN", "FACE", "HELMET", "PLATE")),
-    "model_engine_pool_sizes": frozenset(("MAIN", "FACE", "HELMET", "PLATE")),
-}
-
-SYSTEM_CONFIG_ALLOWED_KEYS = frozenset((
-    "config_schema_version",
-    "terminal_id",
-    "system_performance",
-    "logging",
-    "event_config",
-    "models",
-    "model_confidences",
-    "model_output_formats",
-    "model_engine_pool_sizes",
-    "inference_runtime",
-    "video_decode",
-    "BATCH_SIZE",
-    "REC_FPS",
-    "LOOP_FPS",
-    "PERF_LOG_INTERVAL_SEC",
-    "REC_PRE_SEC",
-    "REC_POST_SEC",
-    "VIDEO_EVENT_MARK_SEC",
-    "VIDEO_EVENT_BORDER_THICKNESS",
-    "EVENT_FRAME_SAVE_DELAY_SEC",
-    "EVENT_FRAME_SAVE_MAX_COUNT",
-    "OUTPUT_RETENTION_DAYS",
-    "OUTPUT_CLEANUP_INTERVAL_SEC",
-    "ROI_SETUP_REQUIRED_API_ENABLED",
-    "INTERACTIVE_INPUT_GUARD_SEC",
-    "VISUAL_ALARM_DURATION",
-    "roi_align_learning",
-    "verbose_logs",
-))
 
 def pctc_class_name(class_id):
     try:
-        class_id = int(class_id)
+        idx = int(class_id)
     except Exception:
         return "unknown"
-    if 0 <= class_id < len(PCTC_CLASS_NAMES):
-        return PCTC_CLASS_NAMES[class_id]
-    return f"class_{class_id}"
+    if 0 <= idx < len(PCTC_CLASS_NAMES):
+        return PCTC_CLASS_NAMES[idx]
+    return f"class_{idx}"
 
 
 def get_visible_pctc_class_ids(events):
-    event_class_ids = {
-        "intrusion": INTRUSION_CLASS_IDS,
-        "illegal_parking": PARKING_CLASS_IDS,
-        "no_helmet": {ID_PCTC_PERSON},
-        "yard_crossing": {ID_PCTC_PERSON},
-        "walkway_out": {ID_PCTC_PERSON},
-        "abnormal_drive": ABNORMAL_DRIVE_CLASS_IDS,
-        "spreader_danger_zone": {
-            ID_PCTC_PERSON,
-            ID_PCTC_CAR,
-            ID_PCTC_TRUCK,
-            ID_PCTC_YT,
-            ID_PCTC_CHASSIS,
-            ID_PCTC_CONTAINER,
-            ID_PCTC_SPREADER,
-        },
-    }
+    event_set = set(events or [])
     visible = set()
-    for event_name in events or []:
-        visible.update(event_class_ids.get(event_name, set()))
-    return visible & PCTC_MAIN_TRACK_CLASS_IDS
-
-
-def get_display_pctc_class_ids(events):
-    """Return classes rendered and inferred for the current terminal view.
-
-    Event detectors still apply their own class filters.  Showing every valid PCTC
-    terminal class by default prevents a valid model detection from disappearing
-    merely because the selected event menu did not reference that class.
-    """
-    cfg = globals().get("SYS_CFG", {})
-    runtime_cfg = cfg.get("inference_runtime", {}) if isinstance(cfg, dict) else {}
-    if bool(runtime_cfg.get("display_all_pctc_objects", True)):
-        return set(PCTC_MAIN_TRACK_CLASS_IDS)
-    return get_visible_pctc_class_ids(events)
+    if "intrusion" in event_set:
+        visible.update(INTRUSION_CLASS_IDS)
+    if "illegal_parking" in event_set:
+        visible.update(PARKING_CLASS_IDS)
+    if "no_helmet" in event_set:
+        visible.add(ID_PCTC_PERSON)
+    return visible
 
 DEBUG_MODE = False
 
@@ -255,6 +131,50 @@ DEBUG_MODE = False
 ALIGN_INTERVAL_SEC = 300.0                 # 화각변경 검사 주기(초)
 ROI_CHANGE_EVENT = "roi_change"            # 이 이벤트가 지정된 카메라만 화각변경 '감지+알림'
 ROI_CHANGE_APPLY_EVENT = "roi_change_apply"  # 감지 + 측정된 평행이동만큼 ROI를 '자동 보정'까지 하는 카메라
+
+SUPPORTED_CAMERA_EVENTS = frozenset({
+    *DETECTION_EVENT_NAMES,
+    ROI_CHANGE_EVENT,
+    ROI_CHANGE_APPLY_EVENT,
+})
+
+
+def sanitize_camera_config(conf):
+    clean = dict(conf or {})
+    raw_events = clean.get("events", [])
+    if not isinstance(raw_events, (list, tuple, set)):
+        raw_events = []
+
+    events = []
+    for event_name in raw_events:
+        event_name = str(event_name).strip()
+        if event_name in SUPPORTED_CAMERA_EVENTS and event_name not in events:
+            events.append(event_name)
+
+    clean["events"] = events
+    clean.setdefault("roi_poly_norm", [])
+    # Line ROIs belonged to the removed conveyor-crossing event. Clear stale
+    # values during migration so deleted crossing guides are not rendered.
+    clean["roi_lines_norm"] = []
+    return clean
+
+
+def sanitize_camera_configs(configs):
+    if not isinstance(configs, dict):
+        return {}, True
+
+    cleaned = {}
+    changed = False
+    for camera_key, conf in configs.items():
+        if not isinstance(conf, dict):
+            changed = True
+            continue
+        clean_conf = sanitize_camera_config(conf)
+        cleaned[camera_key] = clean_conf
+        if clean_conf != conf:
+            changed = True
+    return cleaned, changed
+
 GRID_APPLY_MAX_SHIFT_PX = 150.0            # 자동 보정 허용 이동 상한(px). 초과 시 보정 안 하고 알림만(=사람 재설정 필요)
 GRID_APPLY_SHIFT_SIGN = 1.0                # ROI 보정 방향 부호. 보정이 반대로 되면 -1.0으로 (phaseCorrelate 부호 실측 후 조정)
 ANCHOR_STARTUP_DELAY_SEC = 10.0            # RTSP 연결 직후 무효 프레임 회피용 안정화 대기
@@ -340,96 +260,12 @@ def deep_merge_dict(base, override):
             result[k] = copy.deepcopy(v)
     return result
 
-def _migrate_event_config(raw_event_config):
-    """Normalize aliases and keep only terminal safety-event configuration."""
-    normalized = {}
-    for raw_name, raw_value in dict(raw_event_config or {}).items():
-        event_name = EVENT_NAME_ALIASES.get(str(raw_name), str(raw_name))
-        if event_name not in EVENT_CONFIG_NAMES:
-            continue
-        if event_name not in normalized:
-            normalized[event_name] = raw_value
-        elif isinstance(raw_value, dict) and isinstance(normalized.get(event_name), dict):
-            normalized[event_name] = deep_merge_dict(raw_value, normalized[event_name])
-
-    no_helmet = dict(normalized.get("no_helmet") or {})
-    if "trigger_total_sec" not in no_helmet and "trigger_sec" in no_helmet:
-        no_helmet["trigger_total_sec"] = no_helmet.get("trigger_sec")
-    no_helmet.pop("trigger_sec", None)
-    if no_helmet:
-        normalized["no_helmet"] = no_helmet
-
-    return normalized
-
-
-def _schema_version(value):
-    try:
-        return max(0, int(value))
-    except Exception:
-        return 0
-
-
-def _migrate_system_config(raw_config):
-    """Apply an allow-list schema so retired model/event keys cannot survive."""
-    raw = dict(raw_config or {})
-    source_schema = _schema_version(raw.get("config_schema_version"))
-    migrated = {
-        key: value
-        for key, value in raw.items()
-        if key in SYSTEM_CONFIG_ALLOWED_KEYS
-    }
-    migrated["event_config"] = _migrate_event_config(migrated.get("event_config"))
-
-    for section_name, allowed_keys in MODEL_SECTION_ALLOWED_KEYS.items():
-        section = dict(migrated.get(section_name) or {})
-        migrated[section_name] = {
-            key: value
-            for key, value in section.items()
-            if key in allowed_keys
-        }
-
-    # Schema 2 removes stale single-purpose defaults and lets the runtime inspect
-    # the actual tensor metadata/output before choosing a decoder.
-    if source_schema < 2:
-        models = dict(migrated.get("models") or {})
-        if not str(models.get("MAIN") or "").strip():
-            models["MAIN"] = "pctc_v1.dxnn"
-        migrated["models"] = models
-
-        output_formats = dict(migrated.get("model_output_formats") or {})
-        output_formats["MAIN"] = "auto"
-        migrated["model_output_formats"] = output_formats
-
-        confidences = dict(migrated.get("model_confidences") or {})
-        try:
-            if abs(float(confidences.get("MAIN", 0.6)) - 0.6) < 1e-9:
-                confidences["MAIN"] = 0.35
-        except Exception:
-            confidences["MAIN"] = 0.35
-        try:
-            if abs(float(confidences.get("PERSON", 0.5)) - 0.5) < 1e-9:
-                confidences["PERSON"] = 0.30
-        except Exception:
-            confidences["PERSON"] = 0.30
-        migrated["model_confidences"] = confidences
-
-    # Schema 3 enables the HELMET model's person class as a secondary person detector.
-    # It is decoded at a lower person threshold, while helmet/head retain HELMET's own threshold.
-    if source_schema < 3:
-        confidences = dict(migrated.get("model_confidences") or {})
-        confidences.setdefault("HELMET_PERSON", confidences.get("PERSON", 0.30))
-        migrated["model_confidences"] = confidences
-
-    migrated["config_schema_version"] = CONFIG_SCHEMA_VERSION
-    return migrated
-
 def load_system_config():
     default_config = {
-        "config_schema_version": CONFIG_SCHEMA_VERSION,
         "terminal_id": "99999",
         "system_performance": {
             "target_fps": 10.0,
-            "dynamic_cpu_adjust_enabled": False,
+            "dynamic_cpu_adjust_enabled": False
         },
         "logging": {
             "dir": "./logs",
@@ -439,7 +275,7 @@ def load_system_config():
             "debug_file_level": "DEBUG",
             "retention_days": 14,
             "event_audit_enabled": True,
-            "disk_free_warn_gb": 5.0,
+            "disk_free_warn_gb": 5.0
         },
         "event_config": {
             "intrusion": {
@@ -447,14 +283,14 @@ def load_system_config():
                 "cooldown_sec": 600,
                 "proximity_ratio": 0.0,
                 "blur_face": True,
-                "blur_plate": True,
+                "blur_plate": True
             },
             "illegal_parking": {
                 "enabled": False,
                 "cooldown_sec": 600,
                 "trigger_sec": 5.0,
                 "move_threshold_ratio": 0.1,
-                "blur_plate": True,
+                "blur_plate": True
             },
             "no_helmet": {
                 "enabled": False,
@@ -465,80 +301,33 @@ def load_system_config():
                 "trigger_total_sec": 3.0,
                 "max_gap_sec": 1.5,
                 "window_sec": 30.0,
-                "ignore_top_ratio": 0.2,
-            },
-            "yard_crossing": {
-                "enabled": False,
-                "cooldown_sec": 60,
-                "trigger_sec": 3.0,
-                "blur_face": True,
-                "blur_plate": False,
-            },
-            "abnormal_drive": {
-                "enabled": False,
-                "cooldown_sec": 60,
-                "min_displacement_ratio": 0.35,
-                "opposite_cos_threshold": -0.35,
-                "uturn_min_forward_ratio": 0.45,
-                "uturn_return_ratio": 0.30,
-                "uturn_reverse_cos_threshold": -0.20,
-                "blur_face": False,
-                "blur_plate": True,
-            },
-            "walkway_out": {
-                "enabled": False,
-                "cooldown_sec": 60,
-                "outside_grace_sec": 1,
-                "boundary_margin_ratio": 0.05,
-                "blur_face": True,
-                "blur_plate": False,
-            },
-            "spreader_danger_zone": {
-                "enabled": False,
-                "cooldown_sec": 30,
-                "spreader_container_link_ratio": 1.25,
-                "danger_distance_ratio": 1.20,
-                "min_danger_distance_px": 30.0,
-                "trigger_hold_sec": 0.5,
-                "blur_face": True,
-                "blur_plate": True,
-            },
+                "ignore_top_ratio": 0.2
+            }
         },
         "models": {
-            "MAIN": "pctc_v1.dxnn",
+            "MAIN": "PCTC.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
             "HELMET": "helmet_260622.dxnn",
-            "PLATE": "license_plate_detector_v2.dxnn",
+            "PLATE": "license_plate_detector_v2.dxnn"
         },
         "model_confidences": {
-            "MAIN": 0.35,
+            "MAIN": 0.6,
             "FACE": 0.35,
             "HELMET": 0.85,
-            "PERSON": 0.30,
-            "HELMET_PERSON": 0.30,
-            "PLATE": 0.1,
+            "PERSON": 0.5,
+            "PLATE": 0.1
         },
         "model_output_formats": {
-            "MAIN": "auto",
+            "MAIN": "ppu",
             "FACE": "auto",
             "HELMET": "auto",
-            "PLATE": "yolo",
+            "PLATE": "yolo"
         },
         "model_engine_pool_sizes": {
             "MAIN": 2,
             "FACE": 1,
             "HELMET": 1,
-            "PLATE": 1,
-        },
-        "inference_runtime": {
-            "display_all_pctc_objects": True,
-            "max_detection_area_ratio": 0.95,
-            "log_first_output_signature": True,
-            "empty_detection_log_interval_sec": 10.0,
-            "filter_diagnostic_interval_sec": 10.0,
-            "helmet_person_assist_enabled": True,
-            "helmet_person_class_id": ID_H_PERSON,
-            "person_merge_iou_threshold": 0.35,
+            "PLATE": 1
         },
         "video_decode": {
             "backend": "gstreamer",
@@ -551,10 +340,8 @@ def load_system_config():
             "gstreamer_protocols": "tcp",
             "gstreamer_tcp_timeout_us": 3000000,
             "gstreamer_drop_on_latency": True,
-            "gstreamer_log_drain_sleep_sec": 0.002,
-            "gstreamer_loop_sleep_sec": 0.001,
             "log_interval_sec": 10.0,
-            "verbose_logs": False,
+            "verbose_logs": False
         },
         "BATCH_SIZE": 9,
         "REC_FPS": 3,
@@ -562,8 +349,6 @@ def load_system_config():
         "PERF_LOG_INTERVAL_SEC": 10.0,
         "REC_PRE_SEC": 10,
         "REC_POST_SEC": 10,
-        "VIDEO_EVENT_MARK_SEC": 2.0,
-        "VIDEO_EVENT_BORDER_THICKNESS": 18,
         "EVENT_FRAME_SAVE_DELAY_SEC": 10.0,
         "EVENT_FRAME_SAVE_MAX_COUNT": 0,
         "OUTPUT_RETENTION_DAYS": 14,
@@ -571,31 +356,54 @@ def load_system_config():
         "ROI_SETUP_REQUIRED_API_ENABLED": False,
         "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
         "VISUAL_ALARM_DURATION": 5.0,
+        "MAX_DETECTION_AREA_RATIO": 0.9
     }
 
     if not os.path.exists(CONFIG_COMMON_FILE):
         try:
-            with open(CONFIG_COMMON_FILE, "w", encoding="utf-8") as f:
+            with open(CONFIG_COMMON_FILE, 'w', encoding='utf-8') as f:
                 json.dump(default_config, f, indent=4, ensure_ascii=False)
-        except Exception as exc:
-            print(f"[Warning] 기본 설정 파일 저장 실패: {exc}")
+        except Exception:
+            pass
         return default_config
 
     try:
-        with open(CONFIG_COMMON_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_COMMON_FILE, 'r', encoding='utf-8') as f:
             loaded_config = json.load(f)
-        migrated_config = _migrate_system_config(loaded_config)
-        merged_config = deep_merge_dict(default_config, migrated_config)
-        merged_config = _migrate_system_config(merged_config)
+            
+        merged_config = deep_merge_dict(default_config, loaded_config)
 
+        # Preserve the old no-helmet duration setting under the field actually
+        # consumed by HelmetDetector, then remove the obsolete key.
+        loaded_no_helmet = loaded_config.get("event_config", {}).get("no_helmet", {})
+        merged_no_helmet = merged_config.get("event_config", {}).get("no_helmet", {})
+        if "trigger_total_sec" not in loaded_no_helmet and "trigger_sec" in loaded_no_helmet:
+            try:
+                merged_no_helmet["trigger_total_sec"] = float(loaded_no_helmet["trigger_sec"])
+            except Exception:
+                pass
+        merged_no_helmet.pop("trigger_sec", None)
+
+        # Remove keys from the mixed logistics-terminal branch.
+        for event_name in DEPRECATED_EVENT_NAMES:
+            merged_config.get("event_config", {}).pop(event_name, None)
+        for section_name in ("models", "model_confidences", "model_output_formats", "model_engine_pool_sizes"):
+            section = merged_config.get(section_name, {})
+            section.pop("MAIN_V2", None)
+            section.pop("MAIN_V3", None)
+            section.pop("SIGNALMAN", None)
+        merged_config.pop("INFERENCE_MODE", None)
+        
+        # [수정] 예전 버전 Config에 누락된 항목이 있다면 강제로 병합본을 파일에 덮어씀 (마이그레이션)
         try:
-            with open(CONFIG_COMMON_FILE, "w", encoding="utf-8") as f:
+            with open(CONFIG_COMMON_FILE, 'w', encoding='utf-8') as f:
                 json.dump(merged_config, f, indent=4, ensure_ascii=False)
-        except Exception as exc:
-            print(f"[Warning] 설정 파일 마이그레이션 쓰기 실패: {exc}")
+        except Exception as e:
+            logger.warning(f"설정 파일 마이그레이션 쓰기 실패: {e}")
+
         return merged_config
-    except Exception as exc:
-        print(f"[Warning] 설정 파일 로드 실패. 기본값을 사용합니다: {exc}")
+    except Exception as e:
+        print(f"[Warning] 설정 파일 로드 실패. 기본값을 사용합니다: {e}")
         return default_config
 
 SYS_CFG = load_system_config()
@@ -614,7 +422,8 @@ def get_model_output_format(model_key):
     formats = SYS_CFG.get("model_output_formats", {})
     return str(formats.get(model_key, "auto")).strip().lower()
 
-def get_main_model_output_format(model_path=None):
+def get_main_model_output_format(model_path):
+    # MAIN output decoding is controlled only by model_output_formats.MAIN.
     return get_model_output_format("MAIN")
 
 def get_model_engine_pool_size(model_key, default=1):
@@ -630,193 +439,61 @@ def detection_array(rows):
         return np.empty((0, 6))
     return np.array(rows, dtype=float)
 
-def split_unified_event_detections(
-    raw_dets,
-    main_conf,
-    person_conf,
-    max_area_threshold,
-    class_ids=None,
-):
-    selected_class_ids = set(class_ids or PCTC_MAIN_TRACK_CLASS_IDS)
-    selected_class_ids &= PCTC_MAIN_TRACK_CLASS_IDS
+def filter_pctc_main_detections(raw_dets, main_conf, person_conf, max_area_threshold):
+    """Filter the single PCTC model output for tracking and event logic."""
     filtered = []
-
     if raw_dets is None:
         return detection_array(filtered)
 
     for det in raw_dets:
-        if len(det) < 6:
-            continue
         obj_w = max(0.0, float(det[2]) - float(det[0]))
         obj_h = max(0.0, float(det[3]) - float(det[1]))
-        if (obj_w * obj_h) > float(max_area_threshold):
+        if obj_w <= 0.0 or obj_h <= 0.0:
+            continue
+        if (obj_w * obj_h) > max_area_threshold:
             continue
 
         class_id = int(det[5])
-        if class_id in PCTC_MAIN_IGNORED_CLASS_IDS or class_id not in selected_class_ids:
+        score = float(det[4])
+        if class_id in PCTC_MAIN_IGNORED_CLASS_IDS:
+            continue
+        if class_id not in PCTC_MAIN_TRACK_CLASS_IDS:
             continue
 
-        confidence = float(det[4])
         threshold = person_conf if class_id == ID_PCTC_PERSON else main_conf
-        if confidence >= threshold:
+        if score >= threshold:
             filtered.append(det)
 
     return detection_array(filtered)
 
-def split_helmet_model_detections(
-    raw_dets,
-    helmet_conf,
-    person_conf,
-    max_area_threshold,
-    person_class_id=ID_H_PERSON,
-):
-    """Split the dedicated HELMET model into helmet/head tracks and person-assist detections.
-
-    HELMET model classes are 0=helmet, 1=head, 2=person.  The person result is remapped
-    to the shared PCTC person class ID before it reaches the main tracker.
-    """
-    safety_rows = []
-    person_rows = []
-    if raw_dets is None:
-        return detection_array(safety_rows), detection_array(person_rows)
-
-    for det in raw_dets:
-        if len(det) < 6:
-            continue
-        obj_w = max(0.0, float(det[2]) - float(det[0]))
-        obj_h = max(0.0, float(det[3]) - float(det[1]))
-        if (obj_w * obj_h) > float(max_area_threshold):
-            continue
-
-        class_id = int(det[5])
-        confidence = float(det[4])
-        if class_id in (ID_H_HELMET, ID_H_HEAD):
-            if confidence >= helmet_conf:
-                safety_rows.append(det)
-        elif class_id == int(person_class_id) and confidence >= person_conf:
-            person_det = list(map(float, det[:6]))
-            person_det[5] = float(ID_PCTC_PERSON)
-            person_rows.append(person_det)
-
-    return detection_array(safety_rows), detection_array(person_rows)
-
-
-def _fuse_person_detection(main_det, helmet_det):
-    """Fuse two matched person detections into one shared person box.
-
-    Coordinates use the union box so a close-up partial detection from one model does not
-    discard body extent supplied by the other model. Confidence uses the stronger score.
-    """
-    return [
-        min(float(main_det[0]), float(helmet_det[0])),
-        min(float(main_det[1]), float(helmet_det[1])),
-        max(float(main_det[2]), float(helmet_det[2])),
-        max(float(main_det[3]), float(helmet_det[3])),
-        max(float(main_det[4]), float(helmet_det[4])),
-        float(ID_PCTC_PERSON),
-    ]
-
-
-def merge_person_detections(main_dets, helmet_person_dets, iou_threshold=0.35):
-    """One-to-one IoU fusion for PCTC-person and HELMET-person detections.
-
-    Non-person PCTC objects pass through untouched. Person pairs are greedily matched by
-    descending IoU, fused once, and unmatched detections from either model are preserved.
-    The returned array therefore contains at most one bbox for each matched physical person.
-    """
-    main_rows = [list(map(float, det[:6])) for det in (main_dets if main_dets is not None else []) if len(det) >= 6]
-    helmet_rows = [list(map(float, det[:6])) for det in (helmet_person_dets if helmet_person_dets is not None else []) if len(det) >= 6]
-
-    non_person = [det for det in main_rows if int(det[5]) != ID_PCTC_PERSON]
-    main_persons = [det for det in main_rows if int(det[5]) == ID_PCTC_PERSON]
-    helmet_persons = [det for det in helmet_rows if int(det[5]) == ID_PCTC_PERSON]
-
-    threshold = min(1.0, max(0.0, float(iou_threshold)))
-    candidates = []
-    for main_index, main_det in enumerate(main_persons):
-        for helmet_index, helmet_det in enumerate(helmet_persons):
-            iou = float(calculate_iou(main_det[:4], helmet_det[:4]))
-            if iou >= threshold:
-                candidates.append((iou, main_index, helmet_index))
-    candidates.sort(reverse=True, key=lambda item: item[0])
-
-    matched_main = set()
-    matched_helmet = set()
-    fused_persons = []
-    for _iou, main_index, helmet_index in candidates:
-        if main_index in matched_main or helmet_index in matched_helmet:
-            continue
-        matched_main.add(main_index)
-        matched_helmet.add(helmet_index)
-        fused_persons.append(_fuse_person_detection(main_persons[main_index], helmet_persons[helmet_index]))
-
-    fused_persons.extend(det for index, det in enumerate(main_persons) if index not in matched_main)
-    fused_persons.extend(det for index, det in enumerate(helmet_persons) if index not in matched_helmet)
-    return detection_array(non_person + fused_persons), {
-        "main_person": len(main_persons),
-        "helmet_person": len(helmet_persons),
-        "fused_pairs": len(matched_main),
-        "unmatched_main": len(main_persons) - len(matched_main),
-        "unmatched_helmet": len(helmet_persons) - len(matched_helmet),
-    }
-
-
-def draw_abnormal_drive_zones(image, zones, thickness=2):
-    if image is None:
-        return image
-    for index, zone in enumerate(zones or [], start=1):
-        polygon = zone.get("roi_poly", []) if isinstance(zone, dict) else []
-        direction = zone.get("direction_points", []) if isinstance(zone, dict) else []
-        if len(polygon) >= 3:
-            poly = np.array(polygon, dtype=np.int32)
-            cv2.polylines(image, [poly], True, (255, 0, 255), thickness)
-            label_point = tuple(map(int, polygon[0]))
-            cv2.putText(
-                image,
-                f"ABNORMAL ROI #{index}",
-                (label_point[0], max(18, label_point[1] - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 0, 255),
-                1,
-                cv2.LINE_AA,
-            )
-        if len(direction) == 2:
-            start_pt = tuple(map(int, direction[0]))
-            end_pt = tuple(map(int, direction[1]))
-            cv2.arrowedLine(image, start_pt, end_pt, (255, 0, 255), thickness, tipLength=0.2)
-            cv2.putText(
-                image,
-                f"ALLOWED #{index}",
-                (start_pt[0], max(18, start_pt[1] - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 0, 255),
-                1,
-                cv2.LINE_AA,
-            )
-    return image
-
 
 def create_roi_snapshot(cam, frame):
-    """현재 카메라 프레임에 공용 ROI, abnormal-drive ROI와 이벤트명을 그립니다."""
-    if frame is None:
-        return None
-    image = frame.copy()
+    """현재 카메라 프레임에 ROI와 설정된 이벤트 명만 그립니다."""
+    if frame is None: return None
+    img = frame.copy()
 
+    # 1. ROI Polygon 그리기
     if cam.roi_poly and len(cam.roi_poly) > 2:
-        cv2.polylines(image, [np.array(cam.roi_poly, np.int32)], True, (0, 255, 255), 2)
-    draw_abnormal_drive_zones(image, getattr(cam, "abnormal_drive_zones", []), thickness=2)
+        cv2.polylines(img, [np.array(cam.roi_poly, np.int32)], True, (0, 255, 255), 2)
 
+    # 2. ROI Line 그리기
+    if cam.roi_lines:
+        for i in range(0, len(cam.roi_lines), 2):
+            if i + 1 < len(cam.roi_lines):
+                cv2.line(img, tuple(cam.roi_lines[i]), tuple(cam.roi_lines[i+1]), (0, 0, 255), 2)
+
+    # 3. 설정된 이벤트 명 좌측 상단에 표시
     y_pos = 30
-    for event_name in cam.events:
-        if event_name in (ROI_CHANGE_EVENT, ROI_CHANGE_APPLY_EVENT):
+    for evt in cam.events:
+        # [수정] roi_change 이벤트는 관제 스냅샷 텍스트 렌더링에서 제외합니다.
+        if evt in (ROI_CHANGE_EVENT, ROI_CHANGE_APPLY_EVENT):
             continue
-        display_name = EVENT_REGISTRY[event_name].gui_name if event_name in EVENT_REGISTRY else event_name.upper()
-        cv2.putText(image, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
+
+        display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
+        cv2.putText(img, f"Event: {display_name}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
         y_pos += 30
 
-    return image
+    return img
 
 def _send_roi_snapshot_task( cam_id, terminal_id, img, roi_info_str, w, h, is_req_roi_setup=False, send_type="hourly"):
     """관제 서버로 ROI 스냅샷을 백그라운드에서 전송합니다."""
@@ -1205,13 +882,6 @@ def get_git_metadata():
         pass
     return meta
 
-def ccw(p1, p2, p3):
-    """세 점의 방향성을 판별합니다. (선분 교차 알고리즘용)"""
-    val = (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
-    if val > 0: return 1
-    elif val < 0: return -1
-    return 0
-
 def normalize_roi_points(points, width, height):
     if not points or width <= 0 or height <= 0:
         return []
@@ -1221,98 +891,6 @@ def denormalize_roi_points(points, width, height):
     if not points or width <= 0 or height <= 0:
         return []
     return [[int(round(float(x) * width)), int(round(float(y) * height))] for x, y in points]
-
-def _sanitize_norm_points(value, min_points=0, exact_points=None):
-    if not isinstance(value, list):
-        return []
-    points = []
-    for point in value:
-        if not isinstance(point, (list, tuple)) or len(point) < 2:
-            return []
-        try:
-            x = float(point[0])
-            y = float(point[1])
-        except Exception:
-            return []
-        if not (math.isfinite(x) and math.isfinite(y)):
-            return []
-        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-            return []
-        points.append([round(x, 6), round(y, 6)])
-    if exact_points is not None and len(points) != int(exact_points):
-        return []
-    if len(points) < int(min_points):
-        return []
-    return points
-
-
-def sanitize_abnormal_drive_zones(value):
-    if not isinstance(value, list):
-        return []
-    valid_zones = []
-    for zone in value:
-        if not isinstance(zone, dict):
-            continue
-        polygon = _sanitize_norm_points(zone.get("roi_poly_norm"), min_points=3)
-        direction = _sanitize_norm_points(zone.get("direction_points_norm"), exact_points=2)
-        if len(polygon) < 3 or len(direction) != 2 or direction[0] == direction[1]:
-            continue
-        valid_zones.append({
-            "roi_poly_norm": polygon,
-            "direction_points_norm": direction,
-        })
-    return valid_zones
-
-
-def sanitize_camera_config(raw_conf):
-    conf = dict(raw_conf or {})
-    raw_events = conf.get("events") if isinstance(conf.get("events"), list) else []
-    events = []
-    for raw_name in raw_events:
-        event_name = EVENT_NAME_ALIASES.get(str(raw_name), str(raw_name))
-        if event_name not in SUPPORTED_CAMERA_EVENTS or event_name in events:
-            continue
-        events.append(event_name)
-
-    roi_poly_norm = _sanitize_norm_points(conf.get("roi_poly_norm"), min_points=0)
-    zones = sanitize_abnormal_drive_zones(conf.get("abnormal_drive_zones_norm"))
-
-    legacy_direction = []
-    for legacy_key in ("wrong_way_direction_norm", "abnormal_drive_direction_norm"):
-        if not legacy_direction:
-            legacy_direction = _sanitize_norm_points(conf.get(legacy_key), exact_points=2)
-        conf.pop(legacy_key, None)
-
-    if (
-        "abnormal_drive" in events
-        and not zones
-        and len(roi_poly_norm) >= 3
-        and len(legacy_direction) == 2
-        and legacy_direction[0] != legacy_direction[1]
-    ):
-        zones = [{
-            "roi_poly_norm": roi_poly_norm,
-            "direction_points_norm": legacy_direction,
-        }]
-
-    if not any(event_name in ROI_POLYGON_EVENT_NAMES for event_name in events):
-        roi_poly_norm = []
-
-    conf["events"] = events
-    conf["roi_poly_norm"] = roi_poly_norm
-    conf["roi_lines_norm"] = []
-    conf["abnormal_drive_zones_norm"] = zones
-    return conf
-
-
-def sanitize_camera_configs(raw_configs):
-    if not isinstance(raw_configs, dict):
-        return {}
-    return {
-        str(camera_key): sanitize_camera_config(camera_conf)
-        for camera_key, camera_conf in raw_configs.items()
-        if isinstance(camera_conf, dict)
-    }
 
 def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
     """여러 카메라의 영상을 하나의 모자이크 화면으로 합성합니다."""
@@ -1449,36 +1027,57 @@ def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, b
         logger.error(f" [API 기타 예외 발생]: {e}\n{traceback.format_exc()}")
 
 def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None):
-    """관제 API용 이미지에 이벤트 객체를 표시합니다."""
+    """Create the API evidence image with event boxes."""
     api_img = frame.copy()
-    draw_items = objects_meta or [{"label": event_type, "box": bbox, "tid": tid}]
+    target_tid = int(tid) if tid is not None else None
     drawn = False
 
+    draw_items = objects_meta or [{"label": event_type, "box": bbox, "tid": tid}]
     for obj in draw_items:
         try:
             x1, y1, x2, y2 = int_box(obj.get("box", bbox))
         except Exception:
             continue
-        class_name = str(obj.get("class_name") or obj.get("label") or event_type)
-        cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+        obj_tid = None
+        try:
+            if obj.get("tid") is not None:
+                obj_tid = int(obj.get("tid"))
+        except Exception:
+            obj_tid = None
+
+        is_target = target_tid is not None and obj_tid == target_tid
+        color = (0, 0, 255)
+        thickness = 2 if is_target else 1
+        cv2.rectangle(api_img, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(
             api_img,
-            f"{event_type}: {class_name}",
+            str(event_type),
             (x1, max(20, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (0, 0, 255),
-            2,
+            color,
+            1,
             cv2.LINE_AA,
         )
         drawn = True
 
     if not drawn:
         x1, y1, x2, y2 = map(int, bbox)
-        cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(api_img, str(event_type), (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
+        cv2.putText(
+            api_img,
+            str(event_type),
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
     return api_img
+
 
 def _write_image_file(path, image, label="image", event_id="-"):
     try:
@@ -1549,7 +1148,7 @@ def _write_jsonl_records(path, records):
     except Exception as e:
         logger.error(f"[InferLog] JSONL write failed: {path} | {e}")
 
-def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, trajectories=None, event_id=None, event_ts=None):
+def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99999", cctv_id=1, objects_meta=None, event_id=None, event_ts=None):
     """원본 프레임 이미지를 로컬에 저장하고 탐지 메타데이터를 API 큐에 등록합니다."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
@@ -1577,7 +1176,6 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
             "api_img_path": api_img_path,
             "image_basename": fname
         }
-        
         api_img = _draw_event_api_image(img, event_type, [x1, y1, x2, y2], tid, objects_meta)
 
         h, w = frame.shape[:2]
@@ -1585,12 +1183,9 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
         if objects_meta:
             ai_detected_bboxes = []
             for o in objects_meta:
-
                 item = {
                     "box": [int(b) for b in o['box']],
-                    "label": str(o.get("class_name") or o.get("label") or event_type),
-                    "class_name": str(o.get("class_name") or pctc_class_name(o.get("class_id", -1))),
-                    "class_id": int(o.get("class_id", -1)),
+                    "label": event_type,
                     "score": round(float(o.get('score', 0.95)), 2)
                 }
                 if o.get('tid') is not None:
@@ -1650,66 +1245,20 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, terminal_id="99
 # [6] DeepX NPU 모델 추론 (YOLOv8 버그 픽스 반영)
 # ==========================================
 class YoLoDeepX:
-    """DEEPX inference wrapper with runtime output-format detection.
-
-    The runtime metadata is preferred, but every first output is inspected again so a
-    stale system_config.json value cannot force a PPU tensor through a raw-YOLO parser
-    (or the reverse).  PPU BBOX records follow dxrt::DeviceBoundingBox_t (32 bytes).
-    """
-
-    PPU_BBOX_STRIDE = 32
-    PPU_FACE_STRIDE = 64
-
-    def __init__(
-        self,
-        engine_path,
-        output_format="auto",
-        pool_size=1,
-        model_key=None,
-        class_count=None,
-        ppu_box_format="auto",
-        output_hint=None,
-    ):
+    def __init__(self, engine_path, output_format="auto", pool_size=1):
         if not HAS_DX_ENGINE:
             raise RuntimeError("dx_engine is not installed; YoLoDeepX can only run on a DeepX/NPU runtime.")
 
         self.engine_path = engine_path
-        self.model_key = str(model_key or os.path.basename(str(engine_path or "")) or "MODEL")
-        self.class_count = int(class_count) if class_count is not None else None
         self.requested_output_format = str(output_format or "auto").strip().lower()
-        self.configured_output_format = self._normalize_configured_output_format(output_format)
-        self.output_hint = self._normalize_configured_output_format(output_hint)
-        self.output_format = self.configured_output_format or self.output_hint or "auto"
-        self.ppu_box_format = self._normalize_ppu_box_format(ppu_box_format)
+        self.output_format = self._normalize_configured_output_format(output_format) or "yolo"
         self.pool_size = max(1, int(pool_size or 1))
         self.engine_pool = queue.Queue(maxsize=self.pool_size)
         self.engines_ref = []
-
         self.input_height = 640
         self.input_width = 640
         self.input_layout = "hwc"
         self.input_has_batch = False
-        self.input_dtype = np.uint8
-        self.input_dtype_name = "uint8"
-        self.input_metadata_detail = "metadata unavailable"
-
-        self.output_metadata_format = None
-        self.output_metadata_detail = "metadata unavailable"
-        self.output_metadata_text = ""
-        self.runtime_output_format = None
-        self._first_output_logged = False
-        self._last_empty_log_at = 0.0
-        self._last_format_change = None
-
-        runtime_cfg = SYS_CFG.get("inference_runtime", {}) if isinstance(SYS_CFG, dict) else {}
-        self.log_first_output_signature = bool(runtime_cfg.get("log_first_output_signature", True))
-        try:
-            self.empty_detection_log_interval_sec = max(
-                1.0,
-                float(runtime_cfg.get("empty_detection_log_interval_sec", 10.0)),
-            )
-        except Exception:
-            self.empty_detection_log_interval_sec = 10.0
 
         try:
             io = InferenceOption()
@@ -1718,24 +1267,16 @@ class YoLoDeepX:
                 self.engine_pool.put(engine)
                 self.engines_ref.append(engine)
 
-            first_engine = self.engines_ref[0]
-            self._load_input_shape(first_engine)
-            self.output_format = self._resolve_output_format(output_format, first_engine)
+            self._load_input_shape(self.engines_ref[0])
+            self.output_format = self._resolve_output_format(output_format, self.engines_ref[0])
             logger.info(
-                f"[DeepX][{self.model_key}] model loaded: {os.path.basename(self.engine_path)} "
-                f"(output={self.output_format}, requested={self.requested_output_format}, "
-                f"hint={self.output_hint or '-'}, pool={self.pool_size}, "
-                f"input={self.input_width}x{self.input_height}, "
-                f"layout={self.input_layout}, dtype={self.input_dtype_name})"
+                f"[DeepX] 모델 로드 성공: {os.path.basename(self.engine_path)} "
+                f"(output={self.output_format}, pool={self.pool_size}, "
+                f"input={self.input_width}x{self.input_height}, layout={self.input_layout})"
             )
-            logger.info(
-                f"[DeepX][{self.model_key}] input metadata: {self.input_metadata_detail} | "
-                f"output metadata: {self.output_metadata_detail}"
-            )
-        except Exception as exc:
-            self.release()
-            logger.error(f"[DeepX Load Fail][{self.model_key}] engine init failed ({engine_path}): {exc}")
-            raise
+        except Exception as e:
+            logger.error(f"[DeepX Load Fail] 엔진 초기화 실패 ({engine_path}): {e}")
+            raise e
 
     def __del__(self):
         self.release()
@@ -1755,858 +1296,115 @@ class YoLoDeepX:
 
     def _normalize_configured_output_format(self, output_format):
         fmt = str(output_format or "auto").strip().lower()
-        if fmt in ("", "auto", "detect"):
+        if fmt in ["", "auto"]:
             return None
-        if fmt in ("ppu", "bbox", "deepx_ppu", "yolov8_ppu"):
+        if fmt in ["ppu", "deepx_ppu", "yolov8_ppu"]:
             return "ppu"
-        if fmt in ("ppu_face", "face_ppu", "face"):
-            return "ppu_face"
-        if fmt in ("yolo_xyxy", "xyxy"):
+        if fmt in ["yolo_xyxy", "xyxy"]:
             return "yolo_xyxy"
-        if fmt in ("yolo_tlwh", "tlwh"):
+        if fmt in ["yolo_tlwh", "tlwh"]:
             return "yolo_tlwh"
-        if fmt in ("end2end", "yolo_end2end", "nms", "xyxy_score_class"):
-            return "yolo_end2end"
-        if fmt in ("yolo", "yolov8", "raw", "standard", "raw_yolo"):
+        if fmt in ["yolo", "yolov8", "raw", "standard", "raw_yolo"]:
             return "yolo"
-        logger.warning(
-            f"[DeepX][{getattr(self, 'model_key', 'MODEL')}] unknown output format "
-            f"'{output_format}'; runtime detection will be used."
-        )
-        return None
-
-    @staticmethod
-    def _normalize_ppu_box_format(value):
-        fmt = str(value or "auto").strip().lower()
-        if fmt in ("corner", "xyxy", "x1y1x2y2"):
-            return "corner"
-        if fmt in ("center", "xywh", "cxcywh"):
-            return "center"
-        return "auto"
-
-    def _resolve_output_format(self, output_format, engine=None):
-        configured = self._normalize_configured_output_format(output_format)
-        detected, detail = self._detect_output_format_from_engine(engine)
-        self.output_metadata_format = detected
-        self.output_metadata_detail = detail or "metadata unavailable"
-
-        if detected:
-            if configured and configured != detected and not ({configured, detected} <= {"ppu", "ppu_face"}):
-                logger.warning(
-                    f"[DeepX][{self.model_key}] configured output={configured} disagrees with "
-                    f"runtime metadata={detected}; metadata wins ({self.output_metadata_detail})."
-                )
-            return detected
-        if configured:
-            logger.info(
-                f"[DeepX][{self.model_key}] output metadata was inconclusive; "
-                f"using configured format={configured}."
-            )
-            return configured
-        if self.output_hint:
-            logger.info(
-                f"[DeepX][{self.model_key}] output metadata was inconclusive; "
-                f"using non-binding hint={self.output_hint} until the first output is inspected."
-            )
-            return self.output_hint
-
-        fallback = self._detect_output_format_from_filename()
-        logger.warning(
-            f"[DeepX][{self.model_key}] output metadata was inconclusive "
-            f"({self.output_metadata_detail}); initial fallback={fallback}. "
-            "The first inference output will be inspected again."
-        )
-        return fallback
-
-    def _detect_output_format_from_filename(self):
-        model_name = os.path.basename(str(self.engine_path or "")).lower()
-        if ("_ppu" in model_name or "-ppu" in model_name) and "face" in model_name:
-            return "ppu_face"
-        if "_ppu" in model_name or "-ppu" in model_name:
-            return "ppu"
+        logger.warning(f"[DeepX] 알 수 없는 모델 출력 포맷({output_format})입니다. yolo 후처리로 동작합니다.")
         return "yolo"
 
-    def _detect_output_format_from_engine(self, engine):
-        if engine is None:
-            return None, "engine unavailable"
-
-        info_reader = None
-        for method_name in ("get_output_tensors_info", "get_outputs_info", "get_output_tensor_info"):
-            if hasattr(engine, method_name):
-                info_reader = getattr(engine, method_name)
-                break
-        if info_reader is None:
-            return None, "output tensor metadata API unavailable"
-
-        try:
-            output_info = info_reader()
-        except Exception as exc:
-            return None, f"output tensor metadata read failed: {exc}"
-
-        entries = self._tensor_info_entries(output_info)
-        if not entries:
-            return None, "empty output tensor metadata"
-
-        metadata_text = self._safe_json_text(entries).lower()
-        self.output_metadata_text = metadata_text
-        shapes = [shape for shape in (self._tensor_shape(entry) for entry in entries) if shape]
-        dtype_values = [self._tensor_dtype(entry) for entry in entries]
-        dtypes = [str(value).lower() for value in dtype_values if str(value)]
-        detail = f"shapes={shapes or '-'} dtypes={dtypes or '-'}"
-
-        numeric_types = set()
-        for value in dtype_values:
-            try:
-                numeric_types.add(int(value))
-            except Exception:
-                continue
-
-        if any("face" in dtype for dtype in dtypes) or 11 in numeric_types:
-            return "ppu_face", detail
-        if any("bbox" in dtype for dtype in dtypes) or 10 in numeric_types:
-            return "ppu", detail
-        if re.search(r"(?:^|[^a-z])face(?:[^a-z]|$)", metadata_text) and "type" in metadata_text:
-            return "ppu_face", detail
-        if "bbox" in metadata_text or "postprocess" in metadata_text or "ppu" in metadata_text:
-            return "ppu", detail
-        if self._metadata_looks_raw_yolo(shapes, dtypes):
-            return "yolo", detail
-        if self._metadata_looks_ppu(shapes, dtypes):
-            return "ppu", detail
-        return None, detail
-
-    @staticmethod
-    def _tensor_info_entries(value):
-        if value is None:
-            return []
-        if isinstance(value, dict):
-            for key in ("outputs", "output", "tensors", "tensor_info"):
-                nested = value.get(key)
-                if isinstance(nested, (list, tuple)):
-                    return list(nested)
-            return [value]
-        if isinstance(value, (list, tuple)):
-            return list(value)
-        return [value]
-
-    @staticmethod
-    def _safe_json_text(value):
-        try:
-            return json.dumps(value, ensure_ascii=False, default=str)
-        except Exception:
-            return str(value)
-
-    @staticmethod
-    def _tensor_shape(entry):
-        shape = None
-        if isinstance(entry, dict):
-            for key in ("shape", "dims", "dimension", "tensor_shape"):
-                if key in entry:
-                    shape = entry.get(key)
-                    break
-        else:
-            for key in ("shape", "dims", "dimension", "tensor_shape"):
-                if hasattr(entry, key):
-                    shape = getattr(entry, key)
-                    break
-        if shape is None:
-            return []
-        try:
-            return [int(x) for x in list(shape)]
-        except Exception:
-            return [int(x) for x in re.findall(r"-?\d+", str(shape))]
-
-    @staticmethod
-    def _tensor_dtype(entry):
-        if isinstance(entry, dict):
-            for key in ("dtype", "data_type", "type", "format"):
-                if key in entry and entry.get(key) is not None:
-                    return entry.get(key)
-        else:
-            for key in ("dtype", "data_type", "type", "format"):
-                if hasattr(entry, key):
-                    return getattr(entry, key)
-        return ""
-
-    @staticmethod
-    def _shape_without_ones(shape):
-        return [int(x) for x in shape if int(x) > 1]
-
-    def _metadata_looks_raw_yolo(self, shapes, dtypes):
-        for shape in shapes:
-            dims = self._shape_without_ones(shape)
-            if len(dims) < 2:
-                continue
-            if max(dims) >= 1000 and any(5 <= dim <= 512 for dim in dims):
-                return True
-        return False
-
-    def _metadata_looks_ppu(self, shapes, dtypes):
-        has_byte_output = any(
-            dtype in ("uint8", "byte", "bytes", "void", "v32")
-            or "uint8" in dtype
-            or "bbox" in dtype
-            for dtype in dtypes
-        )
-        if has_byte_output and any(self._shape_looks_ppu_rows(shape) for shape in shapes):
-            return True
-        return any(self._shape_looks_ppu_rows(shape) for shape in shapes) and not self._metadata_looks_raw_yolo(shapes, dtypes)
-
-    @staticmethod
-    def _shape_looks_ppu_rows(shape):
-        dims = [int(x) for x in shape if int(x) > 1]
-        if not dims:
-            return False
-        if len(dims) == 1:
-            return dims[0] <= 4096 or (dims[0] % 32 == 0 and dims[0] <= 131072)
-        return dims[-1] in (6, 7, 8, 32, 64) and max(dims) < 4096
-
-    def _load_input_shape(self, engine):
-        try:
-            input_info = engine.get_input_tensors_info()
-            entries = self._tensor_info_entries(input_info)
-            if not entries:
-                raise ValueError("empty input tensor metadata")
-            entry = entries[0]
-            shape = self._tensor_shape(entry)
-            dtype_text = str(self._tensor_dtype(entry) or "uint8").lower()
-            self.input_metadata_detail = f"shape={shape or '-'} dtype={dtype_text or '-'}"
-        except Exception as exc:
-            logger.warning(
-                f"[DeepX][{self.model_key}] input metadata read failed; using HWC uint8 640x640: {exc}"
-            )
-            return
-
-        if "float" in dtype_text or dtype_text in ("1", "fp32", "f32"):
-            self.input_dtype = np.float32
-            self.input_dtype_name = "float32"
-        else:
-            self.input_dtype = np.uint8
-            self.input_dtype_name = "uint8"
-
-        if len(shape) == 4:
-            self.input_has_batch = True
-            if shape[-1] in (1, 3, 4):
-                self.input_layout = "nhwc"
-                self.input_height, self.input_width = int(shape[1]), int(shape[2])
-            elif shape[1] in (1, 3, 4):
-                self.input_layout = "nchw"
-                self.input_height, self.input_width = int(shape[2]), int(shape[3])
-        elif len(shape) == 3:
-            self.input_has_batch = False
-            if shape[-1] in (1, 3, 4):
-                self.input_layout = "hwc"
-                self.input_height, self.input_width = int(shape[0]), int(shape[1])
-            elif shape[0] in (1, 3, 4):
-                self.input_layout = "chw"
-                self.input_height, self.input_width = int(shape[1]), int(shape[2])
-
-        if self.input_height <= 0 or self.input_width <= 0:
-            self.input_height = 640
-            self.input_width = 640
-
-    def letter_box(self, img, new_shape=None):
-        if new_shape is None:
-            new_shape = (self.input_height, self.input_width)
-        h, w = img.shape[:2]
-        scale = min(float(new_shape[0]) / max(1, h), float(new_shape[1]) / max(1, w))
-        nw = max(1, int(round(w * scale)))
-        nh = max(1, int(round(h * scale)))
-        resized = cv2.resize(img, (nw, nh))
-        canvas = np.full((int(new_shape[0]), int(new_shape[1]), 3), 114, dtype=np.uint8)
-        dw = (int(new_shape[1]) - nw) // 2
-        dh = (int(new_shape[0]) - nh) // 2
-        canvas[dh:dh + nh, dw:dw + nw] = resized
-        return canvas, scale, (dw, dh)
-
-    def _prepare_input_tensor(self, npu_input):
-        # DX-RT's Python API receives one sample per list item.  A leading batch
-        # dimension from model metadata must therefore not be added here.
-        input_tensor = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
-        if self.input_layout in ("nchw", "chw"):
-            input_tensor = np.transpose(input_tensor, (2, 0, 1))
-        if self.input_dtype == np.float32:
-            input_tensor = input_tensor.astype(np.float32) / 255.0
-        else:
-            input_tensor = input_tensor.astype(np.uint8, copy=False)
-        return np.ascontiguousarray(input_tensor)
-
-    @staticmethod
-    def _normalize_outputs(output_tensor):
-        if output_tensor is None:
-            return []
-        if isinstance(output_tensor, (bytes, bytearray, memoryview, np.ndarray)):
-            return [output_tensor]
-        try:
-            outputs = list(output_tensor)
-        except TypeError:
-            return [output_tensor]
-        if len(outputs) == 1 and isinstance(outputs[0], (list, tuple)):
-            return list(outputs[0])
-        return outputs
-
-    def _output_tensor_signature(self, output_tensor):
-        parts = []
-        for index, tensor in enumerate(self._normalize_outputs(output_tensor)[:8]):
-            try:
-                arr = np.asarray(tensor)
-                fields = tuple(arr.dtype.names or ())
-                field_text = f",fields={fields}" if fields else ""
-                parts.append(
-                    f"#{index}:shape={tuple(arr.shape)},dtype={arr.dtype},bytes={arr.nbytes}{field_text}"
-                )
-            except Exception as exc:
-                try:
-                    size = len(tensor)
-                except Exception:
-                    size = "?"
-                parts.append(f"#{index}:type={type(tensor).__name__},len={size},error={exc}")
-        return " | ".join(parts) if parts else "no output tensors"
-
-    @staticmethod
-    def _squeezed_2d_array(tensor):
-        arr = np.asarray(tensor)
-        if arr.size == 0:
-            return None
-        arr = np.squeeze(arr)
-        if arr.ndim == 1:
-            arr = arr.reshape(1, -1)
-        if arr.ndim != 2:
-            return None
-        return arr
-
-    def _looks_like_raw_yolo_array(self, tensor):
-        try:
-            arr = np.asarray(tensor)
-            if arr.dtype.kind not in "fc":
-                return False
-            dims = [int(x) for x in arr.shape if int(x) > 1]
-            return len(dims) >= 2 and max(dims) >= 1000 and any(5 <= dim <= 512 for dim in dims)
-        except Exception:
-            return False
-
-    def _looks_like_end2end_array(self, tensor):
-        try:
-            arr = self._squeezed_2d_array(tensor)
-            if arr is None or arr.dtype.kind not in "fc" or arr.shape[1] not in (6, 7):
-                return False
-            sample = np.asarray(arr[: min(64, len(arr)), :6], dtype=np.float64)
-            if sample.size == 0 or not np.all(np.isfinite(sample)):
-                return False
-            scores = sample[:, 4]
-            labels = sample[:, 5]
-            return (
-                np.all((scores >= -1e-6) & (scores <= 1.01))
-                and np.mean(np.abs(labels - np.round(labels)) < 1e-4) >= 0.9
-            )
-        except Exception:
-            return False
-
-    def _to_uint8_buffer(self, tensor):
-        if isinstance(tensor, (bytes, bytearray, memoryview)):
-            return np.frombuffer(tensor, dtype=np.uint8).copy()
-        arr = np.asarray(tensor)
-        if arr.size == 0:
-            return np.empty((0,), dtype=np.uint8)
-        if arr.dtype.kind == "O":
-            raise TypeError("object-dtype output cannot be interpreted as a packed PPU buffer")
-        return np.ascontiguousarray(arr).view(np.uint8).ravel().copy()
-
-    def _packed_ppu_summary(self, output_tensor, stride=None, conf_thres=0.0):
-        outputs = self._normalize_outputs(output_tensor)
-        if not outputs:
-            return {"plausible": False, "reason": "no output tensors"}
-        try:
-            flat = self._to_uint8_buffer(outputs[0])
-        except Exception as exc:
-            return {"plausible": False, "reason": str(exc)}
-
-        candidate_strides = [int(stride)] if stride else []
-        for value in (self.PPU_BBOX_STRIDE, self.PPU_FACE_STRIDE):
-            if value not in candidate_strides:
-                candidate_strides.append(value)
-
-        for record_stride in candidate_strides:
-            if record_stride <= 0 or flat.size == 0 or flat.size % record_stride != 0:
-                continue
-            records = flat.reshape(flat.size // record_stride, record_stride)
-            if len(records) > 4096 or record_stride < 24:
-                continue
-            coords = np.ascontiguousarray(records[:, :16]).view("<f4").reshape(-1, 4)
-            scores = np.ascontiguousarray(records[:, 20:24]).view("<f4").reshape(-1)
-            if record_stride == self.PPU_BBOX_STRIDE:
-                labels = np.ascontiguousarray(records[:, 24:28]).view("<u4").reshape(-1)
-            else:
-                labels = np.zeros(len(scores), dtype=np.uint32)
-            finite = np.isfinite(scores) & np.all(np.isfinite(coords), axis=1)
-            score_range_ok = finite & (scores >= -1e-6) & (scores <= 1.01)
-            nonnegative_size = finite & (coords[:, 2] >= 0.0) & (coords[:, 3] >= 0.0)
-            valid_fraction = float(np.mean(score_range_ok)) if len(scores) else 0.0
-            plausible = bool(
-                len(scores)
-                and valid_fraction >= 0.95
-                and float(np.mean(nonnegative_size)) >= 0.90
-            )
-            positive = score_range_ok & (scores > 0.0)
-            label_sample = sorted({int(x) for x in labels[positive][:32]})[:12]
-            return {
-                "plausible": plausible,
-                "stride": record_stride,
-                "records": int(len(scores)),
-                "max_score": float(np.max(scores[finite])) if np.any(finite) else None,
-                "min_score": float(np.min(scores[finite])) if np.any(finite) else None,
-                "above_threshold": int(np.sum(score_range_ok & (scores >= float(conf_thres)))),
-                "positive_scores": int(np.sum(positive)),
-                "labels": label_sample,
-                "valid_fraction": valid_fraction,
-            }
-        return {
-            "plausible": False,
-            "reason": f"buffer_bytes={flat.size} is not compatible with 32/64-byte PPU records",
-        }
-
-    def _detect_output_format_from_outputs(self, output_tensor):
-        outputs = self._normalize_outputs(output_tensor)
-        if not outputs:
-            return None, "no output tensors"
-        first = outputs[0]
-        try:
-            arr = np.asarray(first)
-        except Exception as exc:
-            return None, f"cannot convert first output to ndarray: {exc}"
-
-        field_names = {str(name).lower() for name in (arr.dtype.names or ())}
-        if {"x", "y", "w", "h", "score"}.issubset(field_names):
-            return ("ppu" if "label" in field_names else "ppu_face"), "structured PPU dtype"
-        if arr.dtype.kind == "V" and arr.dtype.itemsize in (self.PPU_BBOX_STRIDE, self.PPU_FACE_STRIDE):
-            return (
-                "ppu_face" if arr.dtype.itemsize == self.PPU_FACE_STRIDE else "ppu",
-                f"void record size={arr.dtype.itemsize}",
-            )
-
-        # A clear raw-YOLO tensor must win over the fact that its byte size may
-        # coincidentally be divisible by 32.
-        if self._looks_like_raw_yolo_array(first):
-            return "yolo", f"raw YOLO shape={tuple(arr.shape)}"
-        if self._looks_like_end2end_array(first):
-            if self.output_metadata_format in ("ppu", "ppu_face"):
-                return self.output_metadata_format, "PPU metadata with decoded row tensor"
-            if self.configured_output_format == "yolo_end2end":
-                return "yolo_end2end", "explicit end-to-end configuration"
-            if self.configured_output_format in ("ppu", "ppu_face"):
-                return self.configured_output_format, "explicit PPU configuration with decoded row tensor"
-            if self.output_hint in ("ppu", "ppu_face"):
-                return self.output_hint, "PPU hint with decoded row tensor"
-            return "yolo_end2end", f"end-to-end rows shape={tuple(np.squeeze(arr).shape)}"
-
-        if arr.dtype == np.uint8 and arr.ndim and arr.shape[-1] == self.PPU_FACE_STRIDE:
-            return "ppu_face", f"uint8 packed records shape={tuple(arr.shape)}"
-        if arr.dtype == np.uint8 and arr.ndim and arr.shape[-1] == self.PPU_BBOX_STRIDE:
-            return "ppu", f"uint8 packed records shape={tuple(arr.shape)}"
-
-        if self.output_metadata_format in ("ppu", "ppu_face"):
-            return self.output_metadata_format, f"metadata={self.output_metadata_format}"
-
-        face_summary = self._packed_ppu_summary(output_tensor, stride=self.PPU_FACE_STRIDE)
-        if face_summary.get("plausible") and self.output_format == "ppu_face":
-            return "ppu_face", f"packed PPU probe={face_summary}"
-        bbox_summary = self._packed_ppu_summary(output_tensor, stride=self.PPU_BBOX_STRIDE)
-        if bbox_summary.get("plausible"):
-            return "ppu", f"packed PPU probe={bbox_summary}"
-
-        if self.configured_output_format:
-            return self.configured_output_format, "configured fallback"
-        if self.output_hint:
-            return self.output_hint, "non-binding output hint fallback"
-        return None, f"unrecognized output signature: {self._output_tensor_signature(output_tensor)}"
-
-    def _select_runtime_output_format(self, output_tensor):
-        detected, detail = self._detect_output_format_from_outputs(output_tensor)
-        selected = detected or self.runtime_output_format or self.output_format or "yolo"
-        if selected == "auto":
-            selected = "yolo"
-        if selected != self.runtime_output_format:
-            change_key = (self.runtime_output_format, selected, detail)
-            if change_key != self._last_format_change:
-                logger.info(
-                    f"[DeepX][{self.model_key}] runtime output selected={selected} "
-                    f"(previous={self.runtime_output_format or self.output_format}, reason={detail})"
-                )
-                self._last_format_change = change_key
-            self.runtime_output_format = selected
-        return selected, detail
-
-    @staticmethod
-    def _safe_nms(boxes_xywh, scores, class_ids, conf_thres, iou_thres):
-        if len(boxes_xywh) == 0:
-            return np.empty((0,), dtype=np.int64)
-        boxes_xywh = np.asarray(boxes_xywh, dtype=np.float32)
-        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-        class_ids = np.asarray(class_ids, dtype=np.int64).reshape(-1)
-        offsets = class_ids.astype(np.float32) * 7680.0
-        shifted = boxes_xywh.copy()
-        shifted[:, 0] += offsets
-        shifted[:, 1] += offsets
-        indices = cv2.dnn.NMSBoxes(
-            shifted.tolist(),
-            scores.tolist(),
-            float(conf_thres),
-            float(iou_thres),
-        )
-        if indices is None or len(indices) == 0:
-            return np.empty((0,), dtype=np.int64)
-        return np.asarray(indices).reshape(-1).astype(np.int64)
-
-    def _normalize_raw_prediction(self, output_tensor):
-        outputs = self._normalize_outputs(output_tensor)
-        if not outputs:
-            return None
-        pred = np.asarray(outputs[0])
-        if pred.size == 0:
-            return None
-        if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
-            pred = pred.transpose((0, 2, 1))
-        pred = np.squeeze(pred)
-        if pred.ndim == 1:
-            pred = pred.reshape(1, -1)
-        if pred.ndim != 2:
-            raise ValueError(f"unexpected prediction rank/shape: {pred.shape}")
-        return np.asarray(pred, dtype=np.float32)
-
-    def _scale_normalized_xywh(self, boxes_xywh):
-        boxes = np.asarray(boxes_xywh, dtype=np.float32).copy()
-        if boxes.size and np.nanmax(np.abs(boxes)) <= 2.0:
-            boxes[:, [0, 2]] *= float(self.input_width)
-            boxes[:, [1, 3]] *= float(self.input_height)
-        return boxes
-
-    def _scale_normalized_xyxy(self, boxes_xyxy):
-        boxes = np.asarray(boxes_xyxy, dtype=np.float32).copy()
-        if boxes.size and np.nanmax(np.abs(boxes)) <= 2.0:
-            boxes[:, [0, 2]] *= float(self.input_width)
-            boxes[:, [1, 3]] *= float(self.input_height)
-        return boxes
-
-    def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
-        """Raw YOLOv8 center-xywh output: [4 box columns + class scores]."""
-        try:
-            pred = self._normalize_raw_prediction(output_tensor)
-            if pred is None or pred.shape[1] <= 4:
-                return []
-            class_scores = pred[:, 4:]
-            scores = np.max(class_scores, axis=1)
-            class_ids = np.argmax(class_scores, axis=1).astype(np.int64)
-            valid = np.isfinite(scores) & np.all(np.isfinite(pred[:, :4]), axis=1)
-            valid &= scores >= float(conf_thres)
-            if not np.any(valid):
-                return []
-            boxes = self._scale_normalized_xywh(pred[valid, :4])
-            scores = scores[valid]
-            class_ids = class_ids[valid]
-            boxes_xywh = boxes.copy()
-            boxes_xywh[:, 0] -= boxes_xywh[:, 2] * 0.5
-            boxes_xywh[:, 1] -= boxes_xywh[:, 3] * 0.5
-            keep = self._safe_nms(boxes_xywh, scores, class_ids, conf_thres, iou_thres)
-            return [
-                [
-                    [
-                        float(boxes_xywh[i, 0]),
-                        float(boxes_xywh[i, 1]),
-                        float(boxes_xywh[i, 0] + boxes_xywh[i, 2]),
-                        float(boxes_xywh[i, 1] + boxes_xywh[i, 3]),
-                    ],
-                    float(scores[i]),
-                    int(class_ids[i]),
-                ]
-                for i in keep
-            ]
-        except Exception as exc:
-            logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {exc}")
-            return []
-
     def postprocess_xyxy(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
-        """Raw XYXY output with class-score columns after the first four values."""
+        """출력이 [x1, y1, x2, y2, score, class_id...] 형태일 때의 후처리"""
         try:
-            pred = self._normalize_raw_prediction(output_tensor)
-            if pred is None or pred.shape[1] <= 4:
-                return []
+            pred = np.array(output_tensor[0])
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
+                pred = pred.transpose((0, 2, 1))
+            if pred.ndim == 3:
+                pred = pred[0]
+
             class_scores = pred[:, 4:]
-            scores = np.max(class_scores, axis=1)
-            class_ids = np.argmax(class_scores, axis=1).astype(np.int64)
-            valid = np.isfinite(scores) & np.all(np.isfinite(pred[:, :4]), axis=1)
-            valid &= scores >= float(conf_thres)
-            if not np.any(valid):
-                return []
-            boxes_xyxy = self._scale_normalized_xyxy(pred[valid, :4])
-            scores = scores[valid]
-            class_ids = class_ids[valid]
-            boxes_xywh = np.column_stack(
-                (
-                    boxes_xyxy[:, 0],
-                    boxes_xyxy[:, 1],
-                    boxes_xyxy[:, 2] - boxes_xyxy[:, 0],
-                    boxes_xyxy[:, 3] - boxes_xyxy[:, 1],
-                )
-            )
-            keep = self._safe_nms(boxes_xywh, scores, class_ids, conf_thres, iou_thres)
-            return [
-                [boxes_xyxy[i].astype(float).tolist(), float(scores[i]), int(class_ids[i])]
-                for i in keep
-            ]
-        except Exception as exc:
-            logger.error(f"NPU XYXY Postprocess Error ({os.path.basename(self.engine_path)}): {exc}")
+            if class_scores.shape[1] == 1:
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
+            else:
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
+
+            mask = scores > conf_thres
+            pred = pred[mask]
+            scores = scores[mask]
+            class_ids = class_ids[mask]
+
+            if len(pred) == 0: return []
+
+            boxes_xywh = np.zeros((len(pred), 4), dtype=np.float32)
+            boxes_xywh[:, 0] = pred[:, 0]               
+            boxes_xywh[:, 1] = pred[:, 1]               
+            boxes_xywh[:, 2] = pred[:, 2] - pred[:, 0]  
+            boxes_xywh[:, 3] = pred[:, 3] - pred[:, 1]  
+
+            max_wh = 7680
+            class_offset = class_ids * max_wh
+            boxes_shifted = boxes_xywh.copy()
+            boxes_shifted[:, 0] += class_offset
+            boxes_shifted[:, 1] += class_offset
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+
+            results = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x_min, y_min, w, h = boxes_xywh[i]
+                    results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
+            return results
+        except Exception as e:
+            logger.error(f"NPU XYXY Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
             return []
 
     def postprocess_tlwh(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
-        """Top-left XYWH output with class-score columns after the first four values."""
+        """출력이 [TopLeft_X, TopLeft_Y, Width, Height, score, class_id...] 형태일 때의 후처리"""
         try:
-            pred = self._normalize_raw_prediction(output_tensor)
-            if pred is None or pred.shape[1] <= 4:
-                return []
+            pred = np.array(output_tensor[0])
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
+                pred = pred.transpose((0, 2, 1))
+            if pred.ndim == 3:
+                pred = pred[0]
+
             class_scores = pred[:, 4:]
-            scores = np.max(class_scores, axis=1)
-            class_ids = np.argmax(class_scores, axis=1).astype(np.int64)
-            valid = np.isfinite(scores) & np.all(np.isfinite(pred[:, :4]), axis=1)
-            valid &= scores >= float(conf_thres)
-            if not np.any(valid):
-                return []
-            boxes_xywh = self._scale_normalized_xywh(pred[valid, :4])
-            scores = scores[valid]
-            class_ids = class_ids[valid]
-            keep = self._safe_nms(boxes_xywh, scores, class_ids, conf_thres, iou_thres)
-            return [
-                [
-                    [
-                        float(boxes_xywh[i, 0]),
-                        float(boxes_xywh[i, 1]),
-                        float(boxes_xywh[i, 0] + boxes_xywh[i, 2]),
-                        float(boxes_xywh[i, 1] + boxes_xywh[i, 3]),
-                    ],
-                    float(scores[i]),
-                    int(class_ids[i]),
-                ]
-                for i in keep
-            ]
-        except Exception as exc:
-            logger.error(f"NPU TLWH Postprocess Error ({os.path.basename(self.engine_path)}): {exc}")
-            return []
-
-    def postprocess_end2end(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
-        """End-to-end NMS rows: [x1, y1, x2, y2, score, class_id]."""
-        try:
-            outputs = self._normalize_outputs(output_tensor)
-            if not outputs:
-                return []
-            rows = self._squeezed_2d_array(outputs[0])
-            if rows is None or rows.shape[1] < 6:
-                return []
-            rows = np.asarray(rows[:, :6], dtype=np.float32)
-            boxes_xyxy = self._scale_normalized_xyxy(rows[:, :4])
-            scores = rows[:, 4]
-            class_ids = np.rint(rows[:, 5]).astype(np.int64)
-            valid = np.isfinite(scores) & np.all(np.isfinite(boxes_xyxy), axis=1)
-            valid &= scores >= float(conf_thres)
-            valid &= boxes_xyxy[:, 2] > boxes_xyxy[:, 0]
-            valid &= boxes_xyxy[:, 3] > boxes_xyxy[:, 1]
-            if not np.any(valid):
-                return []
-            boxes_xyxy = boxes_xyxy[valid]
-            scores = scores[valid]
-            class_ids = class_ids[valid]
-            boxes_xywh = np.column_stack(
-                (
-                    boxes_xyxy[:, 0],
-                    boxes_xyxy[:, 1],
-                    boxes_xyxy[:, 2] - boxes_xyxy[:, 0],
-                    boxes_xyxy[:, 3] - boxes_xyxy[:, 1],
-                )
-            )
-            keep = self._safe_nms(boxes_xywh, scores, class_ids, conf_thres, iou_thres)
-            return [
-                [boxes_xyxy[i].astype(float).tolist(), float(scores[i]), int(class_ids[i])]
-                for i in keep
-            ]
-        except Exception as exc:
-            logger.error(f"NPU end-to-end Postprocess Error ({os.path.basename(self.engine_path)}): {exc}")
-            return []
-
-    def _extract_structured_ppu_rows(self, arr):
-        names = tuple(arr.dtype.names or ())
-        if not names:
-            return None
-        lower_to_name = {str(name).lower(): name for name in names}
-        required = ("x", "y", "w", "h", "score")
-        if not all(name in lower_to_name for name in required):
-            return None
-        flat = arr.reshape(-1)
-        boxes = np.column_stack(
-            [np.asarray(flat[lower_to_name[name]], dtype=np.float32) for name in ("x", "y", "w", "h")]
-        )
-        scores = np.asarray(flat[lower_to_name["score"]], dtype=np.float32)
-        label_name = lower_to_name.get("label") or lower_to_name.get("class_id") or lower_to_name.get("class")
-        labels = (
-            np.asarray(flat[label_name], dtype=np.int64)
-            if label_name is not None
-            else np.zeros(len(scores), dtype=np.int64)
-        )
-        return boxes, scores, labels
-
-    def _extract_ppu_rows(self, output_tensor, ppu_format="ppu"):
-        outputs = self._normalize_outputs(output_tensor)
-        if not outputs:
-            return None
-        first = outputs[0]
-        arr = np.asarray(first)
-        if arr.size == 0:
-            return None
-
-        structured = self._extract_structured_ppu_rows(arr)
-        if structured is not None:
-            return structured
-
-        direct = self._squeezed_2d_array(first)
-        if direct is not None and direct.dtype.kind in "fc" and direct.shape[1] == 6:
-            rows = np.asarray(direct, dtype=np.float32)
-            labels = np.rint(rows[:, 5]).astype(np.int64)
-            return rows[:, :4], rows[:, 4], labels
-
-        flat = self._to_uint8_buffer(first)
-        preferred_stride = self.PPU_FACE_STRIDE if ppu_format == "ppu_face" else self.PPU_BBOX_STRIDE
-        strides = [preferred_stride]
-        for stride in (self.PPU_BBOX_STRIDE, self.PPU_FACE_STRIDE):
-            if stride not in strides:
-                strides.append(stride)
-
-        selected_stride = None
-        for stride in strides:
-            if flat.size and flat.size % stride == 0 and flat.size // stride <= 4096:
-                if stride == preferred_stride:
-                    selected_stride = stride
-                    break
-                if selected_stride is None:
-                    selected_stride = stride
-        if selected_stride is None:
-            raise ValueError(f"PPU buffer length {flat.size} is not a valid 32/64-byte record array")
-
-        records = flat.reshape(flat.size // selected_stride, selected_stride)
-        boxes = np.ascontiguousarray(records[:, :16]).view("<f4").reshape(-1, 4)
-        scores = np.ascontiguousarray(records[:, 20:24]).view("<f4").reshape(-1)
-        if selected_stride == self.PPU_BBOX_STRIDE:
-            labels = np.ascontiguousarray(records[:, 24:28]).view("<u4").reshape(-1).astype(np.int64)
-        else:
-            labels = np.zeros(len(scores), dtype=np.int64)
-        return boxes, scores, labels
-
-    def _resolved_ppu_box_format(self):
-        if self.ppu_box_format in ("center", "corner"):
-            return self.ppu_box_format
-        model_name = os.path.basename(str(self.engine_path or "")).lower()
-        if "yolov10" in model_name:
-            return "corner"
-        return "center"
-
-    def postprocess_ppu(self, output_tensor, conf_thres=0.40, iou_thres=0.45, ppu_format="ppu"):
-        try:
-            extracted = self._extract_ppu_rows(output_tensor, ppu_format=ppu_format)
-            if extracted is None:
-                return []
-            boxes_raw, scores, labels = extracted
-            boxes_raw = np.asarray(boxes_raw, dtype=np.float32).reshape(-1, 4)
-            scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-            labels = np.asarray(labels, dtype=np.int64).reshape(-1)
-            if not (len(boxes_raw) == len(scores) == len(labels)):
-                raise ValueError("PPU box/score/label lengths disagree")
-
-            valid = np.all(np.isfinite(boxes_raw), axis=1) & np.isfinite(scores)
-            valid &= scores >= float(conf_thres)
-            valid &= boxes_raw[:, 2] > 0.0
-            valid &= boxes_raw[:, 3] > 0.0
-            valid &= labels >= 0
-            if self.class_count is not None:
-                valid &= labels < int(self.class_count)
-            if not np.any(valid):
-                return []
-
-            boxes_raw = boxes_raw[valid]
-            scores = scores[valid]
-            labels = labels[valid]
-            boxes_raw = self._scale_normalized_xywh(boxes_raw)
-
-            if self._resolved_ppu_box_format() == "corner":
-                boxes_xyxy = boxes_raw.copy()
-                boxes_xywh = np.column_stack(
-                    (
-                        boxes_xyxy[:, 0],
-                        boxes_xyxy[:, 1],
-                        boxes_xyxy[:, 2] - boxes_xyxy[:, 0],
-                        boxes_xyxy[:, 3] - boxes_xyxy[:, 1],
-                    )
-                )
+            if class_scores.shape[1] == 1:
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
             else:
-                boxes_xywh = boxes_raw.copy()
-                boxes_xywh[:, 0] -= boxes_xywh[:, 2] * 0.5
-                boxes_xywh[:, 1] -= boxes_xywh[:, 3] * 0.5
-                boxes_xyxy = np.column_stack(
-                    (
-                        boxes_xywh[:, 0],
-                        boxes_xywh[:, 1],
-                        boxes_xywh[:, 0] + boxes_xywh[:, 2],
-                        boxes_xywh[:, 1] + boxes_xywh[:, 3],
-                    )
-                )
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
 
-            positive_size = (boxes_xywh[:, 2] > 0.0) & (boxes_xywh[:, 3] > 0.0)
-            if not np.any(positive_size):
-                return []
-            boxes_xywh = boxes_xywh[positive_size]
-            boxes_xyxy = boxes_xyxy[positive_size]
-            scores = scores[positive_size]
-            labels = labels[positive_size]
-            keep = self._safe_nms(boxes_xywh, scores, labels, conf_thres, iou_thres)
-            return [
-                [boxes_xyxy[i].astype(float).tolist(), float(scores[i]), int(labels[i])]
-                for i in keep
-            ]
-        except Exception as exc:
-            logger.error(
-                f"NPU PPU Postprocess Error [{self.model_key}] "
-                f"({os.path.basename(self.engine_path)}): {exc}"
-            )
+            mask = scores > conf_thres
+            pred = pred[mask]
+            scores = scores[mask]
+            class_ids = class_ids[mask]
+
+            if len(pred) == 0: return []
+
+            # 이미 좌상단 좌표이므로 크기의 절반을 빼는 연산 생략
+            boxes_xywh = pred[:, :4].copy()
+
+            max_wh = 7680
+            class_offset = class_ids * max_wh
+            boxes_shifted = boxes_xywh.copy()
+            boxes_shifted[:, 0] += class_offset
+            boxes_shifted[:, 1] += class_offset
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+
+            results = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x_min, y_min, w, h = boxes_xywh[i]
+                    results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
+            return results
+        except Exception as e:
+            logger.error(f"NPU TLWH Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
             return []
-
-    def _postprocess_by_format(self, output_format, output_tensor, conf_thres):
-        if output_format == "ppu_face":
-            return self.postprocess_ppu(output_tensor, conf_thres=conf_thres, ppu_format="ppu_face")
-        if output_format == "ppu":
-            return self.postprocess_ppu(output_tensor, conf_thres=conf_thres, ppu_format="ppu")
-        if output_format == "yolo_xyxy":
-            return self.postprocess_xyxy(output_tensor, conf_thres=conf_thres)
-        if output_format == "yolo_tlwh":
-            return self.postprocess_tlwh(output_tensor, conf_thres=conf_thres)
-        if output_format == "yolo_end2end":
-            return self.postprocess_end2end(output_tensor, conf_thres=conf_thres)
-        return self.postprocess(output_tensor, conf_thres=conf_thres)
-
-    def _log_empty_detection(self, output_tensor, selected_format, conf_thres, reason):
-        now = time.monotonic()
-        if now - self._last_empty_log_at < self.empty_detection_log_interval_sec:
-            return
-        self._last_empty_log_at = now
-        signature = self._output_tensor_signature(output_tensor)
-        detail = ""
-        if selected_format in ("ppu", "ppu_face"):
-            stride = self.PPU_FACE_STRIDE if selected_format == "ppu_face" else self.PPU_BBOX_STRIDE
-            summary = self._packed_ppu_summary(output_tensor, stride=stride, conf_thres=conf_thres)
-            detail = f" ppu={summary}"
-        logger.warning(
-            f"[DeepX][{self.model_key}] zero detections after decode "
-            f"format={selected_format} threshold={float(conf_thres):.3f} "
-            f"reason={reason}; output={signature}{detail}"
-        )
 
     def infer(self, img, conf_override=None):
         if img is None:
-            return np.empty((0, 6), dtype=float)
+            return np.empty((0,6))
 
         h_orig, w_orig = img.shape[:2]
         npu_input, scale, offset = self.letter_box(img)
@@ -2615,46 +1413,339 @@ class YoLoDeepX:
 
         try:
             output_tensor = engine.run([input_tensor])
-            threshold = float(conf_override if conf_override is not None else 0.40)
-            threshold = min(1.0, max(0.0, threshold))
-            selected_format, reason = self._select_runtime_output_format(output_tensor)
+            thres = conf_override if conf_override is not None else 0.40
+            
+            # [수정] 출력 포맷에 맞춘 라우팅 적용
+            if self.output_format == "ppu":
+                raw_dets = self.postprocess_ppu(output_tensor, conf_thres=thres)
+            elif self.output_format == "yolo_xyxy":
+                raw_dets = self.postprocess_xyxy(output_tensor, conf_thres=thres)
+            elif self.output_format == "yolo_tlwh":
+                raw_dets = self.postprocess_tlwh(output_tensor, conf_thres=thres)
+            else:
+                raw_dets = self.postprocess(output_tensor, conf_thres=thres)
 
-            if self.log_first_output_signature and not self._first_output_logged:
-                self._first_output_logged = True
-                logger.info(
-                    f"[DeepX][{self.model_key}] first inference output: "
-                    f"format={selected_format}, reason={reason}, "
-                    f"signature={self._output_tensor_signature(output_tensor)}"
-                )
+            if not raw_dets:
+                return np.empty((0,6))
 
-            raw_detections = self._postprocess_by_format(selected_format, output_tensor, threshold)
-            if not raw_detections:
-                self._log_empty_detection(output_tensor, selected_format, threshold, reason)
-                return np.empty((0, 6), dtype=float)
-
+            res = []
             dw, dh = offset
-            rows = []
-            for box, score, class_id in raw_detections:
-                if len(box) < 4:
-                    continue
-                x1 = float(np.clip((float(box[0]) - dw) / scale, 0, w_orig))
-                y1 = float(np.clip((float(box[1]) - dh) / scale, 0, h_orig))
-                x2 = float(np.clip((float(box[2]) - dw) / scale, 0, w_orig))
-                y2 = float(np.clip((float(box[3]) - dh) / scale, 0, h_orig))
-                if not all(math.isfinite(v) for v in (x1, y1, x2, y2, float(score))):
-                    continue
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                rows.append([x1, y1, x2, y2, float(score), int(class_id)])
-            return detection_array(rows)
-        except Exception as exc:
-            logger.error(
-                f"NPU Inference Error [{self.model_key}] "
-                f"({os.path.basename(self.engine_path)}): {exc}\n{traceback.format_exc()}"
-            )
-            return np.empty((0, 6), dtype=float)
+
+            for box, score, cls_id in raw_dets:
+                x1 = np.clip((box[0] - dw) / scale, 0, w_orig)
+                y1 = np.clip((box[1] - dh) / scale, 0, h_orig)
+                x2 = np.clip((box[2] - dw) / scale, 0, w_orig)
+                y2 = np.clip((box[3] - dh) / scale, 0, h_orig)
+                res.append([x1, y1, x2, y2, score, cls_id])
+
+            return np.array(res, dtype=float)
+        except Exception as e:
+            logger.error(f"NPU Inference Error: {e}")
+            return np.empty((0,6))
         finally:
             self.engine_pool.put(engine)
+
+    def _resolve_output_format(self, output_format, engine=None):
+        configured = self._normalize_configured_output_format(output_format)
+        if configured:
+            return configured
+
+        detected, detail = self._detect_output_format_from_engine(engine)
+        if detected:
+            logger.info(
+                f"[DeepX] output_format=auto detected {detected}: "
+                f"{os.path.basename(self.engine_path)} ({detail})"
+            )
+            return detected
+
+        fallback = self._detect_output_format_from_filename()
+        logger.warning(
+            f"[DeepX] output_format=auto could not inspect output tensors for "
+            f"{os.path.basename(self.engine_path)} ({detail or 'no metadata'}). "
+            f"Using filename fallback: {fallback}."
+        )
+        return fallback
+
+    def _detect_output_format_from_filename(self):
+        model_name = os.path.basename(str(self.engine_path or "")).lower()
+        return "ppu" if "_ppu" in model_name or "-ppu" in model_name else "yolo"
+
+    def _detect_output_format_from_engine(self, engine):
+        if engine is None:
+            return None, "engine unavailable"
+
+        info_reader = None
+        for method_name in ["get_output_tensors_info", "get_outputs_info", "get_output_tensor_info"]:
+            if hasattr(engine, method_name):
+                info_reader = getattr(engine, method_name)
+                break
+        if info_reader is None:
+            return None, "output tensor metadata API unavailable"
+
+        try:
+            output_info = info_reader()
+        except Exception as e:
+            return None, f"output tensor metadata read failed: {e}"
+
+        entries = self._tensor_info_entries(output_info)
+        if not entries:
+            return None, "empty output tensor metadata"
+
+        metadata_text = self._safe_json_text(entries).lower()
+        shapes = [shape for shape in (self._tensor_shape(entry) for entry in entries) if shape]
+        dtypes = [self._tensor_dtype(entry).lower() for entry in entries if self._tensor_dtype(entry)]
+        detail = f"shapes={shapes or '-'} dtypes={dtypes or '-'}"
+
+        if "ppu" in metadata_text or "postprocess" in metadata_text or "bbox" in metadata_text:
+            return "ppu", detail
+        if self._metadata_looks_raw_yolo(shapes, dtypes):
+            return "yolo", detail
+        if self._metadata_looks_ppu(shapes, dtypes):
+            return "ppu", detail
+
+        return None, detail
+
+    def _tensor_info_entries(self, value):
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            for key in ["outputs", "output", "tensors", "tensor_info"]:
+                nested = value.get(key)
+                if isinstance(nested, (list, tuple)):
+                    return list(nested)
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def _safe_json_text(self, value):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
+
+    def _tensor_shape(self, entry):
+        shape = None
+        if isinstance(entry, dict):
+            for key in ["shape", "dims", "dimension", "tensor_shape"]:
+                if key in entry:
+                    shape = entry.get(key)
+                    break
+        else:
+            for key in ["shape", "dims", "dimension", "tensor_shape"]:
+                if hasattr(entry, key):
+                    shape = getattr(entry, key)
+                    break
+
+        if shape is None:
+            return []
+        try:
+            return [int(x) for x in list(shape)]
+        except Exception:
+            numbers = re.findall(r"-?\d+", str(shape))
+            return [int(x) for x in numbers]
+
+    def _tensor_dtype(self, entry):
+        if isinstance(entry, dict):
+            for key in ["dtype", "data_type", "type", "format"]:
+                if key in entry and entry.get(key) is not None:
+                    return str(entry.get(key))
+        else:
+            for key in ["dtype", "data_type", "type", "format"]:
+                if hasattr(entry, key):
+                    return str(getattr(entry, key))
+        return ""
+
+    def _shape_without_ones(self, shape):
+        return [int(x) for x in shape if int(x) > 1]
+
+    def _metadata_looks_raw_yolo(self, shapes, dtypes):
+        for shape in shapes:
+            dims = self._shape_without_ones(shape)
+            if len(dims) < 2:
+                continue
+            has_candidate_axis = max(dims) >= 1000
+            has_class_axis = any(5 <= dim <= 256 for dim in dims)
+            if has_candidate_axis and has_class_axis:
+                return True
+        return False
+
+    def _metadata_looks_ppu(self, shapes, dtypes):
+        has_byte_output = any(dtype in ["uint8", "byte", "bytes"] or "uint8" in dtype for dtype in dtypes)
+        if has_byte_output and any(self._shape_looks_ppu_rows(shape) for shape in shapes):
+            return True
+        return any(self._shape_looks_ppu_rows(shape) for shape in shapes) and not self._metadata_looks_raw_yolo(shapes, dtypes)
+
+    def _shape_looks_ppu_rows(self, shape):
+        dims = self._shape_without_ones(shape)
+        if not dims:
+            return False
+        if len(dims) == 1:
+            return dims[0] % 32 == 0 and dims[0] <= 65536
+        return dims[-1] in [6, 7, 8, 32] and max(dims) < 1000
+
+    def _load_input_shape(self, engine):
+        try:
+            input_info = engine.get_input_tensors_info()
+            shape = list(input_info[0].get("shape", []))
+        except Exception as e:
+            logger.warning(f"[DeepX] 입력 텐서 shape 확인 실패. 640x640 기본값을 사용합니다: {e}")
+            return
+
+        if len(shape) == 4:
+            self.input_has_batch = True
+            if shape[-1] in [1, 3, 4]:
+                self.input_layout = "nhwc"
+                self.input_height, self.input_width = int(shape[1]), int(shape[2])
+            elif shape[1] in [1, 3, 4]:
+                self.input_layout = "nchw"
+                self.input_height, self.input_width = int(shape[2]), int(shape[3])
+        elif len(shape) == 3:
+            self.input_has_batch = False
+            if shape[-1] in [1, 3, 4]:
+                self.input_layout = "hwc"
+                self.input_height, self.input_width = int(shape[0]), int(shape[1])
+            elif shape[0] in [1, 3, 4]:
+                self.input_layout = "chw"
+                self.input_height, self.input_width = int(shape[1]), int(shape[2])
+
+    def letter_box(self, img, new_shape=None):
+        if new_shape is None:
+            new_shape = (self.input_height, self.input_width)
+        h, w = img.shape[:2]
+        scale = min(new_shape[0]/h, new_shape[1]/w)
+        nw, nh = int(w*scale), int(h*scale)
+
+        resized = cv2.resize(img, (nw, nh))
+        canvas = np.full((new_shape[0], new_shape[1], 3), 114, dtype=np.uint8)
+
+        dw, dh = (new_shape[1] - nw) // 2, (new_shape[0] - nh) // 2
+        canvas[dh:dh+nh, dw:dw+nw] = resized
+
+        return canvas, scale, (dw, dh)
+
+    def _prepare_input_tensor(self, npu_input):
+        input_tensor = cv2.cvtColor(npu_input, cv2.COLOR_BGR2RGB)
+
+        # Keep the historical HWC path for standard YOLO models. PPU models are
+        # stricter about matching the SDK-reported input shape.
+        if self.output_format == "ppu":
+            if self.input_layout in ["nchw", "chw"]:
+                input_tensor = np.transpose(input_tensor, (2, 0, 1))
+            if self.input_has_batch:
+                input_tensor = np.expand_dims(input_tensor, axis=0)
+
+        return np.ascontiguousarray(input_tensor, dtype=np.uint8)
+
+    def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+        try:
+            pred = np.array(output_tensor[0])
+
+            # YOLOv8 배열 형태 보정
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
+                pred = pred.transpose((0, 2, 1))
+            if pred.ndim == 3:
+                pred = pred[0]
+
+            class_scores = pred[:, 4:]
+            if class_scores.shape[1] == 1:
+                # Single-class YOLO heads expose one score column after xywh.
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
+            else:
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
+
+            # Confidence 필터링
+            mask = scores > conf_thres
+            pred = pred[mask]
+            scores = scores[mask]
+            class_ids = class_ids[mask]
+
+            if len(pred) == 0:
+                return []
+
+            # NMSBoxes 포맷 맞춤 (x_min, y_min, width, height)
+            boxes_xywh = pred[:, :4].copy()
+            boxes_xywh[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2  # 중심 X -> 최소 X
+            boxes_xywh[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2  # 중심 Y -> 최소 Y
+
+            # Class-Aware NMS
+            max_wh = 7680
+            class_offset = class_ids * max_wh
+            boxes_shifted = boxes_xywh.copy()
+            boxes_shifted[:, 0] += class_offset
+            boxes_shifted[:, 1] += class_offset
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+
+            results = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x_min, y_min, w, h = boxes_xywh[i]
+                    results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
+
+            return results
+        except Exception as e:
+            logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
+
+    def postprocess_ppu(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+        try:
+            raw_data = output_tensor[0]
+            if isinstance(raw_data, bytes):
+                flat = np.frombuffer(raw_data, dtype=np.uint8).copy()
+            else:
+                flat = np.ascontiguousarray(raw_data).view(np.uint8).ravel().copy()
+
+            if len(flat) == 0:
+                return []
+
+            stride = 32
+            if len(flat) % stride != 0:
+                logger.error(f"[DeepX PPU] 출력 버퍼 길이({len(flat)})가 {stride}의 배수가 아닙니다.")
+                return []
+
+            flat_stride = flat.reshape(len(flat) // stride, stride)
+            boxes_raw = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(-1, 4)
+            scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
+            labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+
+            mask = scores >= conf_thres
+            if not np.any(mask):
+                return []
+
+            boxes_raw = boxes_raw[mask]
+            scores = scores[mask]
+            labels = labels[mask]
+
+            cx = boxes_raw[:, 0]
+            cy = boxes_raw[:, 1]
+            bw = boxes_raw[:, 2]
+            bh = boxes_raw[:, 3]
+
+            x1 = cx - bw * 0.5
+            y1 = cy - bh * 0.5
+            x2 = cx + bw * 0.5
+            y2 = cy + bh * 0.5
+
+            max_wh = 7680
+            class_offset = labels.astype(np.float32) * max_wh
+            boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, bw, bh])
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+            if indices is None or len(indices) == 0:
+                return []
+
+            results = []
+            for i in np.array(indices).reshape(-1):
+                results.append([[x1[i], y1[i], x2[i], y2[i]], scores[i], labels[i]])
+
+            return results
+        except Exception as e:
+            logger.error(f"NPU PPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
+        
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
 # ==========================================
@@ -2719,168 +1810,104 @@ class SimpleTracker:
 
         return np.array(res_tracks)
 
-def draw_video_event_markers(frame, frame_timestamp, markers, mark_sec=None, border_thickness=None):
-    if frame is None:
-        return frame
-    try:
-        frame_timestamp = float(frame_timestamp)
-    except Exception:
-        return frame
-
-    mark_sec = float(SYS_CFG.get("VIDEO_EVENT_MARK_SEC", 2.0) if mark_sec is None else mark_sec)
-    mark_sec = max(0.0, mark_sec)
-    thickness = int(SYS_CFG.get("VIDEO_EVENT_BORDER_THICKNESS", 18) if border_thickness is None else border_thickness)
-    thickness = max(1, thickness)
-
-    active = []
-    for marker in markers or []:
-        try:
-            trigger_ts = float(marker.get("ts"))
-        except Exception:
-            continue
-        if trigger_ts <= frame_timestamp <= trigger_ts + mark_sec:
-            active.append(marker)
-    if not active:
-        return frame
-
-    marked = frame.copy()
-    height, width = marked.shape[:2]
-    inset = max(1, thickness // 2)
-    cv2.rectangle(marked, (inset, inset), (max(inset, width - inset - 1), max(inset, height - inset - 1)), (0, 0, 255), thickness)
-
-    event_names = []
-    for marker in active:
-        name = str(marker.get("event_name") or "unknown")
-        if name not in event_names:
-            event_names.append(name)
-    first_ts = min(float(marker.get("ts")) for marker in active)
-    trigger_dt = datetime.datetime.fromtimestamp(first_ts, pytz.timezone("Asia/Seoul"))
-    time_text = trigger_dt.strftime("%H:%M:%S.%f")[:-3]
-    label = f"EVENT TRIGGER {time_text} {','.join(event_names)}"
-    cv2.putText(marked, label, (max(10, thickness), max(35, thickness + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-    return marked
-
-
 class VideoRecorder:
     def __init__(self, ip, cam_id=None):
         self.ip = ip
         self.cam_id = cam_id if cam_id is not None else "-"
         self.pre_sec = max(1.0, float(SYS_CFG.get("REC_PRE_SEC", 10.0)))
-        self.max_buffer_len = max(1, int(15 * self.pre_sec))
+        source_fps = max(15.0, float(SYS_CFG.get("video_decode", {}).get("fps_limit", 10.0)))
+        self.max_buffer_len = max(1, int(math.ceil(source_fps * self.pre_sec)))
         self.buffer = deque(maxlen=self.max_buffer_len)
         self.write_queue = queue.Queue()
 
         self.recording = False
-        self.record_end_time = 0.0
+        self.record_end_time = 0
         self.current_event = "unknown"
         self.current_meta = None
         self.current_record_started_at = None
         self.recorded_fps = 3.0
-        self.event_markers = []
-        self.marker_lock = threading.Lock()
         self.running = True
 
         self.thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.thread.start()
 
     def update(self, frame, infer_meta=None, timestamp=None):
-        if frame is None:
-            return
-        frame_timestamp = float(timestamp if timestamp is not None else time.time())
-        self.buffer.append((frame.copy(), infer_meta, frame_timestamp))
+        if frame is None: return
+        self.buffer.append((frame.copy(), infer_meta, timestamp or time.time()))
 
         if self.recording:
             if time.time() > self.record_end_time:
                 self.recording = False
                 self.write_queue.put(None)
-                logger.info(f"[녹화종료] {self.ip} - {self.current_event}")
+                logger.info(f" [녹화종료] {self.ip} - {self.current_event}")
             else:
-                self.write_queue.put((frame.copy(), infer_meta, frame_timestamp))
+                self.write_queue.put((frame.copy(), infer_meta, timestamp or time.time()))
 
     def trigger(self, event_name, objects_meta=None, event_meta=None, current_fps=3.0):
-        trigger_ts = time.time()
-        post_sec = float(SYS_CFG.get("REC_POST_SEC", 10.0))
-        pre_sec = float(SYS_CFG.get("REC_PRE_SEC", 10.0))
-        event_id = str((event_meta or {}).get("event_id", ""))
-        marker = {
-            "ts": trigger_ts,
-            "event_name": str(event_name),
-            "event_id": event_id,
-        }
+        now = time.time()
+        post_sec = SYS_CFG.get("REC_POST_SEC", 10.0)
+        
+        pre_sec = max(1.0, float(SYS_CFG.get("REC_PRE_SEC", 10.0)))
+        target_start_time = now - pre_sec
 
         if self.recording:
-            self.record_end_time = max(self.record_end_time, trigger_ts + post_sec)
-            with self.marker_lock:
-                self.event_markers.append(marker)
-            return
+            self.record_end_time = max(self.record_end_time, now + post_sec)
+        else:
+            logger.info(f"? [녹화시작] {self.ip} - {event_name} (FPS: {current_fps:.1f})")
+            self.recording = True
+            self.record_end_time = now + post_sec
+            self.current_event = event_name
+            self.current_meta = event_meta
+            self.current_record_started_at = now
+            self.recorded_fps = max(1.0, float(current_fps))
 
-        logger.info(f"[녹화시작] {self.ip} - {event_name} (FPS: {current_fps:.1f})")
-        self.recording = True
-        self.record_end_time = trigger_ts + post_sec
-        self.current_event = str(event_name)
-        self.current_meta = dict(event_meta or {})
-        self.current_record_started_at = trigger_ts
-        self.recorded_fps = max(1.0, float(current_fps))
-        with self.marker_lock:
-            self.event_markers = [marker]
-
-        target_start_time = trigger_ts - pre_sec
-        for buffered_item in list(self.buffer):
-            if buffered_item[2] >= target_start_time:
-                self.write_queue.put(buffered_item)
+            for item in list(self.buffer):
+                if item[2] >= target_start_time:
+                    self.write_queue.put(item)
 
     def _writer_loop(self):
         writer = None
+        fpath = None
         infer_log_file = None
         video_frame_index = 0
-
+        
         while self.running:
-            try:
-                item = self.write_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            try: item = self.write_queue.get(timeout=1.0)
+            except queue.Empty: continue
 
             if item is None:
-                if writer:
-                    writer.release()
-                if infer_log_file:
-                    infer_log_file.close()
-                writer = None
-                infer_log_file = None
-                video_frame_index = 0
+                if writer: writer.release()
+                if infer_log_file: infer_log_file.close()
+                writer, infer_log_file = None, None
                 continue
 
-            frame, infer_meta, frame_timestamp = item
+            frame, infer_meta, timestamp = item
 
             if writer is None:
+                # [수정] 모든 산출물을 하나의 videos 디렉토리로 통합
                 dpath = os.path.join(EVENT_ROOT_DIR, "events", self.ip, "videos", self.current_event)
                 os.makedirs(dpath, exist_ok=True)
-
-                time_str = datetime.datetime.fromtimestamp(self.current_record_started_at).strftime("%Y%m%d_%H%M%S")
+                
+                time_str = datetime.datetime.fromtimestamp(self.current_record_started_at).strftime('%Y%m%d_%H%M%S')
                 fname = f"{time_str}_{self.ip}_{self.current_event}.mp4"
-                video_path = os.path.join(dpath, fname)
+                fpath = os.path.join(dpath, fname)
                 infer_log_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.infer.jsonl")
                 meta_path = os.path.join(dpath, f"{time_str}_{self.ip}_{self.current_event}.meta.json")
 
                 if isinstance(self.current_meta, dict):
-                    self.current_meta.update({
-                        "video_path": video_path,
-                        "infer_log_path": infer_log_path,
-                        "recorded_fps": self.recorded_fps,
-                    })
+                    self.current_meta.update({"video_path": fpath, "infer_log_path": infer_log_path, "recorded_fps": self.recorded_fps})
                     try:
-                        with open(meta_path, "w", encoding="utf-8") as meta_file:
-                            json.dump(to_json_safe(self.current_meta), meta_file, indent=4, ensure_ascii=False)
-                    except Exception as exc:
-                        logger.error(f"메타데이터 저장 실패: {exc}")
+                        with open(meta_path, 'w', encoding='utf-8') as f_meta:
+                            json.dump(to_json_safe(self.current_meta), f_meta, indent=4, ensure_ascii=False)
+                    except Exception as e:
+                        logger.error(f"메타데이터 저장 실패: {e}")
 
-                height, width = frame.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(video_path, fourcc, self.recorded_fps, (width, height))
-                try:
-                    infer_log_file = open(infer_log_path, "w", encoding="utf-8")
-                except Exception:
-                    infer_log_file = None
+                h, w = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(fpath, fourcc, self.recorded_fps, (w, h))
+
+                try: infer_log_file = open(infer_log_path, 'w', encoding='utf-8')
+                except Exception: pass
 
             if writer:
                 if infer_log_file and infer_meta is not None:
@@ -2888,94 +1915,50 @@ class VideoRecorder:
                         log_record = dict(infer_meta)
                         log_record["video_frame_index"] = video_frame_index
                         infer_log_file.write(json.dumps(to_json_safe(log_record), ensure_ascii=False) + "\n")
-                    except Exception:
-                        pass
+                    except Exception: pass
 
-                with self.marker_lock:
-                    markers = [dict(marker) for marker in self.event_markers]
-                output_frame = draw_video_event_markers(frame, frame_timestamp, markers)
-                writer.write(output_frame)
+                writer.write(frame)
                 video_frame_index += 1
 
 # ==========================================
-# [8] PCTC 이벤트 감지 로직
+# [8] 정밀 이벤트 감지 로직 (OOP 구조)
 # ==========================================
-def _track_object(track, class_id=None, label=None):
-    class_id = int(track[6] if class_id is None else class_id)
-    class_name = pctc_class_name(class_id)
-    return {
-        "label": str(label or class_name),
-        "class_name": class_name,
-        "box": [int(round(float(v))) for v in track[:4]],
-        "score": float(track[5]),
-        "tid": int(track[4]),
-        "class_id": class_id,
-    }
-
-
-def _bbox_scale(box):
-    return max(1.0, float(box[2]) - float(box[0]), float(box[3]) - float(box[1]))
-
-
-def _bbox_gap(box_a, box_b):
-    dx = max(float(box_a[0]) - float(box_b[2]), float(box_b[0]) - float(box_a[2]), 0.0)
-    dy = max(float(box_a[1]) - float(box_b[3]), float(box_b[1]) - float(box_a[3]), 0.0)
-    return math.hypot(dx, dy)
-
-
-def _point_to_bbox_distance(point, box):
-    px, py = float(point[0]), float(point[1])
-    x1, y1, x2, y2 = map(float, box[:4])
-    dx = max(x1 - px, 0.0, px - x2)
-    dy = max(y1 - py, 0.0, py - y2)
-    return math.hypot(dx, dy)
-
-
-def _unit_vector(start, end):
-    vx = float(end[0]) - float(start[0])
-    vy = float(end[1]) - float(start[1])
-    length = math.hypot(vx, vy)
-    if length <= 1e-9:
-        return None
-    return (vx / length, vy / length)
-
-
 class BaseEventDetector:
     gui_name = "BASE"
-
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        self.config = dict(config or {})
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        self.config = config
         self.roi_poly = np.array(roi_poly, dtype=np.int32) if roi_poly and len(roi_poly) >= 3 else np.empty((0, 2), dtype=np.int32)
         self.roi_lines = roi_lines or []
-        self.abnormal_drive_zones = list(abnormal_drive_zones or [])
         self.fps = SYS_CFG.get("REC_FPS", 3)
 
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         return []
 
-
 class IntrusionDetector(BaseEventDetector):
     gui_name = "INTRUSION"
 
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
-        self.proximity_ratio = max(0.0, float(self.config.get("proximity_ratio", 0.0)))
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        # 0.0 means the anchor point must be inside the ROI. A positive value
+        # also accepts objects just outside the boundary by object_size * ratio.
+        self.proximity_ratio = max(0.0, float(config.get("proximity_ratio", 0.0)))
 
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
-        if self.roi_poly.size == 0:
-            return []
-        privacy_tracks = kwargs.get("privacy_tracks", [])
         triggered = []
+        privacy_tracks = kwargs.get("privacy_tracks", [])
+        if self.roi_poly.size == 0:
+            return triggered
 
         for track in tracks:
             tid = int(track[4])
             class_id = int(track_map.get(tid, -1))
             if class_id not in INTRUSION_CLASS_IDS:
                 continue
+
             anchor = get_foot_point(*track[:4]) if class_id == ID_PCTC_PERSON else get_check_point(*track[:4])
             signed_distance = float(cv2.pointPolygonTest(self.roi_poly, anchor, True))
-            proximity_px = _bbox_scale(track[:4]) * self.proximity_ratio
-            inside_roi = signed_distance >= 0.0
+            object_size = max(1.0, float(track[2] - track[0]), float(track[3] - track[1]))
+            proximity_px = object_size * self.proximity_ratio
             if signed_distance < -proximity_px:
                 continue
 
@@ -2986,660 +1969,381 @@ class IntrusionDetector(BaseEventDetector):
                 "fid": fid,
                 "privacy_tracks": privacy_tracks,
                 "privacy_fid": fid,
-                "objects": [_track_object(track, class_id)],
+                "objects": [{
+                    "label": pctc_class_name(class_id),
+                    "box": [int(x) for x in track[:4]],
+                    "score": float(track[5]),
+                    "tid": tid,
+                    "class_id": class_id,
+                }],
                 "decision_trace": {
                     "detector": "IntrusionDetector",
-                    "reason": "inside_or_near_intrusion_roi",
+                    "reason": "object_inside_or_near_roi",
                     "class_id": class_id,
                     "class_name": pctc_class_name(class_id),
                     "roi_anchor": int_point(anchor),
                     "signed_distance_px": round(signed_distance, 3),
                     "proximity_ratio": round(self.proximity_ratio, 4),
                     "proximity_px": round(proximity_px, 3),
-                    "inside_roi": inside_roi,
+                    "inside_roi": bool(signed_distance >= 0.0),
                 },
             })
-        return triggered
 
+        return triggered
 
 class ParkingDetector(BaseEventDetector):
     gui_name = "PARKING"
 
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
-        self.states = {}
-        self.trigger_sec = max(0.0, float(self.config.get("trigger_sec", 5.0)))
-        self.move_threshold_ratio = max(0.0, float(self.config.get("move_threshold_ratio", 0.1)))
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        self.states = defaultdict(lambda: {"start_time": 0.0, "pos": None})
+        self.trigger_sec = float(config.get("trigger_sec", 5.0))
+        self.move_threshold_ratio = float(config.get("move_threshold_ratio", 0.1))
 
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
-        if self.roi_poly.size == 0:
-            self.states.clear()
-            return []
-
-        current_time = time.time()
-        current_ids = set()
-        privacy_tracks = kwargs.get("privacy_tracks", [])
         triggered = []
+        current_ids = set()
+        current_time = time.time()
+        privacy_tracks = kwargs.get("privacy_tracks", [])
+
+        if self.roi_poly.size == 0:
+            return triggered
 
         for track in tracks:
             tid = int(track[4])
             class_id = int(track_map.get(tid, -1))
             if class_id not in PARKING_CLASS_IDS:
                 continue
-            anchor = get_check_point(*track[:4])
-            if cv2.pointPolygonTest(self.roi_poly, anchor, False) < 0:
+
+            roi_point = get_check_point(*track[:4])
+            if cv2.pointPolygonTest(self.roi_poly, roi_point, False) < 0:
                 continue
 
             current_ids.add(tid)
-            center = get_center_point(*track[:4])
-            object_size = _bbox_scale(track[:4])
-            movement_threshold = object_size * self.move_threshold_ratio
-            state = self.states.get(tid)
+            x1, y1, x2, y2 = track[:4]
+            center = get_center_point(x1, y1, x2, y2)
+            object_size = max(x2 - x1, y2 - y1)
+            move_threshold = object_size * self.move_threshold_ratio
+            state = self.states[tid]
 
-            if state is None or get_distance(center, state["anchor_center"]) >= max(1e-6, movement_threshold):
-                self.states[tid] = {
+            if state["start_time"] == 0.0 or get_distance(center, state["pos"]) > move_threshold:
+                state.update({
                     "start_time": current_time,
-                    "anchor_center": center,
-                    "triggered": False,
-                }
-                state = self.states[tid]
-
-            stationary_sec = current_time - float(state["start_time"])
-            if not state["triggered"] and stationary_sec >= self.trigger_sec:
-                triggered.append({
-                    "tid": tid,
+                    "pos": center,
                     "bbox": track[:4],
                     "frame": frame.copy() if frame is not None else None,
                     "fid": fid,
                     "privacy_tracks": privacy_tracks,
-                    "privacy_fid": fid,
-                    "objects": [_track_object(track, class_id)],
-                    "decision_trace": {
-                        "detector": "ParkingDetector",
-                        "reason": "stationary_duration_exceeded",
-                        "class_id": class_id,
-                        "class_name": pctc_class_name(class_id),
-                        "roi_anchor": int_point(anchor),
-                        "anchor_center": int_point(state["anchor_center"]),
-                        "current_center": int_point(center),
-                        "duration_sec": round(stationary_sec, 3),
-                        "trigger_sec": round(self.trigger_sec, 3),
-                        "move_threshold_ratio": round(self.move_threshold_ratio, 4),
-                        "move_threshold_px": round(movement_threshold, 3),
-                    },
+                    "class_id": class_id,
+                    "score": float(track[5]),
+                    "triggered": False,
                 })
-                state["triggered"] = True
+                continue
 
-        for tid in list(self.states):
+            duration_sec = current_time - state["start_time"]
+            if state.get("triggered", False) or duration_sec < self.trigger_sec:
+                continue
+
+            triggered.append({
+                "tid": tid,
+                "bbox": state["bbox"],
+                "frame": state["frame"],
+                "fid": state["fid"],
+                "privacy_tracks": state.get("privacy_tracks", privacy_tracks),
+                "privacy_fid": state["fid"],
+                "objects": [{
+                    "label": pctc_class_name(class_id),
+                    "box": [int(x) for x in state["bbox"]],
+                    "score": float(state.get("score", track[5])),
+                    "tid": tid,
+                    "class_id": class_id,
+                }],
+                "decision_trace": {
+                    "detector": "ParkingDetector",
+                    "reason": "stationary_duration_exceeded",
+                    "class_id": class_id,
+                    "class_name": pctc_class_name(class_id),
+                    "roi_check_point": int_point(roi_point),
+                    "anchor_center": int_point(state["pos"]),
+                    "current_center": int_point(center),
+                    "duration_sec": round(float(duration_sec), 3),
+                    "trigger_sec": round(float(self.trigger_sec), 3),
+                    "move_threshold_ratio": round(float(self.move_threshold_ratio), 4),
+                    "dynamic_move_threshold": round(float(move_threshold), 3),
+                    "object_size": round(float(object_size), 3),
+                },
+            })
+            state["triggered"] = True
+
+        for tid in list(self.states.keys()):
             if tid not in current_ids:
-                self.states.pop(tid, None)
-        return triggered
+                del self.states[tid]
 
+        return triggered
 
 class HelmetDetector(BaseEventDetector):
     gui_name = "NO-HELMET"
 
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
         self.sessions = []
-        self.min_streak_sec = float(self.config.get("min_streak_sec", 2.0))
-        self.trigger_total_sec = float(self.config.get("trigger_total_sec", 3.0))
-        self.max_gap_sec = float(self.config.get("max_gap_sec", 1.5))
-        self.window_sec = float(self.config.get("window_sec", 30.0))
-        self.ignore_top_ratio = float(self.config.get("ignore_top_ratio", 0.2))
+
+        self.min_streak_sec = config.get("min_streak_sec", 2.0)
+        self.trigger_total_sec = config.get("trigger_total_sec", 4.0)
+        self.max_gap_sec = config.get("max_gap_sec", 1.5)
+
+        self.window_sec = config.get("window_sec", 30.0)
+
+        self.ignore_top_ratio = config.get("ignore_top_ratio", 0.2)
         self.red_helmet_tids = set()
 
     def _get_roi_crop(self, frame, box):
         if frame is None:
             return None
-        image_height, image_width = frame.shape[:2]
+
+        h_img, w_img = frame.shape[:2]
         x1, y1, x2, y2 = map(int, box[:4])
+
         x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(image_width, x2), min(image_height, y2)
-        box_height = y2 - y1
-        if box_height <= 0 or x2 - x1 <= 0:
+        x2, y2 = min(w_img, x2), min(h_img, y2)
+
+        h_box = y2 - y1
+        if h_box <= 0 or (x2 - x1) <= 0:
             return None
-        roi = frame[y1:y1 + int(box_height * 0.5), x1:x2]
-        return roi.copy() if roi.size else None
+
+        roi_y2 = y1 + int(h_box * 0.5)
+        roi = frame[y1:roi_y2, x1:x2]
+
+        if roi.size == 0:
+            return None
+
+        return roi.copy()
 
     def _is_red_helmet_median(self, roi_buffer):
         if not roi_buffer:
             return False
+
         h_means, s_means, r_means = [], [], []
+
         for roi in roi_buffer:
             if roi is None or roi.size == 0:
                 continue
+
             rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
             hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
             r_means.append(np.mean(rgb_roi[:, :, 0]))
             h_means.append(np.mean(hsv_roi[:, :, 0]))
             s_means.append(np.mean(hsv_roi[:, :, 1]))
+
         if not h_means:
             return False
-        return (
-            10 <= np.median(h_means) <= 40
-            and np.median(s_means) >= 60
-            and np.median(r_means) >= 100
-        )
 
-    @staticmethod
-    def _intersection_over_head_area(head_box, person_box):
-        inter_width = max(0.0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0]))
-        inter_height = max(0.0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
-        head_area = max(1.0, (head_box[2] - head_box[0]) * (head_box[3] - head_box[1]))
-        return (inter_width * inter_height) / head_area
+        med_r = np.median(r_means)
+        med_h = np.median(h_means)
+        med_s = np.median(s_means)
+
+        return (10 <= med_h <= 40) and (med_s >= 60) and (med_r >= 100)
+
+    def _get_intersection_over_head_area(self, head_box, person_box):
+        inter_w = max(0, min(head_box[2], person_box[2]) - max(head_box[0], person_box[0]))
+        inter_h = max(0, min(head_box[3], person_box[3]) - max(head_box[1], person_box[1]))
+        inter_area = inter_w * inter_h
+
+        head_area = max(1, (head_box[2] - head_box[0]) * (head_box[3] - head_box[1]))
+        return inter_area / head_area
+
+    def _is_no_helmet_in_roi(self, head_box):
+        if self.roi_poly is None or self.roi_poly.size == 0:
+            return True
+        return cv2.pointPolygonTest(self.roi_poly, get_center_point(*head_box), False) >= 0
 
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
-        helmet_tracks = kwargs.get("helmet_tracks", [])
-        privacy_tracks = kwargs.get("privacy_tracks", [])
+        triggered = []
+        helmet_tracks = kwargs.get('helmet_tracks', [])
+        privacy_tracks = kwargs.get('privacy_tracks', [])
         current_time = time.time()
-        unhelmeted_heads = [track for track in helmet_tracks if int(track[6]) == ID_H_HEAD]
-        current_matches = []
-        ignore_y_threshold = frame.shape[0] * self.ignore_top_ratio if frame is not None else 0.0
 
-        for person in tracks:
-            person_tid = int(person[4])
-            if track_map.get(person_tid) != ID_PCTC_PERSON or person_tid in self.red_helmet_tids:
+        unhelmeted_heads = [t for t in helmet_tracks if int(t[6]) == ID_H_HEAD]
+        current_nh_persons = []
+
+        ignore_y_thresh = 0
+        if frame is not None:
+            ignore_y_thresh = frame.shape[0] * self.ignore_top_ratio
+
+        for p in tracks:
+            p_tid = int(p[4])
+
+            if p_tid in self.red_helmet_tids:
                 continue
-            px1, py1, px2, py2 = person[:4]
-            if py1 <= ignore_y_threshold:
-                continue
-            foot_point = get_foot_point(*person[:4])
-            if self.roi_poly.size and cv2.pointPolygonTest(self.roi_poly, foot_point, False) < 0:
+            if track_map.get(p_tid) != ID_PCTC_PERSON:
                 continue
 
-            person_height = max(1.0, py2 - py1)
-            person_width = max(1.0, px2 - px1)
-            best_ioa = 0.0
-            best_head = None
+            px1, py1, px2, py2 = p[:4]
+
+            if py1 <= ignore_y_thresh:
+                continue
+
+            if self.roi_poly is not None and self.roi_poly.size > 0:
+                foot_pt = get_foot_point(*p[:4])
+                if cv2.pointPolygonTest(self.roi_poly, foot_pt, False) < 0:
+                    continue
+
+            person_height = max(1, py2 - py1)
+            person_width = max(1, px2 - px1)
+
+            max_ioa = 0
+            nh_track_match = None
+
             for head in unhelmeted_heads:
                 hx1, hy1, hx2, hy2 = head[:4]
-                head_center_x = (hx1 + hx2) / 2.0
-                head_center_y = (hy1 + hy2) / 2.0
-                if head_center_y > py1 + person_height * 0.4:
-                    continue
+                hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+
+                if hcy > py1 + person_height * 0.4: continue
                 margin = person_width * 0.15
-                if not (px1 - margin <= head_center_x <= px2 + margin):
+                if hcx < px1 - margin or hcx > px2 + margin: continue
+
+                ioa = self._get_intersection_over_head_area(head[:4], p[:4])
+                if ioa > max_ioa:
+                    max_ioa = ioa
+                    nh_track_match = head
+
+            if max_ioa >= 0.5 and nh_track_match is not None:
+                if not self._is_no_helmet_in_roi(nh_track_match[:4]):
                     continue
-                ioa = self._intersection_over_head_area(head[:4], person[:4])
-                if ioa > best_ioa:
-                    best_ioa = ioa
-                    best_head = head
 
-            if best_head is None or best_ioa < 0.5:
-                continue
-            head_center = get_center_point(*best_head[:4])
-            if self.roi_poly.size and cv2.pointPolygonTest(self.roi_poly, head_center, False) < 0:
-                continue
-
-            current_matches.append({
-                "tid": person_tid,
-                "head_bbox": best_head[:4],
-                "person_bbox": person[:4],
-                "objects": [
-                    _track_object(person, ID_PCTC_PERSON),
-                    {
-                        "label": "head",
-                        "class_name": "head",
-                        "box": [int(round(float(v))) for v in best_head[:4]],
-                        "score": float(best_head[5]),
-                        "tid": int(best_head[4]),
-                        "class_id": ID_H_HEAD,
+                hx1, hy1, hx2, hy2 = nh_track_match[:4]
+                head_center = ((hx1 + hx2) / 2, (hy1 + hy2) / 2)
+                current_nh_persons.append({
+                    'tid': p_tid,
+                    'head_bbox': nh_track_match[:4],
+                    'person_bbox': p[:4],
+                    'decision_context': {
+                        'person_tid': p_tid,
+                        'no_helmet_tid': int(nh_track_match[4]),
+                        'no_helmet_score': float(nh_track_match[5]),
+                        'ioa_with_person': float(max_ioa),
+                        'min_ioa': 0.5,
+                        'head_center': int_point(head_center),
+                        'person_top40_y': int(round(float(py1 + person_height * 0.4))),
+                        'person_width': int(round(float(person_width))),
+                        'ignore_top_ratio': round(float(self.ignore_top_ratio), 4),
+                        'roi_checked': bool(self.roi_poly is not None and self.roi_poly.size > 0),
+                        'roi_passed': True
                     },
-                ],
-                "decision_context": {
-                    "person_tid": person_tid,
-                    "head_tid": int(best_head[4]),
-                    "head_score": float(best_head[5]),
-                    "ioa_with_person": round(best_ioa, 4),
-                    "min_ioa": 0.5,
-                    "head_center": int_point(head_center),
-                    "person_foot_point": int_point(foot_point),
-                    "ignore_top_ratio": round(self.ignore_top_ratio, 4),
-                },
-            })
-
-        for match in current_matches:
-            session = next((item for item in self.sessions if item["last_tid"] == match["tid"] or calculate_iou(match["person_bbox"], item["last_person_bbox"]) > 0.3), None)
-            roi_crop = self._get_roi_crop(frame, match["head_bbox"])
-            if session is None:
-                roi_buffer = deque(maxlen=5)
-                if roi_crop is not None:
-                    roi_buffer.append(roi_crop)
-                self.sessions.append({
-                    "start_time": current_time,
-                    "last_seen_time": current_time,
-                    "streaks": [{"start_time": current_time, "end_time": current_time}],
-                    "last_tid": match["tid"],
-                    "last_person_bbox": match["person_bbox"],
-                    "bbox": match["head_bbox"],
-                    "fid": fid,
-                    "triggered": False,
-                    "roi_buffer": roi_buffer,
-                    "objects": match["objects"],
-                    "decision_context": match["decision_context"],
+                    'objects': [
+                        # [수정] 사람(Person) BBox를 페이로드에서 제외하고, 미착용 머리 객체만 전송
+                        {'label': 'no_helmet', 'box': [int(x) for x in nh_track_match[:4]], 'score': float(nh_track_match[5]), 'tid': int(nh_track_match[4]), 'class_id': ID_H_HEAD}
+                    ],
+                    'privacy_objects': [
+                        {'label': 'person', 'box': [int(x) for x in p[:4]], 'score': float(p[5]), 'tid': p_tid, 'class_id': ID_PCTC_PERSON}
+                    ]
                 })
-                continue
 
-            gap_sec = current_time - session["last_seen_time"]
-            if gap_sec <= self.max_gap_sec:
-                session["streaks"][-1]["end_time"] = current_time
+        for nh_p in current_nh_persons:
+            matched_session = None
+            for session in self.sessions:
+                if session['last_tid'] == nh_p['tid'] or calculate_iou(nh_p['person_bbox'], session['last_person_bbox']) > 0.3:
+                    matched_session = session
+                    break
+
+            roi_crop = self._get_roi_crop(frame, nh_p['head_bbox'])
+
+            if matched_session:
+                gap_sec = current_time - matched_session['last_seen_time']
+                if gap_sec <= self.max_gap_sec:
+                    matched_session['streaks'][-1]['end_time'] = current_time
+                else:
+                    matched_session['streaks'].append({'start_time': current_time, 'end_time': current_time})
+
+                matched_session['last_seen_time'] = current_time
+                matched_session['last_tid'] = nh_p['tid']
+                matched_session['last_person_bbox'] = nh_p['person_bbox']
+                matched_session['bbox'] = nh_p['head_bbox']
+                matched_session['fid'] = fid
+                matched_session['objects'] = nh_p['objects']
+                matched_session['privacy_objects'] = nh_p.get('privacy_objects', [])
+                matched_session['decision_context'] = nh_p.get('decision_context', {})
+
+                if roi_crop is not None:
+                    matched_session['roi_buffer'].append(roi_crop)
             else:
-                session["streaks"].append({"start_time": current_time, "end_time": current_time})
-            session.update({
-                "last_seen_time": current_time,
-                "last_tid": match["tid"],
-                "last_person_bbox": match["person_bbox"],
-                "bbox": match["head_bbox"],
-                "fid": fid,
-                "objects": match["objects"],
-                "decision_context": match["decision_context"],
-            })
-            if roi_crop is not None:
-                session["roi_buffer"].append(roi_crop)
+                new_buffer = deque(maxlen=5)
+                if roi_crop is not None:
+                    new_buffer.append(roi_crop)
 
-        triggered = []
+                self.sessions.append({
+                    'start_time': current_time,
+                    'last_seen_time': current_time,
+                    'streaks': [{'start_time': current_time, 'end_time': current_time}],
+                    'last_tid': nh_p['tid'],
+                    'last_person_bbox': nh_p['person_bbox'],
+                    'bbox': nh_p['head_bbox'],
+                    'fid': fid,
+                    'triggered': False,
+                    'roi_buffer': new_buffer,
+                    'objects': nh_p['objects'],
+                    'privacy_objects': nh_p.get('privacy_objects', []),
+                    'decision_context': nh_p.get('decision_context', {})
+                })
+
         active_sessions = []
         for session in self.sessions:
-            if session["last_tid"] in self.red_helmet_tids:
-                continue
-            if current_time - session["start_time"] > self.window_sec:
-                continue
-            valid_durations = []
-            total_valid_sec = 0.0
-            for streak in session["streaks"]:
-                duration = streak["end_time"] - streak["start_time"]
-                if duration >= self.min_streak_sec:
-                    total_valid_sec += duration
-                    valid_durations.append(round(duration, 3))
+            if session['last_tid'] in self.red_helmet_tids: continue
+            if current_time - session['start_time'] > self.window_sec: continue
 
-            if not session["triggered"] and total_valid_sec >= self.trigger_total_sec:
-                if self._is_red_helmet_median(session["roi_buffer"]):
-                    self.red_helmet_tids.add(session["last_tid"])
+            total_valid_sec = 0.0
+            valid_streaks = []
+            for streak in session['streaks']:
+                streak_duration = streak['end_time'] - streak['start_time']
+                if streak_duration >= self.min_streak_sec:
+                    total_valid_sec += streak_duration
+                    valid_streaks.append({
+                        'duration_sec': round(float(streak_duration), 3)
+                    })
+
+            if not session['triggered'] and total_valid_sec >= self.trigger_total_sec:
+                is_red_helmet = self._is_red_helmet_median(session['roi_buffer'])
+                if is_red_helmet:
+                    self.red_helmet_tids.add(session['last_tid'])
                 else:
                     triggered.append({
-                        "tid": session["last_tid"],
-                        "bbox": session["bbox"],
-                        "frame": frame.copy() if frame is not None else None,
-                        "fid": session["fid"],
-                        "privacy_tracks": privacy_tracks,
-                        "privacy_fid": fid,
-                        "objects": session["objects"],
-                        "decision_trace": {
-                            "detector": "HelmetDetector",
-                            "reason": "no_helmet_duration_exceeded",
-                            "total_valid_sec": round(total_valid_sec, 3),
-                            "trigger_total_sec": round(self.trigger_total_sec, 3),
-                            "min_streak_sec": round(self.min_streak_sec, 3),
-                            "max_gap_sec": round(self.max_gap_sec, 3),
-                            "valid_streaks_sec": valid_durations,
-                            "red_helmet_veto": False,
-                            **session["decision_context"],
-                        },
+                        'tid': session['last_tid'],
+                        'bbox': session['bbox'],
+                        'frame': frame.copy() if frame is not None else None,
+                        'fid': session['fid'],
+                        'privacy_tracks': privacy_tracks, # [추가]
+                        'privacy_fid': fid,
+                        'objects': session['objects'],
+                        'privacy_objects': session.get('privacy_objects', []),
+                        'decision_trace': {
+                            'detector': 'HelmetDetector',
+                            'reason': 'no_helmet_duration_exceeded',
+                            'session_age_sec': round(float(current_time - session['start_time']), 3),
+                            'total_valid_sec': round(float(total_valid_sec), 3),
+                            'trigger_total_sec': round(float(self.trigger_total_sec), 3),
+                            'min_streak_sec': round(float(self.min_streak_sec), 3),
+                            'max_gap_sec': round(float(self.max_gap_sec), 3),
+                            'valid_streaks': valid_streaks,
+                            'red_helmet_veto': False,
+                            'roi_buffer_size': int(len(session.get('roi_buffer', []))),
+                            **session.get('decision_context', {})
+                        }
                     })
-                session["triggered"] = True
+                session['triggered'] = True
+
             active_sessions.append(session)
 
         self.sessions = active_sessions
         return triggered
 
-
-class YardCrossingDetector(BaseEventDetector):
-    gui_name = "YARD-CROSS"
-
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
-        self.trigger_sec = max(0.0, float(self.config.get("trigger_sec", 3.0)))
-        self.states = {}
-
-    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
-        if self.roi_poly.size == 0:
-            self.states.clear()
-            return []
-        current_time = time.time()
-        inside_ids = set()
-        privacy_tracks = kwargs.get("privacy_tracks", [])
-        triggered = []
-
-        for track in tracks:
-            tid = int(track[4])
-            if track_map.get(tid) != ID_PCTC_PERSON:
-                continue
-            foot_point = get_foot_point(*track[:4])
-            if cv2.pointPolygonTest(self.roi_poly, foot_point, False) < 0:
-                continue
-            inside_ids.add(tid)
-            state = self.states.setdefault(tid, {"entered_at": current_time, "triggered": False})
-            dwell_sec = current_time - state["entered_at"]
-            if not state["triggered"] and dwell_sec >= self.trigger_sec:
-                triggered.append({
-                    "tid": tid,
-                    "bbox": track[:4],
-                    "frame": frame.copy() if frame is not None else None,
-                    "fid": fid,
-                    "privacy_tracks": privacy_tracks,
-                    "privacy_fid": fid,
-                    "objects": [_track_object(track, ID_PCTC_PERSON)],
-                    "decision_trace": {
-                        "detector": "YardCrossingDetector",
-                        "reason": "person_dwell_in_yard_crossing_roi",
-                        "class_id": ID_PCTC_PERSON,
-                        "class_name": pctc_class_name(ID_PCTC_PERSON),
-                        "foot_point": int_point(foot_point),
-                        "dwell_sec": round(dwell_sec, 3),
-                        "trigger_sec": round(self.trigger_sec, 3),
-                    },
-                })
-                state["triggered"] = True
-
-        for tid in list(self.states):
-            if tid not in inside_ids:
-                self.states.pop(tid, None)
-        return triggered
-
-
-class AbnormalDriveDetector(BaseEventDetector):
-    gui_name = "ABNORMAL-DRIVE"
-
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
-        self.min_displacement_ratio = max(0.0, float(self.config.get("min_displacement_ratio", 0.35)))
-        self.opposite_cos_threshold = float(self.config.get("opposite_cos_threshold", -0.35))
-        self.uturn_min_forward_ratio = max(0.0, float(self.config.get("uturn_min_forward_ratio", 0.45)))
-        self.uturn_return_ratio = max(0.0, float(self.config.get("uturn_return_ratio", 0.30)))
-        self.uturn_reverse_cos_threshold = float(self.config.get("uturn_reverse_cos_threshold", -0.20))
-        self.states = {}
-
-    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
-        current_time = time.time()
-        active_keys = set()
-        privacy_tracks = kwargs.get("privacy_tracks", [])
-        triggered = []
-
-        prepared_zones = []
-        for zone_index, zone in enumerate(self.abnormal_drive_zones or []):
-            polygon = zone.get("roi_poly", [])
-            direction = zone.get("direction_points", [])
-            if len(polygon) < 3 or len(direction) != 2:
-                continue
-            allowed_unit = _unit_vector(direction[0], direction[1])
-            if allowed_unit is None:
-                continue
-            prepared_zones.append((zone_index, np.array(polygon, dtype=np.int32), polygon, direction, allowed_unit))
-
-        for track in tracks:
-            tid = int(track[4])
-            class_id = int(track_map.get(tid, -1))
-            if class_id not in ABNORMAL_DRIVE_CLASS_IDS:
-                continue
-            current_center = get_check_point(*track[:4])
-            object_size = _bbox_scale(track[:4])
-            min_displacement_px = object_size * self.min_displacement_ratio
-
-            for zone_index, polygon_array, polygon, direction, allowed_unit in prepared_zones:
-                if cv2.pointPolygonTest(polygon_array, current_center, False) < 0:
-                    continue
-                key = (zone_index, tid)
-                active_keys.add(key)
-                state = self.states.get(key)
-                if state is None:
-                    self.states[key] = {
-                        "entry_center": current_center,
-                        "last_center": current_center,
-                        "max_forward_projection_px": 0.0,
-                        "triggered": False,
-                        "entered_at": current_time,
-                    }
-                    continue
-
-                entry_center = state["entry_center"]
-                travel_vector = (
-                    float(current_center[0]) - float(entry_center[0]),
-                    float(current_center[1]) - float(entry_center[1]),
-                )
-                travel_distance = math.hypot(*travel_vector)
-                forward_projection = travel_vector[0] * allowed_unit[0] + travel_vector[1] * allowed_unit[1]
-                state["max_forward_projection_px"] = max(state["max_forward_projection_px"], forward_projection)
-                max_forward_projection = state["max_forward_projection_px"]
-
-                travel_cos = None
-                if travel_distance > 1e-9:
-                    travel_cos = forward_projection / travel_distance
-
-                last_center = state["last_center"]
-                local_vector = (
-                    float(current_center[0]) - float(last_center[0]),
-                    float(current_center[1]) - float(last_center[1]),
-                )
-                local_distance = math.hypot(*local_vector)
-                local_cos = None
-                if local_distance > 1e-9:
-                    local_cos = (local_vector[0] * allowed_unit[0] + local_vector[1] * allowed_unit[1]) / local_distance
-
-                reason = None
-                uturn_forward_px = object_size * self.uturn_min_forward_ratio
-                uturn_return_px = object_size * self.uturn_return_ratio
-                if (
-                    not state["triggered"]
-                    and max_forward_projection >= uturn_forward_px
-                    and max_forward_projection - forward_projection >= uturn_return_px
-                    and local_cos is not None
-                    and local_cos <= self.uturn_reverse_cos_threshold
-                ):
-                    reason = "u_turn_after_forward_travel"
-                elif (
-                    not state["triggered"]
-                    and travel_distance >= min_displacement_px
-                    and travel_cos is not None
-                    and travel_cos <= self.opposite_cos_threshold
-                ):
-                    reason = "opposite_direction_travel"
-
-                if reason:
-                    triggered.append({
-                        "tid": tid,
-                        "bbox": track[:4],
-                        "frame": frame.copy() if frame is not None else None,
-                        "fid": fid,
-                        "privacy_tracks": privacy_tracks,
-                        "privacy_fid": fid,
-                        "objects": [_track_object(track, class_id)],
-                        "decision_trace": {
-                            "detector": "AbnormalDriveDetector",
-                            "reason": reason,
-                            "zone_index": zone_index + 1,
-                            "class_id": class_id,
-                            "class_name": pctc_class_name(class_id),
-                            "roi_anchor": int_point(current_center),
-                            "roi_polygon": [int_point(point) for point in polygon],
-                            "allowed_direction_points": [int_point(point) for point in direction],
-                            "allowed_direction_unit": [round(allowed_unit[0], 6), round(allowed_unit[1], 6)],
-                            "entry_center": int_point(entry_center),
-                            "current_center": int_point(current_center),
-                            "travel_distance_px": round(travel_distance, 3),
-                            "forward_projection_px": round(forward_projection, 3),
-                            "max_forward_projection_px": round(max_forward_projection, 3),
-                            "travel_cos": None if travel_cos is None else round(travel_cos, 6),
-                            "local_cos": None if local_cos is None else round(local_cos, 6),
-                            "min_displacement_px": round(min_displacement_px, 3),
-                        },
-                    })
-                    state["triggered"] = True
-
-                state["last_center"] = current_center
-
-        for key in list(self.states):
-            if key not in active_keys:
-                self.states.pop(key, None)
-        return triggered
-
-
-class WalkwayOutDetector(BaseEventDetector):
-    gui_name = "WALKWAY-OUT"
-
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
-        self.outside_grace_sec = max(0.0, float(self.config.get("outside_grace_sec", 1.0)))
-        self.boundary_margin_ratio = max(0.0, float(self.config.get("boundary_margin_ratio", 0.05)))
-        self.states = {}
-
-    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
-        if self.roi_poly.size == 0:
-            self.states.clear()
-            return []
-        current_time = time.time()
-        visible_person_ids = set()
-        privacy_tracks = kwargs.get("privacy_tracks", [])
-        triggered = []
-
-        for track in tracks:
-            tid = int(track[4])
-            if track_map.get(tid) != ID_PCTC_PERSON:
-                continue
-            visible_person_ids.add(tid)
-            foot_point = get_foot_point(*track[:4])
-            signed_distance = float(cv2.pointPolygonTest(self.roi_poly, foot_point, True))
-            boundary_margin_px = _bbox_scale(track[:4]) * self.boundary_margin_ratio
-
-            if signed_distance >= -boundary_margin_px:
-                self.states.pop(tid, None)
-                continue
-
-            state = self.states.setdefault(tid, {"outside_since": current_time, "triggered": False})
-            outside_sec = current_time - state["outside_since"]
-            if not state["triggered"] and outside_sec >= self.outside_grace_sec:
-                triggered.append({
-                    "tid": tid,
-                    "bbox": track[:4],
-                    "frame": frame.copy() if frame is not None else None,
-                    "fid": fid,
-                    "privacy_tracks": privacy_tracks,
-                    "privacy_fid": fid,
-                    "objects": [_track_object(track, ID_PCTC_PERSON)],
-                    "decision_trace": {
-                        "detector": "WalkwayOutDetector",
-                        "reason": "person_outside_walkway_roi",
-                        "foot_point": int_point(foot_point),
-                        "signed_distance_px": round(signed_distance, 3),
-                        "boundary_margin_px": round(boundary_margin_px, 3),
-                        "outside_sec": round(outside_sec, 3),
-                        "outside_grace_sec": round(self.outside_grace_sec, 3),
-                    },
-                })
-                state["triggered"] = True
-
-        for tid in list(self.states):
-            if tid not in visible_person_ids:
-                self.states.pop(tid, None)
-        return triggered
-
-
-class SpreaderDangerZoneDetector(BaseEventDetector):
-    gui_name = "SPREADER-DANGER"
-
-    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
-        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
-        self.link_ratio = max(0.0, float(self.config.get("spreader_container_link_ratio", 1.25)))
-        self.danger_distance_ratio = max(0.0, float(self.config.get("danger_distance_ratio", 1.20)))
-        self.min_danger_distance_px = max(0.0, float(self.config.get("min_danger_distance_px", 30.0)))
-        self.trigger_hold_sec = max(0.0, float(self.config.get("trigger_hold_sec", 0.5)))
-        self.states = {}
-
-    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
-        current_time = time.time()
-        privacy_tracks = kwargs.get("privacy_tracks", [])
-        spreaders = [track for track in tracks if track_map.get(int(track[4])) == ID_PCTC_SPREADER]
-        containers = [track for track in tracks if track_map.get(int(track[4])) == ID_PCTC_CONTAINER]
-        targets = [track for track in tracks if track_map.get(int(track[4])) in DANGER_APPROACH_CLASS_IDS]
-        active_keys = set()
-        triggered = []
-
-        if not spreaders or not containers:
-            self.states.clear()
-            return []
-
-        operations = []
-        for spreader in spreaders:
-            nearest_container = min(containers, key=lambda item: _bbox_gap(spreader[:4], item[:4]))
-            gap = _bbox_gap(spreader[:4], nearest_container[:4])
-            spreader_height = max(1.0, float(spreader[3]) - float(spreader[1]))
-            container_height = max(1.0, float(nearest_container[3]) - float(nearest_container[1]))
-            reference_height = max(spreader_height, container_height)
-            link_distance = max(10.0, reference_height * self.link_ratio)
-            if gap > link_distance:
-                continue
-            operation_box = [
-                min(float(spreader[0]), float(nearest_container[0])),
-                min(float(spreader[1]), float(nearest_container[1])),
-                max(float(spreader[2]), float(nearest_container[2])),
-                max(float(spreader[3]), float(nearest_container[3])),
-            ]
-            danger_distance = max(self.min_danger_distance_px, reference_height * self.danger_distance_ratio)
-            operations.append((spreader, nearest_container, operation_box, gap, link_distance, danger_distance))
-
-        for spreader, container, operation_box, gap, link_distance, danger_distance in operations:
-            spreader_tid = int(spreader[4])
-            container_tid = int(container[4])
-            for target in targets:
-                target_tid = int(target[4])
-                target_class_id = int(track_map.get(target_tid, -1))
-                anchor = get_foot_point(*target[:4]) if target_class_id == ID_PCTC_PERSON else get_check_point(*target[:4])
-                distance_to_operation = _point_to_bbox_distance(anchor, operation_box)
-                if distance_to_operation > danger_distance:
-                    continue
-
-                key = (spreader_tid, container_tid, target_tid)
-                active_keys.add(key)
-                state = self.states.setdefault(key, {"near_since": current_time, "triggered": False})
-                hold_sec = current_time - state["near_since"]
-                if not state["triggered"] and hold_sec >= self.trigger_hold_sec:
-                    triggered.append({
-                        "tid": target_tid,
-                        "bbox": target[:4],
-                        "frame": frame.copy() if frame is not None else None,
-                        "fid": fid,
-                        "privacy_tracks": privacy_tracks,
-                        "privacy_fid": fid,
-                        "objects": [
-                            _track_object(spreader, ID_PCTC_SPREADER),
-                            _track_object(container, ID_PCTC_CONTAINER),
-                            _track_object(target, target_class_id),
-                        ],
-                        "decision_trace": {
-                            "detector": "SpreaderDangerZoneDetector",
-                            "reason": "target_near_active_spreader_container_operation",
-                            "spreader_track_id": spreader_tid,
-                            "container_track_id": container_tid,
-                            "target_track_id": target_tid,
-                            "target_class_id": target_class_id,
-                            "target_class_name": pctc_class_name(target_class_id),
-                            "target_anchor": int_point(anchor),
-                            "operation_box": int_box(operation_box),
-                            "spreader_container_gap_px": round(gap, 3),
-                            "link_distance_px": round(link_distance, 3),
-                            "distance_to_operation_px": round(distance_to_operation, 3),
-                            "danger_distance_px": round(danger_distance, 3),
-                            "hold_sec": round(hold_sec, 3),
-                            "trigger_hold_sec": round(self.trigger_hold_sec, 3),
-                        },
-                    })
-                    state["triggered"] = True
-
-        for key in list(self.states):
-            if key not in active_keys:
-                self.states.pop(key, None)
-        return triggered
-
-
 EVENT_REGISTRY = {
     "intrusion": IntrusionDetector,
     "illegal_parking": ParkingDetector,
     "no_helmet": HelmetDetector,
-    "yard_crossing": YardCrossingDetector,
-    "abnormal_drive": AbnormalDriveDetector,
-    "walkway_out": WalkwayOutDetector,
-    "spreader_danger_zone": SpreaderDangerZoneDetector,
 }
+
+# ==========================================
 # [9] 터미널 마법사 및 설정 UI
 # ==========================================
 def _flush_terminal_input():
@@ -3751,174 +2455,92 @@ def get_roi_points_scaled(frame, title, mode="poly"):
     guard_interactive_input()
     return normalize_roi_points(pts, orig_w, orig_h)
 
-WIZARD_SAFETY_EVENT_CHOICES = (
-    ("1", "침입 감지"),
-    ("2", "불법 주정차"),
-    ("3", "안전모 미착용"),
-    ("4", "야적장 사이 횡단 금지"),
-    ("5", "역주행/유턴 금지"),
-    ("6", "보행로 이탈 감지"),
-    ("7", "위험구역 진입 감지"),
-)
-WIZARD_SAFETY_SELECTION_MAP = {
-    "1": "intrusion",
-    "2": "illegal_parking",
-    "3": "no_helmet",
-    "4": "yard_crossing",
-    "5": "abnormal_drive",
-    "6": "walkway_out",
-    "7": "spreader_danger_zone",
-}
-WIZARD_CAMERA_OPTION_CHOICES = (
-    ("0", "사용 안 함"),
-    ("1", "카메라 화각변경 감지"),
-    ("2", "카메라 화각변경 감지 + ROI 자동보정"),
-)
-WIZARD_CAMERA_OPTION_MAP = {
-    "0": None,
-    "1": ROI_CHANGE_EVENT,
-    "2": ROI_CHANGE_APPLY_EVENT,
-}
-
-
-def _print_wizard_event_menu():
-    print("=== 안전 이벤트 선택 (1~7, 복수 선택 가능) ===", flush=True)
-    for number, label in WIZARD_SAFETY_EVENT_CHOICES:
-        print(f"  {number}. {label}", flush=True)
-
-
-def _parse_wizard_event_selection(value):
-    text = str(value or "").strip()
-    if not text:
-        return []
-    tokens = [token for token in re.split(r"[,\s]+", text) if token]
-    invalid = [token for token in tokens if token not in WIZARD_SAFETY_SELECTION_MAP]
-    if invalid:
-        raise ValueError(f"허용 번호는 1~7입니다. 잘못된 입력: {', '.join(invalid)}")
-    events = []
-    for token in tokens:
-        event_name = WIZARD_SAFETY_SELECTION_MAP[token]
-        if event_name not in events:
-            events.append(event_name)
-    return events
-
-
-def _print_wizard_camera_option_menu():
-    print("=== 카메라 화각변경 옵션 (안전 이벤트와 별도) ===", flush=True)
-    for number, label in WIZARD_CAMERA_OPTION_CHOICES:
-        print(f"  {number}. {label}", flush=True)
-
-
-def _parse_wizard_camera_option(value):
-    token = str(value or "").strip()
-    if token not in WIZARD_CAMERA_OPTION_MAP:
-        raise ValueError("허용 번호는 0, 1, 2입니다.")
-    return WIZARD_CAMERA_OPTION_MAP[token]
-
-
-def _prompt_wizard_safety_events(ip):
-    while True:
-        _print_wizard_event_menu()
-        try:
-            return _parse_wizard_event_selection(guarded_input(f"[{ip}] 안전 이벤트 선택 (쉼표 또는 공백, 미선택은 Enter): "))
-        except ValueError as exc:
-            print(str(exc), flush=True)
-
-
-def _prompt_wizard_camera_option(ip):
-    while True:
-        _print_wizard_camera_option_menu()
-        try:
-            return _parse_wizard_camera_option(guarded_input(f"[{ip}] 화각변경 옵션 선택 (0/1/2): "))
-        except ValueError as exc:
-            print(str(exc), flush=True)
-
-
 def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     logger.info("=== 설정 마법사 시작 ===")
-    configs = sanitize_camera_configs(existing_configs or {})
+    # 기존 설정을 그대로 복사하여 기반으로 삼음
+    configs = existing_configs.copy() if existing_configs else {}
 
-    for batch_start in range(0, len(rtsp_list), BATCH_SIZE):
-        batch = rtsp_list[batch_start:batch_start + BATCH_SIZE]
+    for i in range(0, len(rtsp_list), BATCH_SIZE):
+        batch = rtsp_list[i : i + BATCH_SIZE]
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             frames = list(executor.map(capture_snapshot, batch))
 
         display = []
-        for frame in frames:
-            if frame is None:
-                blank = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(blank, "Conn Fail", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1)
-                display.append(blank)
+        for idx, frm in enumerate(frames):
+            if frm is None:
+                blk = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(blk, "Conn Fail", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1)
+                display.append(blk)
             else:
-                display.append(frame)
+                display.append(frm)
 
         mosaic = create_mosaic_image(display)
-        columns = max(1, math.ceil(math.sqrt(len(display))))
-        rows = max(1, math.ceil(len(display) / columns))
-        cell_width = SCREEN_WIDTH // columns
-        cell_height = SCREEN_HEIGHT // rows
-        for local_index in range(len(display)):
-            row, column = divmod(local_index, columns)
-            x, y = column * cell_width, row * cell_height
-            cv2.rectangle(mosaic, (x, y), (x + 50, y + 50), (255, 255, 255), -1)
-            camera_number = batch_start + local_index + 1
-            cv2.putText(mosaic, str(camera_number), (x + 10, y + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 1)
+        cols = max(1, math.ceil(math.sqrt(len(display))))
+        rows = max(1, math.ceil(len(display) / cols))
+        cw = SCREEN_WIDTH // cols
+        ch = SCREEN_HEIGHT // rows
+
+        for idx in range(len(display)):
+            r, c = divmod(idx, cols)
+            cx, cy = c * cw, r * ch
+            cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
+            
+            # [요구사항 반영 2] 배치(Batch) 상대 번호가 아닌 CSV 전체 기준 절대 순차 번호 생성
+            abs_cam_id = i + idx + 1 
+            cv2.putText(mosaic, str(abs_cam_id), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 1)
 
         cv2.imshow("Select Cameras", mosaic)
         cv2.waitKey(1)
-        example_ids = f"{batch_start + 1},{batch_start + 2}" if len(batch) > 1 else f"{batch_start + 1}"
-        selection = guarded_input(f">> [Batch {batch_start // BATCH_SIZE + 1}] 설정할 카메라 번호 (예: {example_ids} / 건너뛰기: 엔터): ").strip()
-        if not selection:
+
+        # [요구사항 반영 3] 프롬프트 안내 메시지도 절대 번호 기준으로 변경
+        example_ids = f"{i+1},{i+2}" if len(batch) > 1 else f"{i+1}"
+        sel = guarded_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: {example_ids} / 건너뛰기: 엔터): ").strip()
+        if not sel:
             continue
 
         try:
-            camera_numbers = [int(token) for token in re.split(r"[,\s]+", selection) if token]
-        except ValueError as exc:
-            logger.error(f"카메라 번호 입력 오류: {exc}")
-            continue
+            nums = [int(s.strip()) for s in sel.split(',')]
+            for n in nums:
+                # [요구사항 반영 3] 사용자가 입력한 절대 번호를 다시 배치 내 로컬 인덱스로 변환하여 처리
+                local_idx = n - i - 1 
+                if 0 <= local_idx < len(batch) and frames[local_idx] is not None:
+                    url = batch[local_idx]
+                    ip = extract_ip(url)
 
-        for camera_number in camera_numbers:
-            local_index = camera_number - batch_start - 1
-            if not (0 <= local_index < len(batch)) or frames[local_index] is None:
-                continue
+                    print(
+                        f"[{ip}] 1.Intrusion 2.Illegal Parking 3.No Helmet "
+                        f"4.ROI Change 5.ROI Change+Auto Apply"
+                    )
+                    evts = guarded_input(f"[{ip}] Select events (example: 1,2,5): ")
+                    events = []
 
-            url = batch[local_index]
-            ip = extract_ip(url)
-            safety_events = _prompt_wizard_safety_events(ip)
-            camera_option = _prompt_wizard_camera_option(ip)
-            events = list(safety_events)
-            if camera_option:
-                events.append(camera_option)
+                    selected_events = {s.strip() for s in evts.split(',') if s.strip()}
+                    if '1' in selected_events:
+                        events.append("intrusion")
+                    if '2' in selected_events:
+                        events.append("illegal_parking")
+                    if '3' in selected_events:
+                        events.append("no_helmet")
+                    if '4' in selected_events:
+                        events.append(ROI_CHANGE_EVENT)
+                    if '5' in selected_events:
+                        events.append(ROI_CHANGE_APPLY_EVENT)
 
-            roi_poly_norm = []
-            if any(event_name in ROI_POLYGON_EVENT_NAMES for event_name in safety_events):
-                roi_poly_norm = get_roi_points_scaled(frames[local_index], f"Polygon - CAM: {ip}")
+                    roi_p = []
+                    roi_l = []
+                    if any(event_name in events for event_name in DETECTION_EVENT_NAMES):
+                        roi_p = get_roi_points_scaled(frames[local_idx], f"Polygon - CAM: {ip}")
 
-            abnormal_drive_zones_norm = []
-            if "abnormal_drive" in safety_events:
-                zone_index = 1
-                while True:
-                    polygon = get_roi_points_scaled(frames[local_index], f"abnormal_drive ROI #{zone_index} - CAM: {ip}")
-                    direction = get_roi_points_scaled(frames[local_index], f"Allowed START to END #{zone_index} - CAM: {ip}", mode="line")
-                    if len(polygon) >= 3 and len(direction) == 2 and direction[0] != direction[1]:
-                        abnormal_drive_zones_norm.append({
-                            "roi_poly_norm": polygon,
-                            "direction_points_norm": direction,
-                        })
-                    else:
-                        print(f"경고: abnormal_drive ROI #{zone_index}는 polygon 3점 이상과 방향점 2개가 필요하여 추가하지 않았습니다.", flush=True)
-                    answer = guarded_input("Add another abnormal_drive ROI? (y/n): ").strip().lower()
-                    if answer != "y":
-                        break
-                    zone_index += 1
-
-            configs[ip] = sanitize_camera_config({
-                "url": url,
-                "events": events,
-                "roi_poly_norm": roi_poly_norm,
-                "roi_lines_norm": [],
-                "abnormal_drive_zones_norm": abnormal_drive_zones_norm,
-            })
+                    configs[ip] = {
+                        "url": url,
+                        "events": events,
+                        "roi_poly_norm": roi_p,
+                        "roi_lines_norm": roi_l
+                    }
+        except Exception as e:
+            logger.error(f"마법사 설정 중 오류 발생: {e}")
+            pass
 
     cv2.destroyWindow("Select Cameras")
     return configs
@@ -4521,13 +3143,6 @@ class FrameReader:
         except Exception:
             return 10.0
 
-    def _decode_sleep_sec(self, key, default, max_sec=0.05):
-        try:
-            value = float(self.decode_cfg.get(key, default))
-        except Exception:
-            value = float(default)
-        return min(max(0.0, value), max(0.0, float(max_sec)))
-
     def _decode_verbose_logs(self):
         value = self.decode_cfg.get("verbose_logs", False)
         if isinstance(value, str):
@@ -4607,14 +3222,11 @@ class FrameReader:
         return self.url
 
     def _drain_binary_log_pipe(self, pipe, line_buffer):
-        sleep_sec = self._decode_sleep_sec("gstreamer_log_drain_sleep_sec", 0.002)
         try:
             for raw_line in iter(pipe.readline, b""):
                 line = self._short_external_output(raw_line)
                 if line:
                     line_buffer.append(line)
-                if sleep_sec > 0.0:
-                    time.sleep(sleep_sec)
         except Exception:
             pass
         finally:
@@ -4904,7 +3516,6 @@ class FrameReader:
         frame_size = int(out_w * out_h * 1.5)
         
         fps_limit = self._decode_fps_limit()
-        loop_sleep_sec = self._decode_sleep_sec("gstreamer_loop_sleep_sec", 0.001)
         decoder_info = self._select_gstreamer_decoder(codec)
         if decoder_info is None:
             self._note_decode_failure(f"gstreamer_unsupported_codec_{codec or 'unknown'}")
@@ -4996,8 +3607,6 @@ class FrameReader:
                 self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
                 if not first_frame_logged:
                     first_frame_logged = True
-                if loop_sleep_sec > 0.0:
-                    time.sleep(loop_sleep_sec)
 
             return True
         except Exception as e:
@@ -5166,12 +3775,12 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_plate, cam_id, event_inference_mode="main"):
+    def __init__(self, ip, conf, det_main, det_helmet, det_face, det_plate, cam_id):
         self.ip = ip
         self.camera_key = ip
         self.conf = sanitize_camera_config(conf)
         self.cam_id = cam_id
-        self.event_inference_mode = event_inference_mode
+        self.event_inference_mode = "pctc_main+dedicated_helmet"
         self.events = list(self.conf.get("events", []))
 
         self.det_main = det_main
@@ -5188,48 +3797,24 @@ class Camera:
         self.alerted = defaultdict(set)
         self.last_evt_t = {}
         self.visual_alarms = {}
+
         self.fps_queue = deque(maxlen=30)
         self.current_fps = 0.0
 
         self.roi_poly_norm = self.conf.get("roi_poly_norm", [])
-        self.roi_lines_norm = []
-        self.abnormal_drive_zones_norm = self.conf.get("abnormal_drive_zones_norm", [])
+        self.roi_lines_norm = self.conf.get("roi_lines_norm", [])
         self.roi_poly = []
         self.roi_lines = []
-        self.abnormal_drive_zones = []
 
         self.base_roi_poly = []
         self.base_roi_lines = []
-        self.base_abnormal_drive_zones = []
         self.aligned_roi_poly = []
         self.aligned_roi_lines = []
-        self.aligned_abnormal_drive_zones = []
 
         self.roi_frame_shape = None
         self.status_history = deque(maxlen=10)
         self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
-
-    def _denormalize_abnormal_drive_zones(self, width, height):
-        zones = []
-        for zone in self.abnormal_drive_zones_norm or []:
-            polygon = denormalize_roi_points(zone.get("roi_poly_norm", []), width, height)
-            direction = denormalize_roi_points(zone.get("direction_points_norm", []), width, height)
-            if len(polygon) >= 3 and len(direction) == 2:
-                zones.append({"roi_poly": polygon, "direction_points": direction})
-        return zones
-
-    @staticmethod
-    def _shift_abnormal_drive_zones(zones, shift):
-        dx = int(round(float(shift[0])))
-        dy = int(round(float(shift[1])))
-        shifted = []
-        for zone in zones or []:
-            shifted.append({
-                "roi_poly": [[int(point[0]) + dx, int(point[1]) + dy] for point in zone.get("roi_poly", [])],
-                "direction_points": [[int(point[0]) + dx, int(point[1]) + dy] for point in zone.get("direction_points", [])],
-            })
-        return shifted
 
     def _reset_alignment_state(self, status_text="ALIGN RESET"):
         self.aligner = AnchorTrackingROIAligner()
@@ -5237,13 +3822,11 @@ class Camera:
 
         self.base_roi_poly = []
         self.base_roi_lines = []
-        self.base_abnormal_drive_zones = []
         self.aligned_roi_poly = []
         self.aligned_roi_lines = []
-        self.aligned_abnormal_drive_zones = []
-        self.roi_shift = [0.0, 0.0]
-        self.roi_auto_corrected = False
-        self.roi_setup_pending = False
+        self.roi_shift = [0.0, 0.0]      # roi_change_apply: base ROI에 적용된 평행이동(px)
+        self.roi_auto_corrected = False  # roi_change_apply 1회 보정 래치. True면 관제센터 ROI 수신(update_config) 전까지 추가 보정 금지
+        self.roi_setup_pending = False   # confirm/disturbed 확정 후 관제센터 ROI 수신 전까지 True(=서버에 true 전송 중인 상태). CSV healthcheck 컬럼에 기록
 
         self.last_align_time = 0.0
         self.last_anchor_attempt_time = 0.0
@@ -5254,74 +3837,97 @@ class Camera:
 
     def _rebuild_handlers(self):
         self.handlers = {}
-        for event_name in self.events:
-            detector_class = EVENT_REGISTRY.get(event_name)
-            if detector_class is None:
-                continue
-            self.handlers[event_name] = detector_class(
-                SYS_CFG.get("event_config", {}).get(event_name, {}),
-                self.roi_poly,
-                self.roi_lines,
-                self.abnormal_drive_zones,
-            )
+
+        for ename in self.events:
+            if ename in EVENT_REGISTRY:
+                self.handlers[ename] = EVENT_REGISTRY[ename](
+                    SYS_CFG.get("event_config", {}).get(ename, {}),
+                    self.roi_poly,
+                    self.roi_lines
+                )
 
     def update_config(self, new_conf):
-        old_events = list(self.events)
+        old_events = self.events.copy()
+
+        # 관제센터에서 새 ROI가 적용되면 해당 카메라의 pending/count를 해제한다.
         ROI_ALIGN_LEARNING_STORE.reset_camera(self.camera_key, reason="camera_config_updated")
 
         self.conf = sanitize_camera_config(new_conf)
         self.events = list(self.conf.get("events", []))
         self.roi_poly_norm = self.conf.get("roi_poly_norm", [])
-        self.roi_lines_norm = []
-        self.abnormal_drive_zones_norm = self.conf.get("abnormal_drive_zones_norm", [])
+        self.roi_lines_norm = self.conf.get("roi_lines_norm", [])
+
         self.roi_poly = []
         self.roi_lines = []
-        self.abnormal_drive_zones = []
         self.roi_frame_shape = None
 
         self._reset_alignment_state("ALIGN RESET")
         self._rebuild_handlers()
-        self.status_history.clear()
-        logger.info(f"[CAM:{self.ip}] 무중단 설정 리로드 완료: {old_events} -> {self.events} | ROI aligner reset")
+
+        try:
+            self.status_history.clear()
+        except Exception:
+            pass
+
+        logger.info(
+            f" [CAM:{self.ip}] 무중단 설정 리로드 완료: "
+            f"{old_events} -> {self.events} | ROI aligner reset"
+        )
         logger.debug(f"[CCTV_Aligner] CAM {self.cam_id} aligner reset after config reload")
 
     def _initialize_base_roi_if_needed(self, frame):
         if frame is None:
             return False
-        height, width = frame.shape[:2]
-        need_init = self.roi_frame_shape != frame.shape[:2]
-        need_init = need_init or bool(self.roi_poly_norm and not self.base_roi_poly)
-        need_init = need_init or bool(self.abnormal_drive_zones_norm and not self.base_abnormal_drive_zones)
+
+        h, w = frame.shape[:2]
+
+        need_init = False
+        if self.roi_frame_shape != frame.shape[:2]:
+            need_init = True
+        if self.roi_poly_norm and not self.base_roi_poly:
+            need_init = True
+        if self.roi_lines_norm and not self.base_roi_lines:
+            need_init = True
+
         if not need_init:
             return True
 
-        self.base_roi_poly = denormalize_roi_points(self.roi_poly_norm, width, height) if self.roi_poly_norm else []
-        self.base_roi_lines = []
-        self.base_abnormal_drive_zones = self._denormalize_abnormal_drive_zones(width, height)
-        self.roi_shift = [0.0, 0.0]
+        self.base_roi_poly = denormalize_roi_points(self.roi_poly_norm, w, h) if self.roi_poly_norm else []
+        self.base_roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h) if self.roi_lines_norm else []
+
+        self.roi_shift = [0.0, 0.0]      # 새 base 기준이므로 보정량·1회 보정 래치 초기화
         self.roi_auto_corrected = False
         self.aligned_roi_poly = list(self.base_roi_poly)
-        self.aligned_roi_lines = []
-        self.aligned_abnormal_drive_zones = self._shift_abnormal_drive_zones(self.base_abnormal_drive_zones, self.roi_shift)
+        self.aligned_roi_lines = list(self.base_roi_lines)
         self.roi_frame_shape = frame.shape[:2]
+
         self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
-        logger.info(
-            f"[CAM:{self.cam_id}] base ROI init | poly={len(self.base_roi_poly)} "
-            f"abnormal_zones={len(self.base_abnormal_drive_zones)} shape={frame.shape[:2]}"
-        )
+        logger.info(f"[CAM:{self.cam_id}] base ROI init | poly={len(self.base_roi_poly)} lines={len(self.base_roi_lines)} shape={frame.shape[:2]}")
         return True
 
     def _inject_roi_to_handlers(self, roi_poly, roi_lines):
         self.roi_poly = roi_poly or []
-        self.roi_lines = []
-        self.aligned_abnormal_drive_zones = self._shift_abnormal_drive_zones(self.base_abnormal_drive_zones, self.roi_shift)
-        self.abnormal_drive_zones = self.aligned_abnormal_drive_zones
+        self.roi_lines = roi_lines or []
 
-        for event_name, handler in self.handlers.items():
-            handler.roi_poly = np.array(self.roi_poly, dtype=np.int32) if len(self.roi_poly) >= 3 else np.empty((0, 2), dtype=np.int32)
-            handler.roi_lines = []
-            if event_name == "abnormal_drive":
-                handler.abnormal_drive_zones = list(self.abnormal_drive_zones)
+        for ename in self.events:
+            if ename not in self.handlers: continue
+            handler = self.handlers[ename]
+
+            if self.roi_poly and len(self.roi_poly) >= 3:
+                handler.roi_poly = np.array(self.roi_poly, dtype=np.int32)
+            else:
+                handler.roi_poly = np.empty((0, 2), dtype=np.int32)
+
+            if hasattr(handler, "roi_lines"):
+                handler.roi_lines = self.roi_lines or []
+
+            if hasattr(handler, "lines"):
+                new_lines = []
+                lines = self.roi_lines or []
+                for i in range(0, len(lines), 2):
+                    if i + 1 < len(lines):
+                        new_lines.append((lines[i], lines[i + 1]))
+                handler.lines = new_lines
 
     def _shift_roi_points(self, points, shift):
         """ROI 점들을 (dx, dy)만큼 평행이동한 새 리스트로 반환(roi_change_apply 보정용).homography가
@@ -5471,7 +4077,7 @@ class Camera:
             and decision.get("confirmed", False)
             and not disturbed
             and 0.0 < shift_mag <= GRID_APPLY_MAX_SHIFT_PX
-            and (self.base_roi_poly or self.base_roi_lines or self.base_abnormal_drive_zones)
+            and (self.base_roi_poly or self.base_roi_lines)
         )
         if can_auto_correct:
             # [1순위] homography 보정 시도 (앵커 gray는 이미 aligner에 보관돼 있음)
@@ -5643,9 +4249,8 @@ class Camera:
                     _sh, _sw = snap_img.shape[:2]
                     roi_info = {
                         "roi_poly_norm": self.roi_poly_norm,
-                        "roi_lines_norm": [],
-                        "abnormal_drive_zones_norm": self.abnormal_drive_zones_norm,
-                        "roi_change_poly_norm": []
+                        "roi_lines_norm": self.roi_lines_norm,
+                        "roi_change_poly_norm": []  # 폐기 필드. 관제 서버 호환용 빈 배열.
                     }
                     IMAGE_SAVER_POOL.submit(
                         _send_roi_snapshot_task,
@@ -5713,46 +4318,56 @@ class Camera:
         return fr, fid, connected
 
     def apply_face_blur(self, frame, person_boxes, return_meta=False):
-        if frame is None or self.det_face is None or not person_boxes:
+        if frame is None or self.det_face is None:
             return (frame, []) if return_meta else frame
 
         blur_img = frame.copy()
         blurred_faces = []
+
         try:
             face_conf = SYS_CFG.get("model_confidences", {}).get("FACE", 0.35)
-            face_detections = self.det_face.infer(blur_img, conf_override=face_conf)
-            for detection in face_detections:
-                fx1, fy1, fx2, fy2 = map(int, detection[:4])
-                face_width, face_height = fx2 - fx1, fy2 - fy1
-                if face_width <= 0 or face_height <= 0 or face_width > blur_img.shape[1] * 0.4:
+            f_dets = self.det_face.infer(blur_img, conf_override=face_conf)
+
+            for f in f_dets:
+                fx1, fy1, fx2, fy2 = map(int, f[:4])
+                fw, fh = fx2 - fx1, fy2 - fy1
+
+                if fw > blur_img.shape[1] * 0.4:
                     continue
-                face_center_x = fx1 + face_width / 2.0
-                face_center_y = fy1 + face_height / 2.0
+
+                fcx = fx1 + (fw / 2.0)
+                fcy = fy1 + (fh / 2.0)
+                is_valid_face = False
+
                 matched_person_tid = -1
-                for person in person_boxes:
-                    px1, py1, px2, py2 = map(int, person[:4])
-                    person_width, person_height = px2 - px1, py2 - py1
-                    if (
-                        px1 - person_width * 0.15 <= face_center_x <= px2 + person_width * 0.15
-                        and py1 - person_height * 0.25 <= face_center_y <= py2 + person_height * 0.05
-                    ):
-                        matched_person_tid = int(person[4]) if len(person) > 4 else -1
+                for p in person_boxes:
+                    px1, py1, px2, py2 = map(int, p[:4])
+                    pw, ph = px2 - px1, py2 - py1
+
+                    pad_x = pw * 0.15
+                    pad_y_top = ph * 0.25
+                    pad_y_bottom = ph * 0.05
+
+                    if (px1 - pad_x) <= fcx <= (px2 + pad_x) and (py1 - pad_y_top) <= fcy <= (py2 + pad_y_bottom):
+                        is_valid_face = True
+                        matched_person_tid = int(p[4]) if len(p) > 4 else -1
                         break
-                if matched_person_tid < 0:
-                    continue
-                roi = blur_img[fy1:fy2, fx1:fx2]
-                if roi.size == 0:
-                    continue
-                small = cv2.resize(roi, (max(1, face_width // 15), max(1, face_height // 15)), interpolation=cv2.INTER_LINEAR)
-                blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (face_width, face_height), interpolation=cv2.INTER_NEAREST)
-                blurred_faces.append({
-                    "box": [fx1, fy1, fx2, fy2],
-                    "score": round(float(detection[4]), 4) if len(detection) > 4 else 0.0,
-                    "class_id": int(detection[5]) if len(detection) > 5 else -1,
-                    "matched_person_tid": matched_person_tid,
-                })
-        except Exception as exc:
-            logger.error(f"모자이크 처리 실패: {exc}")
+
+                if is_valid_face:
+                    roi = blur_img[fy1:fy2, fx1:fx2]
+                    if roi.size > 0:
+                        small = cv2.resize(roi, (max(1, fw//15), max(1, fh//15)), interpolation=cv2.INTER_LINEAR)
+                        blur_img[fy1:fy2, fx1:fx2] = cv2.resize(small, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                        blurred_faces.append({
+                            "box": [fx1, fy1, fx2, fy2],
+                            "score": round(float(f[4]), 4) if len(f) > 4 else 0.0,
+                            "class_id": int(f[5]) if len(f) > 5 else -1,
+                            "matched_person_tid": matched_person_tid
+                        })
+
+        except Exception as e:
+            logger.error(f"모자이크 처리 실패: {e}")
+
         return (blur_img, blurred_faces) if return_meta else blur_img
 
     def apply_plate_blur(self, frame, vehicle_boxes=None, return_meta=False):
@@ -5819,331 +4434,371 @@ class Camera:
             "blur_face": bool(blur_face),
             "blur_plate": bool(blur_plate),
             "face": [],
-            "plate": [],
+            "plate": []
         }
+
         if frame is None:
             return frame, privacy_meta
 
         blurred_img = frame.copy()
-        person_boxes = [track for track in t_main if int(track[6]) == ID_PCTC_PERSON]
-        vehicle_boxes = [track for track in t_main if int(track[6]) in PLATE_PRIVACY_CLASS_IDS]
+        person_boxes = [t for t in t_main if int(t[6]) == ID_PCTC_PERSON]
+        vehicle_boxes = [t for t in t_main if int(t[6]) in PLATE_CANDIDATE_CLASS_IDS]
+
         if blur_face:
-            blurred_img, privacy_meta["face"] = self.apply_face_blur(blurred_img, person_boxes, return_meta=True)
+            blurred_img, face_blurs = self.apply_face_blur(blurred_img, person_boxes, return_meta=True)
+            privacy_meta["face"] = face_blurs
+
         if blur_plate:
-            blurred_img, privacy_meta["plate"] = self.apply_plate_blur(blurred_img, vehicle_boxes, return_meta=True)
+            blurred_img, plate_blurs = self.apply_plate_blur(blurred_img, vehicle_boxes, return_meta=True)
+            privacy_meta["plate"] = plate_blurs
+
         privacy_meta["applied"] = bool(privacy_meta["face"] or privacy_meta["plate"])
         return blurred_img, privacy_meta
 
     def _privacy_tracks_from_event_objects(self, objects):
-        label_to_class = {name.lower(): class_id for class_id, name in enumerate(PCTC_CLASS_NAMES)}
-        label_to_class.update({"low_body": ID_PCTC_TRUCK, "yt": ID_PCTC_YT, "yc": ID_PCTC_YC})
-        allowed_classes = {ID_PCTC_PERSON, *PLATE_PRIVACY_CLASS_IDS}
+        label_to_class = {name.lower(): idx for idx, name in enumerate(PCTC_CLASS_NAMES)}
+        label_to_class.update({"vehicle": ID_PCTC_CAR, "truck": ID_PCTC_TRUCK})
         tracks = []
+
         for obj in objects or []:
             try:
                 box = obj.get("box", [])
                 if len(box) < 4:
                     continue
+                class_id = obj.get("class_id")
                 try:
-                    class_id = int(obj.get("class_id"))
+                    class_id = int(class_id)
                 except Exception:
-                    class_id = label_to_class.get(str(obj.get("class_name") or obj.get("label") or "").lower())
-                if class_id not in allowed_classes:
+                    class_id = label_to_class.get(str(obj.get("label", "")).lower())
+                if class_id not in PCTC_MAIN_TRACK_CLASS_IDS:
                     continue
                 tracks.append([
                     float(box[0]), float(box[1]), float(box[2]), float(box[3]),
-                    int(obj.get("tid", -1)), float(obj.get("score", 0.95)), int(class_id),
+                    int(obj.get("tid", -1)),
+                    float(obj.get("score", 0.95)),
+                    int(class_id),
                 ])
             except Exception:
                 continue
+
         return tracks
 
     def _serialize_detection(self, det):
-        class_id = int(det[5])
         return {
-            "box": [int(round(float(value))) for value in det[:4]],
+            "box": [int(round(float(v))) for v in det[:4]],
             "score": round(float(det[4]), 4),
-            "class_id": class_id,
-            "class_name": pctc_class_name(class_id),
+            "class_id": int(det[5])
         }
 
     def _serialize_track(self, track):
-        class_id = int(track[6])
         return {
-            "box": [int(round(float(value))) for value in track[:4]],
+            "box": [int(round(float(v))) for v in track[:4]],
             "tid": int(track[4]),
             "score": round(float(track[5]), 4),
-            "class_id": class_id,
-            "class_name": pctc_class_name(class_id),
+            "class_id": int(track[6])
         }
 
     def _serialize_event_objects(self, objects):
         safe_objects = []
         for obj in objects or []:
-            class_id = int(obj.get("class_id", -1))
             safe_objects.append({
                 "label": str(obj.get("label", "")),
-                "class_name": str(obj.get("class_name") or pctc_class_name(class_id)),
-                "box": [int(round(float(value))) for value in obj.get("box", [])],
+                "box": [int(round(float(v))) for v in obj.get("box", [])],
                 "score": round(float(obj.get("score", 0.0)), 4),
                 "tid": int(obj.get("tid", -1)),
-                "class_id": class_id,
+                "class_id": int(obj.get("class_id", -1))
             })
         return safe_objects
 
     def build_inference_log(self, fid, frame, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events):
-        height, width = frame.shape[:2] if frame is not None else (0, 0)
+        h, w = frame.shape[:2] if frame is not None else (0, 0)
+        kst = pytz.timezone("Asia/Seoul")
         return {
-            "ts": now_kst().isoformat(),
+            "ts": datetime.datetime.now(kst).isoformat(),
             "fid": int(fid),
             "cam_id": int(self.cam_id),
             "ip": str(self.ip),
-            "frame_shape": [int(height), int(width)],
+            "frame_shape": [int(h), int(w)],
             "inference_mode": str(self.event_inference_mode),
             "events": list(self.events),
-            "roi_poly": [[int(point[0]), int(point[1])] for point in (self.roi_poly or [])],
-            "roi_lines": [],
-            "abnormal_drive_zones": to_json_safe(self.abnormal_drive_zones),
+            "roi_poly": [[int(p[0]), int(p[1])] for p in (self.roi_poly or [])],
+            "roi_lines": [[int(p[0]), int(p[1])] for p in (self.roi_lines or [])],
             "detections": {
-                "main": [self._serialize_detection(det) for det in d_main_res],
-                "helmet": [self._serialize_detection(det) for det in d_helmet_res],
+                "main": [self._serialize_detection(d) for d in d_main_res],
+                "helmet": [self._serialize_detection(d) for d in d_helmet_res],
             },
             "tracks": {
-                "main": [self._serialize_track(track) for track in t_main],
-                "helmet": [self._serialize_track(track) for track in t_helmet],
+                "main": [self._serialize_track(t) for t in t_main],
+                "helmet": [self._serialize_track(t) for t in t_helmet],
             },
-            "alarms": {str(int(tid)): event_name for tid, event_name in (alarms or {}).items()},
-            "new_events": [{
-                "event_id": str(event.get("event_id", "")),
-                "ts": str(event.get("ts", "")),
-                "event_name": str(event.get("event_name", "")),
-                "objects": self._serialize_event_objects(event.get("objects", [])),
-                "privacy_blur": to_json_safe(event.get("privacy_blur", {})),
-                "decision_trace": to_json_safe(event.get("decision_trace", {})),
-            } for event in (new_events or [])],
+            "alarms": {str(int(tid)): evt for tid, evt in (alarms or {}).items()},
+            "new_events": [
+                {
+                    "event_id": str(ev.get("event_id", "")),
+                    "ts": str(ev.get("ts", "")),
+                    "event_name": str(ev.get("event_name", "")),
+                    "objects": self._serialize_event_objects(ev.get("objects", [])),
+                    "privacy_blur": to_json_safe(ev.get("privacy_blur", {})),
+                    "decision_trace": to_json_safe(ev.get("decision_trace", {})),
+                }
+                for ev in (new_events or [])
+            ],
         }
 
-    def run_logic(self, frame, fid, d_main_res, d_helmet_res):
-        if frame is None:
+    def run_logic(self, fr, fid, d_main_res, d_helmet_res):
+        if fr is None:
             return [], [], {}, []
 
-        now_value = time.time()
-        self.fps_queue.append(now_value)
+        now_t = time.time()
+        self.fps_queue.append(now_t)
         if len(self.fps_queue) > 1:
-            elapsed = self.fps_queue[-1] - self.fps_queue[0]
-            self.current_fps = len(self.fps_queue) / elapsed if elapsed > 0 else 0.0
+            time_diff = self.fps_queue[-1] - self.fps_queue[0]
+            self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
 
-        self._update_alignment(frame)
-        main_filtered = [det for det in d_main_res if int(det[5]) in PCTC_MAIN_TRACK_CLASS_IDS]
-        t_main = self.trk_main.update(main_filtered)
+        self._update_alignment(fr)
+
+        d_main_filtered = [d for d in d_main_res if int(d[5]) in PCTC_MAIN_TRACK_CLASS_IDS]
+        t_main = self.trk_main.update(d_main_filtered)
         t_helmet = self.trk_helmet.update(d_helmet_res)
-        track_map_main = {int(track[4]): int(track[6]) for track in t_main}
-        score_map_main = {int(track[4]): round(float(track[5]), 4) for track in t_main}
+
+        now = time.time()
         current_alarms = {}
+        track_map_main = {int(t[4]): int(t[6]) for t in t_main}
+        score_map_main = {int(t[4]): round(float(t[5]), 2) for t in t_main}
         newly_triggered_events = []
 
-        for event_name, handler in self.handlers.items():
-            kwargs = {"privacy_tracks": t_main}
-            if event_name == "no_helmet":
-                kwargs["helmet_tracks"] = t_helmet
+        for ename, handler in self.handlers.items():
+            # 1. 이벤트 핸들러에 전달할 인자 세팅
+            if ename == "no_helmet":
+                # [수정 핵심] 메인 객체(사람)가 분석 기준이 되어야 하므로 handler_tracks는 t_main이어야 합니다.
+                kwargs = {'helmet_tracks': t_helmet, 'privacy_tracks': t_main}
+                handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
+            else:
+                kwargs = {'privacy_tracks': t_main}
+                handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
+
             try:
-                triggered_events = handler.process(t_main, track_map_main, None, frame, fid, **kwargs)
-            except Exception as exc:
-                logger.error(f"[CAM:{self.ip}] {event_name} 핸들러 처리 중 예외 발생: {exc}\n{traceback.format_exc()}")
+                # 핸들러 실행 (내부에서 과거 시점의 privacy_tracks를 저장하고 ev에 담아 반환해야 함)
+                triggered = handler.process(handler_tracks, handler_track_map, None, fr, fid, **kwargs)
+            except Exception as e:
+                logger.error(f"🚨 [CAM:{self.ip}] {ename} 핸들러 처리 중 예외 발생: {e}\n{traceback.format_exc()}")
                 continue
 
-            for event in triggered_events:
-                tid = int(event["tid"])
-                bbox = event["bbox"]
-                event_frame = event.get("frame") if event.get("frame") is not None else frame
-                event_config = SYS_CFG.get("event_config", {}).get(event_name, {})
-                cooldown = float(event_config.get("cooldown_sec", 600))
-                class_id = int(track_map_main.get(tid, -1))
-                actual_score = score_map_main.get(tid, 0.95)
-                objects_meta = event.get("objects") or [{
-                    "label": pctc_class_name(class_id),
-                    "class_name": pctc_class_name(class_id),
-                    "class_id": class_id,
-                    "box": [int(round(float(value))) for value in bbox],
-                    "score": actual_score,
-                    "tid": tid,
-                }]
-                privacy_reference_tracks = event.get("privacy_tracks")
-                privacy_reference_fid = event.get("privacy_fid", event.get("fid", fid))
-                if privacy_reference_tracks is not None and len(privacy_reference_tracks) > 0:
-                    privacy_scope = "event_frame_tracks"
-                else:
-                    privacy_reference_tracks = t_main
-                    privacy_scope = "current_tracks"
+            for ev in triggered:
+                tid = ev['tid']
+                bbox = ev['bbox']
+                ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
+                cooldown = SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 600)
 
-                decision_trace = to_json_safe(event.get("decision_trace", {
-                    "detector": handler.__class__.__name__,
-                    "reason": "event_triggered_without_detail",
+                actual_score = handler_score_map.get(tid, score_map_main.get(tid, 0.95))
+                objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
+                
+                # ---------------------------------------------------------
+                # [핵심 로직] 과거 프레임의 모든 객체(privacy_tracks) 복원
+                # ---------------------------------------------------------
+                event_frame_privacy_tracks = ev.get('privacy_tracks')
+                privacy_reference_fid = ev.get('privacy_fid', ev.get('fid', fid))
+                
+                # 타임캡슐(privacy_tracks)이 온전히 반환되었다면 그것을 사용 (과거의 전체 객체)
+                if event_frame_privacy_tracks is not None and len(event_frame_privacy_tracks) > 0:
+                    privacy_reference_tracks = event_frame_privacy_tracks
+                    privacy_reference_tracks_label = "event_frame_tracks"
+                else:
+                    # [수정] 타임캡슐이 없을 경우 위반 객체로 축소하지 않고 무조건 현재 프레임의 전체 객체(t_main)를 마스킹 대상으로 삼음
+                    privacy_reference_tracks = t_main
+                    privacy_reference_tracks_label = "current_tracks"
+
+                decision_trace = to_json_safe(ev.get('decision_trace', {
+                    'detector': handler.__class__.__name__,
+                    'reason': 'event_triggered_without_detail'
                 }))
 
-                if now_value - self.last_evt_t.get(event_name, 0.0) >= cooldown:
+                if ename not in self.alerted[tid] and (now - self.last_evt_t.get(ename, 0) >= cooldown):
                     event_ts_dt = now_kst()
                     event_ts = event_ts_dt.isoformat()
-                    event_fid = int(event.get("fid", fid))
-                    event_id = make_event_id(self.cam_id, self.ip, event_name, tid, event_fid, event_ts_dt)
-                    objects_log = " | ".join(
-                        f"{obj.get('class_name') or obj.get('label')}({float(obj.get('score', 0.0)):.2f}): {obj.get('box')}"
-                        for obj in objects_meta
+                    event_fid = int(ev.get('fid', fid))
+                    event_id = make_event_id(self.cam_id, self.ip, ename, tid, event_fid, event_ts_dt)
+                    
+                    objs_log_str = " | ".join([f"{o['label']}({o['score']:.2f}): {o['box']}" for o in objects_meta])
+                    log_msg = (
+                        f"🔥 [EVENT TRIGGERED] event_id={event_id} CAM:{self.cam_id}({self.ip}) | Event:{ename} | "
+                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FID:{event_fid} | FPS:{self.current_fps:.1f} | "
+                        f"Reason:{decision_trace.get('reason', '-')} | "
+                        f"Objects -> {objs_log_str}"
                     )
-                    logger.warning(
-                        f"[EVENT TRIGGERED] event_id={event_id} CAM:{self.cam_id}({self.ip}) | Event:{event_name} | "
-                        f"TermID:{SYS_CFG.get('terminal_id', '99999')} | TID:{tid} | FID:{event_fid} | "
-                        f"FPS:{self.current_fps:.1f} | Reason:{decision_trace.get('reason', '-')} | Objects -> {objects_log}"
-                    )
+                    logger.warning(log_msg)
 
-                    blur_face = bool(event_config.get("blur_face", True))
-                    blur_plate = bool(event_config.get("blur_plate", True))
-                    saved_image, privacy_meta = self.apply_privacy_blur(
-                        event_frame,
+                    blur_face_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_face", True)
+                    blur_plate_option = SYS_CFG.get("event_config", {}).get(ename, {}).get("blur_plate", True)
+
+                    # 완벽하게 동기화된 트랙(privacy_reference_tracks) 및 t_helmet 으로 다단계 블러 적용
+                    saved_img, privacy_blur_meta = self.apply_privacy_blur(
+                        ev_frame, 
                         privacy_reference_tracks,
                         t_helmet=t_helmet,
-                        blur_face=blur_face,
-                        blur_plate=blur_plate,
+                        blur_face=blur_face_option,
+                        blur_plate=blur_plate_option
                     )
-                    privacy_meta.update({
-                        "scope": "event_snapshot",
-                        "reference_tracks": privacy_scope,
-                        "reference_fid": int(privacy_reference_fid) if privacy_reference_fid is not None else None,
-                    })
+                    
+                    # 블러 처리 메타데이터 로깅 (추적용)
+                    privacy_blur_meta["scope"] = "event_snapshot"
+                    privacy_blur_meta["reference_tracks"] = privacy_reference_tracks_label
+                    try:
+                        privacy_blur_meta["reference_fid"] = int(privacy_reference_fid)
+                    except Exception:
+                        privacy_blur_meta["reference_fid"] = None
+                        
+                    logger.info(
+                        f"[PRIVACY BLUR] event_id={event_id} cam={self.cam_id} event={ename} "
+                        f"face_enabled={blur_face_option} plate_enabled={blur_plate_option} "
+                        f"face_count={len(privacy_blur_meta.get('face', []))} "
+                        f"plate_count={len(privacy_blur_meta.get('plate', []))} "
+                        f"reference_tracks={privacy_blur_meta.get('reference_tracks', '-')}"
+                    )
 
-                    trajectories = {}
+                    event_trajectories = {}
                     for obj in objects_meta:
-                        object_tid = obj.get("tid")
-                        if object_tid in self.trk_main.tracks:
-                            trajectories[object_tid] = list(self.trk_main.tracks[object_tid]["history"])
-                        elif object_tid in self.trk_helmet.tracks:
-                            trajectories[object_tid] = list(self.trk_helmet.tracks[object_tid]["history"])
+                        obj_tid = obj.get('tid')
+                        if obj_tid in self.trk_main.tracks:
+                            event_trajectories[obj_tid] = list(self.trk_main.tracks[obj_tid]['history'])
+                        elif obj_tid in self.trk_helmet.tracks:
+                            event_trajectories[obj_tid] = list(self.trk_helmet.tracks[obj_tid]['history'])
 
                     event_meta = {
-                        "event_id": event_id,
-                        "ts": event_ts,
-                        "event_name": event_name,
-                        "terminal_id": str(SYS_CFG.get("terminal_id", "99999")),
-                        "cctv_id": int(self.cam_id),
-                        "ip": str(self.ip),
-                        "tid": tid,
-                        "bbox": int_box(bbox),
-                        "fid": event_fid,
-                        "objects": self._serialize_event_objects(objects_meta),
-                        "trajectories": to_json_safe(trajectories),
-                        "privacy_blur": to_json_safe(privacy_meta),
-                        "decision_trace": decision_trace,
+                        'event_id': event_id,
+                        'ts': event_ts,
+                        'event_name': ename,
+                        'terminal_id': str(SYS_CFG.get("terminal_id", "99999")),
+                        'cctv_id': int(self.cam_id),
+                        'ip': str(self.ip),
+                        'tid': int(tid),
+                        'bbox': int_box(bbox),
+                        'fid': event_fid,
+                        'objects': self._serialize_event_objects(objects_meta),
+                        'trajectories': to_json_safe(event_trajectories),
+                        'privacy_blur': to_json_safe(privacy_blur_meta),
+                        'decision_trace': decision_trace
                     }
+
                     evidence_paths = save_event_image_with_mark(
-                        frame=saved_image,
-                        ip=self.ip,
-                        event_type=event_name,
-                        bbox=bbox,
-                        tid=tid,
-                        terminal_id=SYS_CFG.get("terminal_id", "99999"),
-                        cctv_id=self.cam_id,
+                        frame=saved_img, ip=self.ip, event_type=ename, bbox=bbox, tid=tid,
+                        terminal_id=SYS_CFG.get("terminal_id", "99999"), cctv_id=self.cam_id,
                         objects_meta=objects_meta,
-                        trajectories=trajectories,
                         event_id=event_id,
-                        event_ts=event_ts,
+                        event_ts=event_ts
                     )
                     if evidence_paths:
                         event_meta.update(evidence_paths)
+
                     self.recorder.trigger(
-                        event_name,
+                        ename,
                         objects_meta=objects_meta,
                         event_meta=event_meta,
-                        current_fps=SYS_CFG.get("video_decode", {}).get("fps_limit", 10.0),
+                        current_fps=SYS_CFG.get("video_decode", {}).get("fps_limit", 15.0)
                     )
-                    self.last_evt_t[event_name] = now_value
+                    self.alerted[tid].add(ename)
+                    self.last_evt_t[ename] = now
+
                     newly_triggered_events.append({
-                        "event_id": event_id,
-                        "ts": event_ts,
-                        "event_name": event_name,
-                        "objects": objects_meta,
-                        "privacy_blur": privacy_meta,
-                        "decision_trace": decision_trace,
+                        'event_id': event_id,
+                        'ts': event_ts,
+                        'event_name': ename,
+                        'objects': objects_meta,
+                        'privacy_blur': privacy_blur_meta,
+                        'decision_trace': decision_trace
                     })
+
                 else:
-                    cooldown_remaining = max(0.0, cooldown - (now_value - self.last_evt_t.get(event_name, 0.0)))
+                    cooldown_remaining = max(0.0, cooldown - (now - self.last_evt_t.get(ename, 0)))
                     logger.debug(
-                        f"[EVENT SUPPRESSED] cam={self.cam_id} ip={self.ip} event={event_name} tid={tid} "
-                        f"fid={int(event.get('fid', fid))} cooldown_remaining={cooldown_remaining:.1f}s"
+                        f"[EVENT SUPPRESSED] cam={self.cam_id} ip={self.ip} event={ename} tid={tid} "
+                        f"fid={int(ev.get('fid', fid))} alerted={ename in self.alerted[tid]} "
+                        f"cooldown_remaining={cooldown_remaining:.1f}s"
                     )
-                current_alarms[tid] = event_name
 
-        alarm_duration = float(SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0))
-        for tid, event_name in current_alarms.items():
-            self.visual_alarms[tid] = {"evt": event_name, "expire": now_value + alarm_duration}
-        for tid in list(self.visual_alarms):
-            if now_value > self.visual_alarms[tid]["expire"]:
-                self.visual_alarms.pop(tid, None)
+                current_alarms[tid] = ename
 
-        active_visual_alarms = {tid: info["evt"] for tid, info in self.visual_alarms.items()}
-        return t_main, t_helmet, active_visual_alarms, newly_triggered_events
+        alarm_duration = SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0)
+        for tid, ename in current_alarms.items():
+            self.visual_alarms[tid] = {'evt': ename, 'expire': now + alarm_duration}
 
-    def draw(self, frame, t_main, t_helmet, alarms, connected=True):
-        if frame is None or not connected:
+        for tid in list(self.visual_alarms.keys()):
+            if now > self.visual_alarms[tid]['expire']:
+                del self.visual_alarms[tid]
+
+        return t_main, t_helmet, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
+
+    def draw(self, fr, t_main, t_helmet, alarms, connected=True):
+        if fr is None or not connected:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
             cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1)
             cv2.putText(blank, self.ip, (50, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             return blank
 
-        height, width = frame.shape[:2]
+        h_frame, w_frame = fr.shape[:2]
         if alarms:
-            cv2.rectangle(frame, (0, 0), (width, height), (0, 0, 255), 20)
-        if len(self.roi_poly) > 2:
-            cv2.polylines(frame, [np.array(self.roi_poly, np.int32)], True, (0, 255, 255), 2)
-        draw_abnormal_drive_zones(frame, self.abnormal_drive_zones, thickness=2)
+            cv2.rectangle(fr, (0, 0), (w_frame, h_frame), (0, 0, 255), 20)
 
-        visible_class_ids = get_display_pctc_class_ids(self.events)
+        if len(self.roi_poly) > 2:
+            cv2.polylines(fr, [np.array(self.roi_poly, np.int32)], True, (0, 255, 255), 2)
+        if self.roi_lines:
+            for idx in range(0, len(self.roi_lines), 2):
+                if idx + 1 < len(self.roi_lines):
+                    cv2.line(fr, tuple(self.roi_lines[idx]), tuple(self.roi_lines[idx + 1]), (0, 0, 255), 2)
+
+        visible_classes = get_visible_pctc_class_ids(self.events)
         for track in t_main:
             tid = int(track[4])
             class_id = int(track[6])
             is_alarmed = tid in alarms
-            if not is_alarmed and class_id not in visible_class_ids:
+            if not is_alarmed and class_id not in visible_classes:
                 continue
+
             color = (0, 0, 255) if is_alarmed else (0, 255, 0)
             if tid in self.trk_main.tracks:
                 history = list(self.trk_main.tracks[tid]["history"])
                 if len(history) > 1:
-                    cv2.polylines(frame, [np.array(history, np.int32)], False, color, 1, cv2.LINE_AA)
+                    cv2.polylines(fr, [np.array(history, np.int32)], False, color, 1, cv2.LINE_AA)
+
             label = f"{pctc_class_name(class_id)} [{tid}]"
             if is_alarmed:
                 label = f"ALARM: {label}"
-            cv2.rectangle(frame, (int(track[0]), int(track[1])), (int(track[2]), int(track[3])), color, 1)
-            cv2.putText(frame, label, (int(track[0]), max(15, int(track[1]) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+            cv2.rectangle(fr, (int(track[0]), int(track[1])), (int(track[2]), int(track[3])), color, 1)
+            cv2.putText(fr, label, (int(track[0]), int(track[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
         if "no_helmet" in self.events:
             for track in t_helmet:
                 tid = int(track[4])
                 class_id = int(track[6])
                 if class_id == ID_H_HELMET:
-                    color, label, thickness = (0, 255, 0), f"Helmet [{tid}]", 1
+                    color = (0, 255, 0)
+                    label = f"Helmet [{tid}]"
+                    thickness = 1
                 elif class_id == ID_H_HEAD:
                     color = (0, 0, 255)
                     label = f"Head [{tid}]"
                     thickness = 3 if "no_helmet" in alarms.values() else 1
                 else:
                     continue
-                cv2.rectangle(frame, (int(track[0]), int(track[1])), (int(track[2]), int(track[3])), color, thickness)
-                cv2.putText(frame, label, (int(track[0]), max(15, int(track[1]) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+                cv2.rectangle(fr, (int(track[0]), int(track[1])), (int(track[2]), int(track[3])), color, thickness)
+                cv2.putText(fr, label, (int(track[0]), int(track[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
-        cv2.putText(frame, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         fps_color = (0, 0, 0) if self.current_fps >= 10.0 else (0, 0, 255)
-        cv2.putText(frame, f"AI FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
+        cv2.putText(fr, f"AI FPS: {self.current_fps:.1f}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.35, fps_color, 1)
 
-        active_events = set(alarms.values())
+        active_alarms = set(alarms.values())
         y_pos = 15
         for event_name in self.events:
             if event_name in (ROI_CHANGE_EVENT, ROI_CHANGE_APPLY_EVENT):
                 continue
             display_name = EVENT_REGISTRY[event_name].gui_name if event_name in EVENT_REGISTRY else event_name.upper()
-            color = (0, 0, 255) if event_name in active_events else (0, 255, 0)
-            prefix = "[!] " if event_name in active_events else " -  "
-            cv2.putText(frame, f"{prefix}{display_name}", (width - 175, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+            color = (0, 0, 255) if event_name in active_alarms else (0, 255, 0)
+            prefix = "[!] " if event_name in active_alarms else " -  "
+            cv2.putText(fr, f"{prefix}{display_name}", (w_frame - 145, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
             y_pos += 20
-        return frame
+
+        return fr
 # ==========================================
 # [11]  Platform 송수신 모듈
 # ==========================================
@@ -6343,42 +4998,25 @@ class HealthCheckDaemon:
         return points
 
     @classmethod
-    def _coerce_abnormal_drive_zones_norm(cls, value):
-        value = cls._decode_jsonish(value)
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            raise ValueError(f"abnormal_drive_zones_norm must be a list, got {type(value).__name__}")
-        zones = []
-        for zone in value:
-            if not isinstance(zone, dict):
-                raise ValueError(f"Invalid abnormal_drive zone: {zone!r}")
-            polygon = cls._coerce_roi_norm_points(zone.get("roi_poly_norm"))
-            direction = cls._coerce_roi_norm_points(zone.get("direction_points_norm"))
-            if len(polygon) < 3 or len(direction) != 2:
-                raise ValueError("abnormal_drive zone requires polygon >=3 and direction points ==2")
-            zones.append({"roi_poly_norm": polygon, "direction_points_norm": direction})
-        return zones
-
-    @classmethod
     def _extract_roi_norm_updates(cls, roi_json):
         payload = cls._decode_jsonish(roi_json)
         if not isinstance(payload, dict):
             return None
+
         candidates = [payload]
         for nested_key in ("roiInfo", "roi_info"):
-            if nested_key in payload:
-                nested = cls._decode_jsonish(payload.get(nested_key))
-                if isinstance(nested, dict):
-                    candidates.append(nested)
+            if nested_key not in payload:
+                continue
+            nested = cls._decode_jsonish(payload.get(nested_key))
+            if isinstance(nested, dict):
+                candidates.append(nested)
+
         for candidate in candidates:
             updates = {}
             if "roi_poly_norm" in candidate:
                 updates["roi_poly_norm"] = cls._coerce_roi_norm_points(candidate.get("roi_poly_norm"))
             if "roi_lines_norm" in candidate:
-                updates["roi_lines_norm"] = []
-            if "abnormal_drive_zones_norm" in candidate:
-                updates["abnormal_drive_zones_norm"] = cls._coerce_abnormal_drive_zones_norm(candidate.get("abnormal_drive_zones_norm"))
+                updates["roi_lines_norm"] = cls._coerce_roi_norm_points(candidate.get("roi_lines_norm"))
             if updates:
                 return updates
         return None
@@ -6431,6 +5069,7 @@ class HealthCheckDaemon:
             if not isinstance(camera_configs, dict):
                 logger.error("[Health Check] cameras config is not an object; ROI update skipped")
                 return []
+            camera_configs, _ = sanitize_camera_configs(camera_configs)
 
             for item in roi_settings:
                 if not isinstance(item, dict):
@@ -6477,6 +5116,7 @@ class HealthCheckDaemon:
                         item_changed = True
 
                 if item_changed:
+                    new_conf = sanitize_camera_config(new_conf)
                     camera_configs[cam.ip] = new_conf
                     runtime_updates.append((cam, new_conf, roi_updates))
                     handled_cctv_ids.append(str(cam.cam_id))
@@ -6648,272 +5288,225 @@ def clear_terminal_roi_snapshot_refresh(cctv_ids=None, reason=""):
         
 def main():
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge AI CCTV Event Detection")
-    parser.add_argument("--gui", action="store_true", help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
+    parser.add_argument('--gui', action='store_true', help="GUI 모드를 활성화하여 모니터에 영상을 렌더링합니다.")
     args = parser.parse_args()
+
     is_gui_mode = args.gui
-    logger.info("[시스템 모드] GUI 모드" if is_gui_mode else "[시스템 모드] CLI (Headless) 모드")
+
+    if not is_gui_mode:
+        logger.info("[시스템 모드] CLI (Headless) 모드로 동작합니다. (렌더링 생략으로 CPU 부하 최소화)")
+    else:
+        logger.info("[시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)")
 
     global DEBUG_MODE
+    logger.info("[System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료")
+
     rtsp_list = load_rtsp_list_from_csv(CAMERA_LIST_FILE)
     if not rtsp_list:
         logger.error(f"카메라 목록 파일({CAMERA_LIST_FILE})을 확인하십시오.")
         return
 
-    config_file = CONFIG_CAMERAS_FILE
+    config_file = os.path.join(PROJECT_ROOT, "cameras.json")
     camera_configs = {}
-    debug_answer = guarded_input(">> CLI 디버그 출력을 활성화하시겠습니까? (파일 로그는 항상 상세히 기록됩니다) [y/N]: ").strip().lower()
-    DEBUG_MODE = debug_answer == "y"
+
+    debug_ans = guarded_input(">> CLI 디버그 출력을 활성화하시겠습니까? (파일 로그는 항상 상세히 기록됩니다) [y/N]: ").strip().lower()
+    DEBUG_MODE = True if debug_ans == 'y' else False
+    
+    _runtime_log_cfg = SYS_CFG.get("logging", {})
+    # [수정] 파일 로그는 무조건 가장 상세한 DEBUG 레벨 고정, 콘솔 출력만 사용자 선택에 따름
+    _debug_file_level = logging.DEBUG 
+    _debug_console_level = logging.DEBUG if DEBUG_MODE else logging.INFO
+    
     logger.setLevel(logging.DEBUG)
     queue_handler.setLevel(logging.DEBUG)
-    file_handler.setLevel(logging.DEBUG)
-    stream_handler.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
+    file_handler.setLevel(_debug_file_level)
+    stream_handler.setLevel(_debug_console_level)
+    
+    if DEBUG_MODE:
+        logger.debug("디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.")
 
     if os.path.exists(config_file):
         try:
-            with open(config_file, "r", encoding="utf-8") as config_handle:
-                loaded_configs = json.load(config_handle)
-            camera_configs = sanitize_camera_configs(loaded_configs)
-            if camera_configs != loaded_configs:
-                with open(config_file, "w", encoding="utf-8") as config_handle:
-                    json.dump(camera_configs, config_handle, indent=4, ensure_ascii=False)
-        except Exception as exc:
-            logger.error(f"cameras.json 로드 실패: {exc}")
-            camera_configs = {}
+            with open(config_file, 'r', encoding='utf-8') as f:
+                camera_configs = json.load(f)
+        except Exception as e:
+            logger.error(f"cameras.json 로드 실패: {e}")
+            pass
 
-        reset_answer = guarded_input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
-        if reset_answer == "y":
+        reset_ans = guarded_input(">> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: ").strip().lower()
+        if reset_ans == 'y':
+            logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
             camera_configs = run_wizard_batch_mode(rtsp_list, camera_configs)
-            with open(config_file, "w", encoding="utf-8") as config_handle:
-                json.dump(camera_configs, config_handle, indent=4, ensure_ascii=False)
+            try:
+                with open(config_file, 'w', encoding='utf-8') as f:
+                    json.dump(camera_configs, f, indent=4)
+            except: pass
     else:
         logger.warning("설정 파일(cameras.json)이 없어 터미널 마법사를 실행합니다.")
         camera_configs = run_wizard_batch_mode(rtsp_list, {})
-        with open(config_file, "w", encoding="utf-8") as config_handle:
-            json.dump(camera_configs, config_handle, indent=4, ensure_ascii=False)
+        try:
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(camera_configs, f, indent=4)
+        except: pass
+
+    camera_configs, camera_configs_changed = sanitize_camera_configs(camera_configs)
+    if camera_configs_changed:
+        try:
+            with open(config_file, "w", encoding="utf-8") as config_fp:
+                json.dump(camera_configs, config_fp, indent=4, ensure_ascii=False)
+            logger.info("Removed deprecated camera events from cameras.json")
+        except Exception as exc:
+            logger.warning(f"Failed to migrate cameras.json: {exc}")
 
     models_cfg = SYS_CFG.get("models", {})
-    event_inference_mode = "main"
-    main_model_path = resolve_model_path(models_cfg.get("MAIN", "pctc_v1.dxnn"))
+    main_model_path = resolve_model_path(models_cfg.get("MAIN", "PCTC.dxnn"))
 
     try:
-        logger.info("DeepX PCTC MAIN 모델과 전용 privacy/helmet 모델을 VPU 메모리로 할당 중...")
+        logger.info("Loading PCTC MAIN and dedicated HELMET models into VPU memory")
         d_main = YoLoDeepX(
             main_model_path,
             output_format=get_main_model_output_format(main_model_path),
             pool_size=get_model_engine_pool_size("MAIN", default=2),
-            model_key="MAIN",
-            class_count=len(PCTC_CLASS_NAMES),
-            ppu_box_format="auto",
-            output_hint="ppu",
         )
         d_helmet = YoLoDeepX(
             resolve_model_path(models_cfg.get("HELMET", "helmet_260622.dxnn")),
             output_format=get_model_output_format("HELMET"),
-            pool_size=get_model_engine_pool_size("HELMET", default=1),
-            model_key="HELMET",
-            class_count=2,
+            pool_size=min(2, get_model_engine_pool_size("HELMET", default=1)),
         )
+
         face_fmt = get_model_output_format("FACE")
+        if face_fmt in ["auto", "yolo"]:
+            face_fmt = "yolo_xyxy"
         d_face = YoLoDeepX(
             resolve_model_path(models_cfg.get("FACE", "yolov8m-face_ppu.dxnn")),
             output_format=face_fmt,
             pool_size=get_model_engine_pool_size("FACE", default=1),
-            model_key="FACE",
-            class_count=1,
         )
+
+        plate_fmt = get_model_output_format("PLATE")
+        if plate_fmt in ["auto", "yolo"]:
+            plate_fmt = "yolo_xyxy"
         d_plate = YoLoDeepX(
             resolve_model_path(models_cfg.get("PLATE", "license_plate_detector_v2.dxnn")),
-            output_format=get_model_output_format("PLATE"),
+            output_format=plate_fmt,
             pool_size=get_model_engine_pool_size("PLATE", default=1),
-            model_key="PLATE",
-            class_count=1,
         )
     except Exception as exc:
-        logger.error(f"모델 로드 실패. 경로를 확인하십시오: {exc}")
+        logger.error(f"Model load failed; check model paths and output formats: {exc}")
         return
 
     cams = []
-    for index, rtsp in enumerate(rtsp_list):
+    for i, rtsp in enumerate(rtsp_list):
         ip = extract_ip(rtsp)
-        conf = sanitize_camera_config(camera_configs.get(ip, {}))
-        if not conf.get("events"):
+        conf = camera_configs.get(ip)
+
+        if not conf or not conf.get('events'):
             continue
-        conf["url"] = rtsp
-        camera_configs[ip] = conf
+        conf['url'] = rtsp
         cams.append(Camera(
-            ip,
-            conf,
-            d_main,
-            d_helmet,
-            d_face,
-            d_plate,
-            cam_id=index + 1,
-            event_inference_mode=event_inference_mode,
+            ip, conf, d_main, d_helmet, d_face, d_plate, cam_id=i + 1
         ))
         logger.info(
-            f"[CAMERA LOADED] cam={index + 1} ip={ip} events={','.join(conf.get('events', [])) or '-'} "
+            f"[CAMERA LOADED] cam={i+1} ip={ip} events={','.join(conf.get('events', [])) or '-'} "
             f"roi_poly_points={len(conf.get('roi_poly_norm', []) or [])} "
-            f"abnormal_zones={len(conf.get('abnormal_drive_zones_norm', []) or [])}"
+            f"roi_line_points={len(conf.get('roi_lines_norm', []) or [])}"
         )
 
     if not cams:
         logger.error("[SYSTEM STARTUP] no active cameras loaded; check cameras.csv and cameras.json events.")
         return
 
-    with open(config_file, "w", encoding="utf-8") as config_handle:
-        json.dump(camera_configs, config_handle, indent=4, ensure_ascii=False)
+    perf_cfg = SYS_CFG.get("system_performance", {})
+    target_fps = float(perf_cfg.get("target_fps", 10.0))
+    dynamic_cpu_adjust = bool(perf_cfg.get("dynamic_cpu_adjust_enabled", False))
+    sys_target_fps = target_fps
 
-    performance_cfg = SYS_CFG.get("system_performance", {})
-    target_fps = float(performance_cfg.get("target_fps", 10.0))
-    dynamic_cpu_adjust = bool(performance_cfg.get("dynamic_cpu_adjust_enabled", False))
-    system_target_fps = target_fps
-    confidence_cfg = SYS_CFG.get("model_confidences", {})
-    main_conf = min(1.0, max(0.0, float(confidence_cfg.get("MAIN", 0.35))))
-    helmet_conf = min(1.0, max(0.0, float(confidence_cfg.get("HELMET", 0.85))))
-    person_conf = min(1.0, max(0.0, float(confidence_cfg.get("PERSON", 0.30))))
-    helmet_person_conf = min(1.0, max(0.0, float(confidence_cfg.get("HELMET_PERSON", person_conf))))
-    runtime_cfg = SYS_CFG.get("inference_runtime", {})
-    display_all_pctc_objects = bool(runtime_cfg.get("display_all_pctc_objects", True))
+    main_conf = SYS_CFG.get("model_confidences", {}).get("MAIN", 0.6)
+    helmet_conf = SYS_CFG["model_confidences"].get("HELMET", 0.55)
+    person_conf = SYS_CFG.get("model_confidences", {}).get("PERSON", 0.5) 
+    loop_count = 0
+    fps_calc_interval = 30
+    last_fps_time = time.time()
+    cpu_usage = 0.0
+    
     try:
-        max_detection_area_ratio = min(1.0, max(0.01, float(runtime_cfg.get("max_detection_area_ratio", 0.95))))
+        current_fps_log_interval_sec = max(1.0, float(SYS_CFG.get("CURRENT_FPS_LOG_INTERVAL_SEC", 10.0)))
     except Exception:
-        max_detection_area_ratio = 0.95
-    try:
-        filter_diagnostic_interval_sec = max(1.0, float(runtime_cfg.get("filter_diagnostic_interval_sec", 10.0)))
-    except Exception:
-        filter_diagnostic_interval_sec = 10.0
-    helmet_person_assist_enabled = bool(runtime_cfg.get("helmet_person_assist_enabled", True))
-    try:
-        helmet_person_class_id = int(runtime_cfg.get("helmet_person_class_id", ID_H_PERSON))
-    except Exception:
-        helmet_person_class_id = ID_H_PERSON
-    try:
-        person_merge_iou_threshold = min(1.0, max(0.0, float(runtime_cfg.get("person_merge_iou_threshold", 0.35))))
-    except Exception:
-        person_merge_iou_threshold = 0.35
-    logger.info(
-        f"[PCTC RUNTIME] model={os.path.basename(main_model_path)} "
-        f"output_setting={get_main_model_output_format(main_model_path)} "
-        f"main_conf={main_conf:.3f} person_conf={person_conf:.3f} "
-        f"helmet_person_conf={helmet_person_conf:.3f} helmet_person_class_id={helmet_person_class_id} "
-        f"person_merge_iou={person_merge_iou_threshold:.2f} helmet_person_assist={helmet_person_assist_enabled} "
-        f"display_all={display_all_pctc_objects} max_area_ratio={max_detection_area_ratio:.3f}"
-    )
+        current_fps_log_interval_sec = 10.0
+    current_fps_last_print = {}
 
     terminal_id = SYS_CFG.get("terminal_id", "99999")
+    software_version = "pctc-v1.0.0"
+    
     log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
     global HEALTH_DAEMON
     health_daemon = HealthCheckDaemon(
         terminal_id=terminal_id,
-        version="v1.3.0-pctc-terminal",
+        version=software_version,
         interval_sec=60,
         cams=cams,
-        config_file=config_file,
+        config_file=config_file
     )
     HEALTH_DAEMON = health_daemon
 
-    last_config_mtime = os.path.getmtime(config_file) if os.path.exists(config_file) else 0.0
-    ram_disk_dir = "/dev/shm/cctv_frames"
-    try:
-        os.makedirs(ram_disk_dir, exist_ok=True)
-    except Exception:
-        ram_disk_dir = "./web_frames"
+    last_config_mtime = 0
+    if os.path.exists(config_file):
+        last_config_mtime = os.path.getmtime(config_file)
 
+    RAM_DISK_DIR = "/dev/shm/cctv_frames"
+    if not os.path.exists(RAM_DISK_DIR):
+        try: os.makedirs(RAM_DISK_DIR, exist_ok=True)
+        except: RAM_DISK_DIR = "./web_frames"
+
+    event_frame_save_delay_sec = float(SYS_CFG.get("EVENT_FRAME_SAVE_DELAY_SEC", 10.0))
+    configured_event_frame_save_max_count = int(SYS_CFG.get("EVENT_FRAME_SAVE_MAX_COUNT", 0) or 0)
+    event_frame_save_fps = max(1.0, float(SYS_CFG.get("REC_FPS", 3)))
+    if configured_event_frame_save_max_count > 0:
+        event_frame_save_max_count = configured_event_frame_save_max_count
+    else:
+        event_frame_save_max_count = int(math.ceil(event_frame_save_delay_sec * event_frame_save_fps * 1.5))
+    event_frame_save_max_count = max(1, int(event_frame_save_max_count))
+    event_save_queues = {c.ip: deque(maxlen=event_frame_save_max_count) for c in cams}
+    last_event_times = {c.ip: 0.0 for c in cams}
+    
     output_retention_days = float(SYS_CFG.get("OUTPUT_RETENTION_DAYS", 14))
     output_cleanup_interval_sec = float(SYS_CFG.get("OUTPUT_CLEANUP_INTERVAL_SEC", 86400))
     last_output_cleanup_time = time.time()
     run_output_retention_cleanup(output_retention_days)
 
-    def run_camera_inference(cam, frame):
-        active_events = [event_name for event_name in cam.events if event_name in EVENT_REGISTRY]
+    def run_camera_inference(cam, fr):
+        active_detection_events = [
+            event_name
+            for event_name in cam.events
+            if event_name in DETECTION_EVENT_NAMES
+        ]
         d_main_res = np.empty((0, 6))
         d_helmet_res = np.empty((0, 6))
-        if not active_events:
-            return d_main_res, d_helmet_res
 
-        display_class_ids = get_display_pctc_class_ids(active_events)
-        height, width = frame.shape[:2]
-        max_area_threshold = height * width * max_detection_area_ratio
-        inference_threshold = min(main_conf, person_conf) if ID_PCTC_PERSON in display_class_ids else main_conf
-        raw_detections = cam.det_main.infer(frame, conf_override=inference_threshold)
-        d_main_res = split_unified_event_detections(
-            raw_detections,
-            main_conf=main_conf,
-            person_conf=person_conf,
-            max_area_threshold=max_area_threshold,
-            class_ids=display_class_ids,
-        )
-
-        raw_count = int(len(raw_detections)) if raw_detections is not None else 0
-        kept_count = int(len(d_main_res))
-        if kept_count and not getattr(cam, "_pctc_first_detection_logged", False):
-            cam._pctc_first_detection_logged = True
-            class_counts = defaultdict(int)
-            for det in d_main_res:
-                class_counts[pctc_class_name(int(det[5]))] += 1
-            logger.info(
-                f"[PCTC DETECTION] cam={cam.cam_id} ip={cam.ip} "
-                f"raw={raw_count} kept={kept_count} classes={dict(class_counts)}"
-            )
-        elif raw_count and not kept_count:
-            now_diag = time.monotonic()
-            last_diag = float(getattr(cam, "_last_pctc_filter_log_at", 0.0) or 0.0)
-            if now_diag - last_diag >= filter_diagnostic_interval_sec:
-                cam._last_pctc_filter_log_at = now_diag
-                class_counts = defaultdict(int)
-                score_max = 0.0
-                area_ratio_max = 0.0
-                for det in raw_detections:
-                    if len(det) < 6:
-                        continue
-                    class_counts[int(det[5])] += 1
-                    score_max = max(score_max, float(det[4]))
-                    det_area = max(0.0, float(det[2]) - float(det[0])) * max(0.0, float(det[3]) - float(det[1]))
-                    area_ratio_max = max(area_ratio_max, det_area / max(1.0, float(height * width)))
-                logger.warning(
-                    f"[PCTC FILTER] cam={cam.cam_id} ip={cam.ip} decoder_raw={raw_count} kept=0 "
-                    f"class_ids={dict(class_counts)} max_score={score_max:.3f} "
-                    f"max_area_ratio_seen={area_ratio_max:.3f} allowed={sorted(display_class_ids)} "
-                    f"main_conf={main_conf:.3f} person_conf={person_conf:.3f} "
-                    f"max_area_ratio_allowed={max_detection_area_ratio:.3f}"
-                )
-
-        # HELMET model is also a secondary person detector (0=helmet, 1=head, 2=person).
-        # Run it whenever the current terminal view needs person, even when PCTC detected none.
-        person_assist_required = helmet_person_assist_enabled and ID_PCTC_PERSON in display_class_ids
-        helmet_safety_required = "no_helmet" in cam.events
-        if (person_assist_required or helmet_safety_required) and cam.det_helmet is not None:
-            helmet_infer_conf = min(helmet_conf, helmet_person_conf) if person_assist_required else helmet_conf
-            raw_helmet = cam.det_helmet.infer(frame, conf_override=helmet_infer_conf)
-            helmet_safety_res, helmet_person_res = split_helmet_model_detections(
-                raw_helmet,
-                helmet_conf=helmet_conf,
-                person_conf=helmet_person_conf,
+        if active_detection_events:
+            h, w = fr.shape[:2]
+            max_area_ratio = min(1.0, max(0.1, float(SYS_CFG.get("MAX_DETECTION_AREA_RATIO", 0.9))))
+            max_area_threshold = (h * w) * max_area_ratio
+            raw_dets = cam.det_main.infer(fr, conf_override=min(main_conf, person_conf))
+            d_main_res = filter_pctc_main_detections(
+                raw_dets,
+                main_conf=main_conf,
+                person_conf=person_conf,
                 max_area_threshold=max_area_threshold,
-                person_class_id=helmet_person_class_id,
             )
-            d_helmet_res = helmet_safety_res if helmet_safety_required else np.empty((0, 6))
-            if person_assist_required:
-                d_main_res, fusion_stats = merge_person_detections(
-                    d_main_res,
-                    helmet_person_res,
-                    iou_threshold=person_merge_iou_threshold,
-                )
-                if (fusion_stats["helmet_person"] or fusion_stats["fused_pairs"]) and not getattr(cam, "_helmet_person_fusion_logged", False):
-                    cam._helmet_person_fusion_logged = True
-                    logger.info(
-                        f"[PERSON FUSION] cam={cam.cam_id} ip={cam.ip} "
-                        f"main_person={fusion_stats['main_person']} helmet_person={fusion_stats['helmet_person']} "
-                        f"fused_pairs={fusion_stats['fused_pairs']} "
-                        f"unmatched_main={fusion_stats['unmatched_main']} "
-                        f"unmatched_helmet={fusion_stats['unmatched_helmet']} "
-                        f"iou_threshold={person_merge_iou_threshold:.2f}"
-                    )
+
+        if (
+            "no_helmet" in cam.events
+            and cam.det_helmet is not None
+            and any(int(det[5]) == ID_PCTC_PERSON for det in d_main_res)
+        ):
+            d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
 
         return d_main_res, d_helmet_res
 
-    system_runtime_state = {"target_fps": system_target_fps}
-
+    # Shared target FPS for camera workers.
+    system_runtime_state = {"target_fps": sys_target_fps}
+    
     class LatestItemBuffer:
         def __init__(self):
             self.item = None
@@ -6939,55 +5532,72 @@ def main():
             self.frame_buffer = LatestItemBuffer()
             self.result_buffer = LatestItemBuffer()
             self.running = True
-            self.last_inference_time = 0.0
+            self.last_inference_time = 0.0 # [추가] FPS 쓰로틀링용 타이머
 
         def run(self):
             while self.running:
                 item = self.frame_buffer.get()
+                
+                # 새로운 프레임이 없다면 즉시 GIL을 해제(Release)하여 다른 스레드에 양보
                 if item is None:
                     time.sleep(0.005)
                     continue
-                now_value = time.time()
-                current_target = max(1.0, float(system_runtime_state.get("target_fps", 10.0)))
-                if now_value - self.last_inference_time < 1.0 / current_target:
+
+                # [핵심 추가] FPS 강제 제한 로직 (프레임 버리기)
+                now = time.time()
+                current_target = max(1.0, system_runtime_state.get("target_fps", 10.0))
+                delay_required = 1.0 / current_target
+                
+                if (now - self.last_inference_time) < delay_required:
+                    # 지정된 FPS(예: 10 FPS)보다 빠르게 들어온 프레임은 무시(Drop)하여 NPU 연산량 방어
                     continue
-                self.last_inference_time = now_value
-                frame, fid, connected = item
-                if not connected or frame is None or not self.cam.events:
-                    self.result_buffer.put((frame, fid, connected, [], [], {}, [], None))
+                
+                self.last_inference_time = now
+                fr, fid, connected = item
+
+                if not connected or fr is None or not self.cam.events:
+                    self.result_buffer.put((fr, fid, connected, [], [], {}, [], None))
                     continue
+
                 try:
-                    d_main_res, d_helmet_res = run_camera_inference(self.cam, frame)
-                    t_main, t_helmet, alarms, new_events = self.cam.run_logic(frame, fid, d_main_res, d_helmet_res)
-                    infer_meta = self.cam.build_inference_log(fid, frame, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events)
-                    self.result_buffer.put((frame, fid, connected, t_main, t_helmet, alarms, new_events, infer_meta))
-                except Exception as exc:
-                    logger.error(f"[Worker Error] CAM {self.cam.cam_id}: {exc}\n{traceback.format_exc()}")
-                    self.result_buffer.put((frame, fid, connected, [], [], {}, [], None))
+                    # 추론과 로직을 한 워커에서 순차 처리하여 스레드 통신 오버헤드 제거
+                    d_main_res, d_helmet_res = run_camera_inference(self.cam, fr)
+                    t_main, t_helmet, alarms, new_events = self.cam.run_logic(fr, fid, d_main_res, d_helmet_res)
+                    infer_meta = self.cam.build_inference_log(fid, fr, d_main_res, d_helmet_res, t_main, t_helmet, alarms, new_events)
+
+                    self.result_buffer.put((fr, fid, connected, t_main, t_helmet, alarms, new_events, infer_meta))
+                except Exception as e:
+                    logger.error(f"[Worker Error] CAM {self.cam.cam_id}: {e}\n{traceback.format_exc()}")
+                    self.result_buffer.put((fr, fid, connected, [], [], {}, [], None))
 
     camera_workers = []
     last_rendered_frames = {}
-    for cam in cams:
-        worker = CameraWorker(cam)
+
+    for c in cams:
+        worker = CameraWorker(c)
         worker.start()
         camera_workers.append(worker)
+        
         blank = np.zeros((360, 640, 3), dtype=np.uint8)
         cv2.putText(blank, "WAITING...", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (150, 150, 150), 2)
-        last_rendered_frames[cam.ip] = blank
+        last_rendered_frames[c.ip] = blank
 
-    last_roi_snapshot_times = {cam.ip: time.time() - 3590.0 for cam in cams}
-    last_worker_active_times = {cam.ip: time.time() for cam in cams}
-    roi_snapshot_interval_sec = 3600.0
+    # [수정] 전역 타이머 삭제 및 개별 타이머/활성시간 딕셔너리 도입
+    last_roi_snapshot_times = {c.ip: time.time() - 3590.0 for c in cams}
+    last_worker_active_times = {c.ip: time.time() for c in cams}
+    ROI_SNAPSHOT_INTERVAL_SEC = 3600.0
+
+    target_fps = sys_target_fps
+    dynamic_delay = 1.0 / target_fps
     last_processed_fids = {}
-    loop_count = 0
-    fps_calc_interval = 30
-    last_fps_time = time.time()
-
+    
     try:
         psutil.cpu_percent(interval=None)
+
         while True:
             start_time = time.time()
-            if output_cleanup_interval_sec > 0 and start_time - last_output_cleanup_time >= output_cleanup_interval_sec:
+
+            if output_cleanup_interval_sec > 0 and (start_time - last_output_cleanup_time) >= output_cleanup_interval_sec:
                 run_output_retention_cleanup(output_retention_days)
                 last_output_cleanup_time = start_time
 
@@ -6995,167 +5605,230 @@ def main():
                 current_mtime = os.path.getmtime(config_file)
                 if current_mtime > last_config_mtime:
                     try:
-                        with open(config_file, "r", encoding="utf-8") as config_handle:
-                            new_configs_raw = json.load(config_handle)
-                        new_configs = sanitize_camera_configs(new_configs_raw)
-                        for cam in cams:
-                            if cam.ip in new_configs:
-                                cam.update_config(new_configs[cam.ip])
+                        with open(config_file, 'r', encoding='utf-8') as f:
+                            new_configs = json.load(f)
+                        new_configs, _ = sanitize_camera_configs(new_configs)
                         camera_configs = new_configs
-                        if new_configs != new_configs_raw:
-                            with open(config_file, "w", encoding="utf-8") as config_handle:
-                                json.dump(new_configs, config_handle, indent=4, ensure_ascii=False)
-                        last_config_mtime = os.path.getmtime(config_file)
-                    except Exception as exc:
-                        logger.warning(f"카메라 설정 핫리로드 실패: {exc}")
+                        for c in cams:
+                            if c.ip in new_configs:
+                                c.update_config(new_configs[c.ip])
+                        last_config_mtime = current_mtime
+                    except Exception as e:
+                        pass
 
             loop_count += 1
+
             if loop_count % fps_calc_interval == 0:
                 current_time = time.time()
-                elapsed = current_time - last_fps_time
+                elapsed_time = current_time - last_fps_time
+                actual_fps = fps_calc_interval / elapsed_time
                 cpu_usage = psutil.cpu_percent(interval=None)
+
                 if dynamic_cpu_adjust:
                     if cpu_usage < 75:
-                        target_fps = min(system_target_fps, target_fps + 1.0)
+                        target_fps = min(sys_target_fps, target_fps + 1.0)
                     elif cpu_usage > 90:
                         target_fps = max(8.0, target_fps - 1.0)
                 else:
-                    target_fps = system_target_fps
+                    target_fps = sys_target_fps
+                
+                # [추가] 계산된 타겟 FPS를 상태 객체에 담아 워커 스레드들과 동기화
                 system_runtime_state["target_fps"] = target_fps
+                
+                dynamic_delay = 1.0 / target_fps
                 last_fps_time = current_time
 
             if loop_count % 300 == 0:
                 gc.collect()
+                mem_usage = psutil.virtual_memory().percent
+                q_size = IMAGE_SAVER_POOL._work_queue.qsize() if hasattr(IMAGE_SAVER_POOL, '_work_queue') else 0
                 log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
 
-            for worker in camera_workers:
-                frame, fid, connected = worker.cam.process_frame()
-                if fid != last_processed_fids.get(worker.cam.ip, -1):
-                    worker.frame_buffer.put((frame, fid, connected))
+            # ---------------------------------------------------------
+            # Stage 1 (Producer): 프레임 캡처 및 버퍼 공급
+            # ---------------------------------------------------------
+            for idx, worker in enumerate(camera_workers):
+                fr, fid, connected = worker.cam.process_frame()
+                last_fid = last_processed_fids.get(worker.cam.ip, -1)
+                if fid != last_fid:
+                    worker.frame_buffer.put((fr, fid, connected))
                     last_processed_fids[worker.cam.ip] = fid
 
-            final_images = []
-            now_value = time.time()
-            roi_snapshot_refresh_ids = get_terminal_roi_snapshot_refresh_cctv_ids()
-            refreshed_ids = set()
-
-            for worker_index, worker in enumerate(camera_workers):
-                cam = worker.cam
-                result = worker.result_buffer.get()
-                if result is None:
-                    if now_value - last_worker_active_times.get(cam.ip, now_value) > WATCHDOG_TIMEOUT:
-                        logger.error(f"[WATCHDOG] CAM:{cam.cam_id}({cam.ip}) worker stalled; hot-swap restart")
+            # ---------------------------------------------------------
+            # Stage 2 (Consumer): 최신 결과 회수, 마스킹 스냅샷, 및 최적화 렌더링
+            # ---------------------------------------------------------
+            final_imgs = []
+            now_time = time.time()
+            
+            roi_snapshot_refresh_cctv_ids = get_terminal_roi_snapshot_refresh_cctv_ids()
+            refreshed_cctv_ids = set()
+            
+            for idx, worker in enumerate(camera_workers):
+                c = worker.cam
+                res = worker.result_buffer.get()
+                
+                if res is None:
+                    # [수정] 좀비 스레드(Deadlock) 감지 및 핫스왑 복구
+                    if (now_time - last_worker_active_times.get(c.ip, now_time)) > WATCHDOG_TIMEOUT:
+                        logger.error(f"🚨 [WATCHDOG] CAM:{c.cam_id}({c.ip}) 스레드 데드락(Zombie) 감지! 핫스왑(Hot-Swap) 복구를 진행합니다.")
+                        
                         worker.running = False
-                        cam.reader.running = False
-                        cam.recorder.running = False
-                        worker.join(timeout=1.0)
-                        conf = sanitize_camera_config(camera_configs.get(cam.ip, cam.conf))
-                        new_cam = Camera(cam.ip, conf, d_main, d_helmet, d_face, d_plate, cam_id=cam.cam_id, event_inference_mode=event_inference_mode)
+                        c.reader.running = False
+                        c.recorder.running = False
+                        try:
+                            worker.join(timeout=1.0)
+                        except Exception:
+                            pass
+                            
+                        conf = camera_configs.get(c.ip, c.conf)
+                        new_cam = Camera(
+                            c.ip, conf, d_main, d_helmet, d_face, d_plate, cam_id=c.cam_id
+                        )
                         new_worker = CameraWorker(new_cam)
                         new_worker.start()
-                        camera_workers[worker_index] = new_worker
-                        cams[cams.index(cam)] = new_cam
+                        
+                        camera_workers[idx] = new_worker
+                        for i_cam, old_cam in enumerate(cams):
+                            if old_cam.ip == c.ip:
+                                cams[i_cam] = new_cam
+                                break
+                                
                         if HEALTH_DAEMON is not None:
                             HEALTH_DAEMON.cams = cams
-                        last_worker_active_times[cam.ip] = time.time()
-                        last_processed_fids[cam.ip] = -1
-                    if is_gui_mode:
-                        final_images.append(last_rendered_frames[cam.ip])
+                            
+                        last_worker_active_times[c.ip] = time.time()
+                        last_processed_fids[c.ip] = -1
+                        logger.info(f"✅ [WATCHDOG] CAM:{c.cam_id}({c.ip}) 핫스왑 복구 완료. 모니터링을 재개합니다.")
+
+                    if is_gui_mode: final_imgs.append(last_rendered_frames[c.ip])
                     continue
 
-                last_worker_active_times[cam.ip] = now_value
-                frame, fid, connected, t_main, t_helmet, alarms, new_events, infer_meta = result
-                cctv_id_text = str(cam.cam_id)
-                force_snapshot = cctv_id_text in roi_snapshot_refresh_ids
-                periodic_snapshot = now_value - last_roi_snapshot_times.get(cam.ip, 0.0) >= roi_snapshot_interval_sec
-                if connected and frame is not None and (periodic_snapshot or force_snapshot):
-                    blurred_snapshot, _ = cam.apply_privacy_blur(frame.copy(), t_main, blur_face=True, blur_plate=True)
-                    cam._initialize_base_roi_if_needed(blurred_snapshot)
-                    snapshot_image = create_roi_snapshot(cam, blurred_snapshot)
-                    if snapshot_image is not None:
-                        height, width = snapshot_image.shape[:2]
-                        roi_info = {
-                            "roi_poly_norm": cam.roi_poly_norm,
-                            "roi_lines_norm": [],
-                            "abnormal_drive_zones_norm": cam.abnormal_drive_zones_norm,
-                        }
+                # 정상 수신 시 활성 시간 갱신
+                last_worker_active_times[c.ip] = now_time
+                fr, fid, connected, t_main, t_helmet, alarms, new_events, infer_meta = res
+
+                # [수정] 개별 카메라 1시간 타이머 검사
+                cctv_id_text = str(c.cam_id)
+                force_camera_snapshot = cctv_id_text in roi_snapshot_refresh_cctv_ids
+                periodic_roi_snapshot_due = (now_time - last_roi_snapshot_times.get(c.ip, 0.0)) >= ROI_SNAPSHOT_INTERVAL_SEC
+                
+                if connected and fr is not None and (periodic_roi_snapshot_due or force_camera_snapshot):
+                    blurred_snap, _ = c.apply_privacy_blur(fr.copy(), t_main, blur_face=True, blur_plate=True)
+                    c._initialize_base_roi_if_needed(blurred_snap)
+                    snap_img = create_roi_snapshot(c, blurred_snap)
+                    if snap_img is not None:
+                        h, w = snap_img.shape[:2]
+                        roi_info = {"roi_poly_norm": c.roi_poly_norm, "roi_lines_norm": c.roi_lines_norm}
+
+                        # [통합] shpark-roi-final의 상세 스냅샷 전송 파라미터 + fixbug의 개별 타이머 갱신 로직 병합
+                        snapshot_send_type = "roi_refresh" if force_camera_snapshot else "hourly"
                         IMAGE_SAVER_POOL.submit(
                             _send_roi_snapshot_task,
-                            cam.cam_id,
-                            terminal_id,
-                            snapshot_image,
-                            json.dumps(roi_info),
-                            width,
-                            height,
-                            bool(cam.align_shifted or cam.roi_setup_pending),
-                            "roi_refresh" if force_snapshot else "hourly",
-                        )
-                        last_roi_snapshot_times[cam.ip] = now_value
-                        if force_snapshot:
-                            refreshed_ids.add(cctv_id_text)
+                            c.cam_id, terminal_id, snap_img, json.dumps(roi_info), w, h,
+                            bool(getattr(c, "align_shifted", False) or getattr(c, "roi_setup_pending", False)),
+                            snapshot_send_type,
+                        )  # 틀어짐/보정후 관제확인 대기 중이면 True 유지
+                        roi_snapshot_queued = True
+                        
+                        # [수정 - fixbug 유지] 전송 성공(큐 삽입) 즉시 해당 카메라 타이머만 갱신
+                        last_roi_snapshot_times[c.ip] = now_time
 
-                if connected and frame is not None and loop_count % 100 == 0:
+                        if force_camera_snapshot: refreshed_cctv_ids.add(cctv_id_text)
+
+                if connected and fr is not None and loop_count % 100 == 0:
                     try:
-                        cv2.imwrite(os.path.join(ram_disk_dir, f"{cam.ip}.jpg"), cv2.resize(frame, (640, 360)), [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    except Exception:
-                        pass
+                        small_fr = cv2.resize(fr, (640, 360))
+                        save_path = os.path.join(RAM_DISK_DIR, f"{c.ip}.jpg")
+                        cv2.imwrite(save_path, small_fr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    except Exception: pass
 
-                if not connected or frame is None or not cam.events:
+                if not connected or fr is None or not c.events:
                     if is_gui_mode:
-                        display_frame = cam.draw(None, [], [], {}, False)
-                        last_rendered_frames[cam.ip] = display_frame
-                        final_images.append(display_frame)
+                        display_fr = c.draw(None, [], [], {}, False)
+                        last_rendered_frames[c.ip] = display_fr
+                        final_imgs.append(display_fr)
                     continue
 
-                record_frame = frame.copy()
-                cv2.putText(record_frame, f"Event Time: {now_kst().strftime('%Y-%m-%d %H:%M:%S')}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                if len(cam.roi_poly) > 2:
-                    cv2.polylines(record_frame, [np.array(cam.roi_poly, np.int32)], True, (0, 255, 255), 1)
-                draw_abnormal_drive_zones(record_frame, cam.abnormal_drive_zones, thickness=1)
-                visible_ids = get_display_pctc_class_ids(cam.events)
-                for track in t_main:
-                    tid, class_id = int(track[4]), int(track[6])
-                    if class_id not in visible_ids and tid not in alarms:
+                cam_ip = c.ip
+                if now_time - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
+                    current_fps_last_print[cam_ip] = now_time
+
+                record_fr = fr.copy()
+                time_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                cv2.putText(record_fr, f"Event Time: {time_str}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                if len(c.roi_poly) > 2:
+                    cv2.polylines(record_fr, [np.array(c.roi_poly, np.int32)], True, (0, 255, 255), 1)
+                if c.roi_lines:
+                    for i in range(0, len(c.roi_lines), 2):
+                        if i + 1 < len(c.roi_lines):
+                            cv2.line(record_fr, tuple(c.roi_lines[i]), tuple(c.roi_lines[i+1]), (0, 0, 255), 1)
+                            
+                visible_record_classes = get_visible_pctc_class_ids(c.events)
+                for t in t_main:
+                    tid, cls_id = int(t[4]), int(t[6])
+                    if cls_id not in visible_record_classes:
                         continue
-                    color = (0, 0, 255) if tid in alarms else (0, 255, 0)
-                    x1, y1, x2, y2 = map(int, track[:4])
-                    cv2.rectangle(record_frame, (x1, y1), (x2, y2), color, 1)
-                    cv2.putText(record_frame, f"{pctc_class_name(class_id)} [{tid}]", (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    bx1, by1, bx2, by2 = map(int, t[:4])
+                    is_alarmed = tid in alarms
+                    color = (0, 0, 255) if is_alarmed else (0, 255, 0)
+                    cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), color, 1)
+                    if tid in c.trk_main.tracks:
+                        hist = list(c.trk_main.tracks[tid]['history'])
+                        if len(hist) > 1:
+                            cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, 1)
+
+                if "no_helmet" in c.events:
+                    for helmet_track in t_helmet:
+                        helmet_class_id = int(helmet_track[6])
+                        if helmet_class_id not in (ID_H_HELMET, ID_H_HEAD):
+                            continue
+                        bx1, by1, bx2, by2 = map(int, helmet_track[:4])
+                        color = (0, 0, 255) if helmet_class_id == ID_H_HEAD else (0, 255, 0)
+                        cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), color, 1)
+
                 if infer_meta:
-                    cam.recorder.update(record_frame, infer_meta, timestamp=now_value)
+                    c.recorder.update(record_fr, infer_meta, timestamp=now_time)
 
                 if is_gui_mode:
-                    display_frame = cam.draw(frame.copy(), t_main, t_helmet, alarms, True)
-                    last_rendered_frames[cam.ip] = display_frame
-                    final_images.append(display_frame)
+                    display_fr = c.draw(fr.copy(), t_main, t_helmet, alarms, True)
+                    last_rendered_frames[c.ip] = display_fr
+                    final_imgs.append(display_fr)
 
-            if refreshed_ids:
-                clear_terminal_roi_snapshot_refresh(cctv_ids=refreshed_ids, reason="roi_snapshot_sent")
+            # [수정] 전역 리셋 로직 삭제 완료
+            if refreshed_cctv_ids:
+                clear_terminal_roi_snapshot_refresh(cctv_ids=refreshed_cctv_ids, reason="roi_snapshot_sent")
+
             if is_gui_mode:
-                if final_images:
-                    cv2.imshow("Monitor", create_mosaic_image(final_images))
-                if cv2.waitKey(1) == ord("q"):
-                    break
+                if final_imgs: cv2.imshow("Monitor", create_mosaic_image(final_imgs))
+                if cv2.waitKey(1) == ord('q'): break
+
             time.sleep(0.001)
 
     except KeyboardInterrupt:
         logger.info("[종료] 사용자에 의해 시스템이 중단되었습니다.")
-    except Exception as exc:
-        logger.error(f"[치명적 오류] {exc}\n{traceback.format_exc()}")
+    except Exception as e:
+        logger.error(f"[치명적 오류] {e}\n{traceback.format_exc()}")
     finally:
-        health_daemon.stop()
-        for cam in cams:
-            cam.reader.running = False
-            cam.recorder.running = False
-        for worker in camera_workers:
-            worker.running = False
-        for model_name in ("d_main", "d_helmet", "d_face", "d_plate"):
+        if 'health_daemon' in locals():
+            health_daemon.stop()
+
+        for c in cams:
+            c.reader.running = False
+            c.recorder.running = False
+
+        if 'camera_workers' in locals():
+            for w in camera_workers:
+                w.running = False
+
+        for model_name in ["d_main", "d_helmet", "d_face", "d_plate"]:
             model = locals().get(model_name)
             if model is not None and hasattr(model, "release"):
                 try:
                     model.release()
                 except Exception:
                     pass
+
         if is_gui_mode:
             cv2.destroyAllWindows()
 

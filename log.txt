@@ -1,0 +1,136 @@
+hudaters@hudaters-nuc13brfa4:~/hai$ python multi_event.py --gui
+2026-08-12 19:57:05 | INFO    | [main] [시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)
+2026-08-12 19:57:05 | INFO    | [main] [System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료
+2026-08-12 19:57:05 | INFO    | [load_rtsp_list_from_csv] 카메라 CSV 로드 완료: 5대
+>> CLI 디버그 출력을 활성화하시겠습니까? (파일 로그는 항상 상세히 기록됩니다) [y/N]: y
+2026-08-12 19:57:06 | DEBUG   | [main] 디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.
+>> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: 
+2026-08-12 19:57:07 | INFO    | [main] DeepX 모델을 VPU 메모리로 할당 중... (event inference: main)
+2026-08-12 19:57:07 | INFO    | [_resolve_output_format] [DeepX] output_format=auto detected ppu: pctc_v1.dxnn (shapes=[[8400]] dtypes=['bbox'])
+2026-08-12 19:57:07 | INFO    | [__init__] [DeepX] 모델 로드 성공: pctc_v1.dxnn (output=ppu, pool=3, input=640x640, layout=nhwc)
+2026-08-12 19:57:07 | INFO    | [_resolve_output_format] [DeepX] output_format=auto detected yolo: helmet_3cls_v8.dxnn (shapes=[[1, 7, 8400]] dtypes=["<class 'numpy.float32'>"])
+2026-08-12 19:57:07 | INFO    | [__init__] [DeepX] 모델 로드 성공: helmet_3cls_v8.dxnn (output=yolo, pool=1, input=640x640, layout=nhwc)
+2026-08-12 19:57:07 | INFO    | [__init__] [DeepX] 모델 로드 성공: yolov8m-face_ppu.dxnn (output=yolo_xyxy, pool=1, input=640x640, layout=nhwc)
+2026-08-12 19:57:07 | INFO    | [__init__] [DeepX] 모델 로드 성공: license_plate_detector_v2.dxnn (output=yolo_xyxy, pool=1, input=640x640, layout=nhwc)
+2026-08-12 19:57:07 | INFO    | [main] [CAMERA LOADED] cam=1 ip=173_cam1 events=walkway_out roi_poly_points=4 roi_line_points=0
+2026-08-12 19:57:07 | INFO    | [main] [CAMERA LOADED] cam=2 ip=173_cam2 events=abnormal_drive roi_poly_points=0 roi_line_points=12
+2026-08-12 19:57:07 | INFO    | [main] [CAMERA LOADED] cam=3 ip=173_cam3 events=spreader_danger_zone roi_poly_points=0 roi_line_points=0
+2026-08-12 19:57:07 | INFO    | [main] [CAMERA LOADED] cam=4 ip=173_cam4 events=yard_crossing roi_poly_points=4 roi_line_points=0
+2026-08-12 19:57:07 | INFO    | [main] [CAMERA LOADED] cam=5 ip=173_cam5 events=spreader_danger_zone roi_poly_points=0 roi_line_points=0
+2026-08-12 19:57:07 | INFO    | [__init__] [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: 60초)
+2026-08-12 19:57:08 | ERROR   | [_run] 🚨 [Health Check] 네트워크/데이터 수집 실패 (누적:1): No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/health'
+2026-08-12 19:57:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 104, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:15 | INFO    | [_initialize_base_roi_if_needed] [CAM:1] base ROI init | poly=4 lines=0 shape=(480, 640)
+2026-08-12 19:57:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 104, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 102, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 106, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:15 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 100, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 102, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 98, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 107, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 111, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 109, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:16 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 115, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 116, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 118, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 109, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 110, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 113, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 636.991, min_val: -50.175
+2026-08-12 19:57:17 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:1 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 19:57:17 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 117, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 111, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 109, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 109, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 105, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:18 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 110, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 116, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 113, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 21, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:19 | INFO    | [_initialize_base_roi_if_needed] [CAM:3] base ROI init | poly=0 lines=0 shape=(480, 640)
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 3, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 636.751, min_val: -52.610
+2026-08-12 19:57:19 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:3 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 115, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 25, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 114, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 20, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 116, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 27, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 18, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 113, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 22, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:19 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 33, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 110, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 21, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 106, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 27, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 113, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 41, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 114, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 38, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 115, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 47, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 115, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 51, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 113, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:20 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 52, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 109, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 61, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 107, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 61, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 116, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 62, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 112, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 57, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 114, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 63, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 108, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 386, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | INFO    | [_initialize_base_roi_if_needed] [CAM:4] base ROI init | poly=4 lines=0 shape=(480, 640)
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 60, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 635.935, min_val: -53.308
+2026-08-12 19:57:21 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:4 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 116, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 386, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 19:57:21 | INFO    | [_initialize_base_roi_if_needed] [CAM:5] base ROI init | poly=0 lines=0 shape=(480, 640)
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 3, 32), max_val: 249.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 8400), max_val: 636.738, min_val: -57.858
+2026-08-12 19:57:21 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:5 전송 실패: No connection adapters were found for '1https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img'
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 118, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 57, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 379, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:21 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 383, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 57, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 110, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 5, 32), max_val: 252.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 377, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 55, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 107, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 380, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 1, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 66, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 111, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 380, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 60, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 110, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 1, 32), max_val: 253.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 382, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 109, 32), max_val: 254.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 62, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (0, 0), tensor is EMPTY (size 0)
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 376, 32), max_val: 255.000, min_val: 0.000
+2026-08-12 19:57:22 | DEBUG   | [infer] [NPU Raw Output] shape: (1, 55, 32), max_val: 255.000, min_val: 0.000
+
