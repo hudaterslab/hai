@@ -74,6 +74,7 @@ ID_G_TRUCK = 6        # trunklinetruck
 ID_RAINCOAT = 8       # raincoat -> 신호수(5)와 동일 취급
 ID_SIGNALFLAG = 9     # signalflag -> 신호수(5)와 동일 취급
 
+ID_STOPSIGN = 13
 # 10: box, 11: soft_package, 12: sack (무시)
 
 TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
@@ -209,14 +210,21 @@ def load_system_config():
                 "state_inherit_distance_ratio": 0.5,
                 "state_inherit_max_size_ratio": 2.5,
                 "state_inherit_max_area_ratio": 6.0
+            },
+            "no_stopsign": {
+                "enabled": False, "cooldown_sec": 600,
+                "parked_threshold_sec": 5.0, 
+                "stopsign_grace_sec": 180.0, 
+                "stopsign_presence_sec": 3.0
             }
         },
         "models": {
             "MAIN_V2": "hanjin_cctv_v2.dxnn",
             "MAIN_V3": "hanjin_cctv_v3.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
-            "HELMET": "helmet_260622.dxnn",
-            "PLATE": "license_plate_detector_v2.dxnn"
+            "HELMET": "helmet_v2.dxnn",
+            "PLATE": "license_plate_detector_v2.dxnn",
+            "STOPSIGN": "sign.dxnn"
         },
         "model_confidences": {
             "MAIN_V2": 0.6,
@@ -225,21 +233,24 @@ def load_system_config():
             "HELMET": 0.85,
             "PERSON": 0.5,
             "SIGNALMAN": 0.5,
-            "PLATE": 0.1
+            "PLATE": 0.1,
+            "STOPSIGN": 0.1
         },
         "model_output_formats": {
             "MAIN_V2": "ppu",
             "MAIN_V3": "ppu",
             "FACE": "auto",
             "HELMET": "auto",
-            "PLATE": "yolo"
+            "PLATE": "yolo",
+            "STOPSIGN": "ppu"
         },
         "model_engine_pool_sizes": {
             "MAIN_V2": 2,
             "MAIN_V3": 1,
             "FACE": 1,
             "HELMET": 1,
-            "PLATE": 1
+            "PLATE": 1,
+            "STOPSIGN": 1
         },
         "video_decode": {
             "backend": "gstreamer",
@@ -366,7 +377,9 @@ def split_unified_event_detections(raw_dets, events, main_conf, person_conf, hel
             
             if conf >= person_conf:
                 d_main_res_list.append(mod_d)
-            if "signal_vehicle" in events and conf >= signalman_conf:
+            
+            # [수정] signal_vehicle 뿐만 아니라 no_stopsign 이벤트에서도 신호수 객체를 수집하도록 조건 확장
+            if ("signal_vehicle" in events or "no_stopsign" in events) and conf >= signalman_conf:
                 d_signalman_res_list.append(mod_d)
                 
         # 3. 사람 및 하반신 (2: person, 4: lowerbody)
@@ -1016,35 +1029,6 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None, auth_
         
         cv2.putText(api_img, "Signalman Auth", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
     
-        if not auth_tokens:
-            cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            cv2.putText(api_img, "Reason: Moving without Signalman", (x_start + 10, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-        else:
-            for i, tkn in enumerate(auth_tokens):
-                remain = tkn.get('remain', 0)
-                sig_tid = tkn.get('sig_tid', 'Unknown')
-                cv2.putText(api_img, f"Auth Remain: {remain:.1f}s", (x_start + 10, y_start + 45 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.putText(api_img, f"Auth by: Signalman [{sig_tid}]", (x_start + 10, y_start + 65 + i * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-
-    return api_img
-
-    if not drawn:
-        x1, y1, x2, y2 = map(int, bbox)
-        cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
-        cv2.putText(api_img, str(event_type), (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv2.LINE_AA)
-
-    # 관제 서버로 전송되는 증거 이미지 우측 하단에 Signalman 상태창 강제 베이킹 (유지)
-    if event_type == "signal_vehicle":
-        h_frame, w_frame = api_img.shape[:2]
-        token_count = max(1, len(auth_tokens) if auth_tokens else 1)
-        box_w, box_h = 340, 35 + token_count * 40
-        x_start, y_start = w_frame - box_w - 20, h_frame - box_h - 20
-
-        overlay = api_img.copy()
-        cv2.rectangle(overlay, (x_start, y_start), (x_start + box_w, y_start + box_h), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, api_img, 0.4, 0, api_img)
-        cv2.putText(api_img, "Last Signalman Checked", (x_start + 10, y_start + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-
         if not auth_tokens:
             cv2.putText(api_img, "Status: UNAUTH (ALARM)", (x_start + 10, y_start + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
             cv2.putText(api_img, "Reason: Moving without Signalman", (x_start + 10, y_start + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
@@ -2910,12 +2894,278 @@ class SignalVehicleDetector(BaseEventDetector):
 
         return triggered
 
+class StopsignDetector(BaseEventDetector):
+    gui_name = "NO-STOPSIGN"
+
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        
+        self.parked_threshold_sec = config.get("parked_threshold_sec", 5.0) 
+        self.stopsign_grace_sec = config.get("stopsign_grace_sec", 180.0)   
+        self.stopsign_presence_sec = config.get("stopsign_presence_sec", 3.0) 
+        
+        self.prox_ratio_x = config.get("prox_ratio_x", 1.0)
+        self.prox_ratio_y = config.get("prox_ratio_y", 1.0)
+
+        self.line_truck_confirm_frames = max(1, int(config.get("line_truck_confirm_frames", 10)))
+        self.line_truck_confirm_ratio = min(1.0, max(0.0, float(config.get("line_truck_confirm_ratio", 0.7))))
+        self.line_truck_car_veto_frames = max(0, int(config.get("line_truck_car_veto_frames", 5)))
+        self.line_truck_min_conf = float(config.get("line_truck_min_conf", 0.7))
+        self.line_truck_car_veto_iou = float(config.get("line_truck_car_veto_iou", 0.10))
+        self.line_truck_car_veto_distance_ratio = float(config.get("line_truck_car_veto_distance_ratio", 0.60))
+        
+        self.line_truck_votes = defaultdict(lambda: deque(maxlen=self.line_truck_confirm_frames))
+        self.recent_car_observations = deque(maxlen=max(30, self.line_truck_car_veto_frames * 10))
+        self.process_seq = 0
+        self.confirmed_line_truck_ids = set()
+
+        self.stationary_anchor = {}
+        self.stationary_start_time = {}
+        self.is_parked = set()
+        
+        self.parked_confirmed_time = {}    
+        self.stopsign_seen_start = {}      
+        self.stopsign_auth = {}            
+        self.triggered_parked_tids = set() 
+
+        self.last_seen_bbox = {}
+        self.last_seen_time = {}
+
+    def _remember_recent_cars(self, tracks, track_map):
+        pass 
+
+    def _has_recent_car_veto(self, truck_box):
+        return False
+
+    def _is_confirmed_line_truck(self, track):
+        return True
+
+    def _get_intersection_over_stopsign_area(self, stopsign_box, truck_box):
+        sx1, sy1, sx2, sy2 = stopsign_box
+        tx1, ty1, tx2, ty2 = truck_box
+        
+        inter_w = max(0, min(sx2, tx2) - max(sx1, tx1))
+        inter_h = max(0, min(sy2, ty2) - max(sy1, ty1))
+        inter_area = max(0, inter_w * inter_h)
+        
+        stopsign_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+        return float(inter_area) / float(stopsign_area)
+
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
+        triggered = []
+        curr_ids = set()
+        current_time = time.time()
+        privacy_tracks = kwargs.get('privacy_tracks', [])
+        self.process_seq += 1
+
+        if self.roi_poly.size == 0 or frame is None: return triggered
+
+        stopsign_tracks = kwargs.get('stopsign_tracks', [])
+
+        # 1. 트럭 확정 로직
+        self.confirmed_line_truck_ids = set()
+        for t in tracks:
+            tid = int(t[4])
+            if track_map.get(tid) == ID_G_TRUCK and self._is_confirmed_line_truck(t):
+                curr_ids.add(tid)
+                self.confirmed_line_truck_ids.add(tid)
+
+        # 2. 트래커 ID 상태 상속 (ID 스위칭 방어)
+        missing_tids = [tid for tid in self.last_seen_bbox.keys() if tid not in curr_ids and (current_time - self.last_seen_time.get(tid, 0)) < 3.0]
+        
+        for curr_tid in curr_ids:
+            curr_box = next((t[:4] for t in tracks if int(t[4]) == curr_tid), None)
+            if curr_box is None: continue
+            curr_fc = get_foot_point(*curr_box)
+            
+            for old_tid in missing_tids:
+                old_box = self.last_seen_bbox[old_tid]
+                iou = calculate_iou(curr_box, old_box)
+                old_fc = get_foot_point(*old_box)
+                dist = get_distance(curr_fc, old_fc)
+                v_size = max(curr_box[2] - curr_box[0], curr_box[3] - curr_box[1])
+                
+                # 거리 또는 IoU 기반 승계 판별
+                if iou > 0.3 or dist < (v_size * 0.5):
+                    logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID 승계 발생: {old_tid} -> {curr_tid} (IoU:{iou:.2f}, Dist:{dist:.1f})")
+                    if old_tid in self.stationary_anchor:
+                        self.stationary_anchor[curr_tid] = self.stationary_anchor[old_tid]
+                        del self.stationary_anchor[old_tid]
+                    if old_tid in self.stationary_start_time:
+                        self.stationary_start_time[curr_tid] = self.stationary_start_time[old_tid]
+                        del self.stationary_start_time[old_tid]
+                    if old_tid in self.is_parked:
+                        self.is_parked.add(curr_tid)
+                        self.is_parked.remove(old_tid)
+                    if old_tid in self.parked_confirmed_time:
+                        self.parked_confirmed_time[curr_tid] = self.parked_confirmed_time[old_tid]
+                        del self.parked_confirmed_time[old_tid]
+                    if old_tid in self.stopsign_auth:
+                        self.stopsign_auth[curr_tid] = self.stopsign_auth[old_tid]
+                        del self.stopsign_auth[old_tid]
+                    if old_tid in self.stopsign_seen_start:
+                        self.stopsign_seen_start[curr_tid] = self.stopsign_seen_start[old_tid]
+                        del self.stopsign_seen_start[old_tid]
+                    if old_tid in self.triggered_parked_tids:
+                        self.triggered_parked_tids.add(curr_tid)
+                        self.triggered_parked_tids.remove(old_tid)
+                    missing_tids.remove(old_tid)
+                    break
+
+        # 3. 정차 상태 업데이트 
+        for t in tracks:
+            tid = int(t[4])
+            if tid not in self.confirmed_line_truck_ids: continue
+
+            x1, y1, x2, y2 = t[:4]
+            fc, c_pt = get_center_point(*t[:4]), get_center_point(*t[:4])
+            v_size = max(x2 - x1, y2 - y1)
+
+            self.last_seen_bbox[tid] = t[:4]
+            self.last_seen_time[tid] = current_time
+
+            is_in_roi = cv2.pointPolygonTest(self.roi_poly, c_pt, False) >= 0
+            if is_in_roi:
+                if tid not in self.stationary_anchor:
+                    self.stationary_anchor[tid] = fc
+                    self.stationary_start_time[tid] = current_time
+                else:
+                    dist_from_anchor = get_distance(self.stationary_anchor[tid], fc)
+                    tolerance = max(v_size * 0.1, 15.0)
+
+                    if dist_from_anchor > tolerance:
+                        self.stationary_anchor[tid] = fc
+                        self.stationary_start_time[tid] = current_time
+                        
+                        if tid in self.is_parked: 
+                            logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 이동 감지 (Dist:{dist_from_anchor:.1f} > Tol:{tolerance:.1f}). 정차 상태 해제 및 타이머 리셋.")
+                            self.is_parked.remove(tid)
+                        if tid in self.parked_confirmed_time: del self.parked_confirmed_time[tid]
+                        if tid in self.stopsign_auth: del self.stopsign_auth[tid]
+                        if tid in self.stopsign_seen_start: del self.stopsign_seen_start[tid]
+                        if tid in self.triggered_parked_tids: self.triggered_parked_tids.remove(tid)
+                    
+                    else:
+                        if current_time - self.stationary_start_time[tid] >= self.parked_threshold_sec:
+                            if tid not in self.is_parked:
+                                logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 정차 확정 (대기 시간 {self.parked_threshold_sec}초 충족).")
+                                self.is_parked.add(tid)
+                                self.parked_confirmed_time[tid] = current_time 
+            else:
+                if tid in self.stationary_anchor: del self.stationary_anchor[tid]
+                if tid in self.stationary_start_time: del self.stationary_start_time[tid]
+                if tid in self.is_parked: self.is_parked.remove(tid)
+                if tid in self.parked_confirmed_time: del self.parked_confirmed_time[tid]
+                if tid in self.stopsign_auth: del self.stopsign_auth[tid]
+                if tid in self.triggered_parked_tids: self.triggered_parked_tids.remove(tid)
+
+        # 4. IoA 기반 표지판 할당 및 타임아웃 검사
+        valid_stopsigns = []
+        for s in stopsign_tracks:
+            sx1, sy1, sx2, sy2 = s[:4]
+            sw, sh = sx2 - sx1, sy2 - sy1
+            if sw < 15 or sh < 15:
+                continue
+                
+            s_pt = get_foot_point(sx1, sy1, sx2, sy2)
+            if self.roi_poly.size > 0 and cv2.pointPolygonTest(self.roi_poly, s_pt, False) < 0:
+                continue
+                
+            valid_stopsigns.append({'box': s[:4], 'pt': s_pt, 'claimed': False, 'tid': int(s[4]) if len(s)>4 else -1})
+
+        for tid in list(self.is_parked):
+            if tid not in self.confirmed_line_truck_ids: continue
+            if tid in self.triggered_parked_tids: continue
+
+            if not self.stopsign_auth.get(tid, False):
+                t_box = next((t[:4] for t in tracks if int(t[4]) == tid), None)
+                if t_box is None: continue
+                
+                best_s = None
+                max_ioa = 0.0
+                
+                # 해당 트럭과 가장 넓게 겹치는(IoA) 미할당 표지판 탐색
+                for s in valid_stopsigns:
+                    if s['claimed']: continue
+                    
+                    ioa = self._get_intersection_over_stopsign_area(s['box'], t_box)
+                    
+                    if ioa > 0:
+                        logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 표지판(SignTID:{s['tid']}) IoA 검사: {ioa:.3f} (임계값: 0.1)")
+                    
+                    if ioa >= 0.1 and ioa > max_ioa:
+                        max_ioa = ioa
+                        best_s = s
+                
+                if best_s is not None:
+                    best_s['claimed'] = True
+                    if tid not in self.stopsign_seen_start:
+                        logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 표지판(SignTID:{best_s['tid']}) 1:1 매칭 완료 (IoA:{max_ioa:.3f}). 인증 대기 시작.")
+                        self.stopsign_seen_start[tid] = current_time
+                    elif current_time - self.stopsign_seen_start[tid] >= self.stopsign_presence_sec:
+                        logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 표지판 연속 인지({self.stopsign_presence_sec}초). 인증(Auth) 완료!")
+                        self.stopsign_auth[tid] = True 
+                else:
+                    if tid in self.stopsign_seen_start:
+                        logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 매칭 중이던 표지판 유실. 인증 대기 리셋.")
+                        del self.stopsign_seen_start[tid]
+
+                parked_duration = current_time - self.parked_confirmed_time.get(tid, current_time)
+                
+                # 약 3초(30프레임)에 한 번씩 트럭의 주차 진행 상황을 로깅
+                if self.process_seq % 30 == 0:
+                    logger.debug(f"[STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 정차 모니터링: {parked_duration:.1f}초 / {self.stopsign_grace_sec}초 | 표지판 Auth: {self.stopsign_auth.get(tid, False)}")
+
+                if parked_duration >= self.stopsign_grace_sec and not self.stopsign_auth.get(tid, False):
+                    logger.debug(f"🔥 [STOPSIGN_DEBUG] FID:{fid} | TID:{tid} 정차 유예 시간({self.stopsign_grace_sec}초) 초과! 이벤트를 발동합니다.")
+                    triggered.append({
+                        'tid': tid,
+                        'bbox': t_box,
+                        'frame': frame.copy() if frame is not None else None,
+                        'fid': fid,
+                        'confidence': float(t_box[5] if len(t_box) > 5 else 0.95),
+                        'privacy_tracks': privacy_tracks,
+                        'privacy_fid': fid,
+                        'objects': [{
+                            'label': 'LineTruck',
+                            'box': [int(x) for x in t_box],
+                            'score': float(t_box[5] if len(t_box) > 5 else 0.95),
+                            'tid': tid,
+                            'class_id': ID_G_TRUCK 
+                        }],
+                        'decision_trace': {
+                            'detector': 'StopsignDetector',
+                            'reason': 'parked_truck_without_stopsign_timeout',
+                            'parked_duration_sec': round(float(parked_duration), 3),
+                            'grace_sec_limit': round(float(self.stopsign_grace_sec), 3),
+                            'stopsign_ioa_threshold': 0.1
+                        }
+                    })
+                    self.triggered_parked_tids.add(tid) 
+
+        # 5. 메모리 관리 
+        for tid in list(self.last_seen_bbox.keys()):
+            if tid not in curr_ids and current_time - self.last_seen_time.get(tid, 0) > 5.0:
+                if tid in self.last_seen_bbox: del self.last_seen_bbox[tid]
+                if tid in self.last_seen_time: del self.last_seen_time[tid]
+                if tid in self.is_parked: self.is_parked.remove(tid)
+                if tid in self.line_truck_votes: del self.line_truck_votes[tid]
+                if tid in self.stationary_anchor: del self.stationary_anchor[tid]
+                if tid in self.stationary_start_time: del self.stationary_start_time[tid]
+                if tid in self.parked_confirmed_time: del self.parked_confirmed_time[tid]
+                if tid in self.stopsign_auth: del self.stopsign_auth[tid]
+                if tid in self.stopsign_seen_start: del self.stopsign_seen_start[tid]
+                if tid in self.triggered_parked_tids: self.triggered_parked_tids.remove(tid)
+
+        return triggered
+
 EVENT_REGISTRY = {
     "intrusion": IntrusionDetector,
     "illegal_parking": ParkingDetector,
     "conveyor_crossing": CrossingDetector,
     "no_helmet": HelmetDetector,
-    "signal_vehicle": SignalVehicleDetector
+    "signal_vehicle": SignalVehicleDetector,
+    "no_stopsign": StopsignDetector
 }
 
 # ==========================================
@@ -3061,14 +3311,13 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
             cx, cy = c * cw, r * ch
             cv2.rectangle(mosaic, (cx, cy), (cx + 50, cy + 50), (255, 255, 255), -1)
             
-            # [요구사항 반영 2] 배치(Batch) 상대 번호가 아닌 CSV 전체 기준 절대 순차 번호 생성
+            # 배치(Batch) 상대 번호가 아닌 CSV 전체 기준 절대 순차 번호 생성
             abs_cam_id = i + idx + 1 
             cv2.putText(mosaic, str(abs_cam_id), (cx + 10, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 1)
 
         cv2.imshow("Select Cameras", mosaic)
         cv2.waitKey(1)
 
-        # [요구사항 반영 3] 프롬프트 안내 메시지도 절대 번호 기준으로 변경
         example_ids = f"{i+1},{i+2}" if len(batch) > 1 else f"{i+1}"
         sel = guarded_input(f">> [Batch {i//BATCH_SIZE + 1}] 설정할 카메라 번호 (예: {example_ids} / 건너뛰기: 엔터): ").strip()
         if not sel:
@@ -3077,7 +3326,7 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
         try:
             nums = [int(s.strip()) for s in sel.split(',')]
             for n in nums:
-                # [요구사항 반영 3] 사용자가 입력한 절대 번호를 다시 배치 내 로컬 인덱스로 변환하여 처리
+                # 사용자가 입력한 절대 번호를 다시 배치 내 로컬 인덱스로 변환하여 처리
                 local_idx = n - i - 1 
                 if 0 <= local_idx < len(batch) and frames[local_idx] is not None:
                     url = batch[local_idx]
@@ -3085,9 +3334,9 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
 
                     print(
                         f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량 "
-                        f"6.roi화각변경 7.roi화각변경+자동보정"
+                        f"6.roi화각변경 7.roi화각변경+자동보정 8.표지판 미설치"
                     )
-                    evts = guarded_input(f"[{ip}] 이벤트 선택 (예: 1,4,7): ")
+                    evts = guarded_input(f"[{ip}] 이벤트 선택 (예: 1,4,7,8): ")
                     events = []
 
                     selected_events = {s.strip() for s in evts.split(',') if s.strip()}
@@ -3099,11 +3348,13 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     if '5' in selected_events: events.append("signal_vehicle")
                     if '6' in selected_events: events.append(ROI_CHANGE_EVENT)
                     if '7' in selected_events: events.append(ROI_CHANGE_APPLY_EVENT)
+                    if '8' in selected_events: events.append("no_stopsign")
 
                     roi_p = []
                     roi_l = []
 
-                    if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle"]):
+                    # [수정] no_stopsign 이벤트 선택 시에도 Polygon ROI를 설정하도록 조건 추가
+                    if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle", "no_stopsign"]):
                         roi_p = get_roi_points_scaled(frames[local_idx], f"Polygon - CAM: {ip}")
 
                     if "conveyor_crossing" in events:
@@ -4357,7 +4608,7 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_main_v2, det_main_v3, det_helmet, det_face, det_signalman, det_plate, cam_id, event_inference_mode="separate"):
+    def __init__(self, ip, conf, det_main_v2, det_main_v3, det_helmet, det_face, det_signalman, det_plate, det_stopsign, cam_id, event_inference_mode="separate"):
         self.ip = ip
         self.camera_key = ip
         self.conf = conf
@@ -4372,7 +4623,9 @@ class Camera:
         self.det_face = det_face
         self.det_signalman = det_signalman
         self.det_plate = det_plate
+        self.det_stopsign = det_stopsign # 신규 추가
 
+        self.trk_stopsign = SimpleTracker() # 신규 추가
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
         self.trk_signalman = SimpleTracker()
@@ -5155,7 +5408,7 @@ class Camera:
             ]
         }
 
-    def run_logic(self, fr, fid, d_main_res, d_helmet_res, d_signalman_res=None):
+    def run_logic(self, fr, fid, d_main_res, d_helmet_res, d_signalman_res=None, d_stopsign_res=None):
         if fr is None:
             return [], [], [], {}, []
 
@@ -5167,14 +5420,18 @@ class Camera:
 
         if d_signalman_res is None:
             d_signalman_res = np.empty((0, 6))
-
+            
+        if d_stopsign_res is None:
+            d_stopsign_res = np.empty((0, 6))
+            
         self._update_alignment(fr)
 
         d_main_filtered = [d for d in d_main_res if int(d[5]) not in [ID_H_HELMET, ID_H_NO_HELMET]]
         t_main = self.trk_main.update(d_main_filtered)
         t_helmet = self.trk_helmet.update(d_helmet_res)
         t_signalman = self.trk_signalman.update(d_signalman_res)
-
+        t_stopsign = self.trk_stopsign.update(d_stopsign_res)
+        
         now = time.time()
         current_alarms = {}
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
@@ -5194,10 +5451,14 @@ class Camera:
             elif ename == "signal_vehicle":
                 kwargs = {'signalman_tracks': t_signalman, 'privacy_tracks': t_main}
                 handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
+            elif ename == "no_stopsign":
+                kwargs = {'stopsign_tracks': t_stopsign, 'privacy_tracks': t_main}
+                handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
+            
             else:
                 kwargs = {'privacy_tracks': t_main}
                 handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
-
+            
             try:
                 # 핸들러 실행 (내부에서 과거 시점의 privacy_tracks를 저장하고 ev에 담아 반환해야 함)
                 triggered = handler.process(handler_tracks, handler_track_map, None, fr, fid, **kwargs)
@@ -5378,9 +5639,9 @@ class Camera:
                     bx1, by1, bx2, by2 = map(int, t[:4])
                     cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), (0, 255, 255), 1)
 
-        return t_main, t_helmet, t_signalman, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
+        return t_main, t_helmet, t_signalman, t_stopsign, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
-    def draw(self, fr, t_main, t_helmet, t_signalman, alarms, connected=True):
+    def draw(self, fr, t_main, t_helmet, t_signalman, t_stopsign, alarms, connected=True):
         if fr is None or not connected:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
             cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 1)
@@ -5400,10 +5661,17 @@ class Camera:
                     cv2.line(fr, tuple(self.roi_lines[i]), tuple(self.roi_lines[i+1]), (0, 0, 255), 2)
 
         allowed_classes = set()
-        if "signal_vehicle" in self.events:
+        if "signal_vehicle" in self.events or "no_stopsign" in self.events:
             allowed_classes.add(ID_G_TRUCK)
+            
+        # 수정: 기존 로직 복구 (횡단, 침입, 안전모일 때만 하반신 허용)
         if "no_helmet" in self.events or "conveyor_crossing" in self.events or "intrusion" in self.events:
             allowed_classes.update([ID_G_PERSON, ID_PERSON_LOW])
+            
+        # 수정: no_stopsign 일 때는 하반신(ID_PERSON_LOW)은 버리고 사람(ID_G_PERSON)만 허용
+        if "no_stopsign" in self.events:
+            allowed_classes.add(ID_G_PERSON)
+            
         if "illegal_parking" in self.events or "intrusion" in self.events:
             allowed_classes.update(TARGET_VEHICLES)
 
@@ -5436,7 +5704,7 @@ class Camera:
             cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
             cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-        if "signal_vehicle" in self.events:
+        if "signal_vehicle" in self.events or "no_stopsign" in self.events:
             for t in t_signalman:
                 tid = int(t[4])
                 color, thickness = (0, 255, 255), 1
@@ -5473,7 +5741,14 @@ class Camera:
 
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
                 cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
-
+        
+        if "no_stopsign" in self.events:
+            for t in t_stopsign: # t_stopsign 인자를 draw 파라미터로도 전달해야 함
+                tid = int(t[4])
+                color, thickness = (255, 0, 255), 2 # 보라색 테두리
+                cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
+                cv2.putText(fr, f"StopSign [{tid}]", (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+                
         #cv2.rectangle(fr, (0, 0), (115, 40), (0, 0, 0), -1)
         cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
@@ -6162,6 +6437,11 @@ def main():
             output_format=get_model_output_format("HELMET"),
             pool_size=helmet_pool_size
         )
+        d_stopsign = YoLoDeepX(
+            resolve_model_path(models_cfg.get("STOPSIGN", "sign.dxnn")),
+            output_format=get_model_output_format("STOPSIGN"),
+            pool_size=get_model_engine_pool_size("STOPSIGN", default=1)
+        )
         
         # [복구 및 활성화] d_face 및 d_plate 모델 로드 (좌표 매칭 오류 픽스)
         face_fmt = get_model_output_format("FACE")
@@ -6198,7 +6478,7 @@ def main():
         conf['url'] = rtsp
         # [수정] d_main_v2, d_main_v3 모두 주입
         cams.append(Camera(
-            ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate,
+            ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate, d_stopsign,
             cam_id=i+1,
             event_inference_mode=event_inference_mode
         ))
@@ -6283,16 +6563,17 @@ def main():
         ]
         t_main_input = np.empty((0, 6))
         d_signalman_res = np.empty((0, 6))
-
+        d_stopsign_res = np.empty((0, 6))
+        
         h, w = fr.shape[:2]
         max_area_threshold = (h * w) * 0.5
 
         if active_detection_events:
             base_conf = min(main_conf, person_conf, signalman_conf)
             
-            # [수정] 하이브리드 라우팅 (V3는 신호수 관련, V2는 그 외)
-            v3_required = "signal_vehicle" in active_detection_events
-            v2_required = any(evt in active_detection_events for evt in ["intrusion", "illegal_parking", "conveyor_crossing", "no_helmet"])
+            # 💡 수정: "no_stopsign" 조건 추가 (트럭, 신호수, 사람을 찾기 위해 V2, V3 모두 활성화)
+            v3_required = any(evt in active_detection_events for evt in ["signal_vehicle", "no_stopsign"])
+            v2_required = any(evt in active_detection_events for evt in ["intrusion", "illegal_parking", "conveyor_crossing", "no_helmet", "no_stopsign"])
 
             raw_dets_v2 = cam.det_main_v2.infer(fr, conf_override=base_conf) if v2_required else []
             raw_dets_v3 = cam.det_main_v3.infer(fr, conf_override=base_conf) if v3_required else []
@@ -6325,8 +6606,25 @@ def main():
                     
             if has_person:
                 d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
-
-        return t_main_input, d_helmet_res, d_signalman_res
+                
+        # 신규: no_stopsign 이벤트가 켜져 있으면 sign.dxnn 모델 추론 수행
+        if "no_stopsign" in cam.events and cam.det_stopsign is not None:
+            stopsign_conf = SYS_CFG.get("model_confidences", {}).get("STOPSIGN", 0.5)
+            raw_stopsign = cam.det_stopsign.infer(fr, conf_override=stopsign_conf)
+            
+            d_stopsign_res_list = []
+            for d in raw_stopsign:
+                cls_id = int(d[5])
+                
+                if cls_id in [ID_STOPSIGN]:
+                    mod_d = list(d)
+                    mod_d[5] = ID_STOPSIGN # 시스템 트래커와 렌더러가 인식하도록 13으로 강제 고정
+                    d_stopsign_res_list.append(mod_d)
+            
+            # SimpleTracker가 완벽히 소화할 수 있도록 Nx6 Numpy Array 형태로 변환
+            d_stopsign_res = detection_array(d_stopsign_res_list)
+            
+        return t_main_input, d_helmet_res, d_signalman_res, d_stopsign_res
 
     # [추가] 메인 스레드와 워커 스레드 간 목표 FPS를 안전하게 공유하기 위한 상태 객체
     system_runtime_state = {"target_fps": sys_target_fps}
@@ -6379,20 +6677,29 @@ def main():
                 self.last_inference_time = now
                 fr, fid, connected = item
 
+                # 💡 수정 포인트 1: 연결 안 됨 / 이벤트 없을 때 스킵하는 구간
                 if not connected or fr is None or not self.cam.events:
-                    self.result_buffer.put((fr, fid, connected, [], [], [], {}, [], None))
+                    # t_stopsign 자리에 빈 배열([]) 추가 (총 10개)
+                    self.result_buffer.put((fr, fid, connected, [], [], [], [], {}, [], None)) 
                     continue
 
                 try:
-                    # 추론과 로직을 한 워커에서 순차 처리하여 스레드 통신 오버헤드 제거
-                    t_main_input, d_helmet_res, d_signalman_res = run_camera_inference(self.cam, fr)
-                    t_main, t_helmet, t_signalman, alarms, new_events = self.cam.run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                    t_main_input, d_helmet_res, d_signalman_res, d_stopsign_res = run_camera_inference(self.cam, fr)
+                    
+                    # 언패킹 6개로 받기 (t_stopsign 추가) 및 파라미터 전달
+                    t_main, t_helmet, t_signalman, t_stopsign, alarms, new_events = self.cam.run_logic(
+                        fr, fid, t_main_input, d_helmet_res, d_signalman_res=d_signalman_res, d_stopsign_res=d_stopsign_res
+                    )
+                    
+                    # infer_meta 에도 필요한 경우 매개변수로 확장하시거나 패스
                     infer_meta = self.cam.build_inference_log(fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events, d_signalman_res=d_signalman_res)
                     
-                    self.result_buffer.put((fr, fid, connected, t_main, t_helmet, t_signalman, alarms, new_events, infer_meta))
+                    self.result_buffer.put((fr, fid, connected, t_main, t_helmet, t_signalman, t_stopsign, alarms, new_events, infer_meta))
                 except Exception as e:
                     logger.error(f"[Worker Error] CAM {self.cam.cam_id}: {e}\n{traceback.format_exc()}")
-                    self.result_buffer.put((fr, fid, connected, [], [], [], {}, [], None))
+                    # 💡 수정 포인트 2: 예외(에러) 발생 시 스킵하는 구간
+                    # t_stopsign 자리에 빈 배열([]) 추가 (총 10개)
+                    self.result_buffer.put((fr, fid, connected, [], [], [], [], {}, [], None))
 
     camera_workers = []
     last_rendered_frames = {}
@@ -6505,7 +6812,7 @@ def main():
                         conf = camera_configs.get(c.ip, c.conf)
                         # [수정 핵심] d_main을 최신 아키텍처에 맞게 d_main_v2, d_main_v3로 변경
                         new_cam = Camera(
-                            c.ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate,
+                            c.ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate, d_stopsign,
                             cam_id=c.cam_id,
                             event_inference_mode=event_inference_mode
                         )
@@ -6530,7 +6837,7 @@ def main():
 
                 # 정상 수신 시 활성 시간 갱신
                 last_worker_active_times[c.ip] = now_time
-                fr, fid, connected, t_main, t_helmet, t_signalman, alarms, new_events, infer_meta = res
+                fr, fid, connected, t_main, t_helmet, t_signalman, t_stopsign, alarms, new_events, infer_meta = res
 
                 # [수정] 개별 카메라 1시간 타이머 검사
                 cctv_id_text = str(c.cam_id)
@@ -6569,7 +6876,7 @@ def main():
 
                 if not connected or fr is None or not c.events:
                     if is_gui_mode:
-                        display_fr = c.draw(None, [], [], [], {}, False)
+                        display_fr = c.draw(None, [], [], [], [], {}, False)
                         last_rendered_frames[c.ip] = display_fr
                         final_imgs.append(display_fr)
                     continue
@@ -6605,7 +6912,7 @@ def main():
                     c.recorder.update(record_fr, infer_meta, timestamp=now_time)
 
                 if is_gui_mode:
-                    display_fr = c.draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
+                    display_fr = c.draw(fr.copy(), t_main, t_helmet, t_signalman, t_stopsign, alarms, True)
                     last_rendered_frames[c.ip] = display_fr
                     final_imgs.append(display_fr)
 
