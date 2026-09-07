@@ -83,7 +83,7 @@ DEBUG_MODE = False
 # ------------------------------------------------------------
 # ROI 보정(Aligner) 튜닝 파라미터
 # ------------------------------------------------------------
-ALIGN_INTERVAL_SEC = 300.0                 # 화각변경 검사 주기(초)
+ALIGN_INTERVAL_SEC = 300.0                  # 화각변경 검사 주기(초)
 ROI_CHANGE_EVENT = "roi_change"            # 이 이벤트가 지정된 카메라만 화각변경 '감지+알림'
 ROI_CHANGE_APPLY_EVENT = "roi_change_apply"  # 감지 + 측정된 평행이동만큼 ROI를 '자동 보정'까지 하는 카메라
 GRID_APPLY_MAX_SHIFT_PX = 150.0            # 자동 보정 허용 이동 상한(px). 초과 시 보정 안 하고 알림만(=사람 재설정 필요)
@@ -105,14 +105,15 @@ ANCHOR_RETRY_INTERVAL_SEC = 30.0           # 앵커 등록 실패 시 재시도 
 #   거미줄은 IR 전용 현상이라 컬러 프레임에는 나타나지 않는다. 즉 IR 직전 앵커와 IR 해제 직후 프레임은
 #   둘 다 거미줄이 없는 상태라, 앵커를 그대로 보존해도 이 오탐의 영향을 받지 않는다.
 #   (그래서 IR 해제 시 재앵커하지 않는다. 재앵커하면 밤사이 실제로 틀어진 경우를 영영 못 잡는다.)
-#   IR이 꺼지면(채도 복귀) 별도 조치 없이 기존 로직이 그대로 다시 동작한다.
+#   IR이 꺼지면 자동노출·화이트밸런스가 안정될 때까지 잠시 기다린 뒤 기존 앵커와 비교를 재개한다.
 #
 # [임계값] 실측상 IR 전환은 1초 만에 0.0으로 떨어지지만(중간 단계 없음), 개체·계절에 따라 IR 조명이
-#   서서히 켜질 수 있다. 이 시스템에서는 '못 막아서 ROI가 오보정되는 것'이 '과하게 막아서 5분짜리 검사를
+#   서서히 켜질 수 있다. 이 시스템에서는 '못 막아서 ROI가 오보정되는 것'이 '과하게 막아서 검사를
 #   몇 번 거르는 것'보다 훨씬 비싸므로, 컬러 최솟값(39.6)까지 여유를 남기는 선에서 넉넉하게 잡는다.
 IR_SAT_MEAN_ON = 15.0                # 프레임 S 평균이 이 값 이하면 IR ON 판정(실측 IR=0.0)
 IR_SAT_MEAN_OFF = 25.0               # S 평균이 이 값 이상이면 IR OFF 판정(실측 컬러=39.6 이상)
                                      #   두 값 사이는 직전 상태 유지(히스테리시스) → IR 전환 경계에서 깜빡임 방지
+IR_OFF_STABILIZE_SEC = 30.0           # IR OFF 후 자동노출·화이트밸런스 안정화 대기(이후 기존 앵커와 비교)
 # 채도는 주기적으로 재지 않고, IR 여부가 실제로 필요한 두 지점(앵커 등록 직전, 격자 검사 직전)에서만
 # 그 자리의 프레임으로 측정한다. 주기 측정은 그 사이 IR로 바뀐 프레임을 놓치는 창만 만들 뿐,
 # 판정은 어차피 두 지점의 즉시 측정이 결정하므로 이득이 없다.
@@ -227,8 +228,8 @@ def measure_frame_saturation_mean(frame):
     """프레임 전체의 HSV S(채도) 평균(0~255)을 반환한다. 측정 실패 시 None.
 
     IR(흑백) 판정용. 원본 해상도 그대로 계산한다.
-    예전에는 폭 320으로 줄여서 쟀지만, 호출이 앵커 재시도와 5분 검사 시점으로 줄어든 뒤로는
-    절감이 카메라 8대 기준 하루 1초 미만이라 의미가 없다. 반면 축소 보간을 잘못 고르면
+    예전에는 폭 320으로 줄여서 쟀지만, 호출이 앵커 재시도와 화각검사 시점으로 제한돼 평균 부하는 작다.
+    반면 축소 보간을 잘못 고르면
     (INTER_AREA 등) 이웃 픽셀 색이 섞여 채도가 실제보다 낮게 나오고, 그러면 컬러 화면을 IR로
     오판해 화각검사가 통째로 멈춘다(실측: 색 텍스처가 잘게 섞인 화면에서 S평균 170 → 38).
     얻는 것에 비해 위험만 남아 축소를 없앴다.
@@ -347,11 +348,11 @@ def _resize_for_align_log(img):
                       interpolation=cv2.INTER_AREA)
 
 
-def _save_roi_align_images_task(check_id, decision, anchor_gray, current_frame, day_dir):
-    """이상 판정 순간의 앵커/현재 프레임을 저장한다(IMAGE_SAVER_POOL에서 비동기 실행).
+def _save_roi_align_images_task(check_id, decision, base_anchor_gray, current_frame, day_dir):
+    """이상 판정 순간의 BASE 앵커/현재 프레임을 저장한다(IMAGE_SAVER_POOL에서 비동기 실행).
 
     두 이미지는 호출 전에 _resize_for_align_log()로 저장 규격까지 줄여 넘어온다(여기서는 쓰기만 한다).
-    앵커는 격자 정합용으로 흑백만 보관하므로 흑백으로, 현재 프레임은 컬러 그대로 남긴다
+    BASE 앵커는 격자 정합용으로 흑백만 보관하므로 흑백으로, 현재 프레임은 컬러 그대로 남긴다
     (IR 전환·렌즈 앞 이물 같은 원인은 컬러 정보가 있어야 판별된다).
     보관 정리는 run_output_retention_cleanup()이 logs/roi_align 하위를 재귀 순회하므로
     다른 산출물과 동일하게 OUTPUT_RETENTION_DAYS(기본 14일) 뒤 자동 삭제된다.
@@ -362,7 +363,7 @@ def _save_roi_align_images_task(check_id, decision, anchor_gray, current_frame, 
         params = [cv2.IMWRITE_JPEG_QUALITY, ROI_ALIGN_IMAGE_JPEG_QUALITY]
 
         saved = []
-        for suffix, img in (("anchor", anchor_gray), ("current", current_frame)):
+        for suffix, img in (("anchor_base", base_anchor_gray), ("current", current_frame)):
             if img is None:
                 continue
             file_path = os.path.join(out_dir, f"{check_id}_{decision}_{suffix}.jpg")
@@ -745,7 +746,7 @@ def _send_roi_snapshot_task( cam_id, terminal_id, img, roi_info_str, w, h, is_re
     """관제 서버로 ROI 스냅샷을 백그라운드에서 전송합니다."""
     url = "https://tmlsafety.hudaters.net/receiver/api/v1/cctv/roi/img"
     send_label = {
-        "roi_check_5min": "5분 ROI 화각검사",
+        "roi_check_5min": "ROI 화각검사",
         "roi_refresh": "ROI 설정반영 스냅샷",
         "hourly": "1시간 정기 ROI 스냅샷",
     }.get(str(send_type), f"ROI 스냅샷({send_type})")
@@ -3355,12 +3356,21 @@ def get_roi_points_scaled(frame, title, mode="poly"):
             elif len(dp) == 2:
                 cv2.line(temp, tuple(dp[0]), tuple(dp[1]), (0, 0, 255), 2)
         else:
-            if len(dp) > 0:
+            # 첫 점부터 클릭 여부를 바로 확인할 수 있도록 점을 함께 표시한다.
+            for point in dp:
+                cv2.circle(temp, tuple(point), 5, (0, 255, 0), -1)
+            if len(dp) >= 2:
                 cv2.polylines(temp, [np.array(dp, np.int32)], True, (0, 255, 0), 2)
 
         cv2.imshow(title, temp)
-        k = cv2.waitKey(1)
-        if k == 13: # Enter
+        # Linux Qt 백엔드에 따라 Enter가 LF(10) 또는 CR(13)로 전달될 수 있다.
+        k = cv2.waitKey(20) & 0xFF
+        if k in (10, 13):
+            # 점을 하나도 찍지 않은 Enter는 기존처럼 전체 화면 적용으로 허용한다.
+            # Polygon을 그리기 시작했다면 최소 3점이 있어야 완료한다.
+            if mode == "poly" and 0 < len(pts) < 3:
+                logger.warning(f"'{title}' ROI Polygon은 최소 3점을 찍어야 합니다. 현재 {len(pts)}점")
+                continue
             break
         if k == 27: # ESC
             pts = []
@@ -3446,15 +3456,36 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     roi_p = []
                     roi_l = []
 
-                    if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle"]):
+                    if any(e in events for e in [
+                        "intrusion",
+                        "illegal_parking",
+                        "no_helmet",
+                        "signal_vehicle",
+                    ]):
                         roi_p = get_roi_points_scaled(frames[local_idx], f"Polygon - CAM: {ip}")
 
-                    if "conveyor_crossing" in events:
+                    # 횡단 및 화각 변경 이벤트는 두 점으로 구성된 ROI Line을 사용한다.
+                    line_roi_requested = (
+                        "conveyor_crossing" in events
+                        or ROI_CHANGE_EVENT in events
+                        or ROI_CHANGE_APPLY_EVENT in events
+                    )
+                    if line_roi_requested:
+                        line_title = (
+                            f"ROI Line - CAM: {ip}"
+                            if ROI_CHANGE_EVENT in events or ROI_CHANGE_APPLY_EVENT in events
+                            else f"Line - CAM: {ip}"
+                        )
                         while True:
-                            l = get_roi_points_scaled(frames[local_idx], f"Line - CAM: {ip}", mode="line")
+                            l = get_roi_points_scaled(frames[local_idx], line_title, mode="line")
                             if len(l) == 2:
                                 roi_l.extend(l)
-                            if guarded_input("횡단 라인을 추가하시겠습니까? (y/n): ") != 'y':
+                            prompt = (
+                                "ROI 라인을 추가하시겠습니까? (y/n): "
+                                if ROI_CHANGE_EVENT in events or ROI_CHANGE_APPLY_EVENT in events
+                                else "횡단 라인을 추가하시겠습니까? (y/n): "
+                            )
+                            if guarded_input(prompt) != 'y':
                                 break
 
                     configs[ip] = {
@@ -3479,9 +3510,10 @@ class ROIAlignLearningStore:
         self.lock = threading.Lock()
         self.data = {"cameras": {}}
 
-    # 3×3 격자 전용 CSV 스키마(decision은 normal/suspect/confirm/disturbed 4종).
+    # 3×3 격자 전용 CSV 스키마(decision은 normal/suspect/confirm/disturbed/ir_on).
     #   decision        : normal(이동 없음) / suspect(이동 감지, 누적 중) / confirm(연속 N회 도달 → API)
     #                     / disturbed(전 칸 이동 + 방향 불일치: 큰 회전/줌/장면 전환, 연속 3회 도달 → 확정)
+    #                     / ir_on(IR 영상이라 화각검사를 수행하지 않음)
     #   suspect_count   : 연속 suspect 횟수(normal이 나오면 0으로 리셋). confirm_count_required(기본 3) 도달 시 confirm
     #   disturbed_count : 연속 disturbed 횟수. disturbed_confirm_count_required(기본 3) 도달 시 확정
     #   abnormal_count  : 카메라별 연속 suspect/disturbed 합산 횟수. normal일 때만 0으로 초기화
@@ -4378,7 +4410,7 @@ class FrameReader:
 
         if codec in ("h264", "avc1"):
             depay, parser = "rtph264depay", "h264parse"
-            hw_candidates = ["vaapih264dec", "vah264dec"]
+            hw_candidates = ["vah264dec", "vaapih264dec"]
             cpu_candidates = ["avdec_h264", "openh264dec"]
         elif codec in ("hevc", "h265"):
             depay, parser = "rtph265depay", "h265parse"
@@ -4713,6 +4745,9 @@ class Camera:
 
         self.roi_frame_shape = None 
         self.status_history = deque(maxlen=10)
+        # 관제센터 ROI 수신 후 실제 Camera/이벤트 핸들러 적용 여부를 다음 ROI 초기화에서
+        # 한 번만 검증하기 위한 보관본. 일반 설정 리로드와 AUTO_CORRECT에는 만들지 않는다.
+        self._pending_roi_apply_verify = None
         self._reset_alignment_state("ALIGN INIT")
         self._rebuild_handlers()
 
@@ -4738,12 +4773,21 @@ class Camera:
         # 화각변경 판정이 normal이 아닌 구간(suspect/confirm/disturbed) 여부.
         # True인 동안 conveyor_crossing 이벤트를 중단한다(아래 _update_alignment 주석 참고).
         self.roi_align_untrusted = False
+        self.roi_auto_correct_observations = []  # 연속 이상 첫 3회의 실제 관측과 이동량
 
         # IR(흑백) 구간 여부. True인 동안 roi_change / roi_change_apply를 모두 중단한다.
         # 리셋 시 False로 두어도 다음 검사에서 현재 프레임 채도로 즉시 다시 판정된다.
         self.ir_active = False
         self.ir_sat_mean = None          # 마지막으로 측정한 S 평균(로그/CSV 표기용)
+        self.ir_off_stabilize_until = 0.0  # IR OFF 후 비교 재개 시각(time.time 기준)
         self._last_ir_pause_log_time = 0.0   # IR 중단 실행로그 주기 제한용(0이면 다음 중단 시 즉시 1회 기록)
+        self._last_ir_csv_time = 0.0     # 일반 blocked 행과 분리된 IR CSV 기록 주기 제한용
+
+        # 한 번의 이상 구간에서 진단 이미지를 정확히 한 세트만 남기기 위한 래치.
+        # 최초 suspect/disturbed에서 BASE 앵커+현재 프레임, 최초 confirm에서 현재 프레임만 저장한다.
+        # normal 복귀 또는 설정 리셋 시 다시 False가 되어 다음 이상 구간을 새로 기록한다.
+        self.roi_diag_preconfirm_saved = False
+        self.roi_diag_confirm_saved = False
 
     def _rebuild_handlers(self):
         self.handlers = {}
@@ -4756,7 +4800,7 @@ class Camera:
                     self.roi_lines
                 )
 
-    def update_config(self, new_conf):
+    def update_config(self, new_conf, verify_control_center_roi=False):
         old_events = self.events.copy()
 
         # 관제센터 ROI가 적용되기 '전'의 실제 사용 좌표를 붙잡아 둔다.
@@ -4793,6 +4837,17 @@ class Camera:
         self.events = new_conf.get('events', [])
         self.roi_poly_norm = new_conf.get('roi_poly_norm', [])
         self.roi_lines_norm = new_conf.get('roi_lines_norm', [])
+
+        # 헬스체크 응답으로 관제센터 ROI를 받은 경우에만 검증 예약을 만든다.
+        # 이 시점에는 정규화 좌표만 있으므로, 프레임 크기를 아는
+        # _initialize_base_roi_if_needed()에서 px 좌표로 바꾼 뒤 실제 핸들러와 비교한다.
+        if verify_control_center_roi:
+            with _ROI_CHANGE_STASH_LOCK:
+                self._pending_roi_apply_verify = {
+                    "received_at": now_kst().isoformat(),
+                    "poly_norm": [list(p) for p in (self.roi_poly_norm or [])],
+                    "lines_norm": [list(p) for p in (self.roi_lines_norm or [])],
+                }
 
         self.roi_poly = []
         self.roi_lines = []
@@ -4840,6 +4895,69 @@ class Camera:
 
         self._inject_roi_to_handlers(self.aligned_roi_poly, self.aligned_roi_lines)
         logger.info(f"[CAM:{self.cam_id}] base ROI init | poly={len(self.base_roi_poly)} lines={len(self.base_roi_lines)} shape={frame.shape[:2]}")
+
+        # 관제센터에서 받은 정규화 ROI가 실제 Camera 객체와 각 이벤트 핸들러에
+        # 같은 픽셀 좌표로 들어갔는지 확인한다. logger.warning은 기존 로깅 큐를 통해
+        # logs/cctv_YYYYMMDD.log에도 그대로 기록된다.
+        with _ROI_CHANGE_STASH_LOCK:
+            pending_verify = getattr(self, "_pending_roi_apply_verify", None)
+            self._pending_roi_apply_verify = None
+
+        if pending_verify:
+            expected_poly = (
+                denormalize_roi_points(pending_verify.get("poly_norm", []), w, h)
+                if pending_verify.get("poly_norm") else []
+            )
+            expected_lines = (
+                denormalize_roi_points(pending_verify.get("lines_norm", []), w, h)
+                if pending_verify.get("lines_norm") else []
+            )
+
+            camera_match = (
+                _fmt_roi_points(expected_poly) == _fmt_roi_points(self.roi_poly)
+                and _fmt_roi_points(expected_lines) == _fmt_roi_points(self.roi_lines)
+            )
+            handler_mismatch = []
+
+            for event_name, handler in self.handlers.items():
+                handler_poly = getattr(handler, "roi_poly", [])
+                if isinstance(handler_poly, np.ndarray):
+                    handler_poly = handler_poly.tolist()
+                handler_lines = getattr(handler, "roi_lines", [])
+
+                handler_ok = (
+                    _fmt_roi_points(handler_poly) == _fmt_roi_points(expected_poly)
+                    and _fmt_roi_points(handler_lines) == _fmt_roi_points(expected_lines)
+                )
+
+                # CrossingDetector는 판정 시 roi_lines가 아니라 선분 쌍인 lines를 사용하므로
+                # 실제 사용 필드까지 한 번 더 확인한다.
+                if handler_ok and hasattr(handler, "lines"):
+                    flattened_lines = []
+                    for segment in (handler.lines or []):
+                        if isinstance(segment, (list, tuple)) and len(segment) == 2:
+                            flattened_lines.extend([segment[0], segment[1]])
+                    handler_ok = (
+                        _fmt_roi_points(flattened_lines) == _fmt_roi_points(expected_lines)
+                    )
+
+                if not handler_ok:
+                    handler_mismatch.append(event_name)
+
+            handler_match = not handler_mismatch
+            verified = camera_match and handler_match
+            result = "SUCCESS" if verified else "FAILED"
+
+            logger.warning(
+                f"[ROI APPLY VERIFIED] source=CONTROL_CENTER cam={self.cam_id} ip={self.ip} "
+                f"result={result} camera_match={camera_match} handler_match={handler_match} "
+                f"handler_mismatch={handler_mismatch or '-'} "
+                f"received_at={pending_verify.get('received_at', '-')} frame_shape={frame.shape[:2]} "
+                f"received_poly_norm={json.dumps(pending_verify.get('poly_norm', []), separators=(',', ':'))} "
+                f"received_lines_norm={json.dumps(pending_verify.get('lines_norm', []), separators=(',', ':'))} "
+                f"expected_poly={_fmt_roi_points(expected_poly)} actual_poly={_fmt_roi_points(self.roi_poly)} "
+                f"expected_lines={_fmt_roi_points(expected_lines)} actual_lines={_fmt_roi_points(self.roi_lines)}"
+            )
 
         # 관제센터가 내려준 ROI가 픽셀 좌표로 확정되는 지점이다. update_config()가 보관해 둔
         # 변경 전 좌표와 짝지어 source=CONTROL_CENTER 로 남긴다(단말기 자동보정과 구분하기 위함).
@@ -4919,17 +5037,24 @@ class Camera:
             shifted.append([int(p[0]) + dx, int(p[1]) + dy])
         return shifted
 
-    def _log_align_blocked(self, decision, detail):
+    def _log_align_blocked(self, decision, detail, csv_decision="normal"):
+        """화각검사를 건너뛴 상태를 CSV에 기록한다.
+
+        일반 차단 상태는 기존처럼 decision=normal로 두되, IR 차단은 표를 열었을 때 바로
+        구분되도록 csv_decision=ir_on으로 기록한다. IR과 일반 차단은 서로의 기록 주기를
+        가로막지 않도록 별도 타이머를 사용한다.
+        """
         try:
             now_b = time.time()
-            if now_b - getattr(self, "_last_blocked_csv_time", 0.0) < ALIGN_INTERVAL_SEC:
+            timer_attr = "_last_ir_csv_time" if csv_decision == "ir_on" else "_last_blocked_csv_time"
+            if now_b - getattr(self, timer_attr, 0.0) < ALIGN_INTERVAL_SEC:
                 return
-            self._last_blocked_csv_time = now_b
+            setattr(self, timer_attr, now_b)
             csv_row = {
                 "timestamp": ROI_ALIGN_LEARNING_STORE._now_iso(),
                 "check_id": make_align_check_id(self.cam_id),
                 "camera_key": self.camera_key,
-                "decision": "normal",
+                "decision": csv_decision,
                 "suspect_count": 0,
                 "disturbed_count": 0,
                 "abnormal_count": 0,
@@ -4956,10 +5081,11 @@ class Camera:
         """주어진 프레임의 채도로 IR(흑백) 여부를 즉시 판정하고 self.ir_active를 반환한다.
 
         호출 지점이 곧 판정이 필요한 지점이므로 주기를 두지 않고 매번 측정한다
-        (720x405 기준 측정 1회 약 1.2ms. 호출은 앵커 재시도와 5분 검사 시점뿐이라 비용이 문제되지 않는다).
+        (720x405 기준 측정 1회 약 1.2ms. 호출은 앵커 재시도와 화각검사 시점뿐이라 비용이 문제되지 않는다).
         판정은 히스테리시스: S 평균 <= IR_SAT_MEAN_ON → IR ON, >= IR_SAT_MEAN_OFF → IR OFF,
         그 사이 값이면 직전 상태를 유지해 전환 경계에서 켜짐/꺼짐이 반복되지 않게 한다.
-        측정 실패(None)면 직전 상태를 그대로 유지한다.
+        측정 실패(None)면 직전 상태를 그대로 유지한다. IR OFF로 바뀌면 즉시 화각검사를
+        재개하지 않고 IR_OFF_STABILIZE_SEC 동안 자동노출·화이트밸런스 안정화를 기다린다.
         """
         sat_mean = measure_frame_saturation_mean(frame)
         if sat_mean is None:
@@ -4976,25 +5102,40 @@ class Camera:
 
         if self.ir_active != prev:
             if self.ir_active:
+                # 안정화 중 다시 IR이 켜진 경우 예약된 검사 재개를 취소한다.
+                self.ir_off_stabilize_until = 0.0
                 logger.info(
                     f"[CAM:{self.cam_id}] IR ON 감지 (saturation_mean={sat_mean:.2f} <= {IR_SAT_MEAN_ON}) "
                     f"| roi_change/roi_change_apply 일시 중단"
                 )
             else:
+                self.ir_off_stabilize_until = time.time() + IR_OFF_STABILIZE_SEC
                 logger.info(
                     f"[CAM:{self.cam_id}] IR OFF 감지 (saturation_mean={sat_mean:.2f} >= {IR_SAT_MEAN_OFF}) "
-                    f"| roi_change/roi_change_apply 재개"
+                    f"| {IR_OFF_STABILIZE_SEC:.0f}초 안정화 대기 시작"
                 )
 
         return self.ir_active
 
+    def _ir_off_stabilize_remaining(self, now=None):
+        """IR OFF 후 남은 안정화 시간(초). 종료 순간에는 대기 상태를 해제하고 로그를 남긴다."""
+        now = time.time() if now is None else float(now)
+        until = float(getattr(self, "ir_off_stabilize_until", 0.0) or 0.0)
+        remaining = until - now
+        if until > 0.0 and remaining <= 0.0:
+            self.ir_off_stabilize_until = 0.0
+            logger.info(
+                f"[CAM:{self.cam_id}] IR OFF 안정화 완료 | 기존 주간 앵커와 화각 비교 재개"
+            )
+            return 0.0
+        return max(0.0, remaining)
+
     def _mark_ir_paused(self):
         """IR 구간이라 화각변경 검사를 건너뛴 것을 상태표시와 판정 CSV에 남긴다.
 
-        검사를 건너뛴 주기는 CSV에서 decision=normal 행으로 남는데, 그것만 보면 '정상으로 판정했다'와
-        구분되지 않는다. 그래서 reason 컬럼 맨 앞에 어느 카메라가 왜 건너뛰었는지를 한글로 명시한다.
-        _log_align_blocked()가 첫 인자를 reason 앞머리에 그대로 붙이므로 결과는 다음과 같다.
-          IR전환:CAM3|화각변경 감지안함 sat=0.0<=15.0 applied_shift=(0.0,0.0)
+        검사를 건너뛴 주기는 CSV의 decision=ir_on으로 남겨 정상 판정과 바로 구분한다.
+        reason에도 카메라·채도·임계값을 함께 남기므로 결과는 다음과 같다.
+          decision=ir_on, reason=IR_ON:CAM3|화각변경 감지안함 sat=0.0 ...
         기록 주기는 _log_align_blocked()가 ALIGN_INTERVAL_SEC로 제한하므로 건너뛴 검사 1회당 1행이다.
         """
         sat_txt = "?" if self.ir_sat_mean is None else f"{self.ir_sat_mean:.1f}"
@@ -5003,9 +5144,10 @@ class Camera:
         # 임계값은 'sat<=ON' 하나로 적지 않는다. 이미 IR인 상태에서 채도가 ON~OFF 사이로
         # 올라오면 히스테리시스로 IR이 유지되는데, 그때 sat=20.0<=15.0 같은 거짓 설명이 남는다.
         self._log_align_blocked(
-            "IR전환",
+            "IR_ON",
             f"CAM{self.cam_id}|화각변경 감지안함 sat={sat_txt} "
             f"(IR ON<={IR_SAT_MEAN_ON} / OFF>={IR_SAT_MEAN_OFF})",
+            csv_decision="ir_on",
         )
 
         # 실행 로그에도 남기되 CSV와 같은 주기로 제한한다.
@@ -5015,6 +5157,33 @@ class Camera:
         if now - float(getattr(self, "_last_ir_pause_log_time", 0.0)) >= ALIGN_INTERVAL_SEC:
             self._last_ir_pause_log_time = now
             logger.info(f"[CAM:{self.cam_id}] {message}")
+
+    def _record_roi_auto_correct_observation(self, decision, grid):
+        """연속 이상 3회 중 suspect 2회 이상이면 suspect 이동량 평균을 반환.
+
+        재설정 대기 중의 합성 confirm/count는 사용하지 않는다. 첫 3회에서만
+        후보를 만들고, normal 또는 설정 초기화 시 새 이상 구간을 시작한다.
+        """
+        if "latched_abnormal_kind" in decision:
+            return None
+        observed = decision.get("observed_decision", decision.get("decision", "normal"))
+        if observed == "normal":
+            self.roi_auto_correct_observations.clear()
+            return None
+        if observed not in ("suspect", "disturbed"):
+            return None
+        history = self.roi_auto_correct_observations
+        if len(history) >= 3:
+            return None
+        history.append((observed, float(grid.get("median_dx", 0.0)),
+                        float(grid.get("median_dy", 0.0))))
+        if len(history) != 3:
+            return None
+        shifts = [(dx, dy) for kind, dx, dy in history if kind == "suspect"]
+        if len(shifts) < 2 or not all(math.isfinite(v) for shift in shifts for v in shift):
+            return None
+        return (sum(dx for dx, _ in shifts) / len(shifts),
+                sum(dy for _, dy in shifts) / len(shifts))
 
     def _update_alignment(self, frame):
         if frame is None:
@@ -5036,8 +5205,8 @@ class Camera:
         # 정작 앵커를 잡는 순간에는 이미 IR로 바뀐 프레임을 컬러로 오인할 수 있다.
         #   ① 앵커 등록 직전  → 앵커는 항상 컬러(비 IR) 프레임에서만 잡힌다
         #   ② 격자 검사 직전  → IR 프레임으로 이동 판정이 들어가지 않는다
-        # IR 구간 동안 직전(주간) 앵커와 카운터는 그대로 보존되므로,
-        # IR이 꺼지면 중단 시점 상태 그대로 감지가 재개된다(밤새 틀어진 경우 IR OFF 후 검사에서 잡힘).
+        # IR 구간 동안 직전(주간) 앵커와 카운터는 그대로 보존한다. IR이 꺼지면 30초 안정화 후
+        # 중단 시점 상태 그대로 감지를 재개한다(밤사이 실제로 틀어진 경우도 기존 앵커 비교로 잡힘).
         if not self.anchor_set:
             now = time.time()
             if getattr(self, "anchor_startup_wait_started_at", 0.0) <= 0.0:
@@ -5057,6 +5226,15 @@ class Camera:
             #    앵커 재시도 주기(ANCHOR_RETRY_INTERVAL_SEC)로만 오므로 매번 측정해도 부담이 없다.
             if self._update_ir_state(frame):
                 self._mark_ir_paused()
+                return
+
+            stabilize_remaining = self._ir_off_stabilize_remaining(now)
+            if stabilize_remaining > 0.0:
+                self.align_status_text = f"IR OFF STABILIZE {stabilize_remaining:.1f}s"
+                self._log_align_blocked(
+                    "IR_OFF_STABILIZE",
+                    f"CAM{self.cam_id}|앵커 등록 대기 remaining={stabilize_remaining:.1f}s",
+                )
                 return
 
             if self.aligner.set_grid_anchor(frame):
@@ -5083,9 +5261,19 @@ class Camera:
             # 건너뛴 것도 이번 검사 주기를 쓴 것으로 처리한다. 이 줄이 없으면 last_align_time이
             # 갱신되지 않아 위 주기 게이트를 매 프레임 통과하고, IR 내내 프레임마다 채도를
             # 측정하게 된다(720x405 기준 1회 약 1ms → 8대 10fps면 밤새 CPU 8% 상시 점유).
-            # 대신 IR이 꺼진 뒤 감지 재개가 최대 ALIGN_INTERVAL_SEC만큼 늦어지는데,
-            # 이동 확정에 어차피 연속 3회(15분)가 필요하므로 실질 영향은 없다.
             self.last_align_time = now
+            return
+
+        stabilize_remaining = self._ir_off_stabilize_remaining(now)
+        if stabilize_remaining > 0.0:
+            self.align_status_text = f"IR OFF STABILIZE {stabilize_remaining:.1f}s"
+            self._log_align_blocked(
+                "IR_OFF_STABILIZE",
+                f"CAM{self.cam_id}|화각변경 비교 대기 remaining={stabilize_remaining:.1f}s",
+            )
+            # 다음 검사가 정확히 안정화 종료 시점에 열리도록 주기 기준시각을 역산한다.
+            # 이 조정이 없으면 10초마다 채도를 다시 계산하거나, 반대로 전체 검사 주기만큼 더 기다리게 된다.
+            self.last_align_time = self.ir_off_stabilize_until - ALIGN_INTERVAL_SEC
             return
 
         # 이 검사 1회를 가리키는 ID. 판정 CSV 행 · 앵커/현재 이미지 · ROI 변경 로그가 이 값을 공유해
@@ -5115,6 +5303,7 @@ class Camera:
             anchor_refreshed = str(action).startswith("grid_refresh")
 
         decision = ROI_ALIGN_LEARNING_STORE.record_check(self.camera_key, self.conf, moved, disturbed=disturbed)
+        auto_correct_shift = self._record_roi_auto_correct_observation(decision, grid)
         decision_name = str(decision.get("decision", "normal"))
         observed_decision = str(decision.get("observed_decision", decision_name))
         decision_pending = bool(decision.get("pending", False))
@@ -5154,44 +5343,68 @@ class Camera:
                     f"[CAM:{self.cam_id}] ROI normal 복귀 | conveyor_crossing 재개"
                 )
 
-        # ---- 이상 판정 순간의 화면 보존 -----------------------------------------------
-        # 숫자만 남기면 "09:30 suspect / 09:35 suspect / 09:40 confirm"까지만 알 수 있고,
-        # 그때 화면에 실제로 무엇이 찍혔는지(사람이 지나갔는지, 렌즈 앞 이물인지, 조명이 바뀌었는지)를
-        # 알 수 없어 원인 규명이 막힌다. normal이 아닌 판정에서만 앵커/현재 프레임을 남긴다.
-        # 아래 자동 보정이 refresh_grid_anchor()로 앵커를 현재 프레임으로 덮어쓰므로,
-        # '틀어지기 전' 앵커를 남기려면 반드시 보정보다 먼저 저장해야 한다.
-        # confirm 확정 후에는 record_check가 관제 ROI 수신까지 계속 confirm을 반환하므로,
-        # 그 래치 구간(latched_abnormal_kind 키가 있는 응답)은 제외해 같은 화면이 무한히 쌓이지 않게 한다.
-        if decision_name != "normal" and "latched_abnormal_kind" not in decision:
+        # ---- 이상 판정 구간당 진단 이미지 3장만 보존 ----------------------------------
+        # 정상 → suspect → suspect → confirm 순서라면 다음 세 파일만 남긴다.
+        #   1) 최초 suspect 시점의 BASE 앵커  2) 최초 suspect 현재 프레임
+        #   3) 최초 confirm 현재 프레임
+        # 두 번째 이후 suspect와 confirm 래치 구간은 저장하지 않는다. disturbed도 suspect와 같은
+        # '확정 전 이상' 단계로 취급해 최초 한 번만 저장한다. normal로 복귀하면 다음 이상 구간을
+        # 기록할 수 있도록 두 저장 래치를 초기화한다.
+        if decision_name == "normal":
+            self.roi_diag_preconfirm_saved = False
+            self.roi_diag_confirm_saved = False
+
+        save_diag_stage = None
+        save_base_anchor = False
+        if decision_name in ("suspect", "disturbed") and not self.roi_diag_preconfirm_saved:
+            save_diag_stage = decision_name
+            save_base_anchor = True
+        elif (
+            decision_name == "confirm"
+            and "latched_abnormal_kind" not in decision
+            and not self.roi_diag_confirm_saved
+        ):
+            save_diag_stage = "confirm"
+            # confirm_count_required=1처럼 suspect 단계 없이 바로 confirm된 설정에서도
+            # 비교 기준을 잃지 않도록 BASE 앵커를 함께 남긴다.
+            save_base_anchor = not self.roi_diag_preconfirm_saved
+
+        if save_diag_stage is not None:
             # 저장 풀은 이벤트 이미지 업로드와 공유하는 단일 워커다. 업로드가 밀려 큐가 포화면
             # 진단 이미지는 버린다(save_event_image_with_mark과 같은 기준). 이벤트 전송이
             # 우선이고, 큐에 쌓인 프레임 사본이 메모리를 잠식하는 것도 막는다.
             if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
                 logger.warning(
                     f"[ROI DRIFT] 저장 큐 포화로 판정 이미지 생략 check_id={check_id} "
-                    f"decision={decision_name}"
+                    f"decision={save_diag_stage}"
                 )
             else:
-                _anchor_slot = (self.aligner.anchor_slots.get(ANCHOR_UPDATED)
-                                or self.aligner.anchor_slots.get(ANCHOR_BASE))
+                # 사용자가 요청한 고정 비교 기준은 주기 갱신되는 UPDATED가 아니라 최초 BASE 앵커다.
+                _base_anchor_slot = self.aligner.anchor_slots.get(ANCHOR_BASE)
                 # 큐에 싣기 전에 저장 규격으로 줄인다(원본 해상도로 대기시키면 메모리를 먹는다).
                 # _resize_for_align_log는 항상 분리된 배열을 돌려주므로,
                 # 앵커 교체나 캡처 버퍼 재사용의 영향을 받지 않는다.
                 IMAGE_SAVER_POOL.submit(
                     _save_roi_align_images_task,
                     check_id,
-                    decision_name,
-                    _resize_for_align_log((_anchor_slot or {}).get("gray")),  # 앵커는 정합용 흑백만 보관됨
+                    save_diag_stage,
+                    _resize_for_align_log((_base_anchor_slot or {}).get("gray"))
+                    if save_base_anchor else None,
                     _resize_for_align_log(frame),
                     check_started_at.strftime("%Y%m%d"),
                 )
+                if save_diag_stage in ("suspect", "disturbed"):
+                    self.roi_diag_preconfirm_saved = True
+                else:
+                    self.roi_diag_confirm_saved = True
 
         # ---- ROI 자동 보정 (roi_change_apply 카메라 전용) ------------------------------
-        # confirm 시점에 [1순위] homography 보정을 시도한다:
+        # 연속 이상 첫 3회 중 suspect가 2회 이상이면 [1순위] homography 보정을 시도한다.
+        # 마지막 관측이 disturbed여도 허용하며, 교차검증에는 suspect 이동량 평균만 쓴다:
         #   앵커(틀어지기 전) gray ↔ 현재 프레임을 ORB 특징점 매칭으로 정합해, 렌즈 왜곡에 의한
         #   지역별 이동량 차이까지 반영해 ROI 점들을 변환한다(전역 평행이동보다 정확).
         #   검증 게이트(estimate_alignment_homography)를 통과 못 하면
-        #   [2순위] 격자 median 평행이동 보정으로 폴백한다. 시도 결과(h=...)는 CSV reason에 기록.
+        #   [2순위] suspect 평균 평행이동으로 폴백한다. 시도 결과(h=...)는 CSV reason에 기록.
         # 보정 후 현재 프레임으로 재앵커한다(→ 다음 검사는 새 위치 기준 → 이중 보정 방지).
         # 보정은 관제센터가 ROI를 내려줄 때까지 '1회만' 한다(roi_auto_corrected 래치).
         #   보정 후 추가 틀어짐이 감지돼도 다시 보정하지 않고 setup required 보고만 유지하며,
@@ -5205,12 +5418,13 @@ class Camera:
         mdx = float(grid.get("median_dx", 0.0))
         mdy = float(grid.get("median_dy", 0.0))
         shift_mag = math.hypot(mdx, mdy)
+        correction_dx, correction_dy = auto_correct_shift or (0.0, 0.0)
+        correction_mag = math.hypot(correction_dx, correction_dy)
         can_auto_correct = (
             ROI_CHANGE_APPLY_EVENT in self.events
             and not self.roi_auto_corrected
-            and decision.get("confirmed", False)
-            and not disturbed
-            and 0.0 < shift_mag <= GRID_APPLY_MAX_SHIFT_PX
+            and auto_correct_shift is not None
+            and 0.0 < correction_mag <= GRID_APPLY_MAX_SHIFT_PX
             and (self.base_roi_poly or self.base_roi_lines)
         )
         if can_auto_correct:
@@ -5232,7 +5446,8 @@ class Camera:
                 H, h_status = estimate_alignment_homography(
                     anchor_gray,
                     cur_gray,
-                    expected_shift=(GRID_APPLY_SHIFT_SIGN * mdx, GRID_APPLY_SHIFT_SIGN * mdy),
+                    expected_shift=(GRID_APPLY_SHIFT_SIGN * correction_dx,
+                                    GRID_APPLY_SHIFT_SIGN * correction_dy),
                 )
                 if H is not None:
                     cand_poly = transform_roi_points_h(self.base_roi_poly, H)
@@ -5275,10 +5490,10 @@ class Camera:
                 self.aligned_roi_poly = new_poly or []
                 self.aligned_roi_lines = new_lines or []
             else:
-                # [2순위] 평행이동(격자 median) 폴백
+                # [2순위] suspect 관측의 평균 이동량으로 폴백(disturbed는 제외)
                 roi_correct_method = "translation"
-                self.roi_shift[0] += GRID_APPLY_SHIFT_SIGN * mdx
-                self.roi_shift[1] += GRID_APPLY_SHIFT_SIGN * mdy
+                self.roi_shift[0] += GRID_APPLY_SHIFT_SIGN * correction_dx
+                self.roi_shift[1] += GRID_APPLY_SHIFT_SIGN * correction_dy
                 self.aligned_roi_poly = self._shift_roi_points(self.base_roi_poly, self.roi_shift)
                 self.aligned_roi_lines = self._shift_roi_points(self.base_roi_lines, self.roi_shift)
 
@@ -5298,6 +5513,7 @@ class Camera:
                 f"[ROI AUTO-CORRECT] check_id={check_id} cam={self.cam_id} ip={self.ip} "
                 f"method={roi_correct_method} "
                 f"grid_shift=({mdx:.1f},{mdy:.1f}) mag={shift_mag:.1f}px "
+                f"suspect_mean=({correction_dx:.1f},{correction_dy:.1f}) "
                 f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
                 f"h={h_status} consistent={consistent}/{consistent_quorum}"
             )
@@ -5314,6 +5530,7 @@ class Camera:
                 lines_after=roi_lines_after,
                 detail=(
                     f"ip={self.ip} grid_shift=({mdx:.1f},{mdy:.1f}) mag={shift_mag:.1f}px "
+                    f"suspect_mean=({correction_dx:.1f},{correction_dy:.1f}) "
                     f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) h={h_status}"
                 ),
             )
@@ -5332,7 +5549,8 @@ class Camera:
                     f"consistent={consistent}/q={consistent_quorum} "
                     f"moving={n_mov}/{n_meas} disturbed={disturbed_count}/{disturbed_required} "
                     f"abnormal={abnormal_count}/{abnormal_required} "
-                    f"auto_corrected=False"
+                    f"auto_corrected={roi_corrected} method={roi_correct_method or '-'} "
+                    f"suspect_mean={auto_correct_shift} h={h_status or '-'}"
                 )
             elif observed_decision == "suspect" and not decision.get("confirmed", False):
                 healthcheck_reason = (
@@ -5340,7 +5558,8 @@ class Camera:
                     f"current=suspect consistent={consistent}/q={consistent_quorum} "
                     f"moving={n_mov}/{n_meas} suspect={suspect_count}/{confirm_required} "
                     f"abnormal={abnormal_count}/{abnormal_required} "
-                    f"auto_corrected=False"
+                    f"auto_corrected={roi_corrected} method={roi_correct_method or '-'} "
+                    f"suspect_mean={auto_correct_shift} h={h_status or '-'}"
                 )
             else:
                 healthcheck_reason = (
@@ -5349,12 +5568,20 @@ class Camera:
                     f"moving={n_mov}/{n_meas} suspect={suspect_count}/{confirm_required} "
                     f"abnormal={abnormal_count}/{abnormal_required} "
                     f"auto_corrected={roi_corrected} method={roi_correct_method or '-'} "
+                    f"suspect_mean={auto_correct_shift} "
                     f"grid_shift=({mdx:.1f},{mdy:.1f}) mag={shift_mag:.1f} "
                     f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
                     f"h={h_status or '-'}"
                 )
             request_terminal_roi_setup_required(reason=healthcheck_reason)
-            if observed_decision == "disturbed":
+            if roi_corrected:
+                self.align_status_text = (
+                    f"ROI AUTO-CORRECT[{roi_correct_method}] + SETUP REQUIRED "
+                    f"shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
+                    f"suspect_mean={auto_correct_shift} "
+                    f"consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
+                )
+            elif observed_decision == "disturbed":
                 self.align_status_text = (
                     f"ROI SETUP REQUIRED disturbed={disturbed_count}/{disturbed_required} "
                     f"abnormal={abnormal_count}/{abnormal_required} "
@@ -5365,12 +5592,6 @@ class Camera:
                     f"ROI SETUP REQUIRED abnormal={abnormal_count}/{abnormal_required} "
                     f"current=suspect={suspect_count}/{confirm_required} "
                     f"consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
-                )
-            elif roi_corrected:
-                self.align_status_text = (
-                    f"ROI AUTO-CORRECT[{roi_correct_method}] + SETUP REQUIRED "
-                    f"shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
-                    f"mag={shift_mag:.1f}px consistent={consistent}/{consistent_quorum} moving={n_mov}/{n_meas}"
                 )
             else:
                 self.align_status_text = (
@@ -5435,6 +5656,7 @@ class Camera:
         shift_reason = (
             f"grid_shift=({mdx:.1f},{mdy:.1f}) "
             f"mag={shift_mag:.1f}px "
+            f"suspect_mean={auto_correct_shift} "
             f"applied_shift=({self.roi_shift[0]:.1f},{self.roi_shift[1]:.1f}) "
             f"method={roi_correct_method or '-'}"
         )
@@ -6506,7 +6728,7 @@ class HealthCheckDaemon:
 
         for cam, new_conf, roi_updates in runtime_updates:
             try:
-                cam.update_config(new_conf)
+                cam.update_config(new_conf, verify_control_center_roi=True)
                 logger.info(
                     f"[Health Check] ROI settings applied: "
                     f"cctvId={cam.cam_id} camera={cam.ip} keys={','.join(sorted(roi_updates.keys()))} "
