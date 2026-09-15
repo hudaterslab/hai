@@ -132,6 +132,7 @@ SAFETY_EVENT_NAMES = (
     "abnormal_drive",
     "walkway_out",
     "spreader_danger_zone",
+    "container_collision_risk",
 )
 
 PORT_EVENT_NAMES = (
@@ -139,6 +140,7 @@ PORT_EVENT_NAMES = (
     "abnormal_drive",
     "walkway_out",
     "spreader_danger_zone",
+    "container_collision_risk",
 )
 
 ROI_POLYGON_EVENT_NAMES = {
@@ -160,13 +162,14 @@ EVENT_NAME_ALIASES = {
 }
 
 EVENT_CONFIG_NAMES = frozenset(SAFETY_EVENT_NAMES)
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 
 MODEL_SECTION_ALLOWED_KEYS = {
     "models": frozenset(("MAIN", "FACE", "HELMET", "PLATE")),
     "model_confidences": frozenset(("MAIN", "PERSON", "HELMET_PERSON", "FACE", "HELMET", "PLATE")),
     "model_output_formats": frozenset(("MAIN", "FACE", "HELMET", "PLATE")),
     "model_engine_pool_sizes": frozenset(("MAIN", "FACE", "HELMET", "PLATE")),
+    "model_input_shapes": frozenset(("MAIN", "FACE", "HELMET", "PLATE")),  # <--- 이 줄 추가
 }
 
 SYSTEM_CONFIG_ALLOWED_KEYS = frozenset((
@@ -179,6 +182,7 @@ SYSTEM_CONFIG_ALLOWED_KEYS = frozenset((
     "model_confidences",
     "model_output_formats",
     "model_engine_pool_sizes",
+    "model_input_shapes",
     "inference_runtime",
     "video_decode",
     "BATCH_SIZE",
@@ -227,6 +231,10 @@ def get_visible_pctc_class_ids(events):
             ID_PCTC_CONTAINER,
             ID_PCTC_SPREADER,
         },
+        "container_collision_risk": {
+        ID_PCTC_CONTAINER,
+        ID_PCTC_SPREADER,
+    },
     }
     visible = set()
     for event_name in events or []:
@@ -503,6 +511,34 @@ def load_system_config():
                 "blur_face": True,
                 "blur_plate": True,
             },
+            "container_collision_risk": {
+                "enabled": False,
+                "cooldown_sec": 30,
+
+                # 스프레더와 들고 있는 컨테이너 결합 판단
+                "pair_center_x_ratio": 0.30,
+                "pair_vertical_gap_ratio": 0.35,
+                "pair_confirm_frames": 3,
+
+                # 컨테이너 횡이동 판단
+                "motion_window_sec": 0.4,
+                "horizontal_move_ratio": 0.04,
+                "horizontal_dominance": 1.5,
+
+                # 진행방향 충돌 예측
+                "lookahead_sec": 1.0,
+                "max_lookahead_ratio": 2.0,
+
+                # 적층 컨테이너 상단과 확보해야 하는 높이
+                "min_clearance_ratio": 0.10,
+                "min_clearance_px": 10.0,
+
+                # 순간 BBox 흔들림 방지
+                "trigger_hold_sec": 0.5,
+
+                "blur_face": True,
+                "blur_plate": True,
+            },
         },
         "models": {
             "MAIN": "pctc_v1.dxnn",
@@ -530,6 +566,12 @@ def load_system_config():
             "HELMET": 1,
             "PLATE": 1,
         },
+        "model_input_shapes": {
+            "MAIN": [640, 384],
+            "FACE": [640, 640],
+            "HELMET": [640, 640],
+            "PLATE": [640, 640]
+        },
         "inference_runtime": {
             "display_all_pctc_objects": True,
             "max_detection_area_ratio": 0.95,
@@ -538,7 +580,7 @@ def load_system_config():
             "filter_diagnostic_interval_sec": 10.0,
             "helmet_person_assist_enabled": True,
             "helmet_person_class_id": ID_H_PERSON,
-            "person_merge_iou_threshold": 0.35,
+            "person_merge_iou_threshold": 0.4,
         },
         "video_decode": {
             "backend": "gstreamer",
@@ -601,6 +643,13 @@ def load_system_config():
 SYS_CFG = load_system_config()
 BATCH_SIZE = SYS_CFG.get("BATCH_SIZE", 9)
 IMAGE_SAVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+def get_model_input_shape(model_key, default=(640, 640)):
+    shapes = SYS_CFG.get("model_input_shapes", {})
+    val = shapes.get(model_key)
+    if isinstance(val, (list, tuple)) and len(val) >= 2:
+        return (int(val[0]), int(val[1]))  # (Width, Height)
+    return default
 
 def resolve_model_path(model_path):
     """설정 파일의 모델 경로가 상대 경로면 프로젝트 폴더 기준 절대 경로로 바꿉니다."""
@@ -1669,11 +1718,13 @@ class YoLoDeepX:
         class_count=None,
         ppu_box_format="auto",
         output_hint=None,
+        input_shape=None,
     ):
         if not HAS_DX_ENGINE:
             raise RuntimeError("dx_engine is not installed; YoLoDeepX can only run on a DeepX/NPU runtime.")
 
         self.engine_path = engine_path
+        self.input_shape_override = input_shape
         self.model_key = str(model_key or os.path.basename(str(engine_path or "")) or "MODEL")
         self.class_count = int(class_count) if class_count is not None else None
         self.requested_output_format = str(output_format or "auto").strip().lower()
@@ -2004,7 +2055,10 @@ class YoLoDeepX:
         if self.input_height <= 0 or self.input_width <= 0:
             self.input_height = 640
             self.input_width = 640
-
+        if hasattr(self, 'input_shape_override') and self.input_shape_override:
+            self.input_width, self.input_height = self.input_shape_override
+            self.input_metadata_detail += f" (Overridden to {self.input_width}x{self.input_height})"
+            
     def letter_box(self, img, new_shape=None):
         if new_shape is None:
             new_shape = (self.input_height, self.input_width)
@@ -2287,7 +2341,7 @@ class YoLoDeepX:
             boxes[:, [1, 3]] *= float(self.input_height)
         return boxes
 
-    def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+    def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.4):
         """Raw YOLOv8 center-xywh output: [4 box columns + class scores]."""
         try:
             pred = self._normalize_raw_prediction(output_tensor)
@@ -2324,7 +2378,7 @@ class YoLoDeepX:
             logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {exc}")
             return []
 
-    def postprocess_xyxy(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+    def postprocess_xyxy(self, output_tensor, conf_thres=0.40, iou_thres=0.4):
         """Raw XYXY output with class-score columns after the first four values."""
         try:
             pred = self._normalize_raw_prediction(output_tensor)
@@ -2357,7 +2411,7 @@ class YoLoDeepX:
             logger.error(f"NPU XYXY Postprocess Error ({os.path.basename(self.engine_path)}): {exc}")
             return []
 
-    def postprocess_tlwh(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+    def postprocess_tlwh(self, output_tensor, conf_thres=0.40, iou_thres=0.4):
         """Top-left XYWH output with class-score columns after the first four values."""
         try:
             pred = self._normalize_raw_prediction(output_tensor)
@@ -2391,7 +2445,7 @@ class YoLoDeepX:
             logger.error(f"NPU TLWH Postprocess Error ({os.path.basename(self.engine_path)}): {exc}")
             return []
 
-    def postprocess_end2end(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+    def postprocess_end2end(self, output_tensor, conf_thres=0.40, iou_thres=0.4):
         """End-to-end NMS rows: [x1, y1, x2, y2, score, class_id]."""
         try:
             outputs = self._normalize_outputs(output_tensor)
@@ -2505,7 +2559,7 @@ class YoLoDeepX:
             return "corner"
         return "center"
 
-    def postprocess_ppu(self, output_tensor, conf_thres=0.40, iou_thres=0.45, ppu_format="ppu"):
+    def postprocess_ppu(self, output_tensor, conf_thres=0.40, iou_thres=0.4, ppu_format="ppu"):
         try:
             extracted = self._extract_ppu_rows(output_tensor, ppu_format=ppu_format)
             if extracted is None:
@@ -2714,7 +2768,7 @@ class SimpleTracker:
                 self.next_id += 1
 
         for tid, trk in self.tracks.items():
-            if trk['lost'] == 0:
+            if trk['lost'] <= 15:
                 res_tracks.append([*trk['bbox'], tid, trk.get('conf', 1.0), trk['cls']])
 
         return np.array(res_tracks)
@@ -2942,7 +2996,7 @@ def _unit_vector(start, end):
 
 class BaseEventDetector:
     gui_name = "BASE"
-
+    
     def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
         self.config = dict(config or {})
         self.roi_poly = np.array(roi_poly, dtype=np.int32) if roi_poly and len(roi_poly) >= 3 else np.empty((0, 2), dtype=np.int32)
@@ -3630,7 +3684,524 @@ class SpreaderDangerZoneDetector(BaseEventDetector):
                 self.states.pop(key, None)
         return triggered
 
+class ContainerCollisionRiskDetector(BaseEventDetector):
+    gui_name = "CONTAINER-COLLISION"
 
+    def __init__(self, config, roi_poly=None, roi_lines=None, abnormal_drive_zones=None):
+        super().__init__(config, roi_poly, roi_lines, abnormal_drive_zones)
+
+        # Spreader <-> Moving Container 결합
+        self.pair_center_x_ratio = max(
+            0.0, float(self.config.get("pair_center_x_ratio", 0.30))
+        )
+        self.pair_vertical_gap_ratio = max(
+            0.0, float(self.config.get("pair_vertical_gap_ratio", 0.35))
+        )
+        self.pair_confirm_frames = max(
+            1, int(self.config.get("pair_confirm_frames", 3))
+        )
+
+        # 횡이동 판단
+        self.motion_window_sec = max(
+            0.1, float(self.config.get("motion_window_sec", 0.4))
+        )
+        self.horizontal_move_ratio = max(
+            0.0, float(self.config.get("horizontal_move_ratio", 0.04))
+        )
+        self.horizontal_dominance = max(
+            1.0, float(self.config.get("horizontal_dominance", 1.5))
+        )
+
+        # 충돌 예측
+        self.lookahead_sec = max(
+            0.1, float(self.config.get("lookahead_sec", 1.0))
+        )
+        self.max_lookahead_ratio = max(
+            0.5, float(self.config.get("max_lookahead_ratio", 2.0))
+        )
+
+        # 안전 높이
+        self.min_clearance_ratio = max(
+            0.0, float(self.config.get("min_clearance_ratio", 0.10))
+        )
+        self.min_clearance_px = max(
+            0.0, float(self.config.get("min_clearance_px", 10.0))
+        )
+
+        self.trigger_hold_sec = max(
+            0.0, float(self.config.get("trigger_hold_sec", 0.5))
+        )
+
+        self.motion_history = defaultdict(lambda: deque(maxlen=30))
+        self.pair_votes = defaultdict(int)
+        self.states = {}
+
+
+    @staticmethod
+    def _center(box):
+        return (
+            (float(box[0]) + float(box[2])) / 2.0,
+            (float(box[1]) + float(box[3])) / 2.0,
+        )
+
+
+    def _find_carried_container(self, spreader, containers):
+        sx1, sy1, sx2, sy2 = map(float, spreader[:4])
+        spreader_cx = (sx1 + sx2) / 2.0
+
+        best_container = None
+        best_score = float("inf")
+
+        for container in containers:
+            cx1, cy1, cx2, cy2 = map(float, container[:4])
+
+            container_width = max(1.0, cx2 - cx1)
+            container_height = max(1.0, cy2 - cy1)
+            container_cx = (cx1 + cx2) / 2.0
+
+            # X축 중심이 어느 정도 일치해야 함
+            center_diff = abs(spreader_cx - container_cx)
+
+            if center_diff > container_width * self.pair_center_x_ratio:
+                continue
+
+            # Spreader 하단과 Container 상단의 간격
+            vertical_gap = cy1 - sy2
+
+            # 컨테이너가 스프레더보다 지나치게 위에 있으면 제외
+            if vertical_gap < -(container_height * 0.50):
+                continue
+
+            if vertical_gap > container_height * self.pair_vertical_gap_ratio:
+                continue
+
+            score = (
+                center_diff / container_width
+                + abs(vertical_gap) / container_height
+            )
+
+            if score < best_score:
+                best_score = score
+                best_container = container
+
+        return best_container
+
+
+    def _get_motion(self, tid, box, current_time):
+        cx, cy = self._center(box)
+
+        history = self.motion_history[tid]
+        history.append((current_time, cx, cy))
+
+        if len(history) < 2:
+            return None
+
+        reference = None
+
+        # 약 motion_window_sec 전의 가장 가까운 좌표 사용
+        for item in reversed(history):
+            if current_time - item[0] >= self.motion_window_sec:
+                reference = item
+                break
+
+        if reference is None:
+            return None
+
+        dt = max(0.001, current_time - reference[0])
+
+        dx = cx - reference[1]
+        dy = cy - reference[2]
+
+        vx = dx / dt
+        vy = dy / dt
+
+        return dx, dy, vx, vy
+
+
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
+        current_time = time.time()
+        privacy_tracks = kwargs.get("privacy_tracks", [])
+
+        spreaders = [
+            track for track in tracks
+            if track_map.get(int(track[4])) == ID_PCTC_SPREADER
+        ]
+
+        containers = [
+            track for track in tracks
+            if track_map.get(int(track[4])) == ID_PCTC_CONTAINER
+        ]
+
+        triggered = []
+
+        if not spreaders or len(containers) < 2:
+            self.states.clear()
+            return triggered
+
+        active_pair_keys = set()
+        active_risk_keys = set()
+
+        visible_container_ids = {
+            int(container[4])
+            for container in containers
+        }
+
+        for spreader in spreaders:
+
+            spreader_tid = int(spreader[4])
+
+            carried = self._find_carried_container(
+                spreader,
+                containers
+            )
+
+            if carried is None:
+                continue
+
+            carried_tid = int(carried[4])
+
+            pair_key = (
+                spreader_tid,
+                carried_tid
+            )
+
+            active_pair_keys.add(pair_key)
+            self.pair_votes[pair_key] += 1
+
+            # 움직임 히스토리는 결합 확정 전부터 누적
+            motion = self._get_motion(
+                carried_tid,
+                carried,
+                current_time
+            )
+
+            if self.pair_votes[pair_key] < self.pair_confirm_frames:
+                continue
+
+            if motion is None:
+                continue
+
+            dx, dy, vx, vy = motion
+
+            cx1, cy1, cx2, cy2 = map(
+                float,
+                carried[:4]
+            )
+
+            moving_width = max(
+                1.0,
+                cx2 - cx1
+            )
+
+            moving_height = max(
+                1.0,
+                cy2 - cy1
+            )
+
+            moving_cx = (
+                cx1 + cx2
+            ) / 2.0
+
+            # ------------------------------
+            # 횡이동 여부 판단
+            # ------------------------------
+
+            if abs(dx) < moving_width * self.horizontal_move_ratio:
+                continue
+
+            # X 이동량이 Y 이동량보다 충분히 커야 함
+            if abs(dx) < abs(dy) * self.horizontal_dominance:
+                continue
+
+            direction = (
+                1 if dx > 0
+                else -1
+            )
+
+            # ------------------------------
+            # 약 1초 후 X 위치 예측
+            # ------------------------------
+
+            predicted_shift = vx * self.lookahead_sec
+
+            max_shift = (
+                moving_width
+                * self.max_lookahead_ratio
+            )
+
+            predicted_shift = max(
+                -max_shift,
+                min(max_shift, predicted_shift)
+            )
+
+            predicted_x1 = (
+                cx1 + predicted_shift
+            )
+
+            predicted_x2 = (
+                cx2 + predicted_shift
+            )
+
+            # 현재부터 예상 위치까지 swept 영역
+            swept_x1 = min(
+                cx1,
+                predicted_x1
+            )
+
+            swept_x2 = max(
+                cx2,
+                predicted_x2
+            )
+
+            # 이동 중 컨테이너의 하단 Y
+            moving_bottom_y = cy2
+
+            required_clearance = max(
+                self.min_clearance_px,
+                moving_height
+                * self.min_clearance_ratio
+            )
+
+            best_obstacle = None
+            best_clearance = float("inf")
+
+            # ------------------------------
+            # 이동방향 앞의 적층 Container 검색
+            # ------------------------------
+
+            for obstacle in containers:
+
+                obstacle_tid = int(
+                    obstacle[4]
+                )
+
+                if obstacle_tid == carried_tid:
+                    continue
+
+                ox1, oy1, ox2, oy2 = map(
+                    float,
+                    obstacle[:4]
+                )
+
+                obstacle_cx = (
+                    ox1 + ox2
+                ) / 2.0
+
+                # 진행방향 반대쪽 Container 제외
+                if direction > 0:
+                    if obstacle_cx <= moving_cx:
+                        continue
+                else:
+                    if obstacle_cx >= moving_cx:
+                        continue
+
+                # 예상 이동 X 경로와 겹치는지
+                horizontal_overlap = max(
+                    0.0,
+                    min(swept_x2, ox2)
+                    - max(swept_x1, ox1)
+                )
+
+                if horizontal_overlap <= 0:
+                    continue
+
+                # 적층 컨테이너의 상단
+                obstacle_top_y = oy1
+
+                # 화면 좌표는 위로 갈수록 Y값이 작음
+                clearance = (
+                    obstacle_top_y
+                    - moving_bottom_y
+                )
+
+                if clearance < best_clearance:
+                    best_clearance = clearance
+                    best_obstacle = obstacle
+
+
+            if best_obstacle is None:
+                continue
+
+            # --------------------------------
+            # 최종 위험 판단
+            #
+            # 안전:
+            # moving_bottom_y가
+            # obstacle_top_y보다 충분히 작아야 함
+            #
+            # 위험:
+            # clearance가 요구값보다 작음
+            # --------------------------------
+
+            if best_clearance >= required_clearance:
+                continue
+
+            obstacle_tid = int(
+                best_obstacle[4]
+            )
+
+            risk_key = (
+                spreader_tid,
+                carried_tid,
+                obstacle_tid
+            )
+
+            active_risk_keys.add(
+                risk_key
+            )
+
+            state = self.states.setdefault(
+                risk_key,
+                {
+                    "risk_since": current_time,
+                    "triggered": False,
+                }
+            )
+
+            hold_sec = (
+                current_time
+                - state["risk_since"]
+            )
+
+            # 순간적인 BBox 흔들림은 무시
+            if (
+                not state["triggered"]
+                and hold_sec >= self.trigger_hold_sec
+            ):
+
+                triggered.append({
+                    "tid": carried_tid,
+
+                    # 대표 객체는 이동중 Container
+                    "bbox": carried[:4],
+
+                    "frame": (
+                        frame.copy()
+                        if frame is not None
+                        else None
+                    ),
+
+                    "fid": fid,
+
+                    "privacy_tracks":
+                        privacy_tracks,
+
+                    "privacy_fid":
+                        fid,
+
+                    "objects": [
+                        _track_object(
+                            spreader,
+                            ID_PCTC_SPREADER
+                        ),
+
+                        _track_object(
+                            carried,
+                            ID_PCTC_CONTAINER,
+                            label="moving_container"
+                        ),
+
+                        _track_object(
+                            best_obstacle,
+                            ID_PCTC_CONTAINER,
+                            label="obstacle_container"
+                        ),
+                    ],
+
+                    "decision_trace": {
+                        "detector":
+                            "ContainerCollisionRiskDetector",
+
+                        "reason":
+                            "horizontal_container_move_with_insufficient_clearance",
+
+                        "spreader_track_id":
+                            spreader_tid,
+
+                        "moving_container_track_id":
+                            carried_tid,
+
+                        "obstacle_container_track_id":
+                            obstacle_tid,
+
+                        "direction":
+                            "right"
+                            if direction > 0
+                            else "left",
+
+                        "dx_px":
+                            round(float(dx), 3),
+
+                        "dy_px":
+                            round(float(dy), 3),
+
+                        "vx_px_sec":
+                            round(float(vx), 3),
+
+                        "vy_px_sec":
+                            round(float(vy), 3),
+
+                        "moving_bottom_y":
+                            round(
+                                float(moving_bottom_y),
+                                3
+                            ),
+
+                        "obstacle_top_y":
+                            round(
+                                float(best_obstacle[1]),
+                                3
+                            ),
+
+                        "clearance_px":
+                            round(
+                                float(best_clearance),
+                                3
+                            ),
+
+                        "required_clearance_px":
+                            round(
+                                float(required_clearance),
+                                3
+                            ),
+
+                        "predicted_shift_px":
+                            round(
+                                float(predicted_shift),
+                                3
+                            ),
+
+                        "risk_hold_sec":
+                            round(
+                                float(hold_sec),
+                                3
+                            ),
+                    },
+                })
+
+                state["triggered"] = True
+
+
+        # Pair가 끊어지면 confirm count 초기화
+        for key in list(self.pair_votes):
+            if key not in active_pair_keys:
+                self.pair_votes.pop(key, None)
+
+        # 위험 상태가 해제되면 다시 이벤트 발생 가능하게 초기화
+        for key in list(self.states):
+            if key not in active_risk_keys:
+                self.states.pop(key, None)
+
+        # 사라진 Container 히스토리 정리
+        for tid in list(self.motion_history):
+            if tid not in visible_container_ids:
+                self.motion_history.pop(
+                    tid,
+                    None
+                )
+
+        return triggered
+    
 EVENT_REGISTRY = {
     "intrusion": IntrusionDetector,
     "illegal_parking": ParkingDetector,
@@ -3639,6 +4210,7 @@ EVENT_REGISTRY = {
     "abnormal_drive": AbnormalDriveDetector,
     "walkway_out": WalkwayOutDetector,
     "spreader_danger_zone": SpreaderDangerZoneDetector,
+    "container_collision_risk": ContainerCollisionRiskDetector,
 }
 # [9] 터미널 마법사 및 설정 UI
 # ==========================================
@@ -3759,6 +4331,7 @@ WIZARD_SAFETY_EVENT_CHOICES = (
     ("5", "역주행/유턴 금지"),
     ("6", "보행로 이탈 감지"),
     ("7", "위험구역 진입 감지"),
+    ("8", "컨테이너 충돌 위험"),
 )
 WIZARD_SAFETY_SELECTION_MAP = {
     "1": "intrusion",
@@ -3768,6 +4341,7 @@ WIZARD_SAFETY_SELECTION_MAP = {
     "5": "abnormal_drive",
     "6": "walkway_out",
     "7": "spreader_danger_zone",
+    "8": "container_collision_risk",
 }
 WIZARD_CAMERA_OPTION_CHOICES = (
     ("0", "사용 안 함"),
@@ -3782,9 +4356,10 @@ WIZARD_CAMERA_OPTION_MAP = {
 
 
 def _print_wizard_event_menu():
-    print("=== 안전 이벤트 선택 (1~7, 복수 선택 가능) ===", flush=True)
+    print("=== 안전 이벤트 선택 (1~8, 복수 선택 가능) ===", flush=True)
     for number, label in WIZARD_SAFETY_EVENT_CHOICES:
         print(f"  {number}. {label}", flush=True)
+    
 
 
 def _parse_wizard_event_selection(value):
@@ -3794,7 +4369,7 @@ def _parse_wizard_event_selection(value):
     tokens = [token for token in re.split(r"[,\s]+", text) if token]
     invalid = [token for token in tokens if token not in WIZARD_SAFETY_SELECTION_MAP]
     if invalid:
-        raise ValueError(f"허용 번호는 1~7입니다. 잘못된 입력: {', '.join(invalid)}")
+        raise ValueError(f"허용 번호는 1~8입니다. 잘못된 입력: {', '.join(invalid)}")
     events = []
     for token in tokens:
         event_name = WIZARD_SAFETY_SELECTION_MAP[token]
@@ -4826,7 +5401,7 @@ class FrameReader:
         return width, height
 
     def _scaled_output_shape(self, width, height):
-        if width <= 720:
+        if width <= 7200:
             return width, height
         ratio = 720.0 / float(width)
         out_height = max(2, int(round((height * ratio) / 2.0) * 2))
@@ -5147,7 +5722,7 @@ class FrameReader:
                     break
 
                 if fr is not None:
-                    if fr.shape[1] > 720:
+                    if fr.shape[1] > 7200:
                         ratio = 720 / fr.shape[1]
                         fr = cv2.resize(fr, (720, int(fr.shape[0] * ratio)), interpolation=cv2.INTER_NEAREST)
                     with self.lock:
@@ -6705,6 +7280,7 @@ def main():
             class_count=len(PCTC_CLASS_NAMES),
             ppu_box_format="auto",
             output_hint="ppu",
+            input_shape=get_model_input_shape("MAIN", (640, 384)),
         )
         d_helmet = YoLoDeepX(
             resolve_model_path(models_cfg.get("HELMET", "helmet_260622.dxnn")),
@@ -6712,6 +7288,7 @@ def main():
             pool_size=get_model_engine_pool_size("HELMET", default=1),
             model_key="HELMET",
             class_count=2,
+            input_shape=get_model_input_shape("HELMET", (640, 640)),
         )
         face_fmt = get_model_output_format("FACE")
         d_face = YoLoDeepX(
@@ -7133,6 +7710,8 @@ def main():
                 clear_terminal_roi_snapshot_refresh(cctv_ids=refreshed_ids, reason="roi_snapshot_sent")
             if is_gui_mode:
                 if final_images:
+                    #h, w, c = create_mosaic_image(final_images).shape
+                    #print(f"width: {w}, height: {h}")
                     cv2.imshow("Monitor", create_mosaic_image(final_images))
                 if cv2.waitKey(1) == ord("q"):
                     break
