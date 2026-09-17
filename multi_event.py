@@ -78,6 +78,13 @@ ID_SIGNALFLAG = 9     # signalflag -> 신호수(5)와 동일 취급
 
 TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
 
+# ==========================================
+# [추가] Safety 모델 클래스 ID 상수
+# ==========================================
+ID_SAFETY_RAIL = 0
+ID_SAFETY_SIGN = 1
+ID_SAFETY_DOOR = 2
+
 DEBUG_MODE = False
 
 # ------------------------------------------------------------
@@ -209,6 +216,12 @@ def load_system_config():
                 "state_inherit_distance_ratio": 0.5,
                 "state_inherit_max_size_ratio": 2.5,
                 "state_inherit_max_area_ratio": 6.0
+            },
+            # [추가] 안전 도킹 이벤트 설정
+            "safety_docking": {
+                "enabled": False, 
+                "cooldown_sec": 600, 
+                "trigger_sec": 3.0
             }
         },
         "models": {
@@ -216,7 +229,9 @@ def load_system_config():
             "MAIN_V3": "hanjin_cctv_v3.dxnn",
             "FACE": "yolov8m-face_ppu.dxnn",
             "HELMET": "helmet_260622.dxnn",
-            "PLATE": "license_plate_detector_v2.dxnn"
+            "PLATE": "license_plate_detector_v2.dxnn",
+            "SAFETY": "safety.dxnn",                # [추가] Safety 모델
+            "DEPTH": "fastdepth_224x224.dxnn"       # [추가] Depth 모델
         },
         "model_confidences": {
             "MAIN_V2": 0.6,
@@ -225,21 +240,26 @@ def load_system_config():
             "HELMET": 0.85,
             "PERSON": 0.5,
             "SIGNALMAN": 0.5,
-            "PLATE": 0.1
+            "PLATE": 0.1,
+            "SAFETY": 0.1                           # [추가] Safety 모델 기본 신뢰도
         },
         "model_output_formats": {
             "MAIN_V2": "ppu",
             "MAIN_V3": "ppu",
             "FACE": "auto",
             "HELMET": "auto",
-            "PLATE": "yolo"
+            "PLATE": "yolo",
+            "SAFETY": "auto",                       # [추가] 이전 단계에서 해결한 auto 포맷 지정
+            "DEPTH": "auto"                         # [추가] Depth 모델 포맷
         },
         "model_engine_pool_sizes": {
             "MAIN_V2": 2,
             "MAIN_V3": 1,
             "FACE": 1,
             "HELMET": 1,
-            "PLATE": 1
+            "PLATE": 1,
+            "SAFETY": 1,                            # [추가] NPU 엔진 풀 사이즈 할당
+            "DEPTH": 1                              # [추가] NPU 엔진 풀 사이즈 할당
         },
         "video_decode": {
             "backend": "gstreamer",
@@ -285,7 +305,6 @@ def load_system_config():
             
         merged_config = deep_merge_dict(default_config, loaded_config)
         
-        # [수정] 예전 버전 Config에 누락된 항목이 있다면 강제로 병합본을 파일에 덮어씀 (마이그레이션)
         try:
             with open(CONFIG_COMMON_FILE, 'w', encoding='utf-8') as f:
                 json.dump(merged_config, f, indent=4, ensure_ascii=False)
@@ -1294,13 +1313,29 @@ class YoLoDeepX:
     def postprocess_xyxy(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
         """출력이 [x1, y1, x2, y2, score, class_id...] 형태일 때의 후처리"""
         try:
-            pred = np.array(output_tensor[0])
+            # [핵심 수정] NPU의 uint8 출력을 무조건 float32로 캐스팅하여 연산 에러 차단
+            pred = np.array(output_tensor[0]).astype(np.float32)
+            
             if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
                 pred = pred.transpose((0, 2, 1))
             if pred.ndim == 3:
                 pred = pred[0]
 
-            class_scores = pred[:, 4:]
+            # [핵심 수정] YOLOv8 텐서 분리(Split Output) 대응
+            if pred.shape[1] == 4 and len(output_tensor) > 1:
+                scores_pred = np.array(output_tensor[1]).astype(np.float32)
+                if scores_pred.ndim == 3 and scores_pred.shape[1] < scores_pred.shape[2]:
+                    scores_pred = scores_pred.transpose((0, 2, 1))
+                if scores_pred.ndim == 3:
+                    scores_pred = scores_pred[0]
+                class_scores = scores_pred
+            else:
+                class_scores = pred[:, 4:]
+
+            # 스코어 배열이 비어있으면 안전하게 빈 리스트 반환 (zero-size array 에러 방지)
+            if class_scores.shape[1] == 0:
+                return []
+
             if class_scores.shape[1] == 1:
                 scores = class_scores[:, 0]
                 class_ids = np.zeros(scores.shape, dtype=np.int32)
@@ -1322,7 +1357,8 @@ class YoLoDeepX:
             boxes_xywh[:, 3] = pred[:, 3] - pred[:, 1]  
 
             max_wh = 7680
-            class_offset = class_ids * max_wh
+            # [핵심 수정] class_ids도 float32로 캐스팅 후 곱셈 (int 캐스팅 에러 방지)
+            class_offset = class_ids.astype(np.float32) * max_wh
             boxes_shifted = boxes_xywh.copy()
             boxes_shifted[:, 0] += class_offset
             boxes_shifted[:, 1] += class_offset
@@ -1333,10 +1369,76 @@ class YoLoDeepX:
             if len(indices) > 0:
                 for i in indices.flatten():
                     x_min, y_min, w, h = boxes_xywh[i]
-                    results.append([[x_min, y_min, x_min + w, y_min + h], scores[i], class_ids[i]])
+                    results.append([[x_min, y_min, x_min + w, y_min + h], float(scores[i]), int(class_ids[i])])
             return results
         except Exception as e:
             logger.error(f"NPU XYXY Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
+            return []
+
+    def postprocess(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
+        try:
+            # [핵심 수정] NPU의 uint8 출력을 무조건 float32로 캐스팅
+            pred = np.array(output_tensor[0]).astype(np.float32)
+
+            # YOLOv8 배열 형태 보정
+            if pred.ndim == 3 and pred.shape[1] < pred.shape[2]:
+                pred = pred.transpose((0, 2, 1))
+            if pred.ndim == 3:
+                pred = pred[0]
+
+            # [핵심 수정] YOLOv8 텐서 분리(Split Output) 대응
+            if pred.shape[1] == 4 and len(output_tensor) > 1:
+                scores_pred = np.array(output_tensor[1]).astype(np.float32)
+                if scores_pred.ndim == 3 and scores_pred.shape[1] < scores_pred.shape[2]:
+                    scores_pred = scores_pred.transpose((0, 2, 1))
+                if scores_pred.ndim == 3:
+                    scores_pred = scores_pred[0]
+                class_scores = scores_pred
+            else:
+                class_scores = pred[:, 4:]
+
+            if class_scores.shape[1] == 0:
+                return []
+
+            if class_scores.shape[1] == 1:
+                scores = class_scores[:, 0]
+                class_ids = np.zeros(scores.shape, dtype=np.int32)
+            else:
+                scores = np.max(class_scores, axis=1)
+                class_ids = np.argmax(class_scores, axis=1)
+
+            # Confidence 필터링
+            mask = scores > conf_thres
+            pred = pred[mask]
+            scores = scores[mask]
+            class_ids = class_ids[mask]
+
+            if len(pred) == 0:
+                return []
+
+            # NMSBoxes 포맷 맞춤 (x_min, y_min, width, height)
+            boxes_xywh = pred[:, :4].copy()
+            boxes_xywh[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2  # 중심 X -> 최소 X
+            boxes_xywh[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2  # 중심 Y -> 최소 Y
+
+            # Class-Aware NMS
+            max_wh = 7680
+            class_offset = class_ids.astype(np.float32) * max_wh
+            boxes_shifted = boxes_xywh.copy()
+            boxes_shifted[:, 0] += class_offset
+            boxes_shifted[:, 1] += class_offset
+
+            indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
+
+            results = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x_min, y_min, w, h = boxes_xywh[i]
+                    results.append([[x_min, y_min, x_min + w, y_min + h], float(scores[i]), int(class_ids[i])])
+
+            return results
+        except Exception as e:
+            logger.error(f"NPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
             return []
 
     def postprocess_tlwh(self, output_tensor, conf_thres=0.40, iou_thres=0.45):
@@ -1683,15 +1785,27 @@ class YoLoDeepX:
             if len(flat) == 0:
                 return []
 
+            # [핵심 수정] PPU 출력 stride 동적 판별 (YOLOv8 640x384는 주로 24바이트 사용)
             stride = 32
-            if len(flat) % stride != 0:
-                logger.error(f"[DeepX PPU] 출력 버퍼 길이({len(flat)})가 {stride}의 배수가 아닙니다.")
+            if len(flat) % 24 == 0 and len(flat) % 32 != 0:
+                stride = 24
+            elif len(flat) % 28 == 0 and len(flat) % 32 != 0:
+                stride = 28
+            elif len(flat) % 32 == 0:
+                stride = 32
+            else:
+                logger.error(f"[DeepX PPU] 알 수 없는 버퍼 길이({len(flat)} bytes).")
                 return []
 
             flat_stride = flat.reshape(len(flat) // stride, stride)
             boxes_raw = np.ascontiguousarray(flat_stride[:, :16]).view(np.float32).reshape(-1, 4)
-            scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
-            labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
+            
+            if stride == 24:
+                scores = np.ascontiguousarray(flat_stride[:, 16:20]).view(np.float32).flatten()
+                labels = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.uint32).flatten()
+            else:
+                scores = np.ascontiguousarray(flat_stride[:, 20:24]).view(np.float32).flatten()
+                labels = np.ascontiguousarray(flat_stride[:, 24:28]).view(np.uint32).flatten()
 
             mask = scores >= conf_thres
             if not np.any(mask):
@@ -1701,19 +1815,22 @@ class YoLoDeepX:
             scores = scores[mask]
             labels = labels[mask]
 
-            cx = boxes_raw[:, 0]
-            cy = boxes_raw[:, 1]
-            bw = boxes_raw[:, 2]
-            bh = boxes_raw[:, 3]
+            # DeepX PPU는 컴파일러 버전에 따라 (cx, cy, w, h) 또는 (x1, y1, x2, y2)를 반환합니다.
+            # (cx, cy, w, h) 포맷의 특징을 띄는지 동적 검사 (x1, y1, x2, y2인데 x1>x2일 수 없음)
+            is_cxcywh = np.any(boxes_raw[:, 2] < boxes_raw[:, 0]) or np.any(boxes_raw[:, 3] < boxes_raw[:, 1])
 
-            x1 = cx - bw * 0.5
-            y1 = cy - bh * 0.5
-            x2 = cx + bw * 0.5
-            y2 = cy + bh * 0.5
+            if is_cxcywh:
+                cx, cy, bw, bh = boxes_raw[:, 0], boxes_raw[:, 1], boxes_raw[:, 2], boxes_raw[:, 3]
+                x1 = cx - bw * 0.5
+                y1 = cy - bh * 0.5
+                x2 = cx + bw * 0.5
+                y2 = cy + bh * 0.5
+            else:
+                x1, y1, x2, y2 = boxes_raw[:, 0], boxes_raw[:, 1], boxes_raw[:, 2], boxes_raw[:, 3]
 
             max_wh = 7680
             class_offset = labels.astype(np.float32) * max_wh
-            boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, bw, bh])
+            boxes_shifted = np.column_stack([x1 + class_offset, y1 + class_offset, x2 - x1, y2 - y1])
 
             indices = cv2.dnn.NMSBoxes(boxes_shifted.tolist(), scores.tolist(), conf_thres, iou_thres)
             if indices is None or len(indices) == 0:
@@ -1721,13 +1838,78 @@ class YoLoDeepX:
 
             results = []
             for i in np.array(indices).reshape(-1):
-                results.append([[x1[i], y1[i], x2[i], y2[i]], scores[i], labels[i]])
+                results.append([[x1[i], y1[i], x2[i], y2[i]], float(scores[i]), int(labels[i])])
 
             return results
         except Exception as e:
             logger.error(f"NPU PPU Postprocess Error ({os.path.basename(self.engine_path)}): {e}")
             return []
+
+
+# ==========================================
+# [추가] Depth 모델(fastdepth) 전용 래퍼 클래스
+# ==========================================
+class DepthDeepX:
+    def __init__(self, engine_path, threshold=1.85, pool_size=1):
+        if not HAS_DX_ENGINE:
+            raise RuntimeError("dx_engine is required for DepthDeepX.")
         
+        self.engine_path = engine_path
+        self.threshold = threshold
+        self.engine_pool = queue.Queue(maxsize=pool_size)
+        
+        from dx_engine import InferenceEngine, InferenceOption
+        io = InferenceOption()
+        for _ in range(pool_size):
+            engine = InferenceEngine(self.engine_path, io)
+            self.engine_pool.put(engine)
+            
+        # 입력 텐서 정보 추출
+        engine_temp = self.engine_pool.get()
+        info = engine_temp.get_input_tensors_info()[0]
+        shape = info.get("shape", [])
+        self.dtype = info.get("dtype", np.uint8)
+        self.is_nchw = len(shape) >= 4 and shape[1] in (1, 3, 4)
+        if self.is_nchw:
+            self.input_height, self.input_width = shape[2], shape[3]
+        else:
+            self.input_height, self.input_width = shape[1], shape[2]
+        self.engine_pool.put(engine_temp)
+
+    def infer_is_docked(self, frame):
+        if frame is None: return True # 프레임 오류 시 기본적으로 안전(접안) 상태로 간주
+        
+        # 전처리
+        resized = cv2.resize(frame, (self.input_width, self.input_height), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        
+        input_tensor = rgb
+        if self.dtype == np.float32:
+            input_tensor = input_tensor.astype(np.float32) / 255.0
+        else:
+            input_tensor = input_tensor.astype(self.dtype)
+            
+        if self.is_nchw:
+            input_tensor = np.transpose(input_tensor, (2, 0, 1))
+            
+        engine = self.engine_pool.get()
+        try:
+            outputs = engine.run([input_tensor])
+            depth = np.squeeze(outputs[0])
+            if depth.dtype != np.float32: depth = depth.astype(np.float32)
+            
+            # 중앙 1/3 (가로세로 33% ~ 66%) 영역을 ROI로 설정하여 깊이 추출
+            roi_y1, roi_y2 = self.input_height // 3, (self.input_height // 3) * 2
+            roi_x1, roi_x2 = self.input_width // 3, (self.input_width // 3) * 2
+            roi_depth = depth[roi_y1:roi_y2, roi_x1:roi_x2]
+            
+            p80_depth = float(np.percentile(roi_depth, 80))
+            is_docked = p80_depth < self.threshold
+            return is_docked
+        finally:
+            self.engine_pool.put(engine)
+            
+            
 # ==========================================
 # [7] 객체 트래커 및 영상 녹화기
 # ==========================================
@@ -2909,13 +3091,81 @@ class SignalVehicleDetector(BaseEventDetector):
                 del self.line_truck_votes[tid]
 
         return triggered
+    
+    
+class SafetyDockingDetector(BaseEventDetector):
+    gui_name = "SAFETY-DOCKING"
 
+    def __init__(self, config, roi_poly=None, roi_lines=None):
+        super().__init__(config, roi_poly, roi_lines)
+        self.trigger_sec = config.get("trigger_sec", 2.0) 
+        self.missing_start_time = 0.0
+        self.is_triggering = False
+
+    def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
+        triggered = []
+        is_docked = kwargs.get('is_docked', True)
+        safety_tracks = kwargs.get('safety_tracks', [])
+        privacy_tracks = kwargs.get('privacy_tracks', [])
+        current_time = time.time()
+
+        if self.roi_poly.size == 0:
+            return triggered
+
+        # 차가 도크에 접안해 있다면 타이머 리셋
+        if is_docked:
+            self.missing_start_time = 0.0
+            self.is_triggering = False
+            return triggered
+
+        # 차가 없을 때, ROI 내부에 안전 시설물이 있는지 확인
+        safety_in_roi = False
+        for t in safety_tracks:
+            cls_id = int(t[6])
+            if cls_id in [ID_SAFETY_RAIL, ID_SAFETY_SIGN, ID_SAFETY_DOOR]: 
+                # 객체의 중심점 혹은 하단점이 ROI 내에 있는지 판별
+                if cv2.pointPolygonTest(self.roi_poly, get_center_point(*t[:4]), False) >= 0:
+                    safety_in_roi = True
+                    break
+
+        # 안전 시설물이 미검출 된 경우 (차가 없는데 문/레일이 없음)
+        if not safety_in_roi:
+            if self.missing_start_time == 0.0:
+                self.missing_start_time = current_time
+            elif current_time - self.missing_start_time >= self.trigger_sec:
+                if not self.is_triggering:
+                    # 미검출 이벤트이므로 ROI 전체를 BBox로 간주하여 전송
+                    bbox = cv2.boundingRect(self.roi_poly) if self.roi_poly.size > 0 else [0, 0, 100, 100]
+                    bx, by, bw, bh = bbox
+                    triggered.append({
+                        'tid': 9999, # 미검출 이벤트용 가상 식별자
+                        'bbox': [bx, by, bx + bw, by + bh],
+                        'frame': frame.copy() if frame is not None else None,
+                        'fid': fid,
+                        'privacy_tracks': privacy_tracks,
+                        'privacy_fid': fid,
+                        'objects': [{'label': 'safety_missing', 'box': [bx, by, bx + bw, by + bh], 'score': 1.0, 'tid': 9999, 'class_id': 99}],
+                        'decision_trace': {
+                            'detector': 'SafetyDockingDetector',
+                            'reason': 'undocked_and_safety_equipment_missing',
+                            'missing_duration_sec': round(current_time - self.missing_start_time, 2)
+                        }
+                    })
+                    self.is_triggering = True
+        else:
+            self.missing_start_time = 0.0
+            self.is_triggering = False
+
+        return triggered
+
+# 기존 EVENT_REGISTRY에 추가
 EVENT_REGISTRY = {
     "intrusion": IntrusionDetector,
     "illegal_parking": ParkingDetector,
     "conveyor_crossing": CrossingDetector,
     "no_helmet": HelmetDetector,
-    "signal_vehicle": SignalVehicleDetector
+    "signal_vehicle": SignalVehicleDetector,
+    "safety_docking": SafetyDockingDetector
 }
 
 # ==========================================
@@ -3083,11 +3333,12 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     url = batch[local_idx]
                     ip = extract_ip(url)
 
+                    # [수정] 안내문에 8.안전도킹 추가
                     print(
                         f"[{ip}] 1.침입 2.주정차 3.안전모 4.횡단 5.신호수차량 "
-                        f"6.roi화각변경 7.roi화각변경+자동보정"
+                        f"6.roi화각변경 7.roi화각변경+자동보정 8.안전도킹"
                     )
-                    evts = guarded_input(f"[{ip}] 이벤트 선택 (예: 1,4,7): ")
+                    evts = guarded_input(f"[{ip}] 이벤트 선택 (예: 1,4,7,8): ")
                     events = []
 
                     selected_events = {s.strip() for s in evts.split(',') if s.strip()}
@@ -3099,11 +3350,13 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     if '5' in selected_events: events.append("signal_vehicle")
                     if '6' in selected_events: events.append(ROI_CHANGE_EVENT)
                     if '7' in selected_events: events.append(ROI_CHANGE_APPLY_EVENT)
+                    if '8' in selected_events: events.append("safety_docking") # [추가] 8번 선택 시 이벤트 추가
 
                     roi_p = []
                     roi_l = []
 
-                    if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle"]):
+                    # [수정] safety_docking 이벤트 선택 시에도 ROI 영역(다각형)을 설정하도록 추가
+                    if any(e in events for e in ["intrusion", "illegal_parking", "no_helmet", "signal_vehicle", "safety_docking"]):
                         roi_p = get_roi_points_scaled(frames[local_idx], f"Polygon - CAM: {ip}")
 
                     if "conveyor_crossing" in events:
@@ -4357,7 +4610,7 @@ class FrameReader:
             return self.frame, self.fid, self.connected
 
 class Camera:
-    def __init__(self, ip, conf, det_main_v2, det_main_v3, det_helmet, det_face, det_signalman, det_plate, cam_id, event_inference_mode="separate"):
+    def __init__(self, ip, conf, det_main_v2, det_main_v3, det_helmet, det_face, det_signalman, det_plate, det_safety, det_depth, cam_id, event_inference_mode="separate"):
         self.ip = ip
         self.camera_key = ip
         self.conf = conf
@@ -4372,7 +4625,11 @@ class Camera:
         self.det_face = det_face
         self.det_signalman = det_signalman
         self.det_plate = det_plate
-
+    
+        self.det_safety = det_safety
+        self.det_depth = det_depth
+        self.trk_safety = SimpleTracker() # Safety 트래커 추가
+    
         self.trk_main = SimpleTracker()
         self.trk_helmet = SimpleTracker()
         self.trk_signalman = SimpleTracker()
@@ -5155,7 +5412,7 @@ class Camera:
             ]
         }
 
-    def run_logic(self, fr, fid, d_main_res, d_helmet_res, d_signalman_res=None):
+    def run_logic(self, fr, fid, d_main_res, d_helmet_res, d_signalman_res, d_safety_res, is_docked):
         if fr is None:
             return [], [], [], {}, []
 
@@ -5174,7 +5431,8 @@ class Camera:
         t_main = self.trk_main.update(d_main_filtered)
         t_helmet = self.trk_helmet.update(d_helmet_res)
         t_signalman = self.trk_signalman.update(d_signalman_res)
-
+        t_safety = self.trk_safety.update(d_safety_res)
+        
         now = time.time()
         current_alarms = {}
         track_map_main = {int(t[4]): int(t[6]) for t in t_main}
@@ -5186,8 +5444,10 @@ class Camera:
         record_fr = None
 
         for ename, handler in self.handlers.items():
-            # 1. 이벤트 핸들러에 전달할 인자 세팅
-            if ename == "no_helmet":
+            if ename == "safety_docking":
+                kwargs = {'is_docked': is_docked, 'safety_tracks': t_safety, 'privacy_tracks': t_main}
+                handler_tracks, handler_track_map, handler_score_map = t_safety, {int(t[4]): int(t[6]) for t in t_safety}, {int(t[4]): round(float(t[5]), 2) for t in t_safety}
+            elif ename == "no_helmet":
                 # [수정 핵심] 메인 객체(사람)가 분석 기준이 되어야 하므로 handler_tracks는 t_main이어야 합니다.
                 kwargs = {'helmet_tracks': t_helmet, 'privacy_tracks': t_main}
                 handler_tracks, handler_track_map, handler_score_map = t_main, track_map_main, score_map_main
@@ -5378,9 +5638,9 @@ class Camera:
                     bx1, by1, bx2, by2 = map(int, t[:4])
                     cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), (0, 255, 255), 1)
 
-        return t_main, t_helmet, t_signalman, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
+        return t_main, t_helmet, t_signalman, t_safety, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
-    def draw(self, fr, t_main, t_helmet, t_signalman, alarms, connected=True):
+    def draw(self, fr, t_main, t_helmet, t_signalman, t_safety, alarms, connected=True):
         if fr is None or not connected:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
             cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 1)
@@ -5473,7 +5733,22 @@ class Camera:
 
                 cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, thickness)
                 cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
-
+                
+        # [추가] Safety 객체 (안전문, 레일, 표지판) GUI 렌더링
+        if "safety_docking" in self.events:
+            for t in t_safety:
+                tid = int(t[4])
+                cls_id = int(t[6])
+                color = (255, 0, 255) # 보라색 테두리
+                
+                if cls_id == ID_SAFETY_RAIL: label = f"Rail [{tid}]"
+                elif cls_id == ID_SAFETY_SIGN: label = f"Sign [{tid}]"
+                elif cls_id == ID_SAFETY_DOOR: label = f"Door [{tid}]"
+                else: label = f"Safety [{tid}]"
+                
+                cv2.rectangle(fr, (int(t[0]), int(t[1])), (int(t[2]), int(t[3])), color, 2)
+                cv2.putText(fr, label, (int(t[0]), int(t[1])-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+                
         #cv2.rectangle(fr, (0, 0), (115, 40), (0, 0, 0), -1)
         cv2.putText(fr, f"CAM {self.cam_id}", (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
@@ -6162,6 +6437,18 @@ def main():
             output_format=get_model_output_format("HELMET"),
             pool_size=helmet_pool_size
         )
+        # [추가] Safety 모델 및 Depth 모델 로드 (config 동적 참조로 수정)
+        d_safety = YoLoDeepX(
+            resolve_model_path(models_cfg.get("SAFETY", "safety.dxnn")),
+            output_format=get_model_output_format("SAFETY"),
+            pool_size=get_model_engine_pool_size("SAFETY", default=1)
+        )
+        
+        d_depth = DepthDeepX(
+            resolve_model_path(models_cfg.get("DEPTH", "fastdepth_224x224.dxnn")),
+            threshold=1.85, # (추가로 시스템 설정에서 빼내도 됩니다)
+            pool_size=get_model_engine_pool_size("DEPTH", default=1)
+        )
         
         # [복구 및 활성화] d_face 및 d_plate 모델 로드 (좌표 매칭 오류 픽스)
         face_fmt = get_model_output_format("FACE")
@@ -6200,7 +6487,9 @@ def main():
         cams.append(Camera(
             ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate,
             cam_id=i+1,
-            event_inference_mode=event_inference_mode
+            event_inference_mode=event_inference_mode,
+            det_safety=d_safety, # [추가]
+            det_depth=d_depth    # [추가]
         ))
         logger.info(
             f"[CAMERA LOADED] cam={i+1} ip={ip} events={','.join(conf.get('events', [])) or '-'} "
@@ -6326,7 +6615,19 @@ def main():
             if has_person:
                 d_helmet_res = cam.det_helmet.infer(fr, conf_override=helmet_conf)
 
-        return t_main_input, d_helmet_res, d_signalman_res
+        # [수정] Safety & Depth 모델 추론 부분
+        is_docked = True
+        d_safety_res = np.empty((0, 6))
+        
+        if "safety_docking" in cam.events:
+            if cam.det_depth:
+                is_docked = cam.det_depth.infer_is_docked(fr)
+            if cam.det_safety:
+                # [핵심 수정] 하드코딩된 0.5 대신 설정 파일의 신뢰도 값을 동적으로 가져오도록 변경
+                safety_conf = SYS_CFG.get("model_confidences", {}).get("SAFETY", 0.4)
+                d_safety_res = cam.det_safety.infer(fr, conf_override=safety_conf)
+                
+        return t_main_input, d_helmet_res, d_signalman_res, d_safety_res, is_docked
 
     # [추가] 메인 스레드와 워커 스레드 간 목표 FPS를 안전하게 공유하기 위한 상태 객체
     system_runtime_state = {"target_fps": sys_target_fps}
@@ -6380,20 +6681,21 @@ def main():
                 fr, fid, connected = item
 
                 if not connected or fr is None or not self.cam.events:
-                    self.result_buffer.put((fr, fid, connected, [], [], [], {}, [], None))
+                    # [핵심 수정] 반환값 10개 짝 맞추기 (t_safety 자리에 빈 리스트 [] 추가)
+                    self.result_buffer.put((fr, fid, connected, [], [], [], [], {}, [], None))
                     continue
 
                 try:
-                    # 추론과 로직을 한 워커에서 순차 처리하여 스레드 통신 오버헤드 제거
-                    t_main_input, d_helmet_res, d_signalman_res = run_camera_inference(self.cam, fr)
-                    t_main, t_helmet, t_signalman, alarms, new_events = self.cam.run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res)
+                    t_main_input, d_helmet_res, d_signalman_res, d_safety_res, is_docked = run_camera_inference(self.cam, fr)
+                    t_main, t_helmet, t_signalman, t_safety, alarms, new_events = self.cam.run_logic(fr, fid, t_main_input, d_helmet_res, d_signalman_res, d_safety_res, is_docked)
                     infer_meta = self.cam.build_inference_log(fid, fr, t_main_input, d_helmet_res, t_main, t_helmet, alarms, new_events, d_signalman_res=d_signalman_res)
                     
-                    self.result_buffer.put((fr, fid, connected, t_main, t_helmet, t_signalman, alarms, new_events, infer_meta))
+                    self.result_buffer.put((fr, fid, connected, t_main, t_helmet, t_signalman, t_safety, alarms, new_events, infer_meta))
                 except Exception as e:
                     logger.error(f"[Worker Error] CAM {self.cam.cam_id}: {e}\n{traceback.format_exc()}")
-                    self.result_buffer.put((fr, fid, connected, [], [], [], {}, [], None))
-
+                    # [핵심 수정] 에러 발생 시 반환값 10개 짝 맞추기 (t_safety 자리에 빈 리스트 [] 추가)
+                    self.result_buffer.put((fr, fid, connected, [], [], [], [], {}, [], None))
+                    
     camera_workers = []
     last_rendered_frames = {}
 
@@ -6505,7 +6807,7 @@ def main():
                         conf = camera_configs.get(c.ip, c.conf)
                         # [수정 핵심] d_main을 최신 아키텍처에 맞게 d_main_v2, d_main_v3로 변경
                         new_cam = Camera(
-                            c.ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate,
+                            c.ip, conf, d_main_v2, d_main_v3, d_helmet, d_face, d_signalman, d_plate, d_safety, d_depth,
                             cam_id=c.cam_id,
                             event_inference_mode=event_inference_mode
                         )
@@ -6530,7 +6832,7 @@ def main():
 
                 # 정상 수신 시 활성 시간 갱신
                 last_worker_active_times[c.ip] = now_time
-                fr, fid, connected, t_main, t_helmet, t_signalman, alarms, new_events, infer_meta = res
+                fr, fid, connected, t_main, t_helmet, t_signalman, t_safety, alarms, new_events, infer_meta = res
 
                 # [수정] 개별 카메라 1시간 타이머 검사
                 cctv_id_text = str(c.cam_id)
@@ -6574,6 +6876,7 @@ def main():
                         final_imgs.append(display_fr)
                     continue
 
+                # 이벤트 발생시 저장관련 코드
                 cam_ip = c.ip
                 if now_time - current_fps_last_print.get(cam_ip, 0.0) >= current_fps_log_interval_sec:
                     current_fps_last_print[cam_ip] = now_time
@@ -6582,8 +6885,14 @@ def main():
                 time_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 cv2.putText(record_fr, f"Event Time: {time_str}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                 
+                # [추가] 이벤트(알람) 발생 시 녹화 영상 테두리에 굵은 빨간색 표시
+                if len(alarms) > 0:
+                    rec_h, rec_w = record_fr.shape[:2]
+                    cv2.rectangle(record_fr, (0, 0), (rec_w, rec_h), (0, 0, 255), 20)
+
                 if len(c.roi_poly) > 2:
                     cv2.polylines(record_fr, [np.array(c.roi_poly, np.int32)], True, (0, 255, 255), 1)
+                    
                 if c.roi_lines:
                     for i in range(0, len(c.roi_lines), 2):
                         if i + 1 < len(c.roi_lines):
@@ -6601,11 +6910,18 @@ def main():
                         if len(hist) > 1:
                             cv2.polylines(record_fr, [np.array(hist, np.int32)], False, color, 1)
 
+                if "safety_docking" in c.events:
+                    for t in t_safety:
+                        bx1, by1, bx2, by2 = map(int, t[:4])
+                        # 보라색(255, 0, 255)으로 안전 시설물 표시
+                        cv2.rectangle(record_fr, (bx1, by1), (bx2, by2), (255, 0, 255), 1)
+
                 if infer_meta:
                     c.recorder.update(record_fr, infer_meta, timestamp=now_time)
 
                 if is_gui_mode:
-                    display_fr = c.draw(fr.copy(), t_main, t_helmet, t_signalman, alarms, True)
+                    # [수정] GUI 모니터 렌더링 시 t_safety 전달
+                    display_fr = c.draw(fr.copy(), t_main, t_helmet, t_signalman, t_safety, alarms, True)
                     last_rendered_frames[c.ip] = display_fr
                     final_imgs.append(display_fr)
 
