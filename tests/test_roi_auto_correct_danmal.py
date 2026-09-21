@@ -11,6 +11,8 @@ from unittest.mock import Mock
 
 SOURCE = Path(__file__).resolve().parents[1] / globals().get(
     "SOURCE_FILENAME", "multi_event_irfilter_danmal.py")
+if not SOURCE.exists():
+    raise unittest.SkipTest("Legacy danmal source is not present in this checkout")
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
 CAMERA = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "Camera")
 METHODS = {n.name: n for n in CAMERA.body if isinstance(n, ast.FunctionDef)}

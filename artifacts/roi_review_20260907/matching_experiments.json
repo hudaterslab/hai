@@ -1,0 +1,962 @@
+[
+  {
+    "preprocess": "gray",
+    "ratio": 0.7,
+    "mutual": true,
+    "matches": 23,
+    "inliers": 12,
+    "accepted": false,
+    "reason": "low_inliers:12/23",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        302.38201904296875,
+        430.8984680175781
+      ],
+      [
+        287.7457275390625,
+        238.8825225830078
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.7,
+    "mutual": false,
+    "matches": 44,
+    "inliers": 16,
+    "accepted": false,
+    "reason": "low_inliers:16/44",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        300.4199523925781,
+        440.81121826171875
+      ],
+      [
+        287.37860107421875,
+        239.61073303222656
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.75,
+    "mutual": true,
+    "matches": 34,
+    "inliers": 16,
+    "accepted": false,
+    "reason": "low_inliers:16/34",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        301.97637939453125,
+        438.1234436035156
+      ],
+      [
+        287.6236572265625,
+        239.1822509765625
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.75,
+    "mutual": false,
+    "matches": 65,
+    "inliers": 18,
+    "accepted": false,
+    "reason": "low_inliers:18/65",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        284.3430480957031,
+        480.6722106933594
+      ],
+      [
+        284.8344421386719,
+        242.7020263671875
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.8,
+    "mutual": true,
+    "matches": 48,
+    "inliers": 22,
+    "accepted": false,
+    "reason": "low_inliers:22/48",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        253.19869995117188,
+        709.2399291992188
+      ],
+      [
+        262.5765686035156,
+        324.5111389160156
+      ]
+    ],
+    "local_counts": [
+      0,
+      1
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.8,
+    "mutual": false,
+    "matches": 96,
+    "inliers": 24,
+    "accepted": false,
+    "reason": "low_inliers:24/96",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        302.981689453125,
+        434.7032775878906
+      ],
+      [
+        288.1310729980469,
+        238.90867614746094
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.85,
+    "mutual": true,
+    "matches": 76,
+    "inliers": 22,
+    "accepted": false,
+    "reason": "low_inliers:22/76",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        256.2709655761719,
+        635.8687133789062
+      ],
+      [
+        267.27325439453125,
+        302.8075866699219
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.85,
+    "mutual": false,
+    "matches": 168,
+    "inliers": 26,
+    "accepted": false,
+    "reason": "low_inliers:26/168",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        327.86517333984375,
+        450.1245422363281
+      ],
+      [
+        304.9136657714844,
+        249.6535186767578
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.9,
+    "mutual": true,
+    "matches": 117,
+    "inliers": 32,
+    "accepted": false,
+    "reason": "low_inliers:32/117",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        281.9734191894531,
+        623.1928100585938
+      ],
+      [
+        276.5886535644531,
+        308.89715576171875
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "gray",
+    "ratio": 0.9,
+    "mutual": false,
+    "matches": 327,
+    "inliers": 31,
+    "accepted": false,
+    "reason": "low_inliers:31/327",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        250.97177124023438,
+        700.5159301757812
+      ],
+      [
+        261.2826232910156,
+        327.5096435546875
+      ]
+    ],
+    "local_counts": [
+      0,
+      1
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.7,
+    "mutual": true,
+    "matches": 22,
+    "inliers": 11,
+    "accepted": false,
+    "reason": "low_inliers:11/22",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        266.5559997558594,
+        467.6630859375
+      ],
+      [
+        281.5669250488281,
+        241.60130310058594
+      ]
+    ],
+    "local_counts": [
+      0,
+      3
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.7,
+    "mutual": false,
+    "matches": 43,
+    "inliers": 19,
+    "accepted": false,
+    "reason": "low_inliers:19/43",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        293.62158203125,
+        465.14178466796875
+      ],
+      [
+        286.4494934082031,
+        241.55389404296875
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.75,
+    "mutual": true,
+    "matches": 32,
+    "inliers": 15,
+    "accepted": false,
+    "reason": "low_inliers:15/32",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        265.8768005371094,
+        627.3993530273438
+      ],
+      [
+        270.6458435058594,
+        304.0333251953125
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.75,
+    "mutual": false,
+    "matches": 63,
+    "inliers": 17,
+    "accepted": false,
+    "reason": "low_inliers:17/63",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        290.0976867675781,
+        503.6335754394531
+      ],
+      [
+        285.7979736328125,
+        243.91336059570312
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.8,
+    "mutual": true,
+    "matches": 45,
+    "inliers": 20,
+    "accepted": false,
+    "reason": "low_inliers:20/45",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        298.3087463378906,
+        457.98626708984375
+      ],
+      [
+        287.1101379394531,
+        240.7552032470703
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.8,
+    "mutual": false,
+    "matches": 93,
+    "inliers": 24,
+    "accepted": false,
+    "reason": "low_inliers:24/93",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        298.5799560546875,
+        445.2729797363281
+      ],
+      [
+        287.27874755859375,
+        240.3136444091797
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.85,
+    "mutual": true,
+    "matches": 76,
+    "inliers": 24,
+    "accepted": false,
+    "reason": "low_inliers:24/76",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        294.53314208984375,
+        470.550537109375
+      ],
+      [
+        286.66552734375,
+        242.44906616210938
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.85,
+    "mutual": false,
+    "matches": 167,
+    "inliers": 29,
+    "accepted": false,
+    "reason": "low_inliers:29/167",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        343.8340759277344,
+        456.2985534667969
+      ],
+      [
+        316.9172058105469,
+        254.11636352539062
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.9,
+    "mutual": true,
+    "matches": 118,
+    "inliers": 30,
+    "accepted": false,
+    "reason": "low_inliers:30/118",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        291.2966613769531,
+        471.5729675292969
+      ],
+      [
+        285.9805908203125,
+        242.01950073242188
+      ]
+    ],
+    "local_counts": [
+      0,
+      5
+    ]
+  },
+  {
+    "preprocess": "jpeg_gray",
+    "ratio": 0.9,
+    "mutual": false,
+    "matches": 330,
+    "inliers": 27,
+    "accepted": false,
+    "reason": "low_inliers:27/330",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        295.7377624511719,
+        460.7202453613281
+      ],
+      [
+        286.5992736816406,
+        241.31021118164062
+      ]
+    ],
+    "local_counts": [
+      0,
+      5
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.7,
+    "mutual": true,
+    "matches": 26,
+    "inliers": 12,
+    "accepted": false,
+    "reason": "low_inliers:12/26",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        279.6432800292969,
+        450.6554870605469
+      ],
+      [
+        285.2561340332031,
+        239.7406768798828
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.7,
+    "mutual": false,
+    "matches": 45,
+    "inliers": 15,
+    "accepted": false,
+    "reason": "low_inliers:15/45",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        273.8734130859375,
+        465.6996154785156
+      ],
+      [
+        284.3266906738281,
+        241.0422821044922
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.75,
+    "mutual": true,
+    "matches": 37,
+    "inliers": 15,
+    "accepted": false,
+    "reason": "low_inliers:15/37",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        284.0677795410156,
+        436.9131164550781
+      ],
+      [
+        286.1598815917969,
+        238.28953552246094
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.75,
+    "mutual": false,
+    "matches": 61,
+    "inliers": 17,
+    "accepted": false,
+    "reason": "low_inliers:17/61",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        323.7002258300781,
+        518.3850708007812
+      ],
+      [
+        300.1861267089844,
+        277.83563232421875
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.8,
+    "mutual": true,
+    "matches": 50,
+    "inliers": 17,
+    "accepted": false,
+    "reason": "low_inliers:17/50",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        296.62139892578125,
+        449.852783203125
+      ],
+      [
+        286.9345397949219,
+        240.36244201660156
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.8,
+    "mutual": false,
+    "matches": 102,
+    "inliers": 20,
+    "accepted": false,
+    "reason": "low_inliers:20/102",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        274.442626953125,
+        461.7940673828125
+      ],
+      [
+        284.463623046875,
+        240.67996215820312
+      ]
+    ],
+    "local_counts": [
+      0,
+      4
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.85,
+    "mutual": true,
+    "matches": 80,
+    "inliers": 19,
+    "accepted": false,
+    "reason": "low_inliers:19/80",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        288.2359313964844,
+        474.99774169921875
+      ],
+      [
+        286.17205810546875,
+        257.6573181152344
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.85,
+    "mutual": false,
+    "matches": 204,
+    "inliers": 17,
+    "accepted": false,
+    "reason": "low_inliers:17/204",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        279.8945007324219,
+        486.53326416015625
+      ],
+      [
+        281.0987548828125,
+        260.0870666503906
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.9,
+    "mutual": true,
+    "matches": 152,
+    "inliers": 16,
+    "accepted": false,
+    "reason": "low_inliers:16/152",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        257.922607421875,
+        442.2082824707031
+      ],
+      [
+        274.3770751953125,
+        239.43771362304688
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "clahe",
+    "ratio": 0.9,
+    "mutual": false,
+    "matches": 450,
+    "inliers": 1,
+    "accepted": false,
+    "reason": "low_inliers:1/450",
+    "next_gate": "low_inliers:1/450",
+    "mapped_roi": [
+      [
+        77.54688262939453,
+        52.3917236328125
+      ],
+      [
+        75.76335906982422,
+        51.586181640625
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.7,
+    "mutual": true,
+    "matches": 21,
+    "inliers": 18,
+    "accepted": false,
+    "reason": "clustered_inliers",
+    "next_gate": "clustered_inliers",
+    "mapped_roi": [
+      [
+        315.80255126953125,
+        544.569091796875
+      ],
+      [
+        294.3946228027344,
+        283.8927001953125
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.7,
+    "mutual": false,
+    "matches": 41,
+    "inliers": 25,
+    "accepted": false,
+    "reason": "roi_out_of_frame",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        271.3029479980469,
+        555.8594360351562
+      ],
+      [
+        271.9341125488281,
+        290.25958251953125
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.75,
+    "mutual": true,
+    "matches": 35,
+    "inliers": 20,
+    "accepted": false,
+    "reason": "roi_unsupported_hull:0",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        300.08447265625,
+        452.7507019042969
+      ],
+      [
+        303.1315002441406,
+        243.55690002441406
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.75,
+    "mutual": false,
+    "matches": 67,
+    "inliers": 30,
+    "accepted": false,
+    "reason": "low_inliers:30/67",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        321.9546203613281,
+        529.2855224609375
+      ],
+      [
+        296.9547119140625,
+        279.9162292480469
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.8,
+    "mutual": true,
+    "matches": 58,
+    "inliers": 32,
+    "accepted": false,
+    "reason": "roi_out_of_frame",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        294.4275817871094,
+        615.6775512695312
+      ],
+      [
+        281.8286437988281,
+        298.8378601074219
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.8,
+    "mutual": false,
+    "matches": 131,
+    "inliers": 35,
+    "accepted": false,
+    "reason": "low_inliers:35/131",
+    "next_gate": "high_reprojection_error",
+    "mapped_roi": [
+      [
+        249.66024780273438,
+        570.8181762695312
+      ],
+      [
+        258.74072265625,
+        295.5912170410156
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.85,
+    "mutual": true,
+    "matches": 102,
+    "inliers": 39,
+    "accepted": false,
+    "reason": "low_inliers:39/102",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        310.39581298828125,
+        557.7538452148438
+      ],
+      [
+        291.14825439453125,
+        288.66326904296875
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.85,
+    "mutual": false,
+    "matches": 253,
+    "inliers": 44,
+    "accepted": false,
+    "reason": "low_inliers:44/253",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        344.8658447265625,
+        465.7777099609375
+      ],
+      [
+        313.3086853027344,
+        262.6866760253906
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.9,
+    "mutual": true,
+    "matches": 214,
+    "inliers": 46,
+    "accepted": false,
+    "reason": "low_inliers:46/214",
+    "next_gate": "roi_out_of_frame",
+    "mapped_roi": [
+      [
+        323.4358215332031,
+        525.3525390625
+      ],
+      [
+        298.9657897949219,
+        280.7410583496094
+      ]
+    ],
+    "local_counts": [
+      0,
+      0
+    ]
+  },
+  {
+    "preprocess": "upscale2",
+    "ratio": 0.9,
+    "mutual": false,
+    "matches": 571,
+    "inliers": 34,
+    "accepted": false,
+    "reason": "low_inliers:34/571",
+    "next_gate": "roi_unsupported_hull:0",
+    "mapped_roi": [
+      [
+        299.1195068359375,
+        474.37677001953125
+      ],
+      [
+        293.51104736328125,
+        257.1659240722656
+      ]
+    ],
+    "local_counts": [
+      1,
+      0
+    ]
+  }
+]
