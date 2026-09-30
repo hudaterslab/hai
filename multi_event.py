@@ -2794,7 +2794,7 @@ class SignalVehicleDetector(BaseEventDetector):
                 start_p = (sum(p[0] for p in h_list[:3])/3, sum(p[1] for p in h_list[:3])/3)
                 end_p = (sum(p[0] for p in h_list[-3:])/3, sum(p[1] for p in h_list[-3:])/3)
                 dist = get_distance(start_p, end_p)
-                min_movement = max(v_size * 0.15, 10.0)
+                min_movement = max(v_size * 0.30, 30.0) # 이전값 min_movement = max(v_size * 0.15, 10.0)
 
                 # 1차 검증: BBox 중심점이 충분히 이동했는가?
                 if dist >= min_movement and is_in_roi:
