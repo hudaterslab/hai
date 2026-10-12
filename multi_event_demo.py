@@ -921,6 +921,252 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
     return mosaic
 
 # ==========================================
+# [데모] 대시보드 화면 (창 1개)
+#   왼쪽 위: 안전 화면 / 왼쪽 아래: 치안 화면 / 오른쪽: 실시간 탐지 목록 (이벤트 카드, 최신이 맨 위)
+# ==========================================
+DEMO_EVENT_INFO = {
+    # 이벤트: (카드 제목, 분류, 분류 색 RGB)
+    EVENT_NO_HELMET: ("안전모 미착용", "안전", (255, 140, 0)),
+    EVENT_NO_VEST: ("안전조끼 미착용", "안전", (255, 140, 0)),
+    EVENT_BLUNT_WEAPON: ("야구방망이 소지", "치안", (140, 90, 220)),
+}
+DEMO_THUMB_SIZE = (608, 270)   # 카드 사진 크기 (가로, 세로)
+
+
+def make_demo_thumbnail(frame, person_box, target_box, label, size=DEMO_THUMB_SIZE):
+    """이벤트 순간 화면에 사람 박스와 대상(머리·몸통·방망이) 박스를 빨갛게 그리고, 그 주변을 카드 비율로 잘라 줄입니다."""
+    if frame is None:
+        return np.full((size[1], size[0], 3), 40, np.uint8)
+    img = frame.copy()
+    h, w = img.shape[:2]
+    boxes = [[float(v) for v in b[:4]] for b in (person_box, target_box) if b is not None and len(b) >= 4]
+    for i, b in enumerate(boxes):
+        x1, y1, x2, y2 = map(int, b)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2 if i == len(boxes) - 1 else 1)
+    if boxes:
+        cv2.putText(img, label, (int(boxes[-1][0]), max(12, int(boxes[-1][1]) - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+        cx = (min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2.0
+        cy = (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2.0
+    else:
+        cx, cy = w / 2.0, h / 2.0
+    # 박스들 가운데를 중심으로 카드 비율(가로:세로)에 맞게 자르기
+    aspect = size[0] / float(size[1])
+    cw, ch = (int(h * aspect), h) if w / float(h) > aspect else (w, int(w / aspect))
+    x0 = int(min(max(0, cx - cw / 2), w - cw))
+    y0 = int(min(max(0, cy - ch / 2), h - ch))
+    return cv2.resize(img[y0:y0 + ch, x0:x0 + cw], size, interpolation=cv2.INTER_AREA)
+
+
+class DemoEventFeed:
+    """실시간 탐지 목록. 알람이 날 때마다 카메라 워커 스레드가 넣고, 화면(메인) 스레드가 읽습니다."""
+
+    def __init__(self, maxlen=30):
+        self.items = deque(maxlen=maxlen)
+        self.counts = defaultdict(int)   # (날짜, 분류) -> 건수
+        self.version = 0
+        self.lock = threading.Lock()
+
+    def add(self, cam_id, event_name, frame, person_box, target_box, label):
+        now = datetime.datetime.now()
+        title, category, color = DEMO_EVENT_INFO.get(event_name, (event_name, "기타", (120, 120, 120)))
+        thumb = make_demo_thumbnail(frame, person_box, target_box, label)
+        with self.lock:
+            self.items.appendleft({'ts': now, 'cam_id': cam_id, 'event': event_name, 'title': title,
+                                   'category': category, 'color': color, 'thumb': thumb})
+            self.counts[(now.date(), category)] += 1
+            self.version += 1
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.items), dict(self.counts), self.version
+
+
+DEMO_EVENT_FEED = DemoEventFeed()
+
+
+class DemoDashboard:
+    """창 하나에 왼쪽 위 안전 화면, 왼쪽 아래 치안 화면, 오른쪽 실시간 탐지 목록을 그립니다.
+    한글은 cv2 로 쓸 수 없어서 Pillow + 한글 폰트로 그립니다 (없으면 영어로 표시)."""
+    VIEW_W, VIEW_H = 960, 540
+    PANEL_W = 640
+    W, H = VIEW_W + PANEL_W, VIEW_H * 2
+    TITLE = "AI SAFETY & SECURITY DEMO"
+    SAFETY_COLOR, SECURITY_COLOR = (255, 140, 0), (140, 90, 220)   # RGB
+    FONT_FILES = {
+        False: ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"],
+        True: ["/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+               "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"],
+    }
+
+    def __init__(self):
+        self._fonts = {}
+        self._panel = None
+        self._panel_key = None
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            self._pil = (Image, ImageDraw, ImageFont)
+        except Exception:
+            self._pil = None
+        self.korean = self._font(20) is not None
+        if not self.korean:
+            logger.warning("[DASHBOARD] Pillow 또는 한글 폰트가 없어 영어로 표시합니다.")
+        self._tags = [self._make_tag("안전", "SAFETY", self.SAFETY_COLOR),
+                      self._make_tag("치안", "SECURITY", self.SECURITY_COLOR)]
+
+    def _font(self, size, bold=False):
+        """한글 폰트 (.ttc 는 그 안에서 한국어(KR) 글꼴을 골라 씀). 없으면 None"""
+        key = (size, bold)
+        if key not in self._fonts:
+            font = None
+            if self._pil is not None:
+                ImageFont = self._pil[2]
+                for path in self.FONT_FILES[bold] + self.FONT_FILES[not bold]:
+                    if not os.path.exists(path):
+                        continue
+                    try:
+                        if path.endswith(".ttc"):
+                            for idx in range(16):
+                                try:
+                                    f = ImageFont.truetype(path, size, index=idx)
+                                except Exception:
+                                    break
+                                if "KR" in f.getname()[0]:
+                                    font = f
+                                    break
+                            font = font or ImageFont.truetype(path, size, index=0)
+                        else:
+                            font = ImageFont.truetype(path, size)
+                        break
+                    except Exception:
+                        continue
+            self._fonts[key] = font
+        return self._fonts[key]
+
+    def _make_tag(self, text, text_en, color_rgb):
+        """화면 왼쪽 아래 '안전' / '치안' 표시. 한 번만 그려 두고 매 프레임 붙여 넣습니다."""
+        if not self.korean:
+            tag = np.zeros((34, 110, 3), np.uint8)
+            tag[:] = color_rgb[::-1]
+            cv2.putText(tag, text_en, (8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            return tag
+        Image, ImageDraw, _ = self._pil
+        font = self._font(20, True)
+        img = Image.new("RGB", (76, 36), color_rgb)
+        d = ImageDraw.Draw(img)
+        d.text(((76 - d.textlength(text, font=font)) / 2, 3), text, font=font, fill=(255, 255, 255))
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    def render(self, safety_img, security_img, feed):
+        """한 화면 합성: 왼쪽 위 안전(960x540), 왼쪽 아래 치안(960x540), 오른쪽 탐지 목록(640x1080)"""
+        canvas = np.zeros((self.H, self.W, 3), np.uint8)
+        for row, img in enumerate((safety_img, security_img)):
+            y0 = row * self.VIEW_H
+            if img is None:
+                cell = np.full((self.VIEW_H, self.VIEW_W, 3), 30, np.uint8)
+                cv2.putText(cell, "OFF", (self.VIEW_W // 2 - 40, self.VIEW_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (120, 120, 120), 2)
+            elif img.shape[:2] != (self.VIEW_H, self.VIEW_W):
+                cell = cv2.resize(img, (self.VIEW_W, self.VIEW_H))
+            else:
+                cell = img
+            canvas[y0:y0 + self.VIEW_H, :self.VIEW_W] = cell
+            tag = self._tags[row]
+            th, tw = tag.shape[:2]
+            canvas[y0 + self.VIEW_H - th - 12:y0 + self.VIEW_H - 12, 12:12 + tw] = tag
+        cv2.line(canvas, (0, self.VIEW_H), (self.VIEW_W, self.VIEW_H), (90, 90, 90), 2)
+        canvas[:, self.VIEW_W:] = self._get_panel(feed)
+        return canvas
+
+    def _get_panel(self, feed):
+        """오른쪽 목록은 새 이벤트가 오거나 시계가 바뀔 때(1초)만 다시 그립니다."""
+        items, counts, version = feed.snapshot()
+        now = datetime.datetime.now()
+        key = (version, now.strftime("%H:%M:%S"))
+        if self._panel is None or key != self._panel_key:
+            self._panel = self._draw_panel(items, counts, now) if self.korean else self._draw_panel_en(items, counts, now)
+            self._panel_key = key
+        return self._panel
+
+    def _draw_panel(self, items, counts, now):
+        Image, ImageDraw, _ = self._pil
+        W, H, m = self.PANEL_W, self.H, 16
+        white, line, gray, dark = (255, 255, 255), (226, 229, 234), (120, 120, 120), (25, 25, 25)
+        img = Image.new("RGB", (W, H), (243, 245, 248))
+        d = ImageDraw.Draw(img)
+        n_safety = counts.get((now.date(), "안전"), 0)
+        n_security = counts.get((now.date(), "치안"), 0)
+        total = n_safety + n_security
+
+        # 1) 맨 위: 오늘 감지 건수 (안전 / 치안), 시계, 비율 막대
+        d.rounded_rectangle((m, m, W - m, 172), radius=12, fill=white, outline=line)
+        d.ellipse((m + 18, m + 25, m + 30, m + 37), fill=(34, 197, 94))
+        d.text((m + 40, m + 14), "실시간 탐지", font=self._font(24, True), fill=dark)
+        clock = now.strftime("%H:%M:%S")
+        d.text((W - m - 18 - d.textlength(clock, font=self._font(20)), m + 18), clock, font=self._font(20), fill=gray)
+        big = self._font(64, True)
+        d.text((m + 18, m + 44), str(total), font=big, fill=dark)
+        bx = m + 18 + d.textlength(str(total), font=big) + 14
+        d.text((bx, m + 64), "TODAY", font=self._font(16), fill=gray)
+        d.text((bx, m + 84), "건 발생", font=self._font(20), fill=(60, 60, 60))
+        rx = W - m - 190
+        for i, (name, n, color) in enumerate((("안전", n_safety, self.SAFETY_COLOR), ("치안", n_security, self.SECURITY_COLOR))):
+            yy = m + 58 + i * 38
+            d.rounded_rectangle((rx, yy, rx + 56, yy + 30), radius=6, fill=color)
+            d.text((rx + 9, yy + 2), name, font=self._font(18, True), fill=white)
+            d.text((rx + 70, yy + 1), f"{n}건", font=self._font(21, True), fill=dark)
+        x0, x1, by = m + 18, W - m - 18, 148
+        d.rounded_rectangle((x0, by, x1, by + 7), radius=3, fill=(225, 228, 233))
+        if total:
+            split = x0 + (x1 - x0) * n_safety / float(total)
+            if n_safety:
+                d.rounded_rectangle((x0, by, split, by + 7), radius=3, fill=self.SAFETY_COLOR)
+            if n_security:
+                d.rounded_rectangle((split, by, x1, by + 7), radius=3, fill=self.SECURITY_COLOR)
+
+        # 2) 이벤트 카드: 사진 / 이벤트 이름 / 카메라·분류 / 시각 (최신이 맨 위, 넘치면 아래가 잘림)
+        y = 186
+        tw, th = DEMO_THUMB_SIZE
+        if not items:
+            d.rounded_rectangle((m, y, W - m, y + 90), radius=12, fill=white, outline=line)
+            d.text((m + 24, y + 30), "아직 탐지된 이벤트가 없습니다", font=self._font(20), fill=gray)
+        for it in items:
+            if y >= H:
+                break
+            card_h = th + 104
+            d.rounded_rectangle((m, y, W - m, y + card_h), radius=12, fill=white, outline=line)
+            img.paste(Image.fromarray(cv2.cvtColor(it['thumb'], cv2.COLOR_BGR2RGB)), (m, y))
+            ty = y + th + 12
+            d.rounded_rectangle((m + 16, ty + 8, m + 56, ty + 48), radius=8, fill=it['color'])
+            mark = self._font(28, True)
+            d.text((m + 36 - d.textlength("!", font=mark) / 2, ty + 9), "!", font=mark, fill=white)
+            d.text((m + 70, ty), it['title'], font=self._font(26, True), fill=dark)
+            d.text((m + 70, ty + 38), f"CAM {it['cam_id']} · {it['category']}", font=self._font(17), fill=gray)
+            ts = it['ts']
+            d.text((m + 70, ty + 62), f"{ts.year}년 {ts.month}월 {ts.day}일 {ts.strftime('%H:%M:%S')}", font=self._font(17), fill=gray)
+            cx = W - m - 56
+            d.rounded_rectangle((cx, ty + 18, cx + 36, ty + 54), radius=8, fill=(250, 250, 252), outline=(210, 214, 220))
+            d.text((cx + 12, ty + 20), ">", font=self._font(22), fill=gray)
+            y += card_h + 14
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    def _draw_panel_en(self, items, counts, now):
+        """한글 폰트가 없을 때: 같은 배치를 영어로"""
+        panel = np.full((self.H, self.PANEL_W, 3), (248, 245, 243), np.uint8)
+        total = sum(n for (day, _), n in counts.items() if day == now.date())
+        cv2.putText(panel, f"REAL-TIME DETECTIONS   {now.strftime('%H:%M:%S')}", (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 2)
+        cv2.putText(panel, f"TODAY: {total}", (16, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (30, 30, 30), 3)
+        y, (tw, th) = 140, DEMO_THUMB_SIZE
+        for it in items:
+            if y + th + 60 > self.H:
+                break
+            panel[y:y + th, 16:16 + tw] = it['thumb']
+            cv2.putText(panel, f"{it['event'].upper()}  CAM {it['cam_id']}  {it['ts'].strftime('%Y-%m-%d %H:%M:%S')}",
+                        (16, y + th + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 1)
+            y += th + 56
+        return panel
+
+
+# ==========================================
 # [5] API 통신 및 이미지 저장 (NAS 연동 제외)
 # ==========================================
 def send_event_image_to_receiver(image_path, event_name, terminal_id, cctv_id, bboxes, img_width=None, img_height=None, event_id=None):
@@ -5021,6 +5267,10 @@ class Camera:
 
                 current_alarms[(tid, ename)] = ev.get('alarm_text', ename.upper().replace('_', ' '))  # 안전모: "NO HELMET"
 
+                # [데모] 대시보드 실시간 탐지 목록에 카드 추가 (저장 여부와 상관없이 알람이 날 때마다)
+                person_box = next((o.get('box') for o in ev.get('privacy_objects', []) if o.get('label') == 'person'), None)
+                DEMO_EVENT_FEED.add(self.cam_id, ename, ev_frame, person_box, bbox, current_alarms[(tid, ename)])
+
         # 화면 알림은 (사람, 이벤트)별로 보관합니다. 같은 사람이 안전모·조끼에 동시에 걸리거나 둔기 창에도 걸리면 각각 표시됩니다.
         alarm_duration = SYS_CFG.get("VISUAL_ALARM_DURATION", 5.0)
         visual_alarms = dict(self.visual_alarms)
@@ -5964,9 +6214,9 @@ def main():
     camera_workers = []
     last_rendered_frames = {}
 
-    # [데모] 이벤트별 창: 한 카메라에 두 이벤트를 켜면 창 2개(안전모+조끼 / 둔기)에 따로 표시합니다.
-    #        카메라가 여러 대면 각 창 안에 그 이벤트를 켠 카메라들이 바둑판(모자이크)으로 나옵니다.
-    #        gui_windows: (창 키, 창 제목, 그 창에 보여줄 이벤트들)
+    # [데모] 대시보드 창 하나: 왼쪽 위 안전 화면 / 왼쪽 아래 치안 화면 / 오른쪽 실시간 탐지 목록
+    #        카메라가 여러 대면 각 화면 안에 그 이벤트를 켠 카메라들이 바둑판(모자이크)으로 나옵니다.
+    #        gui_windows: (화면 키, 이름, 그 화면에 보여줄 이벤트들)
     gui_windows = [(key, title, evts) for key, title, evts in [
                        ("ppe", "SAFETY - HELMET / VEST", (EVENT_NO_HELMET, EVENT_NO_VEST)),
                        ("blunt", "SECURITY - BAT IN HAND", (EVENT_BLUNT_WEAPON,))]
@@ -5976,11 +6226,15 @@ def main():
         """이 카메라가 나오는 창들: [(창 키, 창 이벤트들)]"""
         return [(key, evts) for key, _, evts in gui_windows if any(e in cam.events for e in evts)]
 
+    dashboard = None
+    dashboard_fullscreen = False
+    last_dashboard_time = 0.0
     if is_gui_mode:
-        for win_idx, (key, title, evts) in enumerate(gui_windows):
-            cv2.namedWindow(title, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(title, 960, 540)
-            cv2.moveWindow(title, win_idx * 965, 0)
+        # 'f': 전체 화면 전환, 'q': 종료
+        dashboard = DemoDashboard()
+        cv2.namedWindow(DemoDashboard.TITLE, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.resizeWindow(DemoDashboard.TITLE, int(DemoDashboard.W * 0.8), int(DemoDashboard.H * 0.8))
+        cv2.moveWindow(DemoDashboard.TITLE, 0, 0)
 
     for c in cams:
         worker = CameraWorker(c)
@@ -6066,6 +6320,7 @@ def main():
             # Stage 2 (Consumer): 최신 결과 회수, 마스킹 스냅샷, 및 최적화 렌더링
             # ---------------------------------------------------------
             final_imgs = {key: [] for key, _, _ in gui_windows}
+            gui_dirty = False   # 이번 루프에 새 결과가 왔는지 (대시보드 다시 그리기 판단)
             now_time = time.time()
             
             roi_snapshot_refresh_cctv_ids = get_terminal_roi_snapshot_refresh_cctv_ids()
@@ -6118,6 +6373,7 @@ def main():
                 # 정상 수신 시 활성 시간 갱신
                 last_worker_active_times[c.ip] = now_time
                 fr, fid, connected, t_main, t_pose, t_bat, t_helmet, t_vest, alarms, new_events, infer_meta = res
+                gui_dirty = True
 
                 # [수정] 개별 카메라 1시간 타이머 검사
                 cctv_id_text = str(c.cam_id)
@@ -6219,10 +6475,18 @@ def main():
                 clear_terminal_roi_snapshot_refresh(cctv_ids=refreshed_cctv_ids, reason="roi_snapshot_sent")
 
             if is_gui_mode:
-                for key, title, _ in gui_windows:
-                    if final_imgs.get(key):
-                        cv2.imshow(title, create_mosaic_image(final_imgs[key]))
-                if cv2.waitKey(1) == ord('q'): break
+                # 새 결과가 왔을 때(또는 0.5초마다 시계 갱신)만 대시보드를 다시 그립니다.
+                if gui_dirty or now_time - last_dashboard_time >= 0.5:
+                    views = {key: create_mosaic_image(final_imgs[key], DemoDashboard.VIEW_W, DemoDashboard.VIEW_H)
+                             if final_imgs.get(key) else None for key, _, _ in gui_windows}
+                    cv2.imshow(DemoDashboard.TITLE, dashboard.render(views.get("ppe"), views.get("blunt"), DEMO_EVENT_FEED))
+                    last_dashboard_time = now_time
+                key_in = cv2.waitKey(1) & 0xFF
+                if key_in == ord('q'): break
+                if key_in in (ord('f'), ord('F')):
+                    dashboard_fullscreen = not dashboard_fullscreen
+                    cv2.setWindowProperty(DemoDashboard.TITLE, cv2.WND_PROP_FULLSCREEN,
+                                          cv2.WINDOW_FULLSCREEN if dashboard_fullscreen else cv2.WINDOW_NORMAL)
 
             time.sleep(0.001)
 
