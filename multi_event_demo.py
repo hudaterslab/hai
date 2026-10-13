@@ -216,12 +216,14 @@ def load_system_config():
         "event_config": {
             # 안전모 미착용: 원본 안전모 로직 그대로. 안전모 없는 머리가 연속 3초 이상 잡히면 이벤트
             #   (min_streak_sec / trigger_total_sec 를 원본 2초 / 4초 -> 3초 / 3초로)
-            #   데모용으로 바꾼 값: cooldown_sec 600 -> 10, ignore_top_ratio 0.2 -> 0 (가까이 선 사람 머리가 화면 위쪽이라)
-            "no_helmet": {"enabled": True, "cooldown_sec": 10, "blur_face": True, "blur_plate": False, "trigger_sec": 3.0,
+            #   데모용으로 바꾼 값: cooldown_sec 600 -> 6, ignore_top_ratio 0.2 -> 0 (가까이 선 사람 머리가 화면 위쪽이라)
+            #   cooldown_sec: 같은 이벤트가 한 번 발생하면 이 시간 동안은 다시 발생시키지 않음 (저장·화면 알림·탐지 목록 모두).
+            #                 쿨다운이 끝나면 처음부터 다시 세서, 계속 위반 중이면 다시 3초 뒤 이벤트
+            "no_helmet": {"enabled": True, "cooldown_sec": 6.0, "blur_face": True, "blur_plate": False, "trigger_sec": 3.0,
                           "min_streak_sec": 3.0, "trigger_total_sec": 3.0, "ignore_top_ratio": 0.0},
             # 조끼 미착용: 사람 몸통에 조끼가 no_vest_sec 동안 연속으로 안 보이면 이벤트
             "no_vest": {
-                "enabled": True, "cooldown_sec": 10, "blur_face": True, "blur_plate": False,
+                "enabled": True, "cooldown_sec": 6.0, "blur_face": True, "blur_plate": False,
                 "no_vest_sec": 3.0,             # 이 시간 동안 연속으로 조끼가 없으면 이벤트 (조끼가 한 번이라도 보이면 다시 셈)
                 "ignore_top_ratio": 0.0,
                 # 조끼 모델 best_vest1.dxnn 은 1클래스(0 = 조끼). 모델을 바꾸면 models.VEST /
@@ -232,7 +234,7 @@ def load_system_config():
             },
             # 치안(둔기): 사람 손(손목 관절)과 야구방망이가 연속 3초 이상 겹치면 이벤트
             "blunt_weapon": {
-                "enabled": True, "cooldown_sec": 10, "blur_face": True, "blur_plate": False,
+                "enabled": True, "cooldown_sec": 6.0, "blur_face": True, "blur_plate": False,
                 "hold_sec": 3.0,                # 이 시간 동안 연속으로 겹치면 이벤트
                 "kpt_conf": 0.3,                # 이보다 낮은 손목 관절은 쓰지 않음
                 "hand_margin_ratio": 0.08,      # 방망이 박스를 사람 키의 이 비율만큼 넓혀서 손목이 들어오면 '겹침' (손목~손 거리 보정)
@@ -280,7 +282,9 @@ def load_system_config():
         },
         "bat_class_id": 34,
         "video_decode": {
-            "backend": "gstreamer",
+            # 데모 카메라는 영상과 함께 ONVIF 메타데이터 트랙을 보내서 GStreamer(rtspsrc)로 받으면 1~5분마다 연결이 끊김
+            # -> FFmpeg 로 영상 트랙만 받아 CPU 디코딩 (ffmpeg_pipe). 예전 방식은 "gstreamer"
+            "backend": "ffmpeg_pipe",
             # 데모 카메라(H.265)는 VAAPI 하드웨어 디코딩이 프레임 복사 단계에서 실패(failed to map video frame)해서 CPU 디코딩 사용
             "hw_acceleration": "cpu",
             "hw_device": "/dev/dri/renderD128",
@@ -922,13 +926,20 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
 
 # ==========================================
 # [데모] 대시보드 화면 (창 1개)
-#   왼쪽 위: 안전 화면 / 왼쪽 아래: 치안 화면 / 오른쪽: 실시간 탐지 목록 (이벤트 카드, 최신이 맨 위)
+#   왼쪽 위: 카메라 화면 (안전·치안 탐지를 한 화면에) / 왼쪽 아래: 이벤트 감시 현황 (이벤트별 지금 상태와 3초 진행 막대)
+#   오른쪽: 실시간 탐지 목록 (이벤트 카드, 최신이 맨 위)
 # ==========================================
 DEMO_EVENT_INFO = {
     # 이벤트: (카드 제목, 분류, 분류 색 RGB)
     EVENT_NO_HELMET: ("안전모 미착용", "안전", (255, 140, 0)),
     EVENT_NO_VEST: ("안전조끼 미착용", "안전", (255, 140, 0)),
     EVENT_BLUNT_WEAPON: ("야구방망이 소지", "치안", (140, 90, 220)),
+}
+DEMO_EVENT_RULE = {
+    # 이벤트: (감시 현황 카드의 조건 문구, 한글 폰트가 없을 때 이름)
+    EVENT_NO_HELMET: ("맨머리", "NO HELMET"),
+    EVENT_NO_VEST: ("조끼 미착용", "NO VEST"),
+    EVENT_BLUNT_WEAPON: ("손에 방망이", "BAT IN HAND"),
 }
 DEMO_THUMB_SIZE = (608, 270)   # 카드 사진 크기 (가로, 세로)
 
@@ -984,14 +995,37 @@ class DemoEventFeed:
 DEMO_EVENT_FEED = DemoEventFeed()
 
 
+def collect_demo_status(cams, max_age_sec=2.0):
+    """카메라들의 이벤트 진행 상태(Camera.event_status)를 이벤트별로 합칩니다.
+    여러 카메라면 쿨다운(이벤트 발생) > 감지 중 > 정상 순으로 더 급한 쪽, 같은 상태면 초가 큰 쪽을 씁니다.
+    반환: [(이벤트, 상태, 초, 막대 기준 초, 알림 조건 초)] (DEMO_EVENT_INFO 순서, 켜진 이벤트만)"""
+    rank = {'off': 0, 'idle': 1, 'detecting': 2, 'cooldown': 3}
+    merged = {}
+    now = time.time()
+    for c in cams:
+        status, updated = getattr(c, 'event_status', ({}, 0.0))
+        for evt in c.events:
+            if evt not in DEMO_EVENT_INFO:
+                continue
+            state, sec, total, need = status.get(evt, ('idle', 0.0, 3.0, 3.0))
+            if now - updated > max_age_sec and state != 'off':
+                state, sec, total = 'idle', 0.0, need   # 화면이 끊긴 카메라의 오래된 상태는 쓰지 않음
+            cur = merged.get(evt)
+            if cur is None or (rank[state], sec) > (rank[cur[0]], cur[1]):
+                merged[evt] = (state, sec, total, need)
+    return [(evt,) + merged[evt] for evt in DEMO_EVENT_INFO if evt in merged]
+
+
 class DemoDashboard:
-    """창 하나에 왼쪽 위 안전 화면, 왼쪽 아래 치안 화면, 오른쪽 실시간 탐지 목록을 그립니다.
+    """창 하나에 왼쪽 위 카메라 화면(안전·치안 탐지를 한 화면에), 왼쪽 아래 이벤트 감시 현황, 오른쪽 실시간 탐지 목록을 그립니다.
     한글은 cv2 로 쓸 수 없어서 Pillow + 한글 폰트로 그립니다 (없으면 영어로 표시)."""
-    VIEW_W, VIEW_H = 960, 540
+    VIEW_W, VIEW_H = 1280, 720
     PANEL_W = 640
-    W, H = VIEW_W + PANEL_W, VIEW_H * 2
+    W, H = VIEW_W + PANEL_W, 1080          # 16:9 모니터에 꽉 차는 크기
+    STATUS_H = H - VIEW_H                  # 카메라 화면 아래 '이벤트 감시 현황' 높이
     TITLE = "AI SAFETY & SECURITY DEMO"
     SAFETY_COLOR, SECURITY_COLOR = (255, 140, 0), (140, 90, 220)   # RGB
+    STATE_COLORS = {'idle': (22, 163, 74), 'detecting': (217, 119, 6), 'cooldown': (220, 38, 38), 'off': (150, 150, 150)}   # RGB
     FONT_FILES = {
         False: ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"],
@@ -1003,6 +1037,8 @@ class DemoDashboard:
         self._fonts = {}
         self._panel = None
         self._panel_key = None
+        self._status = None
+        self._status_key = None
         try:
             from PIL import Image, ImageDraw, ImageFont
             self._pil = (Image, ImageDraw, ImageFont)
@@ -1011,8 +1047,6 @@ class DemoDashboard:
         self.korean = self._font(20) is not None
         if not self.korean:
             logger.warning("[DASHBOARD] Pillow 또는 한글 폰트가 없어 영어로 표시합니다.")
-        self._tags = [self._make_tag("안전", "SAFETY", self.SAFETY_COLOR),
-                      self._make_tag("치안", "SECURITY", self.SECURITY_COLOR)]
 
     def _font(self, size, bold=False):
         """한글 폰트 (.ttc 는 그 안에서 한국어(KR) 글꼴을 골라 씀). 없으면 None"""
@@ -1043,39 +1077,91 @@ class DemoDashboard:
             self._fonts[key] = font
         return self._fonts[key]
 
-    def _make_tag(self, text, text_en, color_rgb):
-        """화면 왼쪽 아래 '안전' / '치안' 표시. 한 번만 그려 두고 매 프레임 붙여 넣습니다."""
-        if not self.korean:
-            tag = np.zeros((34, 110, 3), np.uint8)
-            tag[:] = color_rgb[::-1]
-            cv2.putText(tag, text_en, (8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-            return tag
-        Image, ImageDraw, _ = self._pil
-        font = self._font(20, True)
-        img = Image.new("RGB", (76, 36), color_rgb)
-        d = ImageDraw.Draw(img)
-        d.text(((76 - d.textlength(text, font=font)) / 2, 3), text, font=font, fill=(255, 255, 255))
-        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-    def render(self, safety_img, security_img, feed):
-        """한 화면 합성: 왼쪽 위 안전(960x540), 왼쪽 아래 치안(960x540), 오른쪽 탐지 목록(640x1080)"""
+    def render(self, view_img, feed, status):
+        """한 화면 합성: 왼쪽 위 카메라(1280x720), 왼쪽 아래 이벤트 감시 현황(1280x360), 오른쪽 탐지 목록(640x1080)
+        status: collect_demo_status() 결과 [(이벤트, 상태, 진행 초, 필요 초)]"""
         canvas = np.zeros((self.H, self.W, 3), np.uint8)
-        for row, img in enumerate((safety_img, security_img)):
-            y0 = row * self.VIEW_H
-            if img is None:
-                cell = np.full((self.VIEW_H, self.VIEW_W, 3), 30, np.uint8)
-                cv2.putText(cell, "OFF", (self.VIEW_W // 2 - 40, self.VIEW_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (120, 120, 120), 2)
-            elif img.shape[:2] != (self.VIEW_H, self.VIEW_W):
-                cell = cv2.resize(img, (self.VIEW_W, self.VIEW_H))
-            else:
-                cell = img
-            canvas[y0:y0 + self.VIEW_H, :self.VIEW_W] = cell
-            tag = self._tags[row]
-            th, tw = tag.shape[:2]
-            canvas[y0 + self.VIEW_H - th - 12:y0 + self.VIEW_H - 12, 12:12 + tw] = tag
-        cv2.line(canvas, (0, self.VIEW_H), (self.VIEW_W, self.VIEW_H), (90, 90, 90), 2)
+        if view_img is None:
+            cell = np.full((self.VIEW_H, self.VIEW_W, 3), 30, np.uint8)
+            cv2.putText(cell, "OFF", (self.VIEW_W // 2 - 40, self.VIEW_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (120, 120, 120), 2)
+        elif view_img.shape[:2] != (self.VIEW_H, self.VIEW_W):
+            cell = cv2.resize(view_img, (self.VIEW_W, self.VIEW_H))
+        else:
+            cell = view_img
+        canvas[:self.VIEW_H, :self.VIEW_W] = cell
+        canvas[self.VIEW_H:, :self.VIEW_W] = self._get_status(status)
         canvas[:, self.VIEW_W:] = self._get_panel(feed)
         return canvas
+
+    def _get_status(self, status):
+        """감시 현황은 내용(상태, 0.1초 단위 진행 시간)이 바뀔 때만 다시 그립니다."""
+        key = tuple((evt, state, round(sec, 1), total, need) for evt, state, sec, total, need in status)
+        if self._status is None or key != self._status_key:
+            self._status = self._draw_status(status) if self.korean else self._draw_status_en(status)
+            self._status_key = key
+        return self._status
+
+    def _draw_status(self, status):
+        """이벤트마다 카드 1장: 분류·이름 / 조건 / 지금 상태(정상, 감지 중 n초, 이벤트 발생) / 막대
+        막대: 감지 중이면 0초 -> 알림 조건 초까지 차오르고, 이벤트가 나면 쿨다운 동안 꽉 찬 빨강에서 줄어듭니다."""
+        Image, ImageDraw, _ = self._pil
+        W, H, m = self.VIEW_W, self.STATUS_H, 16
+        white, line, gray, dark = (255, 255, 255), (226, 229, 234), (120, 120, 120), (25, 25, 25)
+        img = Image.new("RGB", (W, H), (243, 245, 248))
+        d = ImageDraw.Draw(img)
+        d.text((m + 6, 10), "이벤트 감시 현황", font=self._font(22, True), fill=dark)
+        n = max(1, len(status))
+        cw, y0, y1 = (W - m * (n + 1)) // n, 50, H - m
+        for i, (evt, state, sec, total, need) in enumerate(status):
+            x0 = m + i * (cw + m)
+            x1 = x0 + cw
+            title, category, cat_color = DEMO_EVENT_INFO.get(evt, (evt, "기타", (120, 120, 120)))
+            color = self.STATE_COLORS.get(state, gray)
+            if state == 'cooldown':
+                d.rounded_rectangle((x0, y0, x1, y1), radius=14, fill=(254, 236, 236), outline=color, width=4)
+            else:
+                d.rounded_rectangle((x0, y0, x1, y1), radius=14, fill=white, outline=line)
+            # 분류 배지 + 이벤트 이름 / 조건
+            d.rounded_rectangle((x0 + 22, y0 + 24, x0 + 78, y0 + 54), radius=6, fill=cat_color)
+            d.text((x0 + 31, y0 + 26), category, font=self._font(18, True), fill=white)
+            d.text((x0 + 92, y0 + 20), title, font=self._font(26, True), fill=dark)
+            d.text((x0 + 22, y0 + 74), f"{DEMO_EVENT_RULE.get(evt, (title,))[0]} {need:g}초 지속 시 알림", font=self._font(18), fill=gray)
+            # 지금 상태
+            text = {'cooldown': "이벤트 발생", 'detecting': f"감지 중  {sec:.1f}초", 'off': "모델 없음"}.get(state, "정상")
+            d.ellipse((x0 + 24, y0 + 135, x0 + 42, y0 + 153), fill=color)
+            d.text((x0 + 54, y0 + 118), text, font=self._font(36, True), fill=color)
+            # 막대 (감지 중: 차오름 / 쿨다운: 줄어듦)
+            bx0, bx1, by = x0 + 22, x1 - 22, y0 + 200
+            d.rounded_rectangle((bx0, by, bx1, by + 16), radius=8, fill=(229, 231, 235))
+            ratio = min(1.0, sec / total) if state in ('detecting', 'cooldown') and total > 0 else 0.0
+            if ratio > 0:
+                d.rounded_rectangle((bx0, by, bx0 + max(16.0, (bx1 - bx0) * ratio), by + 16), radius=8, fill=color)
+            small = self._font(16)
+            left, right = ("쿨다운", f"{sec:.1f}초") if state == 'cooldown' else ("0초", f"{total:g}초")
+            d.text((bx0, by + 26), left, font=small, fill=color if state == 'cooldown' else gray)
+            d.text((bx1 - d.textlength(right, font=small), by + 26), right, font=small, fill=color if state == 'cooldown' else gray)
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    def _draw_status_en(self, status):
+        """한글 폰트가 없을 때: 같은 배치를 영어로"""
+        W, H, m = self.VIEW_W, self.STATUS_H, 16
+        img = np.full((H, W, 3), (248, 245, 243), np.uint8)
+        cv2.putText(img, "EVENT STATUS", (m + 6, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 2)
+        n = max(1, len(status))
+        cw, y0, y1 = (W - m * (n + 1)) // n, 50, H - m
+        for i, (evt, state, sec, total, need) in enumerate(status):
+            x0 = m + i * (cw + m)
+            color = self.STATE_COLORS.get(state, (150, 150, 150))[::-1]   # BGR
+            cv2.rectangle(img, (x0, y0), (x0 + cw, y1), (255, 255, 255), -1)
+            cv2.rectangle(img, (x0, y0), (x0 + cw, y1), color if state == 'cooldown' else (226, 229, 234), 4 if state == 'cooldown' else 1)
+            cv2.putText(img, DEMO_EVENT_RULE.get(evt, ("", evt.upper()))[1], (x0 + 22, y0 + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (30, 30, 30), 2)
+            text = {'cooldown': f"ALARM (cooldown {sec:.1f}s)", 'detecting': f"DETECTING {sec:.1f}s", 'off': "NO MODEL"}.get(state, "OK")
+            cv2.putText(img, text, (x0 + 22, y0 + 150), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+            ratio = min(1.0, sec / total) if state in ('detecting', 'cooldown') and total > 0 else 0.0
+            cv2.rectangle(img, (x0 + 22, y0 + 200), (x0 + cw - 22, y0 + 216), (229, 231, 235), -1)
+            if ratio > 0:
+                cv2.rectangle(img, (x0 + 22, y0 + 200), (x0 + 22 + int((cw - 44) * ratio), y0 + 216), color, -1)
+        return img
 
     def _get_panel(self, feed):
         """오른쪽 목록은 새 이벤트가 오거나 시계가 바뀔 때(1초)만 다시 그립니다."""
@@ -2413,6 +2499,14 @@ class HelmetDetector(BaseEventDetector):
             return True
         return cv2.pointPolygonTest(self.roi_poly, get_center_point(*head_box), False) >= 0
 
+    def restart_counting(self, at_time, tid=None):
+        """[데모] 쿨다운: 이벤트가 나면 쿨다운이 끝나는 at_time 부터 맨머리 시간을 처음부터 다시 셉니다.
+        (계속 맨머리면 쿨다운 뒤 3초가 지나 다시 이벤트) tid 가 없으면 모든 사람. 판정 규칙 자체는 그대로입니다."""
+        for session in self.sessions:
+            if tid is None or session['last_tid'] == tid:
+                session['triggered'] = False
+                session['streaks'] = [{'start_time': at_time, 'end_time': at_time}]
+
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
         helmet_tracks = kwargs.get('helmet_tracks', [])
@@ -2612,6 +2706,12 @@ class VestDetector(BaseEventDetector):
         self.person_status = {}    # 화면 표시용: 사람 tid -> "vest" / "no_vest"
         self.person_missing_sec = {}  # 화면 표시용: 사람 tid -> 조끼가 안 보인 지 몇 초째인지
 
+    def restart_counting(self, at_time, tid=None):
+        """[데모] 쿨다운: 쿨다운이 끝나는 at_time 부터 조끼 미착용 시간을 처음부터 다시 셉니다 (tid 가 없으면 세던 모든 사람)."""
+        for t in ([tid] if tid is not None else list(self.missing_since)):
+            self.missing_since[t] = at_time
+            self.fired.discard(t)
+
     def _torso_box(self, person_box, kpts=None, kpt_conf=0.3):
         """어깨·골반 관절로 몸통 박스를 만들고, 관절이 부족하면 사람 박스의 가운데 부분을 씁니다."""
         x1, y1, x2, y2 = [float(v) for v in person_box[:4]]
@@ -2751,6 +2851,12 @@ class BluntWeaponDetector(BaseEventDetector):
 
         self.frame_bats = []           # 화면 표시용: (box, 'held' / 'bat', score)
         self.person_hold_sec = {}      # 화면 표시용: 사람 tid -> 겹친 지 몇 초째인지
+
+    def restart_counting(self, at_time, tid=None):
+        """[데모] 쿨다운: 쿨다운이 끝나는 at_time 부터 손-방망이 겹침 시간을 처음부터 다시 셉니다 (tid 가 없으면 세던 모든 사람)."""
+        for t in ([tid] if tid is not None else list(self.hold_since)):
+            self.hold_since[t] = at_time
+            self.fired.discard(t)
 
     def process(self, tracks, track_map, motion_mask, frame, fid, **kwargs):
         triggered = []
@@ -3617,6 +3723,8 @@ class FrameReader:
         self._decode_window_bytes = 0
         self._decode_window_start = time.time()
         self._gst_check_logged = False
+        self._last_drop_t = None   # [데모] 영상이 끊긴 시각 (다시 들어오면 몇 초 끊겼는지 로그에 남김)
+        self._stream_info = None   # [데모] 처음 확인한 (가로, 세로, 코덱). 재연결 때 ffprobe(약 1.7초)를 건너뛰는 데 씀
 
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -3988,7 +4096,8 @@ class FrameReader:
         return depay, parser, decoder, decoder_kind
 
     def _run_gstreamer_pipe(self):
-        info = self._probe_stream_info()
+        # [데모] 카메라가 영상을 끊었다가 다시 붙을 때는 처음 확인한 정보를 재사용 (재연결 시간 단축)
+        info = self._stream_info or self._probe_stream_info()
         if info is None:
             return False
 
@@ -4051,6 +4160,10 @@ class FrameReader:
         ])
 
         env = os.environ.copy()
+        # [데모] gst-launch -q 는 경고를 출력하지 않으므로, GStreamer 가 올리는 경고·오류(예: 서버가 연결을 닫음)를
+        #        디버그 로그로 stderr 에 남겨 영상 끊김 로그에 함께 기록합니다.
+        env.setdefault("GST_DEBUG", "GST_ERROR_SYSTEM:4")
+        env.setdefault("GST_DEBUG_NO_COLOR", "1")
         proc = None
         gst_failed = False
         gst_stderr_lines = deque(maxlen=30)
@@ -4068,14 +4181,17 @@ class FrameReader:
             self._set_decode_pipeline("gstreamer_pipe_nv12", shape=f"{in_w}x{in_h}->{out_w}x{out_h}", pid=proc.pid, cmd=cmd)
             self.last_t = time.time()
             first_frame_logged = False
+            started_at, frames, end_reason = time.time(), 0, None
 
             while self.running:
                 if time.time() - self.last_t > WATCHDOG_TIMEOUT:
                     self._note_decode_failure(f"gstreamer_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
+                    end_reason = f"{WATCHDOG_TIMEOUT:.0f}초 동안 프레임 없음"
                     break
 
                 raw = proc.stdout.read(frame_size)
                 if len(raw) != frame_size:
+                    end_reason = "gst-launch 종료"
                     break
 
                 # [핵심 최적화] Python GIL을 100% 우회하는 OpenCV C++ 초고속 BGR 변환
@@ -4088,9 +4204,30 @@ class FrameReader:
                     self.last_t = time.time()
                     
                 self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
+                frames += 1
                 if not first_frame_logged:
                     first_frame_logged = True
+                    self._stream_info = info
+                    if self._last_drop_t is not None:
+                        logger.info(f"[CAM:{self.ip}] 카메라 영상 다시 수신 (끊김 {time.time() - self._last_drop_t:.1f}초)")
+                        self._last_drop_t = None
 
+            if frames == 0:
+                self._stream_info = None   # 한 장도 못 받았으면 다음에는 카메라 정보를 다시 확인
+            if end_reason is not None:
+                # [데모] 영상 끊김 원인을 남깁니다: gst-launch 종료 코드와 마지막 오류 메시지 (원래는 verbose_logs 일 때만 남음)
+                try:
+                    code = proc.wait(timeout=1)
+                except Exception:
+                    code = proc.poll()
+                if gst_stderr_thread is not None:
+                    gst_stderr_thread.join(timeout=0.5)
+                self._last_drop_t = time.time()
+                logger.warning(
+                    f"[CAM:{self.ip}] 카메라 영상 끊김 -> 재연결합니다. 원인={end_reason} 종료코드={code} "
+                    f"연결 유지 {time.time() - started_at:.0f}초 프레임 {frames}장 "
+                    f"gst 메시지={' | '.join(list(gst_stderr_lines)[-4:]) or '-'}"
+                )
             return True
         except Exception as e:
             logger.warning(f"[CAM:{self.ip}] GStreamer pipe failed: {e}")
@@ -4196,8 +4333,122 @@ class FrameReader:
                     except Exception:
                         pass
 
+    def _should_use_ffmpeg_pipe(self):
+        """[데모] backend 가 ffmpeg_pipe 면 FFmpeg 로 RTSP 영상 트랙만 받아 CPU 로 디코딩합니다."""
+        backend = str(self.decode_cfg.get("backend", "auto")).strip().lower()
+        return backend in ("ffmpeg_pipe", "ffmpeg_cpu") and bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+    def _run_ffmpeg_pipe(self):
+        """[데모] FFmpeg 로 RTSP '영상 트랙만'(allowed_media_types video) 받아 CPU 디코딩 -> NV12 로 파이프 출력.
+        데모 카메라는 영상과 함께 ONVIF 메타데이터 트랙을 보내는데, GStreamer rtspsrc 는 메타데이터가 한동안 안 오면
+        그 트랙을 시간 초과로 끝내고, 뒤늦게 메타데이터가 오면 RTSP 연결 전체를 끝내서 1~5분마다 영상이 끊겼습니다.
+        FFmpeg 는 영상 트랙만 요청하므로 카메라가 메타데이터를 보내지 않습니다."""
+        info = self._stream_info or self._probe_stream_info()
+        if info is None:
+            return False
+
+        in_w, in_h, _ = info
+        out_w, out_h = self._scaled_output_shape(in_w, in_h)
+        frame_size = int(out_w * out_h * 1.5)   # NV12
+        fps_limit = self._decode_fps_limit()
+        url = self._ensure_clean_url("ffmpeg")
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+        if url.lower().startswith("rtsp://"):
+            cmd.extend(["-rtsp_transport", "tcp", "-allowed_media_types", "video", "-stimeout", "3000000",
+                        "-fflags", "nobuffer", "-flags", "low_delay"])
+        vf_chain = [f"scale={out_w}:{out_h}:flags=bilinear"]
+        if fps_limit is not None:
+            vf_chain.append(f"fps={fps_limit:g}")
+        cmd.extend(["-i", url, "-an", "-vf", ",".join(vf_chain), "-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1"])
+
+        proc = None
+        stderr_lines = deque(maxlen=30)
+        stderr_thread = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=frame_size * 2)
+            if proc.stderr is not None:
+                stderr_thread = threading.Thread(target=self._drain_binary_log_pipe, args=(proc.stderr, stderr_lines), daemon=True)
+                stderr_thread.start()
+            if proc.stdout is None:
+                return False
+
+            self.connected = True
+            self._set_decode_pipeline("ffmpeg_pipe_nv12", shape=f"{in_w}x{in_h}->{out_w}x{out_h}", pid=proc.pid, cmd=cmd)
+            self.last_t = time.time()
+            started_at, frames, end_reason = time.time(), 0, None
+
+            while self.running:
+                if time.time() - self.last_t > WATCHDOG_TIMEOUT:
+                    self._note_decode_failure(f"ffmpeg_timeout_{WATCHDOG_TIMEOUT:.0f}s", level="error")
+                    end_reason = f"{WATCHDOG_TIMEOUT:.0f}초 동안 프레임 없음"
+                    break
+
+                raw = proc.stdout.read(frame_size)
+                if len(raw) != frame_size:
+                    end_reason = "ffmpeg 종료"
+                    break
+
+                yuv_img = np.frombuffer(raw, dtype=np.uint8).reshape((int(out_h * 1.5), out_w))
+                fr = cv2.cvtColor(yuv_img, cv2.COLOR_YUV2BGR_NV12)
+                with self.lock:
+                    self.frame = fr
+                    self.fid += 1
+                    self.last_t = time.time()
+                self._note_decode_frame(frame_size, f"{out_w}x{out_h}")
+                frames += 1
+                if frames == 1:
+                    self._stream_info = info
+                    if self._last_drop_t is not None:
+                        logger.info(f"[CAM:{self.ip}] 카메라 영상 다시 수신 (끊김 {time.time() - self._last_drop_t:.1f}초)")
+                        self._last_drop_t = None
+
+            if frames == 0:
+                self._stream_info = None   # 한 장도 못 받았으면 다음에는 카메라 정보를 다시 확인
+            if end_reason is not None:
+                try:
+                    code = proc.wait(timeout=1)
+                except Exception:
+                    code = proc.poll()
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=0.5)
+                self._last_drop_t = time.time()
+                logger.warning(
+                    f"[CAM:{self.ip}] 카메라 영상 끊김 -> 재연결합니다. 원인={end_reason} 종료코드={code} "
+                    f"연결 유지 {time.time() - started_at:.0f}초 프레임 {frames}장 "
+                    f"ffmpeg 메시지={' | '.join(list(stderr_lines)[-4:]) or '-'}"
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"[CAM:{self.ip}] FFmpeg pipe failed: {e}")
+            return False
+        finally:
+            self.connected = False
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            if stderr_thread is not None:
+                try:
+                    stderr_thread.join(timeout=0.2)
+                except Exception:
+                    pass
+
     def _run(self):
         while self.running:
+            if self._should_use_ffmpeg_pipe():
+                if self._run_ffmpeg_pipe():
+                    continue
+                if not self.decode_cfg.get("fallback_to_cpu", True):
+                    time.sleep(5)
+                    continue
+                logger.warning(f"[CAM:{self.ip}] FFmpeg pipe unavailable; trying OpenCV fallback")
+
             if self._should_use_gstreamer_pipe():
                 used_gstreamer_pipe = self._run_gstreamer_pipe()
                 if used_gstreamer_pipe:
@@ -4253,9 +4504,15 @@ class FrameReader:
             try: cap.release()
             except Exception as e: logger.error(f"카메라 리소스 해제 중 예외: {e}")
 
+    DROP_GRACE_SEC = 5.0   # [데모] 이 시간 안에 다시 연결되면 끊김(NO SIGNAL)으로 표시하지 않고 마지막 화면을 유지
+
     def read(self):
         with self.lock:
-            return self.frame, self.fid, self.connected
+            connected = self.connected
+            if (not connected and self.frame is not None and self._last_drop_t is not None
+                    and time.time() - self._last_drop_t < self.DROP_GRACE_SEC):
+                connected = True   # 짧은 재연결 중: 마지막 화면 유지 (새 프레임이 없으니 판정도 멈춰 있음)
+            return self.frame, self.fid, connected
 
 class Camera:
     def __init__(self, ip, conf, det_main_v2, det_pose, det_bat, det_helmet, det_vest, det_face, det_plate, cam_id, event_inference_mode="separate"):
@@ -4289,6 +4546,7 @@ class Camera:
         self.last_evt_t = {}
         self.last_target_alert_t = {}  # (tid, 이벤트, 동작) -> 마지막 알림 시각 (realert_sec 용)
         self.visual_alarms = {}
+        self.event_status = ({}, 0.0)  # [데모] 대시보드 감시 현황용 ({이벤트: (상태, 진행 초, 필요 초)}, 계산 시각)
 
         self.fps_queue = deque(maxlen=30)
         self.current_fps = 0.0
@@ -5123,6 +5381,19 @@ class Camera:
                 ev_frame = ev.get('frame') if ev.get('frame') is not None else fr
                 cooldown = SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 600)
 
+                # [데모] 같은 이벤트는 한 번 발생하면 cooldown_sec 동안 다시 발생시키지 않습니다 (저장·화면 알림·탐지 목록 모두).
+                #        쿨다운이 끝나면 처음부터 다시 세서, 계속 위반 중이면 3초 뒤 다시 이벤트가 납니다.
+                cooldown_remaining = cooldown - (now - self.last_evt_t.get(ename, 0))
+                if cooldown_remaining > 0:
+                    logger.debug(
+                        f"[EVENT COOLDOWN] cam={self.cam_id} ip={self.ip} event={ename} tid={tid} "
+                        f"fid={int(ev.get('fid', fid))} cooldown_remaining={cooldown_remaining:.1f}s"
+                    )
+                    self._restart_counting(handler, now + cooldown_remaining, tid)
+                    continue
+                self.last_evt_t[ename] = now
+                self._restart_counting(handler, now + cooldown)
+
                 actual_score = handler_score_map.get(tid, score_map_main.get(tid, 0.95))
                 objects_meta = ev.get('objects', [{'label': ename, 'box': [int(x) for x in bbox], 'score': actual_score, 'tid': tid}])
                 
@@ -5155,7 +5426,7 @@ class Camera:
                 else:
                     target_ready = (now - self.last_target_alert_t.get(target_key, 0.0)) >= float(realert_sec)
 
-                if target_ready and (now - self.last_evt_t.get(ename, 0) >= cooldown):
+                if target_ready:
                     event_ts_dt = now_kst()
                     event_ts = event_ts_dt.isoformat()
                     event_fid = int(ev.get('fid', fid))
@@ -5245,7 +5516,6 @@ class Camera:
                         current_fps=SYS_CFG.get("video_decode", {}).get("fps_limit", 15.0)
                     )
                     self.alerted[tid].add(ename)
-                    self.last_evt_t[ename] = now
                     self.last_target_alert_t[target_key] = now
 
                     newly_triggered_events.append({
@@ -5258,11 +5528,10 @@ class Camera:
                     })
 
                 else:
-                    cooldown_remaining = max(0.0, cooldown - (now - self.last_evt_t.get(ename, 0)))
+                    # 같은 사람(tid)의 같은 이벤트는 저장을 한 번만 합니다 (화면 알림·탐지 목록에는 표시)
                     logger.debug(
                         f"[EVENT SUPPRESSED] cam={self.cam_id} ip={self.ip} event={ename} tid={tid} "
-                        f"fid={int(ev.get('fid', fid))} alerted={ename in self.alerted[tid]} "
-                        f"cooldown_remaining={cooldown_remaining:.1f}s"
+                        f"fid={int(ev.get('fid', fid))} alerted={ename in self.alerted[tid]}"
                     )
 
                 current_alarms[(tid, ename)] = ev.get('alarm_text', ename.upper().replace('_', ' '))  # 안전모: "NO HELMET"
@@ -5278,15 +5547,66 @@ class Camera:
             visual_alarms[(tid, ename)] = {'evt': ename, 'text': alarm_text, 'expire': now + alarm_duration}
         self.visual_alarms = {k: v for k, v in visual_alarms.items() if now <= v['expire']}
 
+        try:
+            self._update_event_status(now)
+        except Exception as e:
+            logger.debug(f"[DASHBOARD] CAM:{self.cam_id} 감시 현황 계산 실패: {e}")
+
         alarms = {}  # 사람 tid -> 알림 중인 이벤트 목록
         for (tid, _), info in self.visual_alarms.items():
             alarms.setdefault(tid, []).append(info['evt'])
         return t_main, t_pose, t_bat, t_helmet, t_vest, alarms, newly_triggered_events
 
+    def _restart_counting(self, handler, at_time, tid=None):
+        """[데모] 쿨다운이 끝나는 at_time 부터 그 이벤트 시간을 처음부터 다시 세게 합니다 (tid 가 없으면 세던 모든 사람)."""
+        restart = getattr(handler, 'restart_counting', None)
+        if restart is not None:
+            restart(at_time, tid)
+
+    def _update_event_status(self, now):
+        """[데모] 대시보드 '이벤트 감시 현황'용 상태. 카메라 스레드에서 판정 직후 계산해 한 번에 바꿔 넣습니다.
+        이벤트 -> (상태, 초, 막대 기준 초, 알림 조건 초)
+          'cooldown': 이벤트가 나고 쿨다운 중 (초 = 남은 쿨다운, 막대 기준 = 쿨다운 길이 -> 막대가 줄어듦)
+          'detecting': 조건 시간을 세는 중 (초 = 가장 오래 센 사람, 막대 기준 = 알림 조건 초 -> 막대가 참)
+          'idle': 정상 / 'off': 모델 없음"""
+        status = {}
+        for ename, h in self.handlers.items():
+            sec = 0.0
+            if ename == EVENT_NO_HELMET:
+                need = float(h.trigger_total_sec)
+                off = self.det_helmet is None or self.det_main_v2 is None
+                for s in h.sessions:
+                    # 이미 알린 기록, 빨간 안전모로 판정된 기록, 맨머리가 안 보인 지 max_gap_sec 넘은 기록은 제외
+                    if s['triggered'] or s['last_tid'] in h.red_helmet_tids or now - s['last_seen_time'] > h.max_gap_sec:
+                        continue
+                    streaks = [max(0.0, st['end_time'] - st['start_time']) for st in s['streaks']]
+                    sec = max(sec, sum(x for x in streaks[:-1] if x >= h.min_streak_sec) + streaks[-1])
+            elif ename in (EVENT_NO_VEST, EVENT_BLUNT_WEAPON):
+                if ename == EVENT_NO_VEST:
+                    need, per_person = float(h.no_vest_sec), h.person_missing_sec
+                    off = not h.model_ready or self.det_main_v2 is None
+                else:
+                    need, per_person, off = float(h.hold_sec), h.person_hold_sec, False
+                # 쿨다운 뒤 다시 세기 전인 사람은 음수라 0 으로 봄
+                sec = max([x for tid, x in per_person.items() if tid not in h.fired] + [0.0])
+            else:
+                continue
+
+            cooldown = float(SYS_CFG.get("event_config", {}).get(ename, {}).get("cooldown_sec", 0) or 0)
+            cooldown_left = self.last_evt_t.get(ename, 0) + cooldown - now
+            if off:
+                status[ename] = ('off', 0.0, need, need)
+            elif cooldown_left > 0:
+                status[ename] = ('cooldown', min(cooldown_left, cooldown), cooldown, need)
+            else:
+                status[ename] = ('detecting' if sec > 0 else 'idle', min(sec, need), need, need)
+        self.event_status = (status, now)
+
     def draw(self, fr, t_main, t_pose, t_bat, t_helmet, t_vest, alarms, connected=True, view=None):
         """기존 multi_event.py 화면과 같은 방식 + 객체마다 점수(conf) 표시.
-        view: 이 창에 보여줄 이벤트 목록. 안전 창(안전모, 조끼)이면 MAIN_V2 사람·안전모 모델·조끼 모델 결과,
-        치안 창(둔기)이면 포즈 사람·손목·방망이를 그립니다(None 이면 전부)."""
+        view: 보여줄 이벤트 목록 (None 이면 이 카메라의 이벤트 전부 = 대시보드의 한 화면).
+        안전(안전모, 조끼)은 MAIN_V2 사람·안전모 모델·조끼 모델 결과, 치안(둔기)은 포즈 사람·손목·방망이를 그리고,
+        둘 다 그릴 때 같은 사람의 MAIN_V2 박스와 포즈 박스는 MAIN_V2 박스 하나로 합칩니다."""
         if fr is None or not connected:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
             cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 1)
@@ -5300,7 +5620,7 @@ class Camera:
         show_safety = show_helmet or show_vest
         show_blunt = EVENT_BLUNT_WEAPON in view_events
 
-        # 이 창의 알림. 안전 이벤트는 MAIN_V2 사람 tid, 치안 이벤트는 포즈 사람 tid 기준
+        # 이 화면의 알림. 안전 이벤트는 MAIN_V2 사람 tid, 치안 이벤트는 포즈 사람 tid 기준
         main_alarm_tids, pose_alarm_tids, active_alarms = set(), set(), set()
         for (tid, evt), info in list(self.visual_alarms.items()):
             if evt in view_events:
@@ -5333,15 +5653,25 @@ class Camera:
             else:
                 cv2.putText(fr, text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
 
-        # 1. 안전 창: MAIN_V2 사람 (원본과 같은 라벨). 판정에 안 쓰는 하반신·차량 박스는 그리지 않음
-        if show_safety:
-            for t in t_main:
-                tid, cls_id = int(t[4]), int(t[6])
-                if cls_id != ID_G_PERSON:
-                    continue
-                draw_box(t, f"Person [{tid}]", (0, 255, 0), tracker=self.trk_main, alarmed=tid in main_alarm_tids)
+        # 같은 사람을 MAIN_V2(안전)와 포즈(치안) 모델이 따로 잡으므로, 둘 다 그릴 때는 많이 겹치는(IoU 0.3 이상)
+        # 포즈 사람을 MAIN_V2 사람에 짝지어 박스 하나만 그립니다. 치안 알림도 그 MAIN_V2 사람 박스에 표시합니다.
+        main_persons = [t for t in t_main if int(t[6]) == ID_G_PERSON] if show_safety else []
+        pose_to_main = {}
+        if show_blunt and main_persons:
+            pairs = sorted(((calculate_iou(p[:4], mp[:4]), int(p[4]), int(mp[4])) for p in t_pose for mp in main_persons), reverse=True)
+            for iou, p_tid, m_tid in pairs:
+                if iou < 0.3:
+                    break
+                if p_tid not in pose_to_main and m_tid not in pose_to_main.values():
+                    pose_to_main[p_tid] = m_tid
+        main_alarm_tids |= {pose_to_main[tid] for tid in pose_alarm_tids if tid in pose_to_main}
 
-        # 2. 안전 창: 안전모 모델의 안전모(초록) / 머리(빨강, 안전모 알람 중이면 굵게). 안전모 모델의 사람 등 다른 클래스는 그리지 않음
+        # 1. 안전: MAIN_V2 사람 (원본과 같은 라벨). 판정에 안 쓰는 하반신·차량 박스는 그리지 않음
+        for t in main_persons:
+            tid = int(t[4])
+            draw_box(t, f"Person [{tid}]", (0, 255, 0), tracker=self.trk_main, alarmed=tid in main_alarm_tids)
+
+        # 2. 안전: 안전모 모델의 안전모(초록) / 머리(빨강, 안전모 알람 중이면 굵게). 안전모 모델의 사람 등 다른 클래스는 그리지 않음
         if show_helmet:
             for t in t_helmet:
                 tid, cls_id = int(t[4]), int(t[6])
@@ -5350,7 +5680,7 @@ class Camera:
                 elif cls_id == ID_H_NO_HELMET:
                     draw_box(t, f"Head [{tid}]", (0, 0, 255), 3 if EVENT_NO_HELMET in active_alarms else 2, label_side=True)
 
-        # 3. 안전 창: 조끼 모델 결과
+        # 3. 안전: 조끼 모델 결과
         if show_vest:
             for t in t_vest:
                 tid = int(t[4])
@@ -5359,11 +5689,14 @@ class Camera:
                 else:
                     draw_box(t, f"NoVest [{tid}]", (0, 0, 255), label_side=True)
 
-        # 4. 치안 창: 포즈 사람 + 손목 점, 방망이 (손과 겹친 방망이는 빨강)
+        # 4. 치안: 포즈 사람 + 손목 점, 방망이 (손과 겹친 방망이는 빨강).
+        #    MAIN_V2 사람과 짝지어진 포즈 사람은 손목 점만, 짝이 없으면(MAIN_V2 가 못 잡은 사람) 'Pose' 박스로 그립니다.
         if show_blunt:
             for t in t_pose:
                 tid = int(t[4])
-                draw_box(t, f"Person [{tid}]", (0, 255, 0), tracker=self.trk_pose, alarmed=tid in pose_alarm_tids)
+                if tid not in pose_to_main:
+                    draw_box(t, f"{'Pose' if show_safety else 'Person'} [{tid}]", (0, 255, 0), tracker=self.trk_pose,
+                             alarmed=tid in pose_alarm_tids)
                 kpts = self.trk_pose.tracks.get(tid, {}).get('extra')
                 if kpts is not None:
                     for i in (KP_L_WRIST, KP_R_WRIST):
@@ -6214,17 +6547,11 @@ def main():
     camera_workers = []
     last_rendered_frames = {}
 
-    # [데모] 대시보드 창 하나: 왼쪽 위 안전 화면 / 왼쪽 아래 치안 화면 / 오른쪽 실시간 탐지 목록
-    #        카메라가 여러 대면 각 화면 안에 그 이벤트를 켠 카메라들이 바둑판(모자이크)으로 나옵니다.
-    #        gui_windows: (화면 키, 이름, 그 화면에 보여줄 이벤트들)
-    gui_windows = [(key, title, evts) for key, title, evts in [
-                       ("ppe", "SAFETY - HELMET / VEST", (EVENT_NO_HELMET, EVENT_NO_VEST)),
-                       ("blunt", "SECURITY - BAT IN HAND", (EVENT_BLUNT_WEAPON,))]
-                   if any(e in c.events for c in cams for e in evts)]
-
-    def gui_events(cam):
-        """이 카메라가 나오는 창들: [(창 키, 창 이벤트들)]"""
-        return [(key, evts) for key, _, evts in gui_windows if any(e in cam.events for e in evts)]
+    # [데모] 대시보드 창 하나: 왼쪽 위 카메라 화면(안전·치안 탐지를 한 화면에) / 왼쪽 아래 이벤트 감시 현황 / 오른쪽 실시간 탐지 목록
+    #        카메라가 여러 대면 카메라 화면 칸에 데모 이벤트를 켠 카메라들이 바둑판(모자이크)으로 나옵니다.
+    def on_dashboard(cam):
+        """대시보드 카메라 화면에 나오는 카메라인지 (데모 이벤트를 하나라도 켰는지)"""
+        return any(e in DEMO_EVENT_INFO for e in cam.events)
 
     dashboard = None
     dashboard_fullscreen = False
@@ -6243,8 +6570,8 @@ def main():
 
         blank = np.zeros((360, 640, 3), dtype=np.uint8)
         cv2.putText(blank, "WAITING...", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (150, 150, 150), 2)
-        for key, _ in gui_events(c):
-            last_rendered_frames[(c.ip, key)] = blank
+        if on_dashboard(c):
+            last_rendered_frames[c.ip] = blank
 
     # [수정] 전역 타이머 삭제 및 개별 타이머/활성시간 딕셔너리 도입
     last_roi_snapshot_times = {c.ip: time.time() - 3590.0 for c in cams}
@@ -6319,7 +6646,7 @@ def main():
             # ---------------------------------------------------------
             # Stage 2 (Consumer): 최신 결과 회수, 마스킹 스냅샷, 및 최적화 렌더링
             # ---------------------------------------------------------
-            final_imgs = {key: [] for key, _, _ in gui_windows}
+            final_imgs = []     # 대시보드 카메라 화면에 들어갈 카메라별 화면
             gui_dirty = False   # 이번 루프에 새 결과가 왔는지 (대시보드 다시 그리기 판단)
             now_time = time.time()
             
@@ -6365,9 +6692,8 @@ def main():
                         last_processed_fids[c.ip] = -1
                         logger.info(f"✅ [WATCHDOG] CAM:{c.cam_id}({c.ip}) 핫스왑 복구 완료. 모니터링을 재개합니다.")
 
-                    if is_gui_mode:
-                        for key, _ in gui_events(c):
-                            final_imgs[key].append(last_rendered_frames.get((c.ip, key)))
+                    if is_gui_mode and on_dashboard(c):
+                        final_imgs.append(last_rendered_frames.get(c.ip))
                     continue
 
                 # 정상 수신 시 활성 시간 갱신
@@ -6411,11 +6737,10 @@ def main():
                     except Exception: pass
 
                 if not connected or fr is None or not c.events:
-                    if is_gui_mode:
+                    if is_gui_mode and on_dashboard(c):
                         display_fr = c.draw(None, [], [], [], [], [], {}, False)
-                        for key, _ in gui_events(c):
-                            last_rendered_frames[(c.ip, key)] = display_fr
-                            final_imgs[key].append(display_fr)
+                        last_rendered_frames[c.ip] = display_fr
+                        final_imgs.append(display_fr)
                     continue
 
                 cam_ip = c.ip
@@ -6463,12 +6788,11 @@ def main():
                 if infer_meta:
                     c.recorder.update(record_fr, infer_meta, timestamp=now_time)
 
-                if is_gui_mode:
-                    # 창마다 그 창의 이벤트 관련 표시만 그린 화면을 따로 만듭니다.
-                    for key, evts in gui_events(c):
-                        display_fr = c.draw(fr.copy(), t_main, t_pose, t_bat, t_helmet, t_vest, alarms, True, view=evts)
-                        last_rendered_frames[(c.ip, key)] = display_fr
-                        final_imgs[key].append(display_fr)
+                if is_gui_mode and on_dashboard(c):
+                    # 안전(안전모·조끼)과 치안(방망이) 탐지를 한 화면에 함께 그립니다.
+                    display_fr = c.draw(fr.copy(), t_main, t_pose, t_bat, t_helmet, t_vest, alarms, True)
+                    last_rendered_frames[c.ip] = display_fr
+                    final_imgs.append(display_fr)
 
             # [수정] 전역 리셋 로직 삭제 완료
             if refreshed_cctv_ids:
@@ -6477,9 +6801,8 @@ def main():
             if is_gui_mode:
                 # 새 결과가 왔을 때(또는 0.5초마다 시계 갱신)만 대시보드를 다시 그립니다.
                 if gui_dirty or now_time - last_dashboard_time >= 0.5:
-                    views = {key: create_mosaic_image(final_imgs[key], DemoDashboard.VIEW_W, DemoDashboard.VIEW_H)
-                             if final_imgs.get(key) else None for key, _, _ in gui_windows}
-                    cv2.imshow(DemoDashboard.TITLE, dashboard.render(views.get("ppe"), views.get("blunt"), DEMO_EVENT_FEED))
+                    view = create_mosaic_image(final_imgs, DemoDashboard.VIEW_W, DemoDashboard.VIEW_H) if final_imgs else None
+                    cv2.imshow(DemoDashboard.TITLE, dashboard.render(view, DEMO_EVENT_FEED, collect_demo_status(cams)))
                     last_dashboard_time = now_time
                 key_in = cv2.waitKey(1) & 0xFF
                 if key_in == ord('q'): break
