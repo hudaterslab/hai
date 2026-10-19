@@ -1,0 +1,124 @@
+{
+    "terminal_id": "99999",
+    "system_performance": {
+        "target_fps": 15.0,
+        "dynamic_cpu_adjust_enabled": false
+    },
+    "logging": {
+        "dir": "./logs",
+        "level": "INFO",
+        "file_level": "INFO",
+        "console_level": "INFO",
+        "debug_file_level": "DEBUG",
+        "retention_days": 14,
+        "event_audit_enabled": true,
+        "disk_free_warn_gb": 5.0
+    },
+    "event_config": {
+        "no_helmet": {
+            "enabled": true,
+            "cooldown_sec": 6.0,
+            "blur_face": true,
+            "blur_plate": false,
+            "trigger_sec": 3.0,
+            "min_streak_sec": 3.0,
+            "trigger_total_sec": 3.0,
+            "ignore_top_ratio": 0.0
+        },
+        "no_vest": {
+            "enabled": true,
+            "cooldown_sec": 6.0,
+            "blur_face": true,
+            "blur_plate": false,
+            "no_vest_sec": 3.0,
+            "ignore_top_ratio": 0.0,
+            "vest_class_ids": [
+                0
+            ],
+            "no_vest_class_ids": [],
+            "infer_no_vest_from_person": true
+        },
+        "blunt_weapon": {
+            "enabled": true,
+            "cooldown_sec": 6.0,
+            "blur_face": true,
+            "blur_plate": false,
+            "kpt_conf": 0.4,
+            "hand_margin_ratio": 0.15,
+            "min_length_ratio": 0.15,
+            "gap_tolerance_sec": 2.0,
+            "hold_frames": 3,
+            "min_rotation_deg": 15,
+            "min_bat_move": 0.2,
+            "swing_speed": 0.2,
+            "stroke_dist": 0.12,
+            "elbow_angle": 0
+        }
+    },
+    "models": {
+        "MAIN_V2": "hanjin_cctv_v2.dxnn",
+        "HELMET": "helmet_v2.dxnn",
+        "VEST": "best_vest1.dxnn",
+        "POSE": "yolov8m_pose.dxnn",
+        "BAT": "bat_v5.dxnn",
+        "FACE": "yolov8m-face_ppu.dxnn",
+        "PLATE": "license_plate_detector_v2.dxnn"
+    },
+    "model_confidences": {
+        "MAIN_V2": 0.6,
+        "PERSON": 0.5,
+        "HELMET": 0.55,
+        "VEST": 0.75,
+        "POSE": 0.5,
+        "BAT": 0.6,
+        "FACE": 0.35,
+        "PLATE": 0.1
+    },
+    "model_output_formats": {
+        "MAIN_V2": "ppu",
+        "HELMET": "auto",
+        "VEST": "auto",
+        "POSE": "pose",
+        "BAT": "yolo",
+        "FACE": "auto",
+        "PLATE": "yolo"
+    },
+    "model_engine_pool_sizes": {
+        "MAIN_V2": 1,
+        "HELMET": 1,
+        "VEST": 1,
+        "POSE": 1,
+        "BAT": 1,
+        "FACE": 1,
+        "PLATE": 1
+    },
+    "bat_class_id": 0,
+    "video_decode": {
+        "backend": "ffmpeg_pipe",
+        "hw_acceleration": "cpu",
+        "hw_device": "/dev/dri/renderD128",
+        "vaapi_driver": "iHD",
+        "fallback_to_cpu": true,
+        "fps_limit": 15.0,
+        "gstreamer_latency_ms": 50,
+        "gstreamer_protocols": "tcp",
+        "gstreamer_tcp_timeout_us": 3000000,
+        "gstreamer_drop_on_latency": true,
+        "log_interval_sec": 10.0,
+        "verbose_logs": false
+    },
+    "INFERENCE_MODE": "auto",
+    "BATCH_SIZE": 9,
+    "REC_FPS": 3,
+    "LOOP_FPS": 10.0,
+    "PERF_LOG_INTERVAL_SEC": 10.0,
+    "REC_PRE_SEC": 10,
+    "REC_POST_SEC": 10,
+    "EVENT_FRAME_SAVE_DELAY_SEC": 10.0,
+    "EVENT_FRAME_SAVE_MAX_COUNT": 0,
+    "OUTPUT_RETENTION_DAYS": 14,
+    "OUTPUT_CLEANUP_INTERVAL_SEC": 86400,
+    "ROI_SETUP_REQUIRED_API_ENABLED": false,
+    "INTERACTIVE_INPUT_GUARD_SEC": 0.35,
+    "VISUAL_ALARM_DURATION": 5.0
+}
