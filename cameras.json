@@ -1,0 +1,12 @@
+{
+    "100_media_live_1_1": {
+        "url": "rtsp://192.168.50.100:554/media/live/1/1",
+        "events": [
+            "no_helmet",
+            "no_vest",
+            "blunt_weapon"
+        ],
+        "roi_poly_norm": [],
+        "roi_lines_norm": []
+    }
+}
