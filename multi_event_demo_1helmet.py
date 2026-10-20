@@ -91,6 +91,32 @@ def white_ratio(frame, box):
     white = (hsv[:, :, 1] <= WHITE_MAX_SAT) & (hsv[:, :, 2] >= WHITE_MIN_VAL)
     return float(white.mean())
 
+# ==========================================
+# [추가] 노란색 조끼 필터 로직
+# ==========================================
+YELLOW_VEST_FILTER = True
+YELLOW_MIN_RATIO = 0.2   # 20% 기준 (테스트 시 0.15로 낮춰보는 것 권장)
+
+def yellow_ratio(frame, box):
+    """조끼 박스 영역의 노란색 픽셀 비율 (0~1)"""
+    if frame is None:
+        return 0.0
+    h_img, w_img = frame.shape[:2]
+    x1, y1 = int(max(0, box[0])), int(max(0, box[1]))
+    x2 = int(min(w_img, box[2]))
+    y2 = int(min(h_img, box[3]))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return 0.0
+        
+    hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+    
+    # 노란색 HSV 범위 (현장 조명에 따라 H(색상) 범위를 15~45 등으로 조절 가능)
+    # H: 20~35 (노랑), S: 80 이상 (어느정도 채도가 있음), V: 80 이상 (너무 어둡지 않음)
+    yellow = (hsv[:, :, 0] >= 20) & (hsv[:, :, 0] <= 35) & \
+             (hsv[:, :, 1] >= 80) & (hsv[:, :, 2] >= 80)
+    
+    return float(yellow.mean())
+
 
 def no_helmet_class_ids():
     """미착용으로 보는 클래스: 머리(맨머리) + 흰색이 아닌 안전모"""
@@ -466,13 +492,33 @@ def detection_array(rows):
         return np.empty((0, 6))
     return np.array(rows, dtype=float)
 
-def filter_main_detections(raw_dets, main_conf, person_conf, max_area_threshold):
+#def filter_main_detections(raw_dets, main_conf, person_conf, max_area_threshold):
     """사람 모델(MAIN_V2) 결과에서 화면 대부분을 덮는 거대 박스(비/IR 노이즈 등)를 버리고,
     사람·하반신은 person_conf, 그 밖(차량)은 main_conf 이상만 남깁니다."""
+#    kept = []
+#    for d in raw_dets:
+#        if (float(d[2]) - float(d[0])) * (float(d[3]) - float(d[1])) > max_area_threshold:
+#            continue
+#        need = person_conf if int(d[5]) in (ID_G_PERSON, ID_PERSON_LOW) else main_conf
+#        if float(d[4]) >= need:
+#            kept.append(d)
+#    return detection_array(kept)
+
+def filter_main_detections(raw_dets, main_conf, person_conf, max_area_threshold):
     kept = []
     for d in raw_dets:
-        if (float(d[2]) - float(d[0])) * (float(d[3]) - float(d[1])) > max_area_threshold:
+        box_w = float(d[2]) - float(d[0])
+        box_h = float(d[3]) - float(d[1])
+
+        # 1. 거대 노이즈 박스 제외
+        if box_w * box_h > max_area_threshold:
             continue
+
+        # 2. [추가] 너무 작은 박스 제외 (포스터 속 사람 픽셀 필터링)
+        # 카메라 해상도(1280x720 또는 640x360 등)에 맞춰 현장 상황에 맞게 픽셀(px) 조절 (예: 높이 100픽셀 미만 무시)
+        if box_h < 100 or box_w < 50:
+            continue
+
         need = person_conf if int(d[5]) in (ID_G_PERSON, ID_PERSON_LOW) else main_conf
         if float(d[4]) >= need:
             kept.append(d)
@@ -6811,13 +6857,33 @@ def main():
 
         d_vest_res = []
         if vest_future is not None:
+            checked_vests = []
+
             for d in vest_future.result():
                 if (d[2] - d[0]) * (d[3] - d[1]) > max_area_threshold:
                     continue
+
                 if int(d[5]) in vest_class_ids:
-                    d_vest_res.append([d[0], d[1], d[2], d[3], d[4], ID_VEST])
+                    if YELLOW_VEST_FILTER:
+                        y_ratio = yellow_ratio(fr, d)
+                        is_yellow = y_ratio >= YELLOW_MIN_RATIO
+                        checked_vests.append(f"노랑 {y_ratio:.2f} -> {'조끼착용' if is_yellow else '노랑 아님(스킵)'}")
+
+                        if is_yellow:
+                            d_vest_res.append([d[0], d[1], d[2], d[3], d[4], ID_VEST])
+                        else:
+                            # 노란색 기준 미달 시 조끼 모델 결과 자체를 미착용으로 강제 변환
+                            d_vest_res.append([d[0], d[1], d[2], d[3], d[4], ID_NO_VEST])
+                    else:
+                        d_vest_res.append([d[0], d[1], d[2], d[3], d[4], ID_VEST])
+
                 elif int(d[5]) in no_vest_class_ids:
                     d_vest_res.append([d[0], d[1], d[2], d[3], d[4], ID_NO_VEST])
+                
+            # 터미널 디버깅용 로그 출력 (테스트 시 적절한 비율을 찾기 위해 필요)
+            if checked_vests and time.time() - getattr(cam, '_last_vest_log', 0.0) >= 1.0:
+                cam._last_vest_log = time.time()
+                logger.info(f"[VEST-COLOR] {cam.ip} 노란 픽셀 비율 (기준 {YELLOW_MIN_RATIO}): " + " / ".join(checked_vests))
 
         return (d_main_res, d_pose_res, pose_kpts, detection_array(d_bat_res),
                 detection_array(d_helmet_res), detection_array(d_vest_res))
@@ -6901,14 +6967,15 @@ def main():
         return any(e in DEMO_EVENT_INFO for e in cam.events)
 
     dashboard = None
-    dashboard_fullscreen = False
+    dashboard_fullscreen = True
     last_dashboard_time = 0.0
     if is_gui_mode:
         # 'f': 전체 화면 전환, 'q': 종료
         dashboard = DemoDashboard()
         cv2.namedWindow(DemoDashboard.TITLE, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-        cv2.resizeWindow(DemoDashboard.TITLE, int(DemoDashboard.W * 0.8), int(DemoDashboard.H * 0.8))
-        cv2.moveWindow(DemoDashboard.TITLE, 0, 0)
+        #cv2.resizeWindow(DemoDashboard.TITLE, int(DemoDashboard.W * 0.8), int(DemoDashboard.H * 0.8))
+        #cv2.moveWindow(DemoDashboard.TITLE, 0, 0)
+        cv2.setWindowProperty(DemoDashboard.TITLE, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     for c in cams:
         worker = CameraWorker(c)

@@ -1,0 +1,82 @@
+2026-10-20 22:03:52 | INFO    | [main] [시스템 모드] GUI 모드로 동작합니다. (--gui 플래그 활성화됨)
+2026-10-20 22:03:52 | INFO    | [main] [System] 단일 스크립트 기반 YOLOv8 모듈화 시스템 초기화 완료
+>> CLI 디버그 출력을 활성화하시겠습니까? (파일 로그는 항상 상세히 기록됩니다) [y/N]: 2026-10-20 22:03:53 | DEBUG   | [main] 디버그 모드가 활성화되었습니다. 콘솔 상세 로깅이 시작됩니다.
+>> 기존 설정(cameras.json)을 무시하고 ROI 및 이벤트를 재설정하시겠습니까? [y/N]: 2026-10-20 22:03:54 | INFO    | [main] DeepX 모델을 VPU 메모리로 할당 중... (event inference: main)
+2026-10-20 22:03:54 | INFO    | [__init__] [DeepX] 모델 로드 성공: yolov8m_pose.dxnn (output=pose, pool=1, input=640x640, layout=nhwc)
+2026-10-20 22:03:55 | INFO    | [__init__] [DeepX] 모델 로드 성공: bat_v5.dxnn (output=yolo, pool=1, input=640x640, layout=nhwc)
+2026-10-20 22:03:55 | INFO    | [__init__] [DeepX] 모델 로드 성공: hanjin_cctv_v2.dxnn (output=ppu, pool=1, input=640x640, layout=nhwc)
+2026-10-20 22:03:56 | INFO    | [_resolve_output_format] [DeepX] output_format=auto detected ppu: helmet_v2.dxnn (shapes=[[8400]] dtypes=['bbox'])
+2026-10-20 22:03:56 | INFO    | [__init__] [DeepX] 모델 로드 성공: helmet_v2.dxnn (output=ppu, pool=1, input=640x640, layout=nhwc)
+2026-10-20 22:03:56 | INFO    | [_resolve_output_format] [DeepX] output_format=auto detected ppu: best_vest1.dxnn (shapes=[[8400]] dtypes=['bbox'])
+2026-10-20 22:03:56 | INFO    | [__init__] [DeepX] 모델 로드 성공: best_vest1.dxnn (output=ppu, pool=1, input=640x640, layout=nhwc)
+2026-10-20 22:03:56 | INFO    | [_resolve_output_format] [DeepX] output_format=auto detected ppu: yolov8m-face_ppu.dxnn (shapes=[[8400]] dtypes=['bbox'])
+2026-10-20 22:03:56 | INFO    | [__init__] [DeepX] 모델 로드 성공: yolov8m-face_ppu.dxnn (output=ppu, pool=1, input=640x640, layout=nhwc)
+2026-10-20 22:03:56 | WARNING | [load_optional_model] [MODEL] PLATE 모델 파일이 없어 건너뜁니다: /home/hudaters/Desktop/indemo/license_plate_detector_v2.dxnn
+2026-10-20 22:03:56 | INFO    | [main] [CAMERA LOADED] cam=1 ip=100_media_live_1_1 events=no_helmet,no_vest,blunt_weapon roi_poly_points=0 roi_line_points=0
+2026-10-20 22:03:56 | INFO    | [__init__] [Health Check] 백그라운드 헬스 체크 데몬 시작 (주기: 60초)
+2026-10-20 22:03:56 | DEBUG   | [cleanup_old_files] [Retention] ROI 정합 로그 폴더가 아직 없습니다: /home/hudaters/Desktop/indemo/logs/roi_align
+2026-10-20 22:03:58 | INFO    | [_run] 📊 [SYSTEM STATUS] API:FAIL(404) | CAM:0/1 (Zombie:0) | CPU:22.3% | MEM:11.6% | DISK:6.0/56.7GB | TEMP(Sys/NPU):47.0'C/43.0'C
+2026-10-20 22:04:00 | INFO    | [_initialize_base_roi_if_needed] [CAM:1] base ROI init | poly=0 lines=0 shape=(404, 720)
+2026-10-20 22:04:10 | ERROR   | [_send_roi_snapshot_task]  [ROI Snapshot][1시간 정기 ROI 스냅샷] CAM:1 API 에러 (404): {"httpStatus":404,"success":false,"message":"CCTV 정보를 찾을 수 없습니다. (terminal_id=99999, cctv_server_id=1, cctv_id=1)","errorCode":"ERROR","meta":null,"data":null}
+2026-10-20 22:04:26 | WARNING | [run_logic] 🔥 [EVENT TRIGGERED] event_id=20261020T220426831_cam1_100_media_live_1_1_no_vest_tid1_fid386 CAM:1(100_media_live_1_1) | Event:no_vest | TermID:99999 | TID:1 | FID:386 | FPS:11.8 | Reason:no_vest_continuous | Objects -> no_vest(0.57): [227, 235, 250, 246]
+2026-10-20 22:04:26 | INFO    | [run_logic] [PRIVACY BLUR] event_id=20261020T220426831_cam1_100_media_live_1_1_no_vest_tid1_fid386 cam=1 event=no_vest face_enabled=True plate_enabled=False face_count=0 plate_count=0 reference_tracks=event_frame_tracks
+2026-10-20 22:04:26 | INFO    | [save_event_image_with_mark] [EVIDENCE QUEUED] event_id=20261020T220426831_cam1_100_media_live_1_1_no_vest_tid1_fid386 cam=1 event=no_vest tid=1 image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images/no_vest/20261020_220426_100_media_live_1_1_no_vest_1.jpg api_image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220426_100_media_live_1_1_no_vest_1.jpg
+2026-10-20 22:04:26 | INFO    | [trigger] ? [녹화시작] 100_media_live_1_1 - no_vest (FPS: 15.0)
+2026-10-20 22:04:26 | DEBUG   | [_write_image_file] [EVIDENCE SAVE OK] event_id=20261020T220426831_cam1_100_media_live_1_1_no_vest_tid1_fid386 label=event_image path=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images/no_vest/20261020_220426_100_media_live_1_1_no_vest_1.jpg
+2026-10-20 22:04:26 | DEBUG   | [_write_image_file] [EVIDENCE SAVE OK] event_id=20261020T220426831_cam1_100_media_live_1_1_no_vest_tid1_fid386 label=api_image path=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220426_100_media_live_1_1_no_vest_1.jpg
+2026-10-20 22:04:26 | DEBUG   | [send_event_image_to_receiver] [API SKIP] event_id=20261020T220426831_cam1_100_media_live_1_1_no_vest_tid1_fid386 reason=default_terminal image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220426_100_media_live_1_1_no_vest_1.jpg
+2026-10-20 22:04:26 | DEBUG   | [send_event_image_to_receiver] [API 스킵] 기본 단말 ID(99999) 사용 중: /home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220426_100_media_live_1_1_no_vest_1.jpg
+2026-10-20 22:04:35 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=1 fid=521 alerted=True
+2026-10-20 22:04:36 | INFO    | [update]  [녹화종료] 100_media_live_1_1 - no_vest
+2026-10-20 22:04:50 | WARNING | [run_logic] 🔥 [EVENT TRIGGERED] event_id=20261020T220450961_cam1_100_media_live_1_1_no_vest_tid2_fid745 CAM:1(100_media_live_1_1) | Event:no_vest | TermID:99999 | TID:2 | FID:745 | FPS:11.6 | Reason:no_vest_continuous | Objects -> no_vest(0.52): [226, 235, 250, 246]
+2026-10-20 22:04:50 | INFO    | [run_logic] [PRIVACY BLUR] event_id=20261020T220450961_cam1_100_media_live_1_1_no_vest_tid2_fid745 cam=1 event=no_vest face_enabled=True plate_enabled=False face_count=0 plate_count=0 reference_tracks=event_frame_tracks
+2026-10-20 22:04:50 | INFO    | [save_event_image_with_mark] [EVIDENCE QUEUED] event_id=20261020T220450961_cam1_100_media_live_1_1_no_vest_tid2_fid745 cam=1 event=no_vest tid=2 image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images/no_vest/20261020_220450_100_media_live_1_1_no_vest_2.jpg api_image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220450_100_media_live_1_1_no_vest_2.jpg
+2026-10-20 22:04:50 | INFO    | [trigger] ? [녹화시작] 100_media_live_1_1 - no_vest (FPS: 15.0)
+2026-10-20 22:04:50 | DEBUG   | [_write_image_file] [EVIDENCE SAVE OK] event_id=20261020T220450961_cam1_100_media_live_1_1_no_vest_tid2_fid745 label=event_image path=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images/no_vest/20261020_220450_100_media_live_1_1_no_vest_2.jpg
+2026-10-20 22:04:50 | DEBUG   | [_write_image_file] [EVIDENCE SAVE OK] event_id=20261020T220450961_cam1_100_media_live_1_1_no_vest_tid2_fid745 label=api_image path=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220450_100_media_live_1_1_no_vest_2.jpg
+2026-10-20 22:04:50 | DEBUG   | [send_event_image_to_receiver] [API SKIP] event_id=20261020T220450961_cam1_100_media_live_1_1_no_vest_tid2_fid745 reason=default_terminal image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220450_100_media_live_1_1_no_vest_2.jpg
+2026-10-20 22:04:50 | DEBUG   | [send_event_image_to_receiver] [API 스킵] 기본 단말 ID(99999) 사용 중: /home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220450_100_media_live_1_1_no_vest_2.jpg
+2026-10-20 22:04:59 | INFO    | [_run] 📊 [SYSTEM STATUS] API:FAIL(404) | CAM:1/1 (Zombie:0) | CPU:36.6% | MEM:15.8% | DISK:6.0/56.7GB | TEMP(Sys/NPU):55.0'C/55.0'C
+2026-10-20 22:04:59 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=880 alerted=True
+2026-10-20 22:05:01 | INFO    | [update]  [녹화종료] 100_media_live_1_1 - no_vest
+2026-10-20 22:05:09 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1016 alerted=True
+2026-10-20 22:05:18 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1153 alerted=True
+2026-10-20 22:05:27 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1289 alerted=True
+2026-10-20 22:05:36 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1424 alerted=True
+2026-10-20 22:05:45 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1561 alerted=True
+2026-10-20 22:05:54 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1697 alerted=True
+2026-10-20 22:06:00 | INFO    | [_run] 📊 [SYSTEM STATUS] API:FAIL(404) | CAM:1/1 (Zombie:0) | CPU:35.9% | MEM:16.1% | DISK:6.0/56.7GB | TEMP(Sys/NPU):57.0'C/58.0'C
+2026-10-20 22:06:03 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1834 alerted=True
+2026-10-20 22:06:12 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=1970 alerted=True
+2026-10-20 22:06:21 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=2107 alerted=True
+2026-10-20 22:06:30 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=2242 alerted=True
+2026-10-20 22:06:39 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=2377 alerted=True
+2026-10-20 22:06:48 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=2514 alerted=True
+2026-10-20 22:06:57 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=2649 alerted=True
+2026-10-20 22:07:02 | INFO    | [_run] 📊 [SYSTEM STATUS] API:FAIL(404) | CAM:1/1 (Zombie:0) | CPU:31.0% | MEM:16.1% | DISK:6.0/56.7GB | TEMP(Sys/NPU):58.0'C/60.0'C
+2026-10-20 22:07:06 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=2784 alerted=True
+2026-10-20 22:07:15 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=2919 alerted=True
+2026-10-20 22:07:24 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=3055 alerted=True
+2026-10-20 22:07:34 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=3191 alerted=True
+2026-10-20 22:07:43 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=3326 alerted=True
+2026-10-20 22:07:52 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=3467 alerted=True
+2026-10-20 22:08:01 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=3602 alerted=True
+2026-10-20 22:08:04 | INFO    | [_run] 📊 [SYSTEM STATUS] API:FAIL(404) | CAM:1/1 (Zombie:0) | CPU:33.2% | MEM:16.2% | DISK:6.0/56.7GB | TEMP(Sys/NPU):59.0'C/60.0'C
+2026-10-20 22:08:10 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=3738 alerted=True
+2026-10-20 22:08:19 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=3874 alerted=True
+2026-10-20 22:08:28 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=4010 alerted=True
+2026-10-20 22:08:37 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=2 fid=4145 alerted=True
+2026-10-20 22:08:58 | WARNING | [run_logic] 🔥 [EVENT TRIGGERED] event_id=20261020T220858961_cam1_100_media_live_1_1_no_vest_tid5_fid4465 CAM:1(100_media_live_1_1) | Event:no_vest | TermID:99999 | TID:5 | FID:4465 | FPS:11.5 | Reason:no_vest_continuous | Objects -> no_vest(0.61): [226, 235, 250, 247]
+2026-10-20 22:08:58 | INFO    | [run_logic] [PRIVACY BLUR] event_id=20261020T220858961_cam1_100_media_live_1_1_no_vest_tid5_fid4465 cam=1 event=no_vest face_enabled=True plate_enabled=False face_count=0 plate_count=0 reference_tracks=event_frame_tracks
+2026-10-20 22:08:58 | INFO    | [save_event_image_with_mark] [EVIDENCE QUEUED] event_id=20261020T220858961_cam1_100_media_live_1_1_no_vest_tid5_fid4465 cam=1 event=no_vest tid=5 image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images/no_vest/20261020_220858_100_media_live_1_1_no_vest_5.jpg api_image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220858_100_media_live_1_1_no_vest_5.jpg
+2026-10-20 22:08:58 | INFO    | [trigger] ? [녹화시작] 100_media_live_1_1 - no_vest (FPS: 15.0)
+2026-10-20 22:08:58 | DEBUG   | [_write_image_file] [EVIDENCE SAVE OK] event_id=20261020T220858961_cam1_100_media_live_1_1_no_vest_tid5_fid4465 label=event_image path=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images/no_vest/20261020_220858_100_media_live_1_1_no_vest_5.jpg
+2026-10-20 22:08:58 | DEBUG   | [_write_image_file] [EVIDENCE SAVE OK] event_id=20261020T220858961_cam1_100_media_live_1_1_no_vest_tid5_fid4465 label=api_image path=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220858_100_media_live_1_1_no_vest_5.jpg
+2026-10-20 22:08:58 | DEBUG   | [send_event_image_to_receiver] [API SKIP] event_id=20261020T220858961_cam1_100_media_live_1_1_no_vest_tid5_fid4465 reason=default_terminal image=/home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220858_100_media_live_1_1_no_vest_5.jpg
+2026-10-20 22:08:58 | DEBUG   | [send_event_image_to_receiver] [API 스킵] 기본 단말 ID(99999) 사용 중: /home/hudaters/Desktop/indemo/CCTV_EVENT_ALERT/events/100_media_live_1_1/images_api/no_vest/20261020_220858_100_media_live_1_1_no_vest_5.jpg
+2026-10-20 22:09:05 | INFO    | [_run] 📊 [SYSTEM STATUS] API:FAIL(404) | CAM:1/1 (Zombie:0) | CPU:35.8% | MEM:16.2% | DISK:6.0/56.7GB | TEMP(Sys/NPU):63.0'C/60.0'C
+2026-10-20 22:09:08 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=5 fid=4601 alerted=True
+2026-10-20 22:09:09 | INFO    | [update]  [녹화종료] 100_media_live_1_1 - no_vest
+2026-10-20 22:09:17 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=5 fid=4736 alerted=True
+2026-10-20 22:09:26 | DEBUG   | [run_logic] [EVENT SUPPRESSED] cam=1 ip=100_media_live_1_1 event=no_vest tid=5 fid=4871 alerted=True
+2026-10-20 22:09:29 | INFO    | [graceful_shutdown] [SYSTEM] Waiting for background I/O tasks to finish.
