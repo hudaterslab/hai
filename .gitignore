@@ -38,3 +38,8 @@ __pycache__/
 roi_from_snapshots.py
 .codex*
 .codex_local_skills/
+# Local agent state
+.agentbridge/
+.trail/
+.claude/settings.json
+.claude/settings.local.json
