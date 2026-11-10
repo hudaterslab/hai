@@ -2191,31 +2191,34 @@ class CrossingDetector(BaseEventDetector):
                 for c_line in self.computed_lines:
                     p1, p2 = c_line['p1'], c_line['p2']
                     atype = c_line['anchor_type']
-                    
-                    # 캐싱된 앵커 타입을 사용하여 연산 없이 즉각 좌표 추출
-                    prev_pos = self._get_dynamic_anchor(prev_box, atype)
-                    curr_pos = self._get_dynamic_anchor(curr_box, atype)
-                    trajectory = (prev_pos, curr_pos)
-                    
-                    if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
-                        cross_angle = self._get_angle_between_lines((p1, p2), trajectory)
-                        if cross_angle >= self.min_crossing_angle:
-                            self.candidates[p_tid] = {
-                                'person_height': person_height,
-                                'timestamp_time': current_time,
-                                'line': (p1, p2),
-                                'anchor_type': atype, # [핵심] 판정 시 사용할 앵커 타입 함께 보관
-                                'entry_side': ccw(p1, p2, trajectory[0]),
-                                'cross_angle': cross_angle,
-                                'candidate_trajectory': [trajectory[0], trajectory[1]],
-                                'crossed_pos': curr_pos, 
-                                'bbox': tuple(curr_box),
-                                'frame': frame.copy() if frame is not None else None,
-                                'fid': fid,
-                                'privacy_tracks': privacy_tracks,
-                                'objects': curr_objects
-                            }
-                        break
+
+                    # 가로선은 허리(TOP)와 발(FOOT) 중 먼저 선을 넘는 점으로 후보 등록
+                    for check_type in (('TOP', 'FOOT') if atype == 'TOP' else (atype,)):
+                        trajectory = (self._get_dynamic_anchor(prev_box, check_type), self._get_dynamic_anchor(curr_box, check_type))
+                        if self._is_intersect(p1, p2, trajectory[0], trajectory[1]):
+                            break
+                    else:
+                        continue
+
+                    cross_angle = self._get_angle_between_lines((p1, p2), trajectory)
+                    if cross_angle >= self.min_crossing_angle:
+                        self.candidates[p_tid] = {
+                            'person_height': person_height,
+                            'timestamp_time': current_time,
+                            'line': (p1, p2),
+                            'anchor_type': atype, # [핵심] 판정 시 사용할 앵커 타입 함께 보관
+                            'entry_side': ccw(p1, p2, trajectory[0]),
+                            'cross_angle': cross_angle,
+                            'candidate_trajectory': [trajectory[0], trajectory[1]],
+                            # 발이 먼저 넘어도 거리 판정은 허리 기준이므로 허리 위치를 저장
+                            'crossed_pos': self._get_dynamic_anchor(curr_box, atype),
+                            'bbox': tuple(curr_box),
+                            'frame': frame.copy() if frame is not None else None,
+                            'fid': fid,
+                            'privacy_tracks': privacy_tracks,
+                            'objects': curr_objects
+                        }
+                    break
 
             # 최종 트리거 판별
             if p_tid in self.candidates:
@@ -2226,6 +2229,10 @@ class CrossingDetector(BaseEventDetector):
                 # 저장해둔 앵커 타입으로 현재 위치 즉각 추출
                 curr_pos = self._get_dynamic_anchor(curr_box, atype)
                 curr_side = ccw(p1, p2, curr_pos)
+                # 가로선은 발도 반대편으로 넘어가야 판정 (허리만 넘은 상태는 제외)
+                foot_pos = self._get_dynamic_anchor(curr_box, 'FOOT')
+                foot_side = ccw(p1, p2, foot_pos)
+                foot_ok = atype != 'TOP' or (foot_side != 0 and foot_side != cand['entry_side'])
 
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
@@ -2238,7 +2245,7 @@ class CrossingDetector(BaseEventDetector):
                     tilt_factor = 1.0 + (math.sin(math.radians(line_tilt_angle)) * 0.5)
                     dynamic_threshold = cand['person_height'] * self.distance_ratio * tilt_factor
 
-                    if perp_dist >= dynamic_threshold and post_cross_dist >= (dynamic_threshold * 0.6):
+                    if perp_dist >= dynamic_threshold and post_cross_dist >= (dynamic_threshold * 0.6) and foot_ok:
                         triggered.append({
                             'tid': p_tid,
                             'bbox': cand['bbox'],
@@ -2257,6 +2264,8 @@ class CrossingDetector(BaseEventDetector):
                                 'candidate_age_sec': round(float(current_time - cand['timestamp_time']), 3),
                                 'crossed_pos': int_point(cand['crossed_pos']),
                                 'current_pos': int_point(curr_pos),
+                                'foot_pos': int_point(foot_pos),
+                                'foot_side': int(foot_side),
                                 'perp_dist': round(float(perp_dist), 3),
                                 'post_cross_dist': round(float(post_cross_dist), 3),
                             }
