@@ -2049,6 +2049,10 @@ class CrossingDetector(BaseEventDetector):
 
         self.candidate_ttl_sec = config.get("candidate_ttl_sec", 30.0)
 
+        # 가로선 판정용 최근 발 위치 기록 (tid -> deque[(time, foot_pt)])
+        self.foot_history = {}
+        self.foot_lookback_sec = config.get("foot_lookback_sec", 3.0)
+
     def _is_intersect(self, p1, p2, p3, p4):
         c1 = ccw(p1, p2, p3) * ccw(p1, p2, p4)
         c2 = ccw(p3, p4, p1) * ccw(p3, p4, p2)
@@ -2170,6 +2174,9 @@ class CrossingDetector(BaseEventDetector):
                     del self.candidates[p_tid]
                 continue
 
+            # 점프 방어로 건너뛰는 프레임도 기록 (저 FPS에서 앞발이 허리보다 먼저 넘어가는 경우 대비)
+            self.foot_history.setdefault(p_tid, deque(maxlen=64)).append((current_time, self._get_dynamic_anchor(curr_box, 'FOOT')))
+
             # 이전 박스가 없으면 등록 후 스킵
             if p_tid not in self.prev:
                 self.prev[p_tid] = curr_box
@@ -2212,6 +2219,12 @@ class CrossingDetector(BaseEventDetector):
                             'candidate_trajectory': [trajectory[0], trajectory[1]],
                             # 발이 먼저 넘어도 거리 판정은 허리 기준이므로 허리 위치를 저장
                             'crossed_pos': self._get_dynamic_anchor(curr_box, atype),
+                            # 최근 foot_lookback_sec 안에 발이 진입 쪽에 보였는지 (원근상 허리만 선을 넘는 앞쪽 사람 제외)
+                            'foot_seen_entry': any(
+                                ccw(p1, p2, pt) == ccw(p1, p2, trajectory[0])
+                                for t, pt in self.foot_history.get(p_tid, ())
+                                if current_time - t <= self.foot_lookback_sec
+                            ),
                             'bbox': tuple(curr_box),
                             'frame': frame.copy() if frame is not None else None,
                             'fid': fid,
@@ -2229,10 +2242,11 @@ class CrossingDetector(BaseEventDetector):
                 # 저장해둔 앵커 타입으로 현재 위치 즉각 추출
                 curr_pos = self._get_dynamic_anchor(curr_box, atype)
                 curr_side = ccw(p1, p2, curr_pos)
-                # 가로선은 발도 반대편으로 넘어가야 판정 (허리만 넘은 상태는 제외)
+                # 가로선은 발도 진입 쪽에서 반대편으로 실제로 넘어가야 판정 (허리만 넘은 상태는 제외)
                 foot_pos = self._get_dynamic_anchor(curr_box, 'FOOT')
                 foot_side = ccw(p1, p2, foot_pos)
-                foot_ok = atype != 'TOP' or (foot_side != 0 and foot_side != cand['entry_side'])
+                cand['foot_seen_entry'] = cand['foot_seen_entry'] or foot_side == cand['entry_side']
+                foot_ok = atype != 'TOP' or (cand['foot_seen_entry'] and foot_side != 0 and foot_side != cand['entry_side'])
 
                 if cand['entry_side'] != 0 and curr_side != 0 and cand['entry_side'] != curr_side:
                     perp_dist = self._get_perpendicular_distance(p1, p2, curr_pos)
@@ -2266,6 +2280,7 @@ class CrossingDetector(BaseEventDetector):
                                 'current_pos': int_point(curr_pos),
                                 'foot_pos': int_point(foot_pos),
                                 'foot_side': int(foot_side),
+                                'foot_seen_entry': bool(cand['foot_seen_entry']),
                                 'perp_dist': round(float(perp_dist), 3),
                                 'post_cross_dist': round(float(post_cross_dist), 3),
                             }
@@ -2281,6 +2296,8 @@ class CrossingDetector(BaseEventDetector):
             if tid not in curr_ids:
                 del self.prev[tid]
                 if tid in self.candidates: del self.candidates[tid]
+        for tid in [t for t in self.foot_history if t not in curr_ids]:
+            del self.foot_history[tid]
 
         return triggered
 
